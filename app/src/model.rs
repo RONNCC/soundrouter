@@ -567,4 +567,87 @@ mod tests {
         assert_eq!(ch_label(0, 1), "1");
         assert_eq!(ch_label(3, 4), "4");
     }
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn port() -> impl Strategy<Value = Port> {
+            prop_oneof![
+                (0usize..4, 0u16..70).prop_map(|(src, ch)| Port::Src { src, ch }),
+                (0u16..70).prop_map(|ch| Port::OutIn { ch }),
+                (0u16..70).prop_map(|ch| Port::OutOut { ch }),
+                (0usize..4, 0u16..70).prop_map(|(mon, ch)| Port::Mon { mon, ch }),
+            ]
+        }
+
+        fn kind() -> impl Strategy<Value = SourceKind> {
+            prop_oneof![
+                Just(SourceKind::PassThru),
+                "[a-c]{1,2}".prop_map(|b| SourceKind::App { bundle_id: b }),
+                "[a-c]{1,2}".prop_map(|uid| SourceKind::Device { uid }),
+            ]
+        }
+
+        fn edit() -> impl Strategy<Value = Edit> {
+            let d = 0usize..4;
+            let i = 0usize..4;
+            let db = -100.0f32..12.0;
+            prop_oneof![
+                Just(Edit::NewDevice),
+                d.clone().prop_map(Edit::RemoveDevice),
+                (d.clone(), "[ -~]{0,6}").prop_map(|(d, n)| Edit::Rename(d, n)),
+                (d.clone(), any::<bool>()).prop_map(|(d, b)| Edit::Enable(d, b)),
+                (d.clone(), db.clone()).prop_map(|(d, v)| Edit::Volume(d, v)),
+                (d.clone(), any::<bool>()).prop_map(|(d, b)| Edit::Mute(d, b)),
+                d.clone().prop_map(Edit::GrowChannels),
+                d.clone().prop_map(Edit::ShrinkChannels),
+                (d.clone(), kind(), 0u16..70).prop_map(|(d, k, c)| Edit::AddSource(d, k, c)),
+                (d.clone(), i.clone()).prop_map(|(d, s)| Edit::RemoveSource(d, s)),
+                (d.clone(), i.clone(), any::<bool>()).prop_map(|(d, s, b)| Edit::SourceOn(d, s, b)),
+                (d.clone(), i.clone(), db.clone())
+                    .prop_map(|(d, s, v)| Edit::SourceVolume(d, s, v)),
+                (d.clone(), "[a-c]{1,2}", 0u16..70).prop_map(|(d, u, c)| Edit::AddMonitor(d, u, c)),
+                (d.clone(), i.clone()).prop_map(|(d, m)| Edit::RemoveMonitor(d, m)),
+                (d.clone(), i.clone(), any::<bool>())
+                    .prop_map(|(d, m, b)| Edit::MonitorOn(d, m, b)),
+                (d.clone(), i.clone(), db).prop_map(|(d, m, v)| Edit::MonitorVolume(d, m, v)),
+                (d.clone(), port(), port())
+                    .prop_map(|(d, from, to)| Edit::Connect(d, Link { from, to })),
+                (d.clone(), port(), port())
+                    .prop_map(|(d, from, to)| Edit::Unlink(d, Link { from, to })),
+                (d, port()).prop_map(|(d, p)| Edit::Disconnect(d, p)),
+            ]
+        }
+
+        proptest! {
+            /// Mirrors `App::commit`: apply, validate, roll back on failure. Whatever the edit
+            /// sequence (including out-of-range indices and ports), the config the app keeps
+            /// validates, survives a JSON round trip, and only text/size-sensitive edits may be refused.
+            #[test]
+            fn edit_sequences_keep_config_valid(edits in proptest::collection::vec(edit(), 0..60)) {
+                let mut cfg = default_config();
+                for e in edits {
+                    let prev = cfg.clone();
+                    apply(&mut cfg, e.clone());
+                    if cfg.validate().is_err() {
+                        prop_assert!(
+                            matches!(e, Edit::Rename(..) | Edit::AddSource(..) | Edit::AddMonitor(..)),
+                            "unexpected invalid result from {e:?}"
+                        );
+                        cfg = prev;
+                    }
+                    prop_assert!(cfg.validate().is_ok());
+                }
+                let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+                prop_assert_eq!(back, cfg);
+            }
+
+            #[test]
+            fn pct_db_round_trip(pct in 0.5f32..400.0) {
+                let back = db_to_pct(pct_to_db(pct));
+                prop_assert!((back - pct).abs() <= pct * 1e-3, "{pct} -> {back}");
+            }
+        }
+    }
 }

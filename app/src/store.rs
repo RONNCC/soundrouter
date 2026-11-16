@@ -8,7 +8,47 @@ pub fn default_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/SoundRouter/config.json"))
 }
 
-/// Missing file -> default config. Unreadable or invalid file -> default plus a message.
+/// Highest config `version` this build understands.
+const SUPPORTED_VERSION: u64 = 1;
+
+/// `version` of a JSON document, if it has a numeric one.
+fn file_version(text: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("version")?
+        .as_u64()
+}
+
+fn future_version_msg(v: u64) -> String {
+    format!(
+        "Config was written by a newer SoundRouter (version {v}); using defaults and leaving the file untouched"
+    )
+}
+
+/// Move a file we cannot use out of the way so the next save cannot destroy it.
+/// `config.json.bad`, or `config.json.bad.<unix secs>[.n]` if that exists.
+fn quarantine(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut dest = path.with_file_name(format!("{name}.bad"));
+    let mut n = 0;
+    while dest.exists() {
+        let sfx = if n == 0 {
+            String::new()
+        } else {
+            format!(".{n}")
+        };
+        dest = path.with_file_name(format!("{name}.bad.{secs}{sfx}"));
+        n += 1;
+    }
+    std::fs::rename(path, &dest)?;
+    Ok(dest)
+}
+
+/// Missing file -> default config. Newer-version file -> defaults, file kept (and `save` refuses
+/// to overwrite it). Corrupt or invalid file -> moved to `config.json.bad`, defaults, and a message.
 pub fn load(path: &Path) -> (Config, Option<String>) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -20,29 +60,57 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
             );
         }
     };
-    match serde_json::from_str::<Config>(&text) {
-        Ok(cfg) => match cfg.validate() {
-            Ok(()) => (cfg, None),
-            Err(e) => (
-                default_config(),
-                Some(format!("Ignoring invalid config: {e}")),
-            ),
-        },
-        Err(e) => (
-            default_config(),
-            Some(format!("Ignoring unreadable config: {e}")),
-        ),
+    if let Some(v) = file_version(&text).filter(|&v| v > SUPPORTED_VERSION) {
+        return (default_config(), Some(future_version_msg(v)));
     }
+    let problem = match serde_json::from_str::<Config>(&text) {
+        Ok(cfg) => match cfg.validate() {
+            Ok(()) => return (cfg, None),
+            Err(e) => format!("invalid config: {e}"),
+        },
+        Err(e) => format!("unreadable config: {e}"),
+    };
+    let kept = match quarantine(path) {
+        Ok(p) => format!("saved as {}", p.display()),
+        Err(e) => format!("could not move it aside: {e}"),
+    };
+    (
+        default_config(),
+        Some(format!("Ignoring {problem} ({kept})")),
+    )
 }
 
-/// Write to a temp file next to the target, then rename over it.
+/// Write to a temp file next to the target, fsync it, then rename over the target.
+/// Refuses to replace a file written by a newer version. Unknown JSON fields are not preserved
+/// (shortcut: `Config` has no catch-all; the version refusal protects newer files, upgrade if
+/// same-version extensions appear).
 pub fn save(path: &Path, cfg: &Config) -> std::io::Result<()> {
+    use std::io::Write;
+    let ctx = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()));
+    if let Some(v) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| file_version(&t))
+        .filter(|&v| v > SUPPORTED_VERSION)
+    {
+        return Err(std::io::Error::other(format!(
+            "{} was written by a newer SoundRouter (version {v}); not overwriting it",
+            path.display()
+        )));
+    }
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).map_err(ctx)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(cfg)?)?;
-    std::fs::rename(&tmp, path)
+    let res = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec_pretty(cfg)?)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res.map_err(ctx)
 }
 
 #[cfg(test)]
@@ -79,21 +147,113 @@ mod tests {
         assert!(msg.is_none());
     }
 
+    fn bad_files(path: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".bad"))
+            .collect();
+        v.sort();
+        v
+    }
+
     #[test]
-    fn garbage_and_invalid_fall_back_with_message() {
+    fn corrupt_file_is_quarantined_not_overwritten() {
         let dir = tmpdir("bad");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
         std::fs::write(&path, "{nope").unwrap();
         let (cfg, msg) = load(&path);
         assert_eq!(cfg, default_config());
-        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("config.json.bad"));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.json.bad")).unwrap(),
+            "{nope"
+        );
+        // The next save writes a fresh file; the quarantined one survives.
+        save(&path, &cfg).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.json.bad")).unwrap(),
+            "{nope"
+        );
+        assert_eq!(load(&path).0, cfg);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_file_is_quarantined_and_second_one_gets_distinct_name() {
+        let dir = tmpdir("invalid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
         let mut bad = default_config();
         bad.devices.push(bad.devices[0].clone()); // duplicate id
-        std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
+        let text = serde_json::to_string(&bad).unwrap();
+        std::fs::write(&path, &text).unwrap();
         let (cfg, msg) = load(&path);
         assert_eq!(cfg, default_config());
         assert!(msg.unwrap().contains("duplicate"));
+        std::fs::write(&path, "garbage").unwrap();
+        load(&path);
+        let kept = bad_files(&path);
+        assert_eq!(kept.len(), 2);
+        let contents: Vec<_> = kept
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect();
+        assert!(contents.contains(&text) && contents.contains(&"garbage".to_string()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn future_version_is_kept_and_save_refuses() {
+        let dir = tmpdir("future");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let text = r#"{"version":2,"devices":[],"new_field":{"a":1}}"#;
+        std::fs::write(&path, text).unwrap();
+        let (cfg, msg) = load(&path);
+        assert_eq!(cfg, default_config());
+        assert!(msg.unwrap().contains("version 2"));
+        let err = save(&path, &cfg).unwrap_err();
+        assert!(err.to_string().contains("newer"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert!(bad_files(&path).is_empty());
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_into_read_only_dir_errors_cleanly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("ro");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(dir.join("probe")).is_ok() {
+            // running as root: permissions are not enforced, nothing to test
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        let path = dir.join("config.json");
+        let err = save(&path, &default_config()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("config.json"));
+        assert!(!path.exists() && !path.with_extension("json.tmp").exists());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_replaces_existing_current_version_file() {
+        let dir = tmpdir("replace");
+        let path = dir.join("config.json");
+        save(&path, &default_config()).unwrap();
+        let mut cfg = default_config();
+        apply(&mut cfg, Edit::NewDevice);
+        save(&path, &cfg).unwrap();
+        assert_eq!(load(&path), (cfg, None));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
