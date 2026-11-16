@@ -872,6 +872,7 @@ fn a_failed_self_test_offers_diagnostics() {
     let mut h = setup_run(installed(), None);
     click(&mut h, "Continue");
     until(&mut h, "self-test", |h| has(h, "Copy diagnostics"));
+    settle(&mut h); // the sheet re-centres for its new height; click where the button ends up
     h.get_by_label_contains("no audio came back");
     click(&mut h, "Copy diagnostics");
     h.get_by_label("Copied to clipboard");

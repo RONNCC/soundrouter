@@ -115,6 +115,7 @@ jobs:
     # Experimental: hosted runners may deny audio-capture TCC, so this can fail for reasons unrelated to the code.
     runs-on: macos-15
     continue-on-error: true
+    timeout-minutes: 10 # an unanswerable audio-capture TCC prompt blocks the tap forever
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95

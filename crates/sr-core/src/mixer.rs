@@ -87,11 +87,10 @@ fn ramp_add(dst: &mut [f32], src: &[f32], from: f32, to: f32) {
         }
         return;
     }
+    // from + step*k, not a running sum: f32 drift over a block would show up as a step at the next block boundary.
     let step = (to - from) / dst.len() as f32;
-    let mut g = from;
-    for (d, s) in dst.iter_mut().zip(src) {
-        g += step;
-        *d += clean(*s) * g;
+    for (k, (d, s)) in dst.iter_mut().zip(src).enumerate() {
+        *d += clean(*s) * (from + step * (k + 1) as f32);
     }
 }
 
@@ -103,10 +102,8 @@ fn ramp_scale(buf: &mut [f32], from: f32, to: f32) {
         return;
     }
     let step = (to - from) / buf.len() as f32;
-    let mut g = from;
-    for x in buf {
-        g += step;
-        *x *= g;
+    for (k, x) in buf.iter_mut().enumerate() {
+        *x *= from + step * (k + 1) as f32;
     }
 }
 
