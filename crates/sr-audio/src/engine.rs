@@ -21,7 +21,7 @@ use sr_core::backend::{AppInfo, Backend, HwDevice, MeterReading};
 use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice};
 use sr_core::driver_proto::{COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, companion_uid};
 use sr_core::meters::Meters;
-use sr_core::mixer::{MixPlan, Mixer, MixerHandle, mixer};
+use sr_core::mixer::{IoLayout, MixPlan, Mixer, MixerHandle, mixer};
 
 use crate::apps::{self, AppGroup};
 use crate::driver;
@@ -52,6 +52,7 @@ struct Shared {
 struct Cb {
     mixer: Mixer,
     shared: Arc<Shared>,
+    meters: Arc<Meters>,
     in_planar: Vec<f32>,
     out_planar: Vec<f32>,
 }
@@ -319,12 +320,19 @@ fn plan_subs(dev: &VirtualDevice, present: &dyn Fn(&str) -> bool) -> Vec<String>
 const MAIN_UID_OVERRIDE: &str = "SR_MAIN_UID_OVERRIDE";
 
 fn main_candidates(dev: &VirtualDevice) -> Vec<String> {
-    if let Some(uid) = std::env::var(MAIN_UID_OVERRIDE)
-        .ok()
-        .filter(|u| !u.is_empty())
-    {
-        return if hal::device_by_uid(&uid).is_some() {
-            vec![uid]
+    let ov = std::env::var(MAIN_UID_OVERRIDE).ok();
+    main_candidates_in(dev, ov.as_deref(), &|u| hal::device_by_uid(u).is_some())
+}
+
+/// Main-device uids to try, best first, present only. A non-empty `override_uid` is the only candidate.
+fn main_candidates_in(
+    dev: &VirtualDevice,
+    override_uid: Option<&str>,
+    present: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    if let Some(uid) = override_uid.filter(|u| !u.is_empty()) {
+        return if present(uid) {
+            vec![uid.to_owned()]
         } else {
             vec![]
         };
@@ -334,7 +342,7 @@ fn main_candidates(dev: &VirtualDevice) -> Vec<String> {
     if ALLOW_VISIBLE_FALLBACK {
         c.push(vis);
     }
-    c.retain(|u| hal::device_by_uid(u).is_some());
+    c.retain(|u| present(u));
     c
 }
 
@@ -492,38 +500,71 @@ fn app_sources(dev: &VirtualDevice) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-/// Bring the live taps in line with the config + running processes (live tap-list edit, I/O keeps running).
-fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
-    let mut changed = false;
-    let mut removed = Vec::new();
-    let mut i = 0;
-    while i < v.taps.len() {
-        let t = &v.taps[i];
-        let want = app_sources(&v.dev)
+/// What `sync_taps` must do to move `current` to the desired state. Indices refer to `current`.
+#[derive(Debug, Default, PartialEq)]
+struct TapPlan {
+    keep: Vec<usize>,
+    /// Same source, new process objects: rewrite the tap description.
+    update: Vec<(usize, Vec<u32>)>,
+    remove: Vec<usize>,
+    /// `(source id, bundle id, process objects)` of taps to create, in source order.
+    create: Vec<(String, String, Vec<u32>)>,
+}
+
+/// Pure diff of live taps against the config + running processes. A tap whose app has no
+/// processes is removed (app quit); it comes back as `create` once the app runs again.
+fn tap_plan(current: &[Tap], dev: &VirtualDevice, groups: &[AppGroup]) -> TapPlan {
+    let mut p = TapPlan::default();
+    for (i, t) in current.iter().enumerate() {
+        let objs = app_sources(dev)
             .find(|(id, b)| *id == t.source_id && *b == t.bundle)
-            .map(|(_, b)| app_objs(groups, b));
-        match want {
-            Some(objs) if !objs.is_empty() => {
-                if objs != t.objs {
-                    let desc = make_desc(&format!("sr-{}", t.source_id), &objs);
-                    hal::set_object(t.id, kAudioTapPropertyDescription, &desc)
-                        .map_err(|s| anyhow!("set tap description: {}", hal::fourcc(s)))?;
-                    v.taps[i].objs = objs;
-                }
-                i += 1;
-            }
-            _ => {
-                removed.push(v.taps.remove(i));
-                changed = true;
-            }
+            .map(|(_, b)| app_objs(groups, b))
+            .unwrap_or_default();
+        if objs.is_empty() {
+            p.remove.push(i);
+        } else if objs != t.objs {
+            p.update.push((i, objs));
+        } else {
+            p.keep.push(i);
         }
     }
-    let new: Vec<(String, String, Vec<u32>)> = app_sources(&v.dev)
-        .filter(|(id, _)| !v.taps.iter().any(|t| t.source_id == *id))
-        .map(|(id, b)| (id.to_owned(), b.to_owned(), app_objs(groups, b)))
-        .filter(|(_, _, o)| !o.is_empty())
-        .collect();
-    for (id, b, objs) in new {
+    for (id, b) in app_sources(dev) {
+        let live = current
+            .iter()
+            .enumerate()
+            .any(|(i, t)| t.source_id == id && !p.remove.contains(&i));
+        let objs = app_objs(groups, b);
+        if !live && !objs.is_empty() {
+            p.create.push((id.to_owned(), b.to_owned(), objs));
+        }
+    }
+    p
+}
+
+/// Bring the live taps in line with the config + running processes (live tap-list edit, I/O keeps running).
+fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
+    let plan = tap_plan(&v.taps, &v.dev, groups);
+    log::debug!(
+        "taps for '{}': keep {} update {} remove {} create {}",
+        v.dev.id,
+        plan.keep.len(),
+        plan.update.len(),
+        plan.remove.len(),
+        plan.create.len()
+    );
+    let mut changed = !plan.remove.is_empty();
+    for (i, objs) in plan.update {
+        let t = &v.taps[i];
+        let desc = make_desc(&format!("sr-{}", t.source_id), &objs);
+        hal::set_object(t.id, kAudioTapPropertyDescription, &desc)
+            .map_err(|s| anyhow!("set tap description: {}", hal::fourcc(s)))?;
+        v.taps[i].objs = objs;
+    }
+    let mut removed = Vec::new();
+    for &i in plan.remove.iter().rev() {
+        removed.push(v.taps.remove(i));
+    }
+    for (id, b, objs) in plan.create {
         match create_tap(&id, &b, objs) {
             Ok(t) => {
                 v.taps.push(t);
@@ -556,49 +597,79 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
     Ok(())
 }
 
+/// The config-derived inputs of the layout spec.
+#[derive(Debug, Default, PartialEq)]
+struct LayoutInputs {
+    /// Source id fed by the main device's input.
+    passthru: Option<String>,
+    /// Device uid -> Device source id (first source wins).
+    device_sources: HashMap<String, String>,
+    /// Uids of enabled monitors.
+    monitors: HashSet<String>,
+}
+
+fn layout_inputs(dev: &VirtualDevice) -> LayoutInputs {
+    LayoutInputs {
+        passthru: dev
+            .sources
+            .iter()
+            .find(|s| s.kind == SourceKind::PassThru)
+            .map(|s| s.id.clone()),
+        device_sources: dev
+            .sources
+            .iter()
+            .rev()
+            .filter_map(|s| match &s.kind {
+                SourceKind::Device { uid } => Some((uid.clone(), s.id.clone())),
+                _ => None,
+            })
+            .collect(),
+        monitors: dev
+            .monitors
+            .iter()
+            .filter(|m| m.enabled)
+            .map(|m| m.device_uid.clone())
+            .collect(),
+    }
+}
+
+/// The mixer handles at most `MAX_CH` channels per direction. Fail loudly rather than drop channels:
+/// the aggregate's inputs are the device's own channels + hardware sources + 2 per app tap, its
+/// outputs the device's channels + enabled monitors' channels.
+fn check_width(lay: &IoLayout) -> Result<()> {
+    let (n_in, n_out) = (lay.inputs.len(), lay.outputs.len());
+    if n_in > MAX_CH || n_out > MAX_CH {
+        bail!(
+            "aggregate needs {n_in} input / {n_out} output channels but the engine mixes at most {MAX_CH} per direction \
+             (inputs = device channels + hardware sources + 2 per app source; outputs = device channels + monitor channels); \
+             reduce the device's channel count or remove sources/monitors"
+        );
+    }
+    Ok(())
+}
+
 /// Recompute the layout from the aggregate's current streams, compile the plan, publish both.
 fn refresh_layout(v: &mut Vdev) -> Result<()> {
     let ain = hal::stream_channels(v.agg, kAudioObjectPropertyScopeInput);
     let aout = hal::stream_channels(v.agg, kAudioObjectPropertyScopeOutput);
-    let passthru = v
-        .dev
-        .sources
-        .iter()
-        .find(|s| s.kind == SourceKind::PassThru)
-        .map(|s| s.id.clone());
-    let device_sources: HashMap<String, String> = v
-        .dev
-        .sources
-        .iter()
-        .rev()
-        .filter_map(|s| match &s.kind {
-            SourceKind::Device { uid } => Some((uid.clone(), s.id.clone())),
-            _ => None,
-        })
-        .collect();
-    let monitors: HashSet<String> = v
-        .dev
-        .monitors
-        .iter()
-        .filter(|m| m.enabled)
-        .map(|m| m.device_uid.clone())
-        .collect();
+    let li = layout_inputs(&v.dev);
     let tap_ids: Vec<String> = v.taps.iter().map(|t| t.source_id.clone()).collect();
     let spec = LayoutSpec {
         subs: &v.subs,
-        passthru: passthru.as_deref(),
-        device_sources: &device_sources,
-        monitors: &monitors,
+        passthru: li.passthru.as_deref(),
+        device_sources: &li.device_sources,
+        monitors: &li.monitors,
         taps: &tap_ids,
     };
     let lay = layout::build_layout(&spec, &ain, &aout)?;
-    if lay.inputs.len() > MAX_CH || lay.outputs.len() > MAX_CH {
-        bail!(
-            "aggregate has {} in / {} out channels; limit is {MAX_CH}",
-            lay.inputs.len(),
-            lay.outputs.len()
-        );
-    }
+    check_width(&lay).with_context(|| {
+        format!(
+            "device '{}' ({} channels, {} app taps)",
+            v.dev.id,
+            v.dev.channels,
+            v.taps.len()
+        )
+    })?;
     v.handle.set_plan(MixPlan::compile(&v.dev, &lay));
     v.layout = lay;
     v.shared
@@ -705,6 +776,7 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
     let cb = Box::into_raw(Box::new(Cb {
         mixer: mx,
         shared: shared.clone(),
+        meters: meters.clone(),
         in_planar: vec![0.0; SCRATCH_LEN],
         out_planar: vec![0.0; SCRATCH_LEN],
     }));
@@ -792,7 +864,8 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
     let frames = outs.first().map_or(0, frames_of);
     let n_in: usize = ins.iter().map(|b| b.mNumberChannels as usize).sum();
     let n_out: usize = outs.iter().map(|b| b.mNumberChannels as usize).sum();
-    let ok = key == cb.shared.expected.load(Relaxed)
+    let expected = cb.shared.expected.load(Relaxed);
+    let ok = key == expected
         && n_in <= MAX_CH
         && n_out <= MAX_CH
         && ins
@@ -800,6 +873,10 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
             .chain(outs.iter())
             .all(|b| b.mNumberChannels > 0 && frames_of(b) == frames);
     if !ok {
+        // expected == 0 is deliberate silence while the layout is rebuilt, not a mismatch.
+        if expected != 0 {
+            cb.meters.mismatch_count.fetch_add(1, Relaxed);
+        }
         for b in outs.iter() {
             if !b.mData.is_null() {
                 unsafe { std::ptr::write_bytes(b.mData as *mut u8, 0, b.mDataByteSize as usize) };
@@ -855,45 +932,4 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use sr_core::config::{Monitor, Source};
-
-    fn src(id: &str, kind: SourceKind) -> Source {
-        Source {
-            id: id.into(),
-            kind,
-            channels: 2,
-            volume_db: 0.0,
-            muted: false,
-        }
-    }
-    fn mon(uid: &str, enabled: bool) -> Monitor {
-        Monitor {
-            device_uid: uid.into(),
-            enabled,
-            volume_db: 0.0,
-            wires: vec![],
-        }
-    }
-
-    #[test]
-    fn subs_deduped_and_filtered() {
-        let dev = VirtualDevice {
-            id: "v1".into(),
-            name: "n".into(),
-            enabled: true,
-            channels: 2,
-            volume_db: 0.0,
-            muted: false,
-            sources: vec![
-                src("a", SourceKind::Device { uid: "mic".into() }),
-                src("b", SourceKind::Device { uid: "gone".into() }),
-                src("c", SourceKind::PassThru),
-            ],
-            wires: vec![],
-            monitors: vec![mon("spk", true), mon("mic", true), mon("off", false)],
-        };
-        assert_eq!(plan_subs(&dev, &|u| u != "gone"), ["mic", "spk"]);
-    }
-}
+mod tests;
