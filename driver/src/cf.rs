@@ -208,7 +208,6 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(256))]
         #[test]
         fn parse_never_panics(t in arb_tree()) {
-            let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
             let cf = build(&t);
             if let Ok(list) = parse_devices(Some(&cf)) {
                 // validated output must survive a round trip unchanged
@@ -223,46 +222,31 @@ mod tests {
             ch in 1u16..=2,
             name in "[a-zA-Z0-9✓]{1,20}",
         ) {
-            let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
             let list: Vec<_> = (0..n).map(|i| d(&format!("u{i}"), &name, ch)).collect();
             let p = devices_to_plist(&list);
             prop_assert_eq!(parse_devices(Some(&p)).unwrap(), list);
         }
     }
 
-    /// Serialises tests that allocate heavily so the RSS heuristic is not polluted.
-    static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn rss_kb() -> u64 {
-        let out = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
-    }
-
-    /// Heuristic: a leaked ref per round trip (~10k * 16 devices) would add tens of MB.
+    /// Deterministic leak/over-release check via retain counts held across the loop.
     #[test]
     fn round_trip_does_not_leak() {
-        let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
-        let list: Vec<_> = (0..16)
+        let list: Vec<_> = (0..4)
             .map(|i| d(&format!("uid-{i}"), "Loopback", 2))
             .collect();
-        let run = || {
-            for _ in 0..2_000 {
-                let p = devices_to_plist(&list);
-                assert_eq!(parse_devices(Some(&p)).unwrap().len(), 16);
-            }
-        };
-        run(); // warm up allocator
-        let before = rss_kb();
-        for _ in 0..5 {
-            run();
+        let held = devices_to_plist(&list);
+        let dict = unsafe { held.get_unchecked(0) };
+        let (arr_rc, dict_rc) = (held.retain_count(), dict.retain_count());
+        for _ in 0..1_000 {
+            // get_data-style +1 handoff: raw pointer out, reclaimed exactly once.
+            let raw = CFRetained::into_raw(held.clone()).as_ptr() as *const c_void;
+            let back =
+                unsafe { CFRetained::from_raw(std::ptr::NonNull::new(raw as *mut _).unwrap()) };
+            assert_eq!(parse_devices(Some(&back)).unwrap(), list);
+            let fresh = devices_to_plist(&list);
+            assert_eq!(parse_devices(Some(&fresh)).unwrap().len(), 4);
         }
-        let grown = rss_kb().saturating_sub(before);
-        assert!(
-            grown < 8 * 1024,
-            "RSS grew {grown} KiB over 10k round trips"
-        );
+        assert_eq!(held.retain_count(), arr_rc);
+        assert_eq!(dict.retain_count(), dict_rc);
     }
 }
