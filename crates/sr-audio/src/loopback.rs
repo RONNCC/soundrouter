@@ -80,10 +80,39 @@ impl Stats {
     }
 }
 
+/// Sine generator; phase in radians, advanced once per frame.
+#[derive(Clone, Copy)]
+struct Tone {
+    phase: f64,
+    step: f64,
+}
+
+impl Tone {
+    fn new(rate: f64) -> Self {
+        Tone {
+            phase: 0.0,
+            step: std::f64::consts::TAU * TONE_HZ as f64 / rate,
+        }
+    }
+
+    /// Fill interleaved `buf` (`ch` channels); silence when `!on`, phase still advances.
+    fn fill(&mut self, buf: &mut [f32], ch: usize, on: bool) {
+        for frame in buf.chunks_mut(ch) {
+            let v = if on {
+                (TONE_AMP as f64 * self.phase.sin()) as f32
+            } else {
+                0.0
+            };
+            self.phase = (self.phase + self.step) % std::f64::consts::TAU;
+            frame.fill(v);
+        }
+    }
+}
+
 struct Ctx {
     stats: Arc<Stats>,
-    tone: bool,
-    phase: f32,
+    enabled: bool,
+    tone: Tone,
 }
 
 unsafe extern "C-unwind" fn ioproc(
@@ -111,6 +140,9 @@ unsafe extern "C-unwind" fn ioproc(
             (*out).mBuffers.as_mut_ptr(),
             (*out).mNumberBuffers as usize,
         );
+        // Every buffer carries the same tone; phase advances once per frame, not per buffer.
+        let start = ctx.tone;
+        let mut end = start;
         for b in outs {
             if b.mData.is_null() {
                 continue;
@@ -118,17 +150,10 @@ unsafe extern "C-unwind" fn ioproc(
             let ch = (b.mNumberChannels as usize).max(1);
             let s =
                 std::slice::from_raw_parts_mut(b.mData as *mut f32, b.mDataByteSize as usize / 4);
-            for frame in s.chunks_mut(ch) {
-                let v = if ctx.tone {
-                    TONE_AMP * ctx.phase.sin()
-                } else {
-                    0.0
-                };
-                ctx.phase = (ctx.phase + std::f32::consts::TAU * TONE_HZ / 48_000.0)
-                    % std::f32::consts::TAU;
-                frame.fill(v);
-            }
+            end = start;
+            end.fill(s, ch, ctx.enabled);
         }
+        ctx.tone = end;
     }));
     0
 }
@@ -147,10 +172,11 @@ impl Probe {
     pub fn start(uid: &str, tone: bool) -> Result<Probe> {
         let dev = hal::device_by_uid(uid).ok_or_else(|| anyhow!("no device with uid '{uid}'"))?;
         let stats = Arc::new(Stats::new());
+        let rate = hal::nominal_rate(dev);
         let ctx = Box::into_raw(Box::new(Ctx {
             stats: stats.clone(),
-            tone,
-            phase: 0.0,
+            enabled: tone,
+            tone: Tone::new(if rate > 0.0 { rate } else { 48_000.0 }),
         }));
         let mut p = Probe {
             dev,
@@ -158,7 +184,7 @@ impl Probe {
             ctx,
             stats,
             in_channels: hal::total_channels(dev, kAudioObjectPropertyScopeInput) as usize,
-            rate: hal::nominal_rate(dev),
+            rate,
         };
         let st = unsafe {
             AudioDeviceCreateIOProcID(
@@ -234,5 +260,25 @@ mod tests {
         assert!((s.rms_dbfs() - 20.0 * 0.5f64.log10()).abs() < 1e-6);
         assert_eq!(s.take_peaks(2), [0.5, 0.5]);
         assert_eq!(s.take_peaks(2), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn tone_continuous_across_buffers() {
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            let mut t = Tone::new(rate);
+            let mut all = Vec::new();
+            for n in [64usize, 100, 37, 512] {
+                let mut b = vec![0.0f32; n * 2];
+                t.fill(&mut b, 2, true);
+                assert!(b.chunks(2).all(|f| f[0] == f[1]));
+                all.extend(b.chunks(2).map(|f| f[0]));
+            }
+            let max_step = TONE_AMP as f64 * t.step * 1.01;
+            for w in all.windows(2) {
+                assert!(((w[1] - w[0]) as f64).abs() <= max_step, "rate {rate}");
+            }
+            let peak = all.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!((peak - TONE_AMP).abs() < 0.01);
+        }
     }
 }
