@@ -35,8 +35,14 @@ pub struct Source {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceKind {
-    App { bundle_id: String },
-    Device { uid: String },
+    App {
+        bundle_id: String,
+    },
+    Device {
+        uid: String,
+    },
+    /// What apps play directly into the virtual device; has the device's channel count.
+    PassThru,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -89,6 +95,12 @@ impl Config {
                     return Err(format!(
                         "source '{}': channels {} must be in 1..={MAX_CH}",
                         src.id, src.channels
+                    ));
+                }
+                if src.kind == SourceKind::PassThru && src.channels != dev.channels {
+                    return Err(format!(
+                        "source '{}': pass_thru channels {} must equal device channels {}",
+                        src.id, src.channels, dev.channels
                     ));
                 }
             }
@@ -148,10 +160,67 @@ mod tests {
         assert_eq!(cfg, back);
     }
 
+    fn example() -> Config {
+        serde_json::from_str(EXAMPLE).unwrap()
+    }
+
+    #[test]
+    fn pass_thru_round_trips() {
+        let mut cfg = example();
+        cfg.devices[0].sources.push(Source {
+            id: "p".into(),
+            kind: SourceKind::PassThru,
+            channels: 2,
+            volume_db: 0.0,
+            muted: false,
+        });
+        cfg.devices[0].wires.push(Wire {
+            source: "p".into(),
+            src_ch: 1,
+            out_ch: 0,
+        });
+        cfg.validate().unwrap();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""kind":{"type":"pass_thru"}"#));
+        assert_eq!(cfg, serde_json::from_str::<Config>(&json).unwrap());
+        cfg.devices[0].sources[2].channels = 4;
+        assert!(cfg.validate().is_err());
+    }
+
     #[test]
     fn rejects_dangling_wire() {
-        let mut cfg: Config = serde_json::from_str(EXAMPLE).unwrap();
+        let mut cfg = example();
         cfg.devices[0].wires[0].source = "nope".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_bad_values() {
+        let bad: [(&str, fn(&mut Config)); 10] = [
+            ("dup device", |c| {
+                let d = c.devices[0].clone();
+                c.devices.push(d);
+            }),
+            ("dup source", |c| {
+                let s = c.devices[0].sources[0].clone();
+                c.devices[0].sources.push(s);
+            }),
+            ("odd channels", |c| c.devices[0].channels = 3),
+            ("zero channels", |c| c.devices[0].channels = 0),
+            ("too many channels", |c| c.devices[0].channels = 66),
+            ("source zero ch", |c| c.devices[0].sources[0].channels = 0),
+            ("src_ch range", |c| c.devices[0].wires[0].src_ch = 2),
+            ("out_ch range", |c| c.devices[0].wires[0].out_ch = 2),
+            ("monitor out_ch range", |c| {
+                c.devices[0].monitors[0].wires[0].out_ch = 2
+            }),
+            ("source too wide", |c| c.devices[0].sources[0].channels = 65),
+        ];
+        for (name, f) in bad {
+            let mut cfg = example();
+            f(&mut cfg);
+            assert!(cfg.validate().is_err(), "{name} accepted");
+        }
+        assert!(Config::default().validate().is_ok());
     }
 }
