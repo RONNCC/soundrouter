@@ -36,7 +36,7 @@ test_live() {
   tools  # always rebuild: a stale srctl hides parser fixes
   local srctl=$TOOLS/srctl log=/tmp/sr-coreaudiod.log lp
   log stream --level debug --predicate 'process == "coreaudiod" AND (eventMessage CONTAINS[c] "SoundRouter" OR eventMessage CONTAINS "PlugIn")' >"$log" 2>&1 &
-  lp=$!; trap 'kill $lp 2>/dev/null || true' EXIT; sleep 1
+  lp=$!; trap "kill $lp 2>/dev/null || true" EXIT; sleep 1
 
   step "1/8 driver loaded by coreaudiod"
   "$srctl" get || fail "not loaded; see $log and: codesign -dv $DEST"
@@ -50,8 +50,8 @@ test_live() {
   step "4/8 loopback latency (expect ~2x buffer)"
   for n in 512 128 32; do "$srctl" loop soundrouter:v1 "$n"; done
   step "5/8 channel change 8->16 while IO runs"
-  "$srctl" loop soundrouter:v2 128 & sleep 1
-  "$srctl" set "soundrouter:v1:SoundRouter 1:2" "soundrouter:v2:SoundRouter 2:16"; wait || true
+  "$srctl" loop soundrouter:v2 128 & lpid=$!; sleep 1
+  "$srctl" set "soundrouter:v1:SoundRouter 1:2" "soundrouter:v2:SoundRouter 2:16"; wait "$lpid" || true
   "$srctl" loop soundrouter:v2 128
   { profiler | grep -A8 "SoundRouter 2" | grep -i -E "channels|SoundRouter"; } || true
   step "6/8 rename"
