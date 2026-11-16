@@ -3,23 +3,51 @@ use std::collections::HashSet;
 
 pub const MAX_CH: usize = 64;
 pub const MAX_FRAMES: usize = 4096;
+/// Longest device name; matches the driver, which truncates beyond it.
+pub const MAX_NAME_CHARS: usize = 64;
+/// Highest accepted volume in dB; anything lower (even -200) is valid and just means near-silence.
+pub const MAX_DB: f32 = 24.0;
+pub const CONFIG_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+fn yes() -> bool {
+    true
+}
+fn stereo() -> u16 {
+    2
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub version: u32,
     pub devices: Vec<VirtualDevice>,
-} // version = 1
+}
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            version: CONFIG_VERSION,
+            devices: Vec::new(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VirtualDevice {
-    pub id: String, // stable short id, e.g. "v1"; driver UID = DEVICE_UID_PREFIX + id
-    pub name: String,
+    pub id: String,   // stable short id, e.g. "v1"; driver UID = DEVICE_UID_PREFIX + id
+    pub name: String, // non-blank after trim, at most MAX_NAME_CHARS chars
+    #[serde(default = "yes")]
     pub enabled: bool,
+    #[serde(default = "stereo")]
     pub channels: u16, // 2..=MAX_CH, even
+    #[serde(default)]
     pub volume_db: f32,
+    #[serde(default)]
     pub muted: bool,
+    #[serde(default)]
     pub sources: Vec<Source>,
+    #[serde(default)]
     pub wires: Vec<Wire>,
+    #[serde(default)]
     pub monitors: Vec<Monitor>,
 }
 
@@ -27,8 +55,11 @@ pub struct VirtualDevice {
 pub struct Source {
     pub id: String,
     pub kind: SourceKind,
+    #[serde(default = "stereo")]
     pub channels: u16,
+    #[serde(default)]
     pub volume_db: f32,
+    #[serde(default)]
     pub muted: bool,
 }
 
@@ -55,8 +86,11 @@ pub struct Wire {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Monitor {
     pub device_uid: String,
+    #[serde(default = "yes")]
     pub enabled: bool,
+    #[serde(default)]
     pub volume_db: f32,
+    #[serde(default)]
     pub wires: Vec<MonitorWire>,
 }
 
@@ -64,17 +98,45 @@ pub struct Monitor {
 pub struct MonitorWire {
     pub out_ch: u16,
     pub dst_ch: u16,
-} // vdev ch -> monitor ch
+} // vdev ch -> monitor ch; dst_ch can't be range-checked here (hardware channel count unknown)
+
+fn check_db(what: &str, db: f32) -> Result<(), String> {
+    if db.is_finite() && db <= MAX_DB {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what}: volume {db} dB must be finite and <= {MAX_DB}"
+        ))
+    }
+}
 
 impl Config {
-    /// Checks ids are unique, channel counts are in range, and wires reference
-    /// existing source ids and in-range channels.
+    /// Checks version, ids are unique, names usable, volumes sane, channel counts in range,
+    /// and wires reference existing source ids and in-range channels.
+    /// `MonitorWire::dst_ch` is not checked: the hardware channel count is unknown here,
+    /// so the mixer silently drops wires to channels the monitor device lacks.
     pub fn validate(&self) -> Result<(), String> {
+        if self.version != CONFIG_VERSION {
+            return Err(format!(
+                "unsupported config version {} (expected {CONFIG_VERSION})",
+                self.version
+            ));
+        }
         let mut dev_ids = HashSet::new();
         for dev in &self.devices {
             if !dev_ids.insert(dev.id.as_str()) {
                 return Err(format!("duplicate device id '{}'", dev.id));
             }
+            if dev.name.trim().is_empty() {
+                return Err(format!("device '{}': name is empty", dev.id));
+            }
+            if dev.name.chars().count() > MAX_NAME_CHARS {
+                return Err(format!(
+                    "device '{}': name longer than {MAX_NAME_CHARS} characters",
+                    dev.id
+                ));
+            }
+            check_db(&format!("device '{}'", dev.id), dev.volume_db)?;
             let ch = usize::from(dev.channels);
             if !(2..=MAX_CH).contains(&ch) || ch % 2 != 0 {
                 return Err(format!(
@@ -94,6 +156,14 @@ impl Config {
                 if !(1..=MAX_CH).contains(&sc) {
                     return Err(format!(
                         "source '{}': channels {} must be in 1..={MAX_CH}",
+                        src.id, src.channels
+                    ));
+                }
+                check_db(&format!("source '{}'", src.id), src.volume_db)?;
+                // A process tap is always a stereo mixdown; other channels would never carry audio.
+                if matches!(src.kind, SourceKind::App { .. }) && src.channels != 2 {
+                    return Err(format!(
+                        "source '{}': app sources are stereo, channels {} must be 2",
                         src.id, src.channels
                     ));
                 }
@@ -125,6 +195,7 @@ impl Config {
                 }
             }
             for m in &dev.monitors {
+                check_db(&format!("monitor '{}'", m.device_uid), m.volume_db)?;
                 for mw in &m.wires {
                     if mw.out_ch >= dev.channels {
                         return Err(format!(
@@ -197,7 +268,7 @@ mod tests {
     #[test]
     fn rejects_bad_values() {
         type Mutate = fn(&mut Config);
-        let bad: [(&str, Mutate); 10] = [
+        let bad: [(&str, Mutate); 18] = [
             ("dup device", |c| {
                 let d = c.devices[0].clone();
                 c.devices.push(d);
@@ -209,19 +280,59 @@ mod tests {
             ("odd channels", |c| c.devices[0].channels = 3),
             ("zero channels", |c| c.devices[0].channels = 0),
             ("too many channels", |c| c.devices[0].channels = 66),
-            ("source zero ch", |c| c.devices[0].sources[0].channels = 0),
+            ("source zero ch", |c| c.devices[0].sources[1].channels = 0),
             ("src_ch range", |c| c.devices[0].wires[0].src_ch = 2),
             ("out_ch range", |c| c.devices[0].wires[0].out_ch = 2),
             ("monitor out_ch range", |c| {
                 c.devices[0].monitors[0].wires[0].out_ch = 2
             }),
-            ("source too wide", |c| c.devices[0].sources[0].channels = 65),
+            ("source too wide", |c| c.devices[0].sources[1].channels = 65),
+            ("version 2", |c| c.version = 2),
+            ("version 0", |c| c.version = 0),
+            ("blank name", |c| c.devices[0].name = " \t ".into()),
+            ("long name", |c| c.devices[0].name = "x".repeat(65)),
+            ("nan device volume", |c| c.devices[0].volume_db = f32::NAN),
+            ("loud source", |c| c.devices[0].sources[1].volume_db = 24.5),
+            ("inf monitor volume", |c| {
+                c.devices[0].monitors[0].volume_db = f32::NEG_INFINITY
+            }),
+            ("mono app source", |c| c.devices[0].sources[0].channels = 1),
         ];
         for (name, f) in bad {
             let mut cfg = example();
             f(&mut cfg);
             assert!(cfg.validate().is_err(), "{name} accepted");
         }
+        let good: [(&str, Mutate); 4] = [
+            ("max gain", |c| c.devices[0].volume_db = 24.0),
+            ("near silence", |c| {
+                c.devices[0].sources[0].volume_db = -200.0
+            }),
+            ("64 char name", |c| c.devices[0].name = "é".repeat(64)),
+            ("mono device source", |c| {
+                c.devices[0].sources[1].channels = 1
+            }),
+        ];
+        for (name, f) in good {
+            let mut cfg = example();
+            f(&mut cfg);
+            cfg.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn minimal_json_parses_with_defaults() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg, Config::default());
+        let cfg: Config = serde_json::from_str(
+            r#"{"devices":[{"id":"v","name":"N","sources":[{"id":"s","kind":{"type":"pass_thru"},"channels":2}],
+                "monitors":[{"device_uid":"u"}]}]}"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let d = &cfg.devices[0];
+        assert!(d.enabled && !d.muted && d.channels == 2 && d.volume_db == 0.0);
+        assert!(d.wires.is_empty() && d.monitors[0].enabled && d.monitors[0].wires.is_empty());
     }
 }

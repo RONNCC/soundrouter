@@ -28,9 +28,11 @@ impl Default for Meters {
     }
 }
 
-/// Peak |x| of a block. NaN samples are ignored (`f32::max` prefers the non-NaN side).
+/// Peak |x| of a block. NaN and infinite samples are ignored, as the mixer treats them as silence.
 pub fn peak(block: &[f32]) -> f32 {
-    block.iter().fold(0.0, |m, x| m.max(x.abs()))
+    block
+        .iter()
+        .fold(0.0, |m, x| if x.is_finite() { m.max(x.abs()) } else { m })
 }
 
 fn bump(slot: Option<&AtomicU32>, p: f32) {

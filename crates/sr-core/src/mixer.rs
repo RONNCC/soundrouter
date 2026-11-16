@@ -1,10 +1,12 @@
-use crate::config::{MAX_CH, MAX_FRAMES, VirtualDevice};
+use crate::config::{MAX_CH, MAX_DB, MAX_FRAMES, VirtualDevice};
 use crate::meters::{METER_SLOTS, Meters, peak};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::ptr::null_mut;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::Ordering::{AcqRel, Relaxed};
 
 pub enum OutPort {
     Device(u16),
@@ -28,10 +30,11 @@ impl Gain {
     fn new(key: impl Hash, db: f32, off: bool) -> Gain {
         let mut h = DefaultHasher::new();
         key.hash(&mut h);
-        let target = if off || !db.is_finite() {
+        // NaN is silence; +inf and anything above +24 dB clamp so a bad value cannot blow up the output.
+        let target = if off || db.is_nan() {
             0.0
         } else {
-            10f32.powf(db / 20.0)
+            10f32.powf(db.min(MAX_DB) / 20.0)
         };
         Gain {
             key: h.finish(),
@@ -70,10 +73,17 @@ pub struct MixPlan {
     acc: Vec<f32>, // nch * MAX_FRAMES vdev channel scratch
 }
 
+/// NaN/Inf samples count as silence so one bad source cannot poison the whole device.
+fn clean(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
 fn ramp_add(dst: &mut [f32], src: &[f32], from: f32, to: f32) {
     if from == to {
         if to != 0.0 {
-            dst.iter_mut().zip(src).for_each(|(d, s)| *d += s * to);
+            dst.iter_mut()
+                .zip(src)
+                .for_each(|(d, s)| *d += clean(*s) * to);
         }
         return;
     }
@@ -81,7 +91,7 @@ fn ramp_add(dst: &mut [f32], src: &[f32], from: f32, to: f32) {
     let mut g = from;
     for (d, s) in dst.iter_mut().zip(src) {
         g += step;
-        *d += s * g;
+        *d += clean(*s) * g;
     }
 }
 
@@ -251,63 +261,74 @@ impl MixPlan {
     }
 }
 
-const PLAN_QUEUE: usize = 4;
-// Every box ever pushed comes back here; at most PLAN_QUEUE + 1 are outstanding per control-side drain.
-const RETURN_QUEUE: usize = 2 * PLAN_QUEUE;
+// Boxes outstanding on the return ring: at most 1 per `set_plan`, and `set_plan` drains it first.
+const RETURN_QUEUE: usize = 4;
+
+/// Single-slot plan mailbox: a newer plan replaces an unread older one, so the audio thread
+/// always sees the newest plan no matter how long it was not consuming.
+struct Mailbox(AtomicPtr<MixPlan>);
+impl Mailbox {
+    fn swap(&self, new: *mut MixPlan) -> Option<Box<MixPlan>> {
+        let old = self.0.swap(new, AcqRel);
+        // SAFETY: the slot only ever holds null or a pointer from `Box::into_raw` in `put`,
+        // and `swap` hands each stored pointer out exactly once.
+        (!old.is_null()).then(|| unsafe { Box::from_raw(old) })
+    }
+    /// Returns the plan it replaced, if the audio thread had not taken it yet.
+    fn put(&self, p: Box<MixPlan>) -> Option<Box<MixPlan>> {
+        self.swap(Box::into_raw(p))
+    }
+    fn take(&self) -> Option<Box<MixPlan>> {
+        self.swap(null_mut())
+    }
+}
+impl Drop for Mailbox {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
 
 /// Audio-thread side; zero alloc in process.
 pub struct Mixer {
     plan: Option<Box<MixPlan>>,
-    rx: Consumer<Box<MixPlan>>,
+    slot: Arc<Mailbox>,
     ret: Producer<Box<MixPlan>>,
     meters: Arc<Meters>,
 }
 /// Control side.
 pub struct MixerHandle {
-    tx: Producer<Box<MixPlan>>,
+    slot: Arc<Mailbox>,
     ret: Consumer<Box<MixPlan>>,
-    /// Newest plan the full queue refused; retried by `flush`/`set_plan`.
-    stash: Option<Box<MixPlan>>,
 }
 pub fn mixer(meters: Arc<Meters>) -> (Mixer, MixerHandle) {
-    let (tx, rx) = RingBuffer::new(PLAN_QUEUE);
+    let slot = Arc::new(Mailbox(AtomicPtr::new(null_mut())));
     let (ret, back) = RingBuffer::new(RETURN_QUEUE);
     (
         Mixer {
             plan: None,
-            rx,
+            slot: slot.clone(),
             ret,
             meters,
         },
-        MixerHandle {
-            tx,
-            ret: back,
-            stash: None,
-        },
+        MixerHandle { slot, ret: back },
     )
 }
 impl MixerHandle {
-    /// rtrb push Box<MixPlan>; old boxes come back on a 2nd rtrb and drop here.
-    /// If the audio thread is not consuming and the queue is full, the newest plan is kept
-    /// aside (replacing any older one) and pushed on the next `flush`/`set_plan`.
+    /// Publish `p`; the audio thread applies it at its next block, replacing any plan it has
+    /// not picked up yet. Plans the audio thread retired come back on a ring and drop here.
     pub fn set_plan(&mut self, p: MixPlan) {
-        self.stash = Some(Box::new(p));
         self.flush();
+        drop(self.slot.put(Box::new(p)));
     }
 
-    /// Drop plans returned by the audio thread and push the stashed plan if there is room.
+    /// Drop plans returned by the audio thread.
     pub fn flush(&mut self) {
         while self.ret.pop().is_ok() {}
-        if let Some(p) = self.stash.take()
-            && let Err(rtrb::PushError::Full(p)) = self.tx.push(p)
-        {
-            self.stash = Some(p);
-        }
     }
 }
 impl Mixer {
     fn poll(&mut self) {
-        while let Ok(mut new) = self.rx.pop() {
+        if let Some(mut new) = self.slot.take() {
             if let Some(old) = self.plan.take() {
                 new.inherit(&old);
                 let _ = self.ret.push(old); // full return queue: drops here, cannot happen by sizing

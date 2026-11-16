@@ -308,3 +308,66 @@ fn meters_hold_max_across_blocks_and_ignore_nan() {
     assert_eq!(r.sources[0].1[0], 0.9);
     assert_eq!(r.sources[0].1[1], 0.1);
 }
+
+#[test]
+fn newest_plan_wins_after_audio_thread_was_away() {
+    // Audio thread not consuming (TCC prompt, shape mismatch): plans pile up, the newest must win.
+    let meters = Arc::new(Meters::new());
+    let (mut m, mut h) = mixer(meters);
+    for db in [0.0, -6.0, -12.0, -18.0, -24.0, -30.0] {
+        let mut d = dev();
+        d.sources[0].volume_db = db;
+        h.set_plan(MixPlan::compile(&d, &layout()));
+    }
+    let n = 64;
+    let o = run(&mut m, &vec![vec![1.0; n]; 2], 4, n);
+    assert!(
+        close(o[0][n - 1], 10f32.powf(-30.0 / 20.0)),
+        "{}",
+        o[0][n - 1]
+    );
+    // ... and a plan published while the old ones are still outstanding replaces them too
+    let mut d = dev();
+    d.sources[0].muted = true;
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    run(&mut m, &vec![vec![1.0; n]; 2], 4, n);
+    let o = run(&mut m, &vec![vec![1.0; n]; 2], 4, n);
+    assert!(o[0].iter().all(|x| *x == 1.0));
+}
+
+#[test]
+fn dropping_either_side_with_plans_pending_is_clean() {
+    let (m, mut h) = mixer(Arc::new(Meters::new()));
+    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    drop(m);
+    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    h.flush();
+    drop(h);
+    let (m, mut h) = mixer(Arc::new(Meters::new()));
+    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    drop(h);
+    drop(m);
+}
+
+/// `cargo test -p sr-core --release -- --ignored`: sanitizing non-finite samples must stay cheap.
+#[test]
+#[ignore = "timing"]
+fn process_is_far_below_realtime_budget() {
+    let mut d = dev();
+    d.monitors.push(mon("spk", true, -3.0));
+    let (mut m, _h, _) = setup(&d, &layout());
+    let n = 512;
+    let ins: Vec<Vec<f32>> = vec![vec![0.25; n]; 2];
+    run(&mut m, &ins, 4, n);
+    let t = std::time::Instant::now();
+    for _ in 0..2000 {
+        run(&mut m, &ins, 4, n);
+    }
+    let per_block = t.elapsed() / 2000;
+    // 512 frames at 48 kHz = 10.6 ms of audio; demand < 1% of it (the harness allocates too).
+    assert!(
+        per_block < std::time::Duration::from_micros(100),
+        "{per_block:?}"
+    );
+}

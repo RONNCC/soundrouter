@@ -3589,6 +3589,7 @@ name = "sr-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "proptest",
  "rtrb",
  "serde",
  "serde_json",
