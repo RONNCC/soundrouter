@@ -15,6 +15,10 @@ sr-audio = { path = "../crates/sr-audio" }
 anyhow.workspace = true
 serde_json.workspace = true
 eframe = "=0.37.0"
+log = "0.4"
+fern = "0.7"
+humantime = "2"
+env_filter = { version = "2", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 window-vibrancy = "0.8.1"
@@ -26,3 +30,4 @@ snapshots = []
 [dev-dependencies]
 proptest = "1"
 egui_kittest = { version = "=0.37.0", features = ["eframe", "wgpu", "snapshot"] }
+tempfile = "3"

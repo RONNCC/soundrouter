@@ -12,6 +12,9 @@ use sr_core::driver_proto::{DEVICE_UID_PREFIX, DriverDevice, PLUGIN_BUNDLE_ID, c
 #[derive(Parser)]
 #[command(name = "sr-cli", version, about = "SoundRouter headless tool")]
 struct Cli {
+    /// Log more: -v info, -vv debug (default: warnings only; RUST_LOG overrides)
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -71,7 +74,14 @@ fn db(x: f32) -> String {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let level = match cli.verbose {
+        0 => "warn",
+        1 => "info",
+        _ => "debug",
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+    match cli.cmd {
         Cmd::List => list(),
         Cmd::Driver { op: DriverOp::Get } => {
             let list = driver::get_devices(driver::require_plugin()?)?;

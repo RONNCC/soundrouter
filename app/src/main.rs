@@ -3,6 +3,7 @@ mod app;
 mod fake;
 mod graph;
 mod layout;
+mod logging;
 mod meter;
 mod model;
 mod store;
@@ -51,6 +52,8 @@ fn real_backend() -> anyhow::Result<Box<dyn Backend + Send>> {
 
 fn main() -> eframe::Result {
     let args = parse_args();
+    let log_file = logging::init();
+    logging::banner(log_file.as_deref());
     let demo = args.demo;
     let vibrancy_wanted = cfg!(target_os = "macos");
     let opts = eframe::NativeOptions {
