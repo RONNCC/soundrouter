@@ -1,11 +1,12 @@
 //! First-run setup: driver install/uninstall through the macOS administrator prompt, the
 //! permission explanations, the loopback self-test and the sheet that walks through them.
-use crate::theme::Tokens;
+use crate::sheet::{
+    Glyph, Kind, Row, Sheet, Status, body, button, buttons, checklist, error, modal, progress,
+};
+use crate::theme::{Tokens, tokens};
 use crate::widgets::name_button;
 use crate::worker::SelfTestState;
-use eframe::egui::{
-    self, Align2, Color32, Context, CornerRadius, FontId, Id, Modal, Rect, RichText, Sense, Stroke,
-};
+use eframe::egui::{self, Align2, Context, CornerRadius, FontId, Id, Rect, Sense, Stroke, Theme};
 use sr_core::backend::{EngineStatus, TccStatus};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -301,19 +302,14 @@ impl Setup {
             return None;
         }
         self.sync(v);
+        let t = tokens(ctx.theme() == Theme::Dark);
         let mut action = None;
         if self.open || v.status.driver_version.is_none() {
             self.shown = true;
-            Modal::new(Id::unique("setup_sheet")).show(ctx, |ui| {
-                ui.set_width(420.0);
-                action = self.sheet(ui, v);
-            });
+            action = self.sheet(ctx, &t, v);
         }
         if self.confirm.is_some() {
-            Modal::new(Id::unique("uninstall_dialog")).show(ctx, |ui| {
-                ui.set_width(420.0);
-                self.uninstall_dialog(ui);
-            });
+            self.uninstall_dialog(ctx, &t);
         }
         action
     }
@@ -323,187 +319,435 @@ impl Setup {
         self.step = Step::Welcome;
     }
 
-    fn sheet(&mut self, ui: &mut egui::Ui, v: &View) -> Option<Action> {
+    fn sheet(&mut self, ctx: &Context, t: &Tokens, v: &View) -> Option<Action> {
         let mut action = None;
-        let ctx = ui.ctx().clone();
-        let heading = |ui: &mut egui::Ui, t: &str| ui.heading(t);
         match self.step {
-            Step::Welcome => {
-                heading(ui, "Set up SoundRouter");
-                ui.label(
-                    "SoundRouter creates virtual audio devices and routes app and microphone audio between them. \
-                     It needs a small system audio driver; macOS will ask for your password to install it.",
-                );
-                ui.horizontal(|ui| {
-                    if primary(ui, "Install Driver…") {
-                        self.start_install(&ctx);
-                    }
-                    if ui.button("Try Demo").clicked() {
-                        self.demo = true;
-                        action = Some(Action::Demo);
-                    }
-                });
-            }
+            Step::Welcome => modal(
+                ctx,
+                t,
+                &Sheet {
+                    id: "setup_welcome",
+                    buttons: true,
+                    glyph: Glyph::App,
+                    title: "Set up SoundRouter",
+                    intro: "SoundRouter creates virtual audio devices and routes app and microphone audio \
+                            between them. It needs a small system audio driver; macOS will ask for your \
+                            password to install it.",
+                },
+                self,
+                |ui, _| {
+                    checklist(
+                        ui,
+                        t,
+                        &[Row {
+                            state: Status::Pending,
+                            title: "Audio driver",
+                            status: "Not installed",
+                            detail: "Adds the virtual devices to macOS.",
+                            action: None,
+                        }],
+                    );
+                },
+                |ui, s| {
+                    buttons(
+                        ui,
+                        s,
+                        |ui, s| {
+                            if button(ui, t, "Try Demo", Kind::Secondary) {
+                                s.demo = true;
+                                action = Some(Action::Demo);
+                            }
+                        },
+                        |ui, s| {
+                            if button(ui, t, "Install Driver…", Kind::Primary) {
+                                s.start_install(ctx);
+                            }
+                        },
+                    );
+                },
+            ),
             Step::Driver => {
-                heading(ui, "Install the audio driver");
-                if self.busy == Some(Busy::Installing) {
-                    ui.label("Waiting for the password dialog…");
-                } else if self.deadline.is_some() {
-                    ui.label("Starting the driver…");
+                let installing = self.busy == Some(Busy::Installing);
+                let starting = self.deadline.is_some();
+                let (glyph, title, intro) = if installing {
+                    (
+                        Glyph::App,
+                        "Install the audio driver",
+                        "macOS asks for your password to copy the driver into place.",
+                    )
+                } else if starting {
+                    (
+                        Glyph::App,
+                        "Install the audio driver",
+                        "The driver is installed. macOS is loading it.",
+                    )
                 } else {
-                    ui.colored_label(ui.visuals().error_fg_color, "Driver not installed");
-                    if let Some(e) = &self.error {
-                        ui.label(e);
-                    }
-                    ui.horizontal(|ui| {
-                        if primary(ui, "Retry") {
-                            self.start_install(&ctx);
+                    (
+                        Glyph::Warn,
+                        "Driver not installed",
+                        "SoundRouter needs its audio driver to create virtual devices.",
+                    )
+                };
+                modal(
+                    ctx,
+                    t,
+                    &Sheet {
+                        id: "setup_driver",
+                        buttons: !(installing || starting),
+                        glyph,
+                        title,
+                        intro,
+                    },
+                    self,
+                    |ui, s| {
+                        if installing {
+                            progress(ui, t, "Waiting for the password dialog…");
+                        } else if starting {
+                            progress(ui, t, "Starting the driver…");
+                        } else {
+                            if let Some(e) = &s.error {
+                                error(ui, t, e);
+                            }
+                            if s.copied {
+                                body(ui, t, "Copied to clipboard");
+                            }
                         }
-                        if ui.button("Try Demo").clicked() {
-                            self.demo = true;
-                            action = Some(Action::Demo);
+                    },
+                    |ui, s| {
+                        if installing || starting {
+                            return;
                         }
-                        self.copy_button(ui, v);
-                    });
-                }
+                        buttons(
+                            ui,
+                            s,
+                            |ui, s| {
+                                if button(ui, t, "Try Demo", Kind::Secondary) {
+                                    s.demo = true;
+                                    action = Some(Action::Demo);
+                                }
+                                s.copy_button(ui, t, v);
+                            },
+                            |ui, s| {
+                                if button(ui, t, "Retry", Kind::Primary) {
+                                    s.start_install(ctx);
+                                }
+                            },
+                        );
+                    },
+                )
             }
             Step::Permissions => {
-                heading(ui, "Allow access");
-                let (mic, cap) = (v.status.mic, v.status.tcc);
-                ui.label(
-                    "Microphone: SoundRouter reads the virtual device's input to check that audio flows. \
-                     macOS asks the first time.",
-                );
-                ui.label(format!("Microphone: {}", tcc_word(mic)));
-                ui.label(
-                    "System Audio Recording: needed to capture audio from apps you add as sources. \
-                     macOS asks when the first app source starts.",
-                );
-                ui.label(format!("System Audio Recording: {}", tcc_word(cap)));
-                ui.horizontal(|ui| {
-                    match mic {
-                        TccStatus::Granted => {
-                            if primary(ui, "Continue") {
-                                self.step = Step::Verify;
-                                action = Some(Action::Test);
-                            }
+                let mic = v.status.mic;
+                modal(
+                    ctx,
+                    t,
+                    &Sheet {
+                        id: "setup_permissions",
+                        buttons: true,
+                        glyph: Glyph::App,
+                        title: "Allow access",
+                        intro: "SoundRouter needs two permissions. macOS asks for each the first time it is needed.",
+                    },
+                    self,
+                    |ui, _| {
+                        let rows = permission_rows(v, true);
+                        if checklist(ui, t, &rows) == Some(1) {
+                            open_url(AUDIO_CAPTURE_SETTINGS);
                         }
-                        TccStatus::Unknown => {
-                            if primary(ui, "Allow Microphone") {
-                                self.step = Step::Verify;
-                                action = Some(Action::AllowMic);
-                            }
-                        }
-                        TccStatus::Denied => {
-                            if primary(ui, "Open Microphone Settings") {
-                                open_url(MIC_SETTINGS);
-                            }
-                            if ui.button("Continue").clicked() {
-                                self.step = Step::Verify;
-                                action = Some(Action::Test);
-                            }
-                        }
-                    }
-                    if cap != TccStatus::Granted && ui.button("Open Settings").clicked() {
-                        open_url(AUDIO_CAPTURE_SETTINGS);
-                    }
-                    if !v.first_apply_pending && ui.button("Close").clicked() {
-                        self.close();
-                    }
-                });
+                    },
+                    |ui, s| {
+                        buttons(
+                            ui,
+                            s,
+                            |_, _| {},
+                            |ui, s| {
+                                match mic {
+                                    TccStatus::Granted => {
+                                        if button(ui, t, "Continue", Kind::Primary) {
+                                            s.step = Step::Verify;
+                                            action = Some(Action::Test);
+                                        }
+                                    }
+                                    TccStatus::Unknown => {
+                                        if button(ui, t, "Allow Microphone", Kind::Primary) {
+                                            s.step = Step::Verify;
+                                            action = Some(Action::AllowMic);
+                                        }
+                                    }
+                                    TccStatus::Denied => {
+                                        if button(ui, t, "Open Microphone Settings", Kind::Primary)
+                                        {
+                                            open_url(MIC_SETTINGS);
+                                        }
+                                        if button(ui, t, "Continue", Kind::Secondary) {
+                                            s.step = Step::Verify;
+                                            action = Some(Action::Test);
+                                        }
+                                    }
+                                }
+                                if !v.first_apply_pending && button(ui, t, "Close", Kind::Secondary)
+                                {
+                                    s.close();
+                                }
+                            },
+                        );
+                    },
+                )
             }
             Step::Verify => {
-                heading(ui, "Check the audio path");
-                match v.test {
-                    SelfTestState::Idle | SelfTestState::Running => {
-                        ui.label("Playing a quiet tone through the virtual device…");
+                let (glyph, intro) = match v.test {
+                    SelfTestState::Idle | SelfTestState::Running => (
+                        Glyph::App,
+                        "SoundRouter plays a quiet tone into the virtual device and listens for it to come back.",
+                    ),
+                    SelfTestState::Done(Ok(r)) if r.passed => {
+                        (Glyph::Ok, "The tone made it through the virtual device.")
                     }
-                    SelfTestState::Done(Ok(t)) if t.passed => {
-                        ui.label(format!(
-                            "Audio flows ({:.0} dBFS, {} dropouts)",
-                            t.rms_dbfs, t.dropouts
-                        ));
-                        if primary(ui, "Continue") {
-                            self.step = Step::Done;
-                        }
-                    }
-                    SelfTestState::Done(r) => {
-                        let why = match r {
-                            Ok(t) => format!(
-                                "No clean audio came back ({:.0} dBFS, {} dropouts).",
-                                t.rms_dbfs, t.dropouts
-                            ),
-                            Err(e) => format!("The test failed: {e}"),
-                        };
-                        ui.colored_label(ui.visuals().error_fg_color, why);
-                        ui.label("Check the permissions above, then try again.");
-                        ui.horizontal(|ui| {
-                            if primary(ui, "Retry") {
-                                action = Some(Action::Test);
+                    SelfTestState::Done(_) => (Glyph::Fail, "The tone did not come back cleanly."),
+                };
+                modal(
+                    ctx,
+                    t,
+                    &Sheet {
+                        id: "setup_verify",
+                        buttons: !matches!(v.test, SelfTestState::Idle | SelfTestState::Running),
+                        glyph,
+                        title: "Check the audio path",
+                        intro,
+                    },
+                    self,
+                    |ui, s| {
+                        let flows;
+                        let why;
+                        let mut rows = permission_rows(v, false).to_vec();
+                        rows.insert(
+                            0,
+                            Row {
+                                state: Status::Ok,
+                                title: "Audio driver",
+                                status: "Loaded",
+                                detail: "",
+                                action: None,
+                            },
+                        );
+                        rows.push(match v.test {
+                            SelfTestState::Idle | SelfTestState::Running => Row {
+                                state: Status::Running,
+                                title: "Loopback test",
+                                status: "Testing",
+                                detail: "",
+                                action: None,
+                            },
+                            SelfTestState::Done(Ok(r)) if r.passed => {
+                                flows = format!(
+                                    "Audio flows ({:.0} dBFS, {} dropouts)",
+                                    r.rms_dbfs, r.dropouts
+                                );
+                                Row {
+                                    state: Status::Ok,
+                                    title: "Loopback test",
+                                    status: "Passed",
+                                    detail: &flows,
+                                    action: None,
+                                }
                             }
-                            self.copy_button(ui, v);
-                            if ui.button("Close").clicked() {
-                                self.close();
+                            SelfTestState::Done(r) => {
+                                why = match r {
+                                    Ok(r) => format!(
+                                        "No clean audio came back ({:.0} dBFS, {} dropouts).",
+                                        r.rms_dbfs, r.dropouts
+                                    ),
+                                    Err(e) => format!("The test failed: {e}"),
+                                };
+                                Row {
+                                    state: Status::Fail,
+                                    title: "Loopback test",
+                                    status: "Failed",
+                                    detail: &why,
+                                    action: None,
+                                }
                             }
                         });
-                    }
-                }
+                        checklist(ui, t, &rows);
+                        match v.test {
+                            SelfTestState::Idle | SelfTestState::Running => {
+                                progress(ui, t, "Playing a quiet tone through the virtual device…");
+                            }
+                            SelfTestState::Done(Ok(r)) if r.passed => {}
+                            SelfTestState::Done(_) => body(
+                                ui,
+                                t,
+                                if v.status.mic == TccStatus::Granted {
+                                    "Microphone access is allowed, so the audio path itself looks silent. Try again, or copy diagnostics for support."
+                                } else {
+                                    "Check the Microphone permission, then try again."
+                                },
+                            ),
+                        }
+                        if s.copied {
+                            body(ui, t, "Copied to clipboard");
+                        }
+                    },
+                    |ui, s| match v.test {
+                        SelfTestState::Idle | SelfTestState::Running => {}
+                        SelfTestState::Done(Ok(r)) if r.passed => buttons(
+                            ui,
+                            s,
+                            |_, _| {},
+                            |ui, s| {
+                                if button(ui, t, "Continue", Kind::Primary) {
+                                    s.step = Step::Done;
+                                }
+                            },
+                        ),
+                        SelfTestState::Done(_) => buttons(
+                            ui,
+                            s,
+                            |ui, s| s.copy_button(ui, t, v),
+                            |ui, s| {
+                                if button(ui, t, "Retry", Kind::Primary) {
+                                    action = Some(Action::Test);
+                                }
+                                if button(ui, t, "Close", Kind::Secondary) {
+                                    s.close();
+                                }
+                            },
+                        ),
+                    },
+                )
             }
-            Step::Done => {
-                heading(ui, "You're all set");
-                ui.label(format!(
-                    "In Zoom, OBS or any other app, choose “{}” as the microphone or speaker.",
-                    v.device_name
-                ));
-                if primary(ui, "Done") {
-                    self.close();
-                }
-            }
+            Step::Done => modal(
+                ctx,
+                t,
+                &Sheet {
+                    id: "setup_done",
+                    buttons: true,
+                    glyph: Glyph::Ok,
+                    title: "You're all set",
+                    intro: &format!(
+                        "In Zoom, OBS or any other app, choose “{}” as the microphone or speaker.",
+                        v.device_name
+                    ),
+                },
+                self,
+                |_, _| {},
+                |ui, s| {
+                    buttons(
+                        ui,
+                        s,
+                        |_, _| {},
+                        |ui, s| {
+                            if button(ui, t, "Done", Kind::Primary) {
+                                s.close();
+                            }
+                        },
+                    );
+                },
+            ),
         }
         action
     }
 
-    fn copy_button(&mut self, ui: &mut egui::Ui, v: &View) {
-        if ui.button("Copy diagnostics").clicked() {
+    fn copy_button(&mut self, ui: &mut egui::Ui, t: &Tokens, v: &View) {
+        if button(ui, t, "Copy diagnostics", Kind::Secondary) {
             ui.ctx().copy_text((v.diagnostics)());
             self.copied = true;
         }
-        if self.copied {
-            ui.label("Copied to clipboard");
-        }
     }
 
-    fn uninstall_dialog(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        ui.heading("Uninstall the audio driver?");
-        ui.label(format!(
-            "This removes SoundRouter.driver from {HAL_DIR} and briefly restarts macOS audio. \
-             macOS will ask for your password."
-        ));
+    fn uninstall_dialog(&mut self, ctx: &Context, t: &Tokens) {
         let busy = self.busy == Some(Busy::Uninstalling);
-        if let Some(remove) = &mut self.confirm {
-            ui.add_enabled(
-                !busy,
-                egui::Checkbox::new(remove, "Also delete my SoundRouter settings"),
-            );
-        }
-        if busy {
-            ui.label("Waiting for the password dialog…");
-        } else {
-            if let Some(e) = &self.error {
-                ui.colored_label(ui.visuals().error_fg_color, format!("Not uninstalled: {e}"));
-            }
-            ui.horizontal(|ui| {
-                if primary(ui, "Uninstall") {
-                    let script = uninstall_script(self.confirm == Some(true));
-                    self.spawn(&ctx, Busy::Uninstalling, script);
+        modal(
+            ctx,
+            t,
+            &Sheet {
+                id: "uninstall_dialog",
+                buttons: !busy,
+                glyph: Glyph::Warn,
+                title: "Uninstall the audio driver?",
+                intro: &format!(
+                    "This removes SoundRouter.driver from {HAL_DIR} and briefly restarts macOS audio. \
+                     macOS will ask for your password."
+                ),
+            },
+            self,
+            |ui, s| {
+                if let Some(remove) = &mut s.confirm {
+                    ui.add_enabled(
+                        !busy,
+                        egui::Checkbox::new(remove, "Also delete my SoundRouter settings"),
+                    );
                 }
-                if ui.button("Cancel").clicked() {
-                    self.confirm = None;
-                    self.error = None;
+                if busy {
+                    progress(ui, t, "Waiting for the password dialog…");
+                } else if let Some(e) = &s.error {
+                    error(ui, t, &format!("Not uninstalled: {e}"));
                 }
-            });
-        }
+            },
+            |ui, s| {
+                if busy {
+                    return;
+                }
+                buttons(
+                    ui,
+                    s,
+                    |_, _| {},
+                    |ui, s| {
+                        if button(ui, t, "Uninstall", Kind::Danger) {
+                            let script = uninstall_script(s.confirm == Some(true));
+                            s.spawn(ctx, Busy::Uninstalling, script);
+                        }
+                        if button(ui, t, "Cancel", Kind::Secondary) {
+                            s.confirm = None;
+                            s.error = None;
+                        }
+                    },
+                );
+            },
+        );
+    }
+}
+
+/// Microphone and System Audio Recording as checklist rows. `explain` adds the why and the
+/// Settings shortcut (index 1 is the audio capture row).
+fn permission_rows<'a>(v: &View, explain: bool) -> [Row<'a>; 2] {
+    let look = |s: TccStatus| match s {
+        TccStatus::Granted => Status::Ok,
+        TccStatus::Denied => Status::Fail,
+        TccStatus::Unknown => Status::Pending,
+    };
+    let (mic, cap) = (v.status.mic, v.status.tcc);
+    [
+        Row {
+            state: look(mic),
+            title: "Microphone",
+            status: tcc_word(mic),
+            detail: if explain {
+                "Reads the virtual device's input to check that audio flows. macOS asks the first time."
+            } else {
+                ""
+            },
+            action: None,
+        },
+        Row {
+            state: look(cap),
+            title: "System Audio Recording",
+            status: tcc_word(cap),
+            detail: if explain {
+                "Captures audio from apps you add as sources. macOS asks when the first app source starts."
+            } else {
+                ""
+            },
+            action: (explain && cap != TccStatus::Granted).then_some("Open Settings"),
+        },
+    ]
+}
+
+/// For support text: the status as the user sees it when it is not decided, else its name.
+fn tcc_diag(s: TccStatus) -> String {
+    match s {
+        TccStatus::Unknown => "Not asked yet".into(),
+        _ => format!("{s:?}"),
     }
 }
 
@@ -517,12 +761,6 @@ fn tcc_word(s: TccStatus) -> &'static str {
 
 fn open_url(url: &str) {
     let _ = Command::new("open").arg(url).spawn();
-}
-
-fn primary(ui: &mut egui::Ui, label: &str) -> bool {
-    let b = egui::Button::new(RichText::new(label).color(Color32::WHITE))
-        .fill(ui.visuals().selection.bg_fill);
-    ui.add(b).clicked()
 }
 
 /// Footer button in the style of the Delete button.
@@ -576,8 +814,8 @@ pub fn diagnostics(
             "driver bundle in app: {}",
             driver_source.map_or("missing".into(), |p| p.display().to_string())
         ),
-        format!("TCC audio capture: {:?}", status.tcc),
-        format!("TCC microphone: {:?}", status.mic),
+        format!("TCC audio capture: {}", tcc_diag(status.tcc)),
+        format!("TCC microphone: {}", tcc_diag(status.mic)),
         format!("virtual devices: {devices}"),
     ];
     for (id, s) in &status.per_device {
@@ -711,6 +949,7 @@ mod tests {
             "protocol version 1",
             "driver bundle in app: missing",
             "TCC microphone: Denied",
+            "TCC audio capture: Not asked yet",
             "virtual devices: 2",
             "self-test: error: boom",
             "apply error: tap denied",

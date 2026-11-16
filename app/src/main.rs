@@ -10,6 +10,7 @@ mod login;
 mod meter;
 mod model;
 mod setup;
+mod sheet;
 mod store;
 mod theme;
 mod tray;

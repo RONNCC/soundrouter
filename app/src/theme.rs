@@ -26,6 +26,8 @@ pub struct Tokens {
     pub meter: [Color32; 3],
     pub track: Color32,
     pub shadow: Color32,
+    /// Dims the window behind a modal sheet.
+    pub scrim: Color32,
     pub switch_off: Color32,
     pub danger: Color32,
 }
@@ -45,6 +47,7 @@ pub fn tokens(dark: bool) -> Tokens {
             meter: [hex(0x30D158), hex(0xFFD60A), hex(0xFF453A)],
             track: hex(0x1C1C1E),
             shadow: Color32::from_black_alpha(90),
+            scrim: Color32::from_black_alpha(80),
             switch_off: hex(0x48484A),
             danger: hex(0xFF453A),
         }
@@ -62,6 +65,7 @@ pub fn tokens(dark: bool) -> Tokens {
             meter: [hex(0x34C759), hex(0xFFCC00), hex(0xFF3B30)],
             track: hex(0xE5E5EA),
             shadow: Color32::from_black_alpha(28),
+            scrim: Color32::from_black_alpha(36),
             switch_off: hex(0xC7C7CC),
             danger: hex(0xFF3B30),
         }

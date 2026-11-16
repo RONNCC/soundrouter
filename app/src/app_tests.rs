@@ -662,6 +662,208 @@ mod snapshots {
         );
     }
 
+    /// A window showing the setup flow, driven by `before`; both themes.
+    fn sheet(
+        name: &str,
+        size: egui::Vec2,
+        status: EngineStatus,
+        test: Option<SelfTest>,
+        runner: Runner,
+        before: fn(&mut Harness<'static, App>),
+    ) {
+        let mut results = egui_kittest::SnapshotResults::new();
+        for (theme, suffix) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+            let (status, runner, test) = (status.clone(), runner.clone(), test.clone());
+            let mut h = Harness::builder()
+                .with_size(size)
+                .with_step_dt(0.05)
+                .with_theme(theme)
+                .with_context_setup(crate::theme::install_fonts)
+                .wgpu()
+                .build_eframe(move |cc| {
+                    let mut b = FakeBackend::frozen(1.5);
+                    b.status = status;
+                    b.self_test = test;
+                    let w =
+                        Worker::spawn_inline(Box::new(b), cc.egui_ctx.clone(), Box::new(|_| None));
+                    let mut app = App::new(demo_config(), None, w, None, false, false);
+                    app.setup =
+                        Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()));
+                    app
+                });
+            wait_published(&mut h);
+            settle(&mut h);
+            before(&mut h);
+            h.run_steps(5);
+            h.snapshot(format!("sheet_{name}_{suffix}"));
+            results.extend_harness(&mut h);
+        }
+    }
+
+    const WIDE: egui::Vec2 = egui::vec2(900.0, 640.0);
+
+    fn mic_unasked() -> EngineStatus {
+        EngineStatus {
+            mic: TccStatus::Unknown,
+            tcc: TccStatus::Unknown,
+            ..installed()
+        }
+    }
+
+    #[test]
+    fn sheet_allow_access_not_asked() {
+        sheet(
+            "allow_unasked",
+            WIDE,
+            mic_unasked(),
+            flowing(),
+            never_run(),
+            |_| {},
+        );
+    }
+
+    #[test]
+    fn sheet_allow_access_granted() {
+        sheet(
+            "allow_granted",
+            WIDE,
+            installed(),
+            flowing(),
+            never_run(),
+            |h| {
+                click(h, "Test Setup…");
+            },
+        );
+    }
+
+    #[test]
+    fn sheet_allow_access_denied() {
+        let denied = EngineStatus {
+            mic: TccStatus::Denied,
+            tcc: TccStatus::Denied,
+            ..installed()
+        };
+        sheet("allow_denied", WIDE, denied, flowing(), never_run(), |h| {
+            click(h, "Test Setup…");
+        });
+    }
+
+    #[test]
+    fn sheet_self_test_running() {
+        sheet(
+            "test_running",
+            WIDE,
+            installed(),
+            flowing(),
+            never_run(),
+            |h| {
+                click(h, "Test Setup…");
+                click(h, "Continue");
+                h.state().worker.shared.lock().unwrap().self_test = SelfTestState::Running;
+                h.run_steps(3);
+            },
+        );
+    }
+
+    #[test]
+    fn sheet_self_test_pass() {
+        sheet(
+            "test_pass",
+            WIDE,
+            installed(),
+            flowing(),
+            never_run(),
+            |h| {
+                click(h, "Test Setup…");
+                click(h, "Continue");
+                until(h, "self-test", |h| {
+                    h.query_by_label_contains("Audio flows").is_some()
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn sheet_self_test_fail() {
+        sheet("test_fail", WIDE, installed(), None, never_run(), |h| {
+            click(h, "Test Setup…");
+            click(h, "Continue");
+            until(h, "self-test", |h| has(h, "Copy diagnostics"));
+        });
+    }
+
+    #[test]
+    fn sheet_all_done() {
+        sheet("done", WIDE, installed(), flowing(), never_run(), |h| {
+            click(h, "Test Setup…");
+            click(h, "Continue");
+            until(h, "self-test", |h| {
+                h.query_by_label_contains("Audio flows").is_some()
+            });
+            click(h, "Continue");
+        });
+    }
+
+    #[test]
+    fn sheet_driver_missing() {
+        sheet(
+            "driver_missing",
+            WIDE,
+            no_driver(),
+            None,
+            never_run(),
+            |_| {},
+        );
+    }
+
+    #[test]
+    fn sheet_driver_install_failed() {
+        let runner = recording(Err(SetupError::Cancelled)).0;
+        sheet("driver_failed", WIDE, no_driver(), None, runner, |h| {
+            click(h, "Install Driver…");
+            until(h, "runner result", |h| has(h, "Driver not installed"));
+        });
+    }
+
+    #[test]
+    fn sheet_uninstall_confirm() {
+        sheet("uninstall", WIDE, installed(), None, never_run(), |h| {
+            click(h, "Uninstall…");
+        });
+    }
+
+    #[test]
+    fn sheet_uninstall_failed() {
+        let runner = recording(Err(SetupError::Failed("Operation not permitted".into()))).0;
+        sheet("uninstall_failed", WIDE, installed(), None, runner, |h| {
+            click(h, "Uninstall…");
+            click(h, "Uninstall");
+            until(h, "runner result", |h| {
+                h.query_by_label_contains("Not uninstalled").is_some()
+            });
+        });
+    }
+
+    /// A long failure in a small window: the body scrolls, the buttons stay inside the card.
+    #[test]
+    fn sheet_long_content_in_a_small_window() {
+        let long = "The installer stopped: ".to_string()
+            + &"ditto: /Library/Audio/Plug-Ins/HAL/SoundRouter.driver: Operation not permitted. "
+                .repeat(30);
+        let runner = recording(Err(SetupError::Failed(long))).0;
+        sheet(
+            "overflow",
+            egui::vec2(520.0, 340.0),
+            no_driver(),
+            None,
+            runner,
+            |h| {
+                click(h, "Install Driver…");
+                until(h, "runner result", |h| has(h, "Driver not installed"));
+            },
+        );
+    }
+
     /// Regenerates the README screenshots:
     /// `cargo test -p soundrouter-app --features snapshots -- --ignored docs_screenshots`
     #[test]
