@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build + assemble + ad-hoc (or SIGN_ID) sign target/SoundRouter.driver. Run from anywhere.
 set -euo pipefail
+[ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH" || true
 cd "$(dirname "$0")/.."
 export MACOSX_DEPLOYMENT_TARGET=14.0
 OUT=target/SoundRouter.driver

@@ -2,6 +2,7 @@
 # build | fakehost | install | uninstall | restart | test for the SoundRouter HAL driver.
 # install/uninstall/restart/test use sudo internally: run this script as your user, not with sudo.
 set -euo pipefail
+[ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH" || true
 cd "$(dirname "$0")/.."
 NAME=SoundRouter
 DEST=/Library/Audio/Plug-Ins/HAL/$NAME.driver

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build target/SoundRouter.app. Ad-hoc signed unless SIGN_ID is set.
 set -euo pipefail
+[ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH" || true
 cd "$(dirname "$0")/.."
 
 APP=target/SoundRouter.app

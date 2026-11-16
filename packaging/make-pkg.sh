@@ -4,6 +4,7 @@
 # falling back to target/SoundRouter.driver (build-driver.sh).
 # productsign only when INSTALLER_ID is set.
 set -euo pipefail
+[ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH" || true
 cd "$(dirname "$0")/.."
 
 APP=target/SoundRouter.app

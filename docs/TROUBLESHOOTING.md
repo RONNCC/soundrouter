@@ -26,3 +26,6 @@ Do not route a virtual device's own output into a monitor that an app records fr
 
 ## Logs
 GUI: `~/Library/Logs/SoundRouter/soundrouter.log`. CLI: stderr; `-v` info, `-vv` debug, `RUST_LOG` overrides.
+
+## rustc 1.89 is not supported
+If you see `rustc 1.89 is not supported`, rustup's cargo must come first on PATH (`export PATH="$HOME/.cargo/bin:$PATH"`); Homebrew cargo ignores `rust-toolchain.toml`. `packaging/*.sh` do this automatically.
