@@ -1,7 +1,8 @@
 //! Backend worker thread: applies configs, polls meters at 30 Hz, refreshes hardware/apps every 2 s.
+use crate::fake::FakeBackend;
 use crate::icons::{self, IconResolver};
 use eframe::egui::{ColorImage, Context};
-use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading};
+use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading, SelfTest};
 use sr_core::config::{Config, SourceKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -11,6 +12,15 @@ use std::time::{Duration, Instant};
 
 const METER_PERIOD: Duration = Duration::from_millis(33);
 const REFRESH_PERIOD: Duration = Duration::from_secs(2);
+
+/// Progress of the loopback self-test the setup sheet asks for.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum SelfTestState {
+    #[default]
+    Idle,
+    Running,
+    Done(Result<SelfTest, String>),
+}
 
 #[derive(Default)]
 pub struct Snapshot {
@@ -22,21 +32,50 @@ pub struct Snapshot {
     /// Error of the most recent `apply`; cleared by the next success.
     pub apply_error: Option<String>,
     pub status: EngineStatus,
+    /// False until the first status poll, so the GUI does not mistake "not asked yet" for "no driver".
+    pub status_ready: bool,
+    pub self_test: SelfTestState,
+}
+
+enum Msg {
+    Apply(Config),
+    SelfTest(String),
+    /// Replace the backend with the synthetic one.
+    Demo,
 }
 
 pub struct Worker {
-    tx: Option<Sender<Config>>,
+    tx: Option<Sender<Msg>>,
     handle: Option<JoinHandle<()>>,
     pub shared: Arc<Mutex<Snapshot>>,
 }
 
-/// Newest queued config, if any: bursts (slider drags) collapse to the latest.
-fn drain_latest(rx: &Receiver<Config>, first: Option<Config>) -> Option<Config> {
-    let mut newest = first;
-    while let Ok(c) = rx.try_recv() {
-        newest = Some(c);
+/// Everything queued since the last iteration. Bursts of configs (slider drags) collapse to the
+/// latest; self-test requests for the same device collapse to one.
+#[derive(Default)]
+struct Batch {
+    cfg: Option<Config>,
+    tests: Vec<String>,
+    demo: bool,
+}
+
+fn drain_latest(rx: &Receiver<Msg>, first: Option<Msg>) -> Batch {
+    let mut b = Batch::default();
+    for m in first
+        .into_iter()
+        .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+    {
+        match m {
+            Msg::Apply(c) => b.cfg = Some(c),
+            Msg::SelfTest(id) => {
+                if !b.tests.contains(&id) {
+                    b.tests.push(id);
+                }
+            }
+            Msg::Demo => b.demo = true,
+        }
     }
-    newest
+    b
 }
 
 /// One worker iteration. Backend calls run with the snapshot mutex released, so the UI never
@@ -51,6 +90,20 @@ struct Pump {
 }
 
 impl Pump {
+    /// Demo swap, then config, then self-tests: the tests see the devices the config creates.
+    fn run(&mut self, b: Batch, now: Instant, snap: &Mutex<Snapshot>) {
+        if b.demo {
+            self.backend = Box::new(FakeBackend::new());
+            self.next_refresh = now;
+        }
+        self.tick(b.cfg, now, snap);
+        for id in b.tests {
+            snap.lock().unwrap().self_test = SelfTestState::Running;
+            let r = self.backend.self_test(&id).map_err(|e| format!("{e:#}"));
+            snap.lock().unwrap().self_test = SelfTestState::Done(r);
+        }
+    }
+
     fn tick(&mut self, newest: Option<Config>, now: Instant, snap: &Mutex<Snapshot>) {
         let mut apply_result = None;
         if let Some(c) = newest {
@@ -77,6 +130,7 @@ impl Pump {
         s.meters = meters;
         if let Some((hw, apps, status, icons)) = refresh {
             s.status = status;
+            s.status_ready = true;
             s.hardware = hw;
             s.apps = apps;
             s.icons.extend(icons);
@@ -118,7 +172,7 @@ impl Worker {
         ctx: Context,
         resolve_icon: IconResolver,
     ) -> Worker {
-        let (tx, rx) = mpsc::channel::<Config>();
+        let (tx, rx) = mpsc::channel::<Msg>();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let snap = shared.clone();
         let handle = std::thread::spawn(move || {
@@ -135,7 +189,7 @@ impl Worker {
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
-                pump.tick(drain_latest(&rx, first), Instant::now(), &snap);
+                pump.run(drain_latest(&rx, first), Instant::now(), &snap);
                 ctx.request_repaint();
             }
         });
@@ -147,9 +201,29 @@ impl Worker {
     }
 
     pub fn apply(&self, cfg: &Config) {
+        self.send(Msg::Apply(cfg.clone()));
+    }
+
+    fn send(&self, m: Msg) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(cfg.clone());
+            let _ = tx.send(m);
         }
+    }
+
+    /// Loopback-test virtual device `id` off the UI thread; the result lands in `Snapshot::self_test`.
+    pub fn self_test(&self, id: &str) {
+        self.shared.lock().unwrap().self_test = SelfTestState::Running;
+        self.send(Msg::SelfTest(id.to_string()));
+    }
+
+    /// Report a self-test that cannot even start.
+    pub fn fail_self_test(&self, why: &str) {
+        self.shared.lock().unwrap().self_test = SelfTestState::Done(Err(why.to_string()));
+    }
+
+    /// Swap the real engine for the synthetic one (the setup sheet's "Try Demo").
+    pub fn use_demo(&self) {
+        self.send(Msg::Demo);
     }
 
     /// Stop the thread and wait for it, so the backend (and its CoreAudio devices) is dropped
@@ -222,6 +296,16 @@ mod tests {
             self.probe();
             (id == "v1").then(MeterReading::default)
         }
+        fn self_test(&mut self, id: &str) -> anyhow::Result<SelfTest> {
+            self.probe();
+            anyhow::ensure!(id == "v1", "no device {id}");
+            Ok(SelfTest {
+                rms_dbfs: -6.0,
+                dropouts: 0,
+                rate: 48_000.0,
+                passed: true,
+            })
+        }
     }
 
     fn setup() -> (Pump, Arc<Mutex<Log>>, Arc<Mutex<Snapshot>>) {
@@ -252,13 +336,13 @@ mod tests {
             let mut c = default_config();
             c.devices[0].volume_db = -(i as f32);
             cfgs.push(c.clone());
-            tx.send(c).unwrap();
+            tx.send(Msg::Apply(c)).unwrap();
         }
         let first = rx.recv().ok();
-        let newest = drain_latest(&rx, first);
-        assert_eq!(newest.as_ref(), cfgs.last());
+        let batch = drain_latest(&rx, first);
+        assert_eq!(batch.cfg.as_ref(), cfgs.last());
         let (mut pump, log, snap) = setup();
-        pump.tick(newest, Instant::now(), &snap);
+        pump.run(batch, Instant::now(), &snap);
         let l = log.lock().unwrap();
         assert_eq!(l.applied.len(), 1);
         assert_eq!(l.applied[0].devices[0].volume_db, -99.0);
@@ -342,6 +426,56 @@ mod tests {
         assert_eq!(
             asked,
             ["com.fake.configured", "com.fake.missing", "com.fake.player"]
+        );
+    }
+
+    #[test]
+    fn self_test_result_reaches_the_snapshot_and_requests_collapse() {
+        let (tx, rx) = mpsc::channel();
+        for id in ["v1", "v1", "nope"] {
+            tx.send(Msg::SelfTest(id.into())).unwrap();
+        }
+        let batch = drain_latest(&rx, None);
+        assert_eq!(batch.tests, ["v1", "nope"]);
+        let (mut pump, log, snap) = setup();
+        pump.run(batch, Instant::now(), &snap);
+        // the last request (unknown device) is the one left behind
+        assert_eq!(
+            snap.lock().unwrap().self_test,
+            SelfTestState::Done(Err("no device nope".into()))
+        );
+        pump.run(
+            Batch {
+                tests: vec!["v1".into()],
+                ..Batch::default()
+            },
+            Instant::now(),
+            &snap,
+        );
+        let SelfTestState::Done(Ok(t)) = snap.lock().unwrap().self_test.clone() else {
+            panic!("no result");
+        };
+        assert!(t.passed);
+        assert!(log.lock().unwrap().lock_free);
+    }
+
+    #[test]
+    fn demo_message_swaps_in_the_synthetic_backend() {
+        let (mut pump, _log, snap) = setup();
+        let now = Instant::now();
+        pump.run(
+            Batch {
+                demo: true,
+                ..Batch::default()
+            },
+            now,
+            &snap,
+        );
+        let s = snap.lock().unwrap();
+        assert!(s.status_ready);
+        assert_eq!(
+            s.status.driver_version.as_deref(),
+            Some(crate::fake::DEMO_DRIVER)
         );
     }
 }

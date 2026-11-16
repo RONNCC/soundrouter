@@ -1,12 +1,16 @@
 //! Whole-window tests: the real `App` and worker driven through the accessibility tree, so every
 //! control is found by the name a screen reader would announce, then clicked/dragged/typed at.
 use super::*;
-use crate::fake::{FakeBackend, demo_config};
+use crate::fake::{FakeBackend, demo_config, demo_status};
 use crate::model::default_config;
-use crate::worker::Snapshot;
+use crate::setup::{Runner, SetupError};
+use crate::worker::SelfTestState;
 use egui_kittest::{Harness, kittest::Queryable};
-use sr_core::backend::{AppInfo, Backend, DeviceState, EngineStatus, HwDevice, MeterReading};
+use sr_core::backend::{
+    AppInfo, Backend, DeviceState, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
+};
 use sr_core::config::SourceKind;
+use std::sync::{Arc, Mutex};
 
 /// Fake backend whose `apply` always fails, like a missing driver.
 struct Failing(FakeBackend, &'static str);
@@ -24,28 +28,42 @@ impl Backend for Failing {
     fn meters(&self, id: &str) -> Option<MeterReading> {
         self.0.meters(id)
     }
+    fn status(&self) -> EngineStatus {
+        self.0.status()
+    }
 }
 
-/// Block until the worker thread has published what the window needs, without timers: its first
-/// refresh (hardware/apps) and either meters for every enabled device or the apply error.
-fn wait_published(app: &App) {
-    let ready = |s: &Snapshot| {
-        !s.hardware.is_empty()
-            && (s.apply_error.is_some()
+/// Step the window until `done` holds, without timers: the worker thread answers in between.
+fn until(h: &mut Harness<App>, what: &str, done: impl Fn(&Harness<App>) -> bool) {
+    for _ in 0..20_000u32 {
+        if done(h) {
+            return;
+        }
+        h.step();
+        std::thread::yield_now();
+    }
+    panic!("never happened: {what}");
+}
+
+/// Block until the worker thread has published what the window needs: its first refresh (status,
+/// hardware, apps) and, unless the setup sheet holds the first apply back, either meters for every
+/// enabled device or the apply error.
+fn wait_published(h: &mut Harness<App>) {
+    until(h, "worker publishing", |h| {
+        let app = h.state();
+        let s = app.worker.shared.lock().unwrap();
+        let held = s.status.driver_version.is_none() || s.status.mic == TccStatus::Unknown;
+        s.status_ready
+            && !s.hardware.is_empty()
+            && (held
+                || s.apply_error.is_some()
                 || app
                     .cfg
                     .devices
                     .iter()
                     .filter(|d| d.enabled)
                     .all(|d| s.meters.contains_key(&d.id)))
-    };
-    for _ in 0..50_000_000u32 {
-        if ready(&app.worker.shared.lock().unwrap()) {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    panic!("worker never published");
+    });
 }
 
 pub(super) fn window(
@@ -55,6 +73,22 @@ pub(super) fn window(
     theme: Theme,
     demo: bool,
 ) -> Harness<'static, App> {
+    window_with(cfg, backend, toast, theme, demo, never_run())
+}
+
+/// A runner for tests that must not reach the administrator prompt.
+fn never_run() -> Runner {
+    Arc::new(|_| Err(SetupError::Failed("no admin in tests".into())))
+}
+
+fn window_with(
+    cfg: Config,
+    backend: Box<dyn Backend + Send>,
+    toast: Option<&str>,
+    theme: Theme,
+    demo: bool,
+    runner: Runner,
+) -> Harness<'static, App> {
     let toast = toast.map(str::to_string);
     let mut h = Harness::builder()
         .with_size(vec2(1180.0, 700.0))
@@ -63,9 +97,11 @@ pub(super) fn window(
         .with_context_setup(crate::theme::install_fonts)
         .build_eframe(move |cc| {
             let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
-            App::new(cfg, None, w, toast, false, demo)
+            let mut app = App::new(cfg, None, w, toast, false, demo);
+            app.setup = Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()));
+            app
         });
-    wait_published(h.state());
+    wait_published(&mut h);
     settle(&mut h);
     h
 }
@@ -483,15 +519,6 @@ fn a_failed_apply_shows_in_the_status_bar() {
         false,
     );
     h.get_by_label("boom: no such device");
-    // a missing driver gets an actionable message instead of the raw error
-    let h = window(
-        demo_config(),
-        Box::new(Failing(FakeBackend::frozen(1.5), "driver not installed")),
-        None,
-        Theme::Dark,
-        false,
-    );
-    h.get_by_label_contains("Driver not installed. Run");
 }
 
 #[test]
@@ -552,7 +579,7 @@ mod snapshots {
                 let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
                 App::new(cfg, None, w, toast.map(str::to_string), false, false)
             });
-        wait_published(h.state());
+        wait_published(&mut h);
         settle(&mut h);
         before(&mut h);
         // meters and peak markers have settled on the frozen readings
@@ -649,7 +676,7 @@ mod snapshots {
                     let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
                     App::new(demo_config(), None, w, None, false, true)
                 });
-            wait_published(h.state());
+            wait_published(&mut h);
             settle(&mut h);
             h.run_steps(5);
             let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/screenshots");
@@ -667,10 +694,18 @@ fn with_status(status: EngineStatus) -> Harness<'static, App> {
     window(demo_config(), Box::new(b), None, Theme::Dark, false)
 }
 
+/// Status of an installed (non-demo) driver with every permission granted.
+fn installed() -> EngineStatus {
+    EngineStatus {
+        driver_version: Some("1".into()),
+        ..demo_status()
+    }
+}
+
 fn one(state: DeviceState) -> EngineStatus {
     EngineStatus {
         per_device: vec![("v1".into(), state)],
-        ..EngineStatus::default()
+        ..demo_status()
     }
 }
 
@@ -700,13 +735,13 @@ fn device_states_show_as_named_dots_and_permission_banner() {
 fn engine_warnings_and_background_error_show_in_the_status_bar() {
     let h = with_status(EngineStatus {
         warnings: vec!["wire A".into(), "wire B".into()],
-        ..EngineStatus::default()
+        ..demo_status()
     });
     h.get_by_label("wire A; wire B");
     let h = with_status(EngineStatus {
         background_error: Some("device vanished".into()),
         warnings: vec!["wire A".into()],
-        ..EngineStatus::default()
+        ..demo_status()
     });
     h.get_by_label("device vanished");
 }
@@ -731,4 +766,182 @@ fn app_source_shows_its_icon_once_the_worker_publishes_one() {
     // The source menu lists apps (with icon rows) and stays fully named.
     click(&mut h, "Add source");
     h.get_by_label("Pass-Thru");
+}
+
+/// A runner that records every script and answers with `result`.
+fn recording(result: Result<(), SetupError>) -> (Runner, Arc<Mutex<Vec<String>>>) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let c = calls.clone();
+    let runner: Runner = Arc::new(move |script| {
+        c.lock().unwrap().push(script.to_string());
+        result.clone()
+    });
+    (runner, calls)
+}
+
+fn with_runner(status: EngineStatus, runner: Runner) -> Harness<'static, App> {
+    let mut b = FakeBackend::frozen(1.5);
+    b.status = status;
+    window_with(demo_config(), Box::new(b), None, Theme::Dark, false, runner)
+}
+
+fn has(h: &Harness<App>, label: &str) -> bool {
+    h.query_by_label(label).is_some()
+}
+
+fn no_driver() -> EngineStatus {
+    EngineStatus {
+        driver_version: None,
+        ..demo_status()
+    }
+}
+
+#[test]
+fn without_a_driver_the_sheet_installs_it_and_a_cancel_says_not_installed() {
+    let (runner, calls) = recording(Err(SetupError::Cancelled));
+    let mut h = with_runner(no_driver(), runner);
+    h.get_by_label("Try Demo");
+    assert!(calls.lock().unwrap().is_empty());
+    click(&mut h, "Install Driver…");
+    until(&mut h, "runner result", |h| has(h, "Driver not installed"));
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].contains("/Library/Audio/Plug-Ins/HAL"));
+    assert!(calls[0].contains("'/App/Resources/SoundRouter.driver'"));
+    h.get_by_label("Retry");
+    h.get_by_label("Copy diagnostics");
+}
+
+#[test]
+fn a_driver_that_never_shows_up_after_a_good_install_times_out() {
+    let (runner, _) = recording(Ok(()));
+    let mut h = with_runner(no_driver(), runner);
+    click(&mut h, "Install Driver…");
+    until(&mut h, "waiting for the driver", |h| {
+        has(h, "Starting the driver…")
+    });
+    until(&mut h, "deadline", |h| has(h, "Driver not installed"));
+    h.get_by_label_contains("has not loaded it yet");
+}
+
+#[test]
+fn a_driver_present_hides_the_sheet_and_the_footer_offers_test_and_uninstall() {
+    let h = open(demo_config()); // the demo driver: nothing to test or uninstall
+    assert!(!has(&h, "Install Driver…") && !has(&h, "Test Setup…") && !has(&h, "Uninstall…"));
+    let h = with_runner(installed(), never_run());
+    assert!(!has(&h, "Install Driver…"));
+    h.get_by_label("Test Setup…");
+    h.get_by_label("Uninstall…");
+}
+
+fn setup_run(status: EngineStatus, test: Option<SelfTest>) -> Harness<'static, App> {
+    let mut b = FakeBackend::frozen(1.5);
+    b.status = status;
+    b.self_test = test;
+    let mut h = window(demo_config(), Box::new(b), None, Theme::Dark, false);
+    click(&mut h, "Test Setup…");
+    h
+}
+
+fn flowing() -> Option<SelfTest> {
+    Some(SelfTest {
+        rms_dbfs: -6.0,
+        dropouts: 0,
+        rate: 48_000.0,
+        passed: true,
+    })
+}
+
+#[test]
+fn test_setup_walks_permissions_verify_done_on_a_passing_test() {
+    let mut h = setup_run(installed(), flowing());
+    h.get_by_label("Microphone: Allowed");
+    click(&mut h, "Continue");
+    until(&mut h, "self-test", |h| {
+        h.query_by_label_contains("Audio flows").is_some()
+    });
+    h.get_by_label("Audio flows (-6 dBFS, 0 dropouts)");
+    click(&mut h, "Continue");
+    h.get_by_label_contains("choose “Loopback Audio”");
+    click(&mut h, "Done");
+    assert!(!has(&h, "Continue") && !has(&h, "Done"));
+}
+
+#[test]
+fn a_failed_self_test_offers_diagnostics() {
+    let mut h = setup_run(installed(), None);
+    click(&mut h, "Continue");
+    until(&mut h, "self-test", |h| has(h, "Copy diagnostics"));
+    h.get_by_label_contains("no audio came back");
+    click(&mut h, "Copy diagnostics");
+    h.get_by_label("Copied to clipboard");
+    h.get_by_label("Retry");
+}
+
+#[test]
+fn denied_audio_capture_offers_open_settings() {
+    let h = setup_run(
+        EngineStatus {
+            tcc: TccStatus::Denied,
+            ..installed()
+        },
+        flowing(),
+    );
+    h.get_by_label("Open Settings");
+    h.get_by_label("System Audio Recording: Denied");
+    let h = setup_run(installed(), flowing());
+    assert!(!has(&h, "Open Settings"));
+}
+
+#[test]
+fn the_microphone_question_is_explained_before_the_first_apply() {
+    let status = EngineStatus {
+        mic: TccStatus::Unknown,
+        ..installed()
+    };
+    let mut h = with_runner(status, never_run());
+    h.get_by_label("Allow Microphone");
+    assert!(!has(&h, "Close"), "cannot skip the explanation");
+    assert!(h.state().worker.shared.lock().unwrap().meters.is_empty());
+    click(&mut h, "Allow Microphone");
+    until(&mut h, "apply and self-test", |h| {
+        let s = h.state().worker.shared.lock().unwrap();
+        !s.meters.is_empty() && matches!(s.self_test, SelfTestState::Done(_))
+    });
+}
+
+#[test]
+fn try_demo_swaps_to_the_synthetic_engine() {
+    let mut h = with_runner(no_driver(), never_run());
+    click(&mut h, "Try Demo");
+    until(&mut h, "demo", |h| {
+        has(h, "Demo mode: synthetic audio, nothing is saved")
+    });
+    assert!(!has(&h, "Install Driver…"));
+    until(&mut h, "demo meters", |h| {
+        !h.state().worker.shared.lock().unwrap().meters.is_empty()
+    });
+}
+
+#[test]
+fn uninstall_asks_first_and_deletes_settings_only_when_ticked() {
+    let (runner, calls) = recording(Err(SetupError::Cancelled));
+    let mut h = with_runner(installed(), runner);
+    click(&mut h, "Uninstall…");
+    assert!(calls.lock().unwrap().is_empty());
+    click(&mut h, "Cancel");
+    assert!(!has(&h, "Uninstall"));
+    click(&mut h, "Uninstall…");
+    click(&mut h, "Uninstall");
+    until(&mut h, "runner", |h| has(h, "Not uninstalled: Cancelled."));
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("rm -rf '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'"));
+        assert!(!calls[0].contains("Application Support"));
+    }
+    click(&mut h, "Also delete my SoundRouter settings");
+    click(&mut h, "Uninstall");
+    until(&mut h, "second run", |_| calls.lock().unwrap().len() == 2);
+    assert!(calls.lock().unwrap()[1].contains("Application Support/SoundRouter"));
 }

@@ -3,6 +3,7 @@ use crate::graph::{self, GraphCtx, GraphState};
 use crate::icons::IconTextures;
 use crate::login;
 use crate::model::{Edit, apply, db_to_pct, pct_to_db};
+use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, Setup};
 use crate::store;
 use crate::theme::{Tokens, semibold, tokens};
 use crate::tray::{self, Action, Event, Tray, WinState};
@@ -14,15 +15,13 @@ use eframe::egui::{
     self, Align2, CornerRadius, FontId, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit, Theme,
     UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
-use sr_core::backend::{DeviceState, EngineStatus};
+use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
 use sr_core::config::Config;
 use std::path::PathBuf;
 use std::time::Duration;
 
 const SIDEBAR_W: f32 = 250.0;
 const ROW_H: f32 = 78.0;
-const AUDIO_CAPTURE_SETTINGS: &str =
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture";
 pub const PERMISSION_BANNER: &str =
     "Waiting for System Audio Recording permission — allow it in the prompt / System Settings";
 const BLANK_NAME: &str = "A device name can't be empty.";
@@ -47,6 +46,9 @@ pub struct App {
     win: WinState,
     /// Passes left before hiding a `--background` window (eframe shows it after the first frame).
     hide_in: u8,
+    setup: Setup,
+    /// The config has been sent to the engine at least once (and the driver is still there).
+    applied: bool,
 }
 
 /// Label and dot color for a device state; idle devices show no dot.
@@ -69,7 +71,6 @@ impl App {
         vibrancy: bool,
         demo: bool,
     ) -> Self {
-        worker.apply(&cfg);
         Self {
             cfg,
             path,
@@ -85,6 +86,8 @@ impl App {
             tray: None,
             win: WinState::default(),
             hide_in: 0,
+            setup: Setup::system(),
+            applied: false,
         }
     }
 
@@ -161,6 +164,80 @@ impl App {
         self.worker.shared.lock().unwrap().status.clone()
     }
 
+    /// First apply, the setup sheet and what it asks for.
+    fn drive_setup(&mut self, ctx: &egui::Context) {
+        let (ready, status, test, apply_error) = {
+            let s = self.worker.shared.lock().unwrap();
+            (
+                s.status_ready,
+                s.status.clone(),
+                s.self_test.clone(),
+                s.apply_error.clone(),
+            )
+        };
+        let driver = status.driver_version.is_some();
+        if ready && !driver {
+            self.applied = false; // re-apply once a driver (re)appears
+        }
+        // With the driver present but the Microphone question open, the sheet explains it first.
+        let pending = ready && driver && !self.applied && status.mic == TccStatus::Unknown;
+        if ready && driver && !self.applied && !pending {
+            self.applied = true;
+            self.worker.apply(&self.cfg);
+        }
+        let dev = self
+            .cfg
+            .devices
+            .get(self.selected)
+            .or(self.cfg.devices.first());
+        let name = dev.map_or("Loopback Audio", |d| d.name.as_str());
+        let source = self.setup.source().map(std::path::Path::to_path_buf);
+        let diagnostics = || {
+            setup::diagnostics(
+                &sr_audio::os_version(),
+                &status,
+                &test,
+                apply_error.as_deref(),
+                self.cfg.devices.len(),
+                source.as_deref(),
+            )
+        };
+        let view = setup::View {
+            status: &status,
+            ready,
+            test: &test,
+            device_name: name,
+            first_apply_pending: pending,
+            now: ctx.input(|i| i.time),
+            diagnostics: &diagnostics,
+        };
+        let id = dev.map(|d| d.id.clone());
+        let action = self.setup.show(ctx, &view);
+        match action {
+            Some(SetupAction::AllowMic | SetupAction::Test) => {
+                if action == Some(SetupAction::AllowMic) && !self.applied {
+                    self.applied = true;
+                    self.worker.apply(&self.cfg);
+                }
+                match id {
+                    Some(id) => self.worker.self_test(&id),
+                    None => self
+                        .worker
+                        .fail_self_test("There is no virtual device to test."),
+                }
+            }
+            Some(SetupAction::Demo) => {
+                self.demo = true;
+                self.path = None; // never overwrite the saved config with demo edits
+                self.cfg = crate::fake::demo_config();
+                self.applied = true;
+                self.worker.use_demo();
+                self.worker.apply(&self.cfg);
+            }
+            None => {}
+        }
+    }
+
     fn commit(&mut self, edits: Vec<Edit>) {
         // A blank name can never be valid (the driver rejects it and then drops every device).
         let mut blank_rename = false;
@@ -197,7 +274,9 @@ impl App {
         if self.selected > last {
             self.selected = last;
         }
-        self.worker.apply(&self.cfg);
+        if self.applied {
+            self.worker.apply(&self.cfg);
+        }
         self.save_pending = true;
     }
 
@@ -470,6 +549,27 @@ impl App {
                 if has && resp.clicked() {
                     edits.push(Edit::RemoveDevice(self.selected));
                 }
+                let real_driver = self
+                    .engine_status()
+                    .driver_version
+                    .is_some_and(|v| v != crate::fake::DEMO_DRIVER);
+                let mut reserved = 0.0;
+                if real_driver {
+                    let by = r.center().y - 13.0;
+                    let uninstall =
+                        Rect::from_min_size(pos2(r.right() - 18.0 - 90.0, by), vec2(90.0, 26.0));
+                    let test = Rect::from_min_size(
+                        uninstall.min - vec2(8.0 + 104.0, 0.0),
+                        vec2(104.0, 26.0),
+                    );
+                    if setup::footer_button(ui, test, "test_setup", "Test Setup…", t) {
+                        self.setup.open_test();
+                    }
+                    if setup::footer_button(ui, uninstall, "uninstall", "Uninstall…", t) {
+                        self.setup.ask_uninstall();
+                    }
+                    reserved = r.right() - test.left() + 12.0;
+                }
                 let (apply_error, es) = {
                     let s = self.worker.shared.lock().unwrap();
                     (s.apply_error.clone(), s.status.clone())
@@ -482,10 +582,6 @@ impl App {
                     .or(es.background_error)
                     .or(warn);
                 let (msg, color) = match status {
-                    Some(m) if m.contains("driver not installed") => (
-                        "Driver not installed. Run `packaging/driver-dev.sh install`, then relaunch.".to_string(),
-                        t.danger,
-                    ),
                     Some(m) => (m, t.danger),
                     None if self.demo => (
                         "Demo mode: synthetic audio, nothing is saved".to_string(),
@@ -494,10 +590,21 @@ impl App {
                     None => return,
                 };
                 let x = btn.right() + 18.0;
-                let width = r.right() - 18.0 - x;
-                graph::text_left(ui, x, r.center().y, &msg, FontId::proportional(12.0), color, width);
+                let width = r.right() - 18.0 - x - reserved;
+                graph::text_left(
+                    ui,
+                    x,
+                    r.center().y,
+                    &msg,
+                    FontId::proportional(12.0),
+                    color,
+                    width,
+                );
                 let status = ui.interact(
-                    Rect::from_min_max(pos2(x, r.top()), pos2(r.right() - 18.0, r.bottom())),
+                    Rect::from_min_max(
+                        pos2(x, r.top()),
+                        pos2(r.right() - 18.0 - reserved, r.bottom()),
+                    ),
                     Id::unique("status"),
                     Sense::hover(),
                 );
@@ -510,7 +617,7 @@ impl App {
             .per_device
             .iter()
             .any(|(_, s)| *s == DeviceState::WaitingForPermission);
-        if waiting {
+        if waiting && !self.setup.shown() {
             egui::Panel::top("permission")
                 .frame(
                     egui::Frame::default()
@@ -651,6 +758,7 @@ impl eframe::App for App {
             self.graph.drag = None;
         }
         self.commit(edits);
+        self.drive_setup(&ctx);
 
         if self.save_pending && !ctx.input(|i| i.pointer.any_down()) {
             self.save_pending = false;
