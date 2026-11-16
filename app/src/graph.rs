@@ -2,8 +2,8 @@
 //! Reads the config, emits `Edit`s; never mutates it.
 use crate::icons::{self, IconTextures};
 use crate::layout::{
-    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, PORT_R, TOP, body_height, wire_distance,
-    wire_points,
+    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, PORT_R, TOP, body_height,
+    wire_distance, wire_points,
 };
 use crate::meter::{PeakHold, level};
 use crate::model::{Edit, Link, Port, can_link, ch_label, links};
@@ -20,6 +20,7 @@ use eframe::egui::{
 use sr_core::backend::{AppInfo, HwDevice, MeterReading};
 use sr_core::config::{Monitor, Source, SourceKind, VirtualDevice};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 const MAX_ROWS: u16 = 32;
 
@@ -30,6 +31,8 @@ pub struct GraphCtx<'a> {
     pub apps: &'a [AppInfo],
     /// App icon textures by source key; keys without one fall back to the letter tile.
     pub icons: &'a IconTextures,
+    /// Apps installed in /Applications etc., empty until the background scan finishes.
+    pub installed: &'a [AppInfo],
     pub reading: Option<&'a MeterReading>,
     pub t: &'a Tokens,
     /// Minimum height of the graph area (so it fills the pane).
@@ -41,6 +44,9 @@ pub struct GraphState {
     pub expanded: HashSet<String>,
     pub peaks: HashMap<(CardId, u16), PeakHold>,
     pub drag: Option<Port>,
+    /// Filled once by a background scan (started on the first frame), see `sr_audio::apps::installed_apps`.
+    pub installed: Arc<OnceLock<Vec<AppInfo>>>,
+    pub scan_started: bool,
 }
 
 fn mon_rows(m: &Monitor, hw: &[HwDevice]) -> u16 {
@@ -50,19 +56,23 @@ fn mon_rows(m: &Monitor, hw: &[HwDevice]) -> u16 {
     }
 }
 
-fn source_title(s: &Source, hw: &[HwDevice], apps: &[AppInfo]) -> (String, &'static str) {
+fn source_title(g: &GraphCtx, s: &Source) -> (String, &'static str) {
+    let (hw, apps) = (g.hw, g.apps);
     match &s.kind {
         SourceKind::App { bundle_id } => (
-            apps.iter().find(|a| &a.bundle_id == bundle_id).map_or_else(
-                || {
-                    bundle_id
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(bundle_id)
-                        .to_string()
-                },
-                |a| a.name.clone(),
-            ),
+            apps.iter()
+                .chain(g.installed)
+                .find(|a| &a.bundle_id == bundle_id)
+                .map_or_else(
+                    || {
+                        bundle_id
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(bundle_id)
+                            .to_string()
+                    },
+                    |a| a.name.clone(),
+                ),
             "Application",
         ),
         SourceKind::Device { uid } => (
@@ -134,6 +144,14 @@ pub fn text_left(ui: &Ui, x: f32, cy: f32, text: &str, font: FontId, color: Colo
 pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>) -> Layout {
     let dev = g.dev;
     let dt = ui.input(|i| i.stable_dt).min(0.1);
+    // Tests seed `st.installed` themselves; a real scan would race with them.
+    if !cfg!(test) && !std::mem::replace(&mut st.scan_started, true) {
+        let (list, ctx) = (st.installed.clone(), ui.ctx().clone());
+        std::thread::spawn(move || {
+            let _ = list.set(sr_audio::apps::installed_apps());
+            ctx.request_repaint();
+        });
+    }
     let key = |s: &str| format!("{}/{s}", dev.id);
     let src_specs: Vec<CardSpec> = dev
         .sources
@@ -141,6 +159,7 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
         .map(|s| CardSpec {
             rows: s.channels.clamp(1, MAX_ROWS),
             expanded: st.expanded.contains(&key(&s.id)),
+            mute_row: matches!(s.kind, SourceKind::App { .. }),
         })
         .collect();
     let mon_specs: Vec<CardSpec> = dev
@@ -149,6 +168,7 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
         .map(|m| CardSpec {
             rows: mon_rows(m, g.hw),
             expanded: st.expanded.contains(&key(&format!("m:{}", m.device_uid))),
+            mute_row: false,
         })
         .collect();
     let origin = ui.cursor().min;
@@ -378,6 +398,29 @@ fn source_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
             edits.push(Edit::AddSource(d, kind, 2));
         }
     }
+    ui.menu_button("Choose App…", |ui| {
+        ui.set_min_width(210.0);
+        if g.installed.is_empty() {
+            ui.label("Scanning applications…");
+        }
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .show(ui, |ui| {
+                for a in g.installed {
+                    let kind = SourceKind::App {
+                        bundle_id: a.bundle_id.clone(),
+                    };
+                    let exists = dev.sources.iter().any(|s| s.kind == kind);
+                    if ui
+                        .add_enabled(!exists, egui::Button::new(&a.name))
+                        .clicked()
+                    {
+                        edits.push(Edit::AddSource(d, kind, 2));
+                        ui.close();
+                    }
+                }
+            });
+    });
     ui.separator();
     ui.label(
         egui::RichText::new("Input Devices")
@@ -444,7 +487,7 @@ fn card(
     let (title, _sub, on, vol_db, opt_key) = match c.id {
         CardId::Src(i) => {
             let s = &dev.sources[i];
-            let (title, sub) = source_title(s, g.hw, g.apps);
+            let (title, sub) = source_title(g, s);
             (
                 title,
                 sub.to_string(),
@@ -661,7 +704,29 @@ fn card(
             CardId::Out(_) => unreachable!(),
         });
     }
-    let rm = Rect::from_min_size(pos2(r.left() + 14.0, y0 + FOOT_H + 26.0), vec2(120.0, 20.0));
+    let mut rm_y = y0 + FOOT_H + 26.0;
+    if let CardId::Src(i) = c.id {
+        let s = &dev.sources[i];
+        if matches!(s.kind, SourceKind::App { .. }) {
+            let row = Rect::from_min_size(
+                pos2(r.left() + 14.0, y0 + FOOT_H + 24.0),
+                vec2(r.width() - 28.0, 20.0),
+            );
+            let mut m = s.mute_original;
+            let cb = ui.scope_builder(UiBuilder::new().max_rect(row), |ui| {
+                ui.checkbox(
+                    &mut m,
+                    egui::RichText::new("Mute in original output").size(11.0),
+                )
+            });
+            name_widget(ui, &cb.inner, &format!("{title} mute in original output"));
+            if m != s.mute_original {
+                edits.push(Edit::SourceMuteOriginal(d, i, m));
+            }
+            rm_y += MUTE_H;
+        }
+    }
+    let rm = Rect::from_min_size(pos2(r.left() + 14.0, rm_y), vec2(120.0, 20.0));
     let resp = ui.interact(rm, Id::unique(("rm", d, c.id)), Sense::click());
     let (label, edit) = match c.id {
         CardId::Src(i) => ("Remove Source", Edit::RemoveSource(d, i)),
@@ -733,7 +798,7 @@ fn port_label(g: &GraphCtx, p: Port) -> String {
     match p {
         Port::Src { src, ch } => format!(
             "{} channel {} output",
-            source_title(&g.dev.sources[src], g.hw, g.apps).0,
+            source_title(g, &g.dev.sources[src]).0,
             ch + 1
         ),
         Port::OutIn { ch } => format!("Output channel {} input", ch + 1),
@@ -885,6 +950,7 @@ mod tests {
                         hw: &[],
                         apps: &[],
                         icons: &IconTextures::default(),
+                        installed: &[],
                         reading: None,
                         t: &tk,
                         min_h: 500.0,

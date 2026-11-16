@@ -408,6 +408,47 @@ fn adding_an_app_source_makes_a_stereo_source() {
 }
 
 #[test]
+fn choose_app_wires_an_installed_app_that_is_not_running() {
+    let mut h = open(demo_config());
+    h.state_mut()
+        .graph
+        .installed
+        .set(vec![AppInfo {
+            bundle_id: "com.example.sketch".into(),
+            name: "Sketchbook".into(),
+            running_output: false,
+        }])
+        .unwrap();
+    click(&mut h, "Add source");
+    click(&mut h, "Choose App…");
+    click(&mut h, "Sketchbook");
+    let src = h.state().cfg.devices[0].sources.last().unwrap().clone();
+    assert_eq!(
+        src.kind,
+        SourceKind::App {
+            bundle_id: "com.example.sketch".into()
+        }
+    );
+    assert!(!src.mute_original);
+    // The card is named after the installed app and the config applies without an error toast.
+    h.get_by_label("Sketchbook enabled");
+    settle(&mut h);
+    assert!(h.state().toast.is_none());
+}
+
+#[test]
+fn mute_in_original_output_is_an_app_option() {
+    let mut h = open(demo_config());
+    click(&mut h, "Safari options");
+    let name = "Safari mute in original output";
+    assert!(!h.state().cfg.devices[0].sources[0].mute_original);
+    click(&mut h, name);
+    assert!(h.state().cfg.devices[0].sources[0].mute_original);
+    click(&mut h, name);
+    assert!(!h.state().cfg.devices[0].sources[0].mute_original);
+}
+
+#[test]
 fn adding_an_input_device_keeps_its_own_channel_count() {
     let mut h = open(demo_config());
     click(&mut h, "Add source");

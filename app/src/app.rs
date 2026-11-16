@@ -503,6 +503,7 @@ impl App {
                 let snap = self.worker.shared.lock().unwrap();
                 let hw = snap.hardware.clone();
                 let apps = snap.apps.clone();
+                let installed = self.graph.installed.clone();
                 let reading = snap.meters.get(&dev.id).cloned();
                 self.icon_tex.sync(ui.ctx(), &snap.icons);
                 drop(snap);
@@ -517,6 +518,7 @@ impl App {
                                 hw: &hw,
                                 apps: &apps,
                                 icons: &self.icon_tex,
+                                installed: installed.get().map_or(&[], Vec::as_slice),
                                 reading: reading.as_ref(),
                                 t,
                                 min_h: area.height(),

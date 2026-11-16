@@ -8,6 +8,8 @@ pub const ICON_BODY: f32 = 48.0;
 pub const ROW_H: f32 = 24.0;
 pub const FOOT_H: f32 = 28.0;
 pub const OPTIONS_H: f32 = 58.0;
+/// Extra height of an expanded app card: the "Mute in original output" row.
+pub const MUTE_H: f32 = 22.0;
 pub const OUT_PAD: f32 = 10.0;
 pub const GAP: f32 = 16.0;
 /// Space above the first card for the column headers.
@@ -39,6 +41,8 @@ pub struct CardLayout {
 pub struct CardSpec {
     pub rows: u16,
     pub expanded: bool,
+    /// App source: its options carry the mute row.
+    pub mute_row: bool,
 }
 
 #[derive(Debug)]
@@ -56,12 +60,12 @@ pub fn body_height(rows: u16, icon: bool) -> f32 {
     if icon { rows.max(ICON_BODY) } else { rows }
 }
 
-pub fn card_height(rows: u16, options: bool, expanded: bool, icon: bool) -> f32 {
+pub fn card_height(rows: u16, options: bool, expanded: bool, icon: bool, mute_row: bool) -> f32 {
     let body = HEAD_H + body_height(rows, icon);
     if !options {
         body + OUT_PAD
     } else if expanded {
-        body + FOOT_H + OPTIONS_H
+        body + FOOT_H + OPTIONS_H + if mute_row { MUTE_H } else { 0.0 }
     } else {
         body + FOOT_H
     }
@@ -88,7 +92,7 @@ impl Layout {
             let mut y = TOP;
             for (id, spec, options) in specs {
                 let icon = matches!(id, CardId::Src(_));
-                let h = card_height(spec.rows, options, spec.expanded, icon);
+                let h = card_height(spec.rows, options, spec.expanded, icon, spec.mute_row);
                 cards.push(CardLayout {
                     id,
                     rect: Rect::from_min_size(origin + vec2(col_x[col], y), vec2(card_w, h)),
@@ -116,6 +120,7 @@ impl Layout {
                     CardSpec {
                         rows: 2,
                         expanded: false,
+                        mute_row: false,
                     },
                     false,
                 )
@@ -231,6 +236,7 @@ mod tests {
         let s = CardSpec {
             rows: 2,
             expanded: false,
+            mute_row: false,
         };
         Layout::compute(pos2(100.0, 50.0), 900.0, &[s, s], 1, &[s])
     }
@@ -253,10 +259,12 @@ mod tests {
         let c = CardSpec {
             rows: 2,
             expanded: true,
+            mute_row: false,
         };
         let n = CardSpec {
             rows: 2,
             expanded: false,
+            mute_row: false,
         };
         let l = Layout::compute(Pos2::ZERO, 900.0, &[c, n], 1, &[]);
         let a = l.card(CardId::Src(0)).unwrap().rect;
@@ -289,6 +297,7 @@ mod tests {
             &[CardSpec {
                 rows: 1,
                 expanded: false,
+                mute_row: false,
             }],
             1,
             &[],
@@ -306,6 +315,7 @@ mod tests {
         let s = CardSpec {
             rows: 2,
             expanded: false,
+            mute_row: false,
         };
         let l = Layout::compute(Pos2::ZERO, 900.0, &[s], 2, &[]);
         let p = l.port_pos(Port::OutIn { ch: 3 }).unwrap();

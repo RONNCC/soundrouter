@@ -9,6 +9,7 @@ fn src(id: &str, kind: SourceKind) -> Source {
         channels: 2,
         volume_db: 0.0,
         muted: false,
+        mute_original: false,
     }
 }
 fn mon(uid: &str, enabled: bool) -> Monitor {
@@ -150,6 +151,7 @@ fn tap(id: u32, source: &str, bundle: &str, objs: &[u32]) -> Tap {
         id,
         uid: format!("tap{id}"),
         objs: objs.to_vec(),
+        mute: false,
     }
 }
 fn group(bundle: &str, objs: &[u32]) -> AppGroup {
@@ -195,7 +197,7 @@ fn tap_plan_app_quit_removes_then_relaunch_creates() {
     assert_eq!(
         p,
         TapPlan {
-            create: vec![("s1".into(), "com.a".into(), vec![9])],
+            create: vec![("s1".into(), "com.a".into(), vec![9], false)],
             ..TapPlan::default()
         }
     );
@@ -247,13 +249,39 @@ fn tap_plan_config_changes() {
     assert_eq!(p.remove, [0, 1]);
     assert_eq!(p.keep, [2]);
     assert!(p.update.is_empty());
-    assert_eq!(p.create, [("s1".to_owned(), "com.b".to_owned(), vec![8])]);
+    assert_eq!(
+        p.create,
+        [("s1".to_owned(), "com.b".to_owned(), vec![8], false)]
+    );
 }
 
 #[test]
 fn tap_plan_skips_sources_whose_app_is_not_running() {
     let p = tap_plan(&[], &one_app(), &[group("com.other", &[1])]);
     assert_eq!(p, TapPlan::default());
+    // Same with no processes at all: an idle source, no tap, nothing to remove.
+    assert_eq!(tap_plan(&[], &one_app(), &[]), TapPlan::default());
+}
+
+#[test]
+fn tap_plan_mute_flip_rebuilds_tap() {
+    let mut dev = one_app();
+    let cur = [tap(1, "s1", "com.a", &[5])];
+    let groups = [group("com.a", &[5])];
+    dev.sources[0].mute_original = true;
+    let p = tap_plan(&cur, &dev, &groups);
+    assert_eq!(p.remove, [0]);
+    assert!(p.keep.is_empty() && p.update.is_empty());
+    assert_eq!(
+        p.create,
+        [("s1".to_owned(), "com.a".to_owned(), vec![5], true)]
+    );
+    // A tap built with mute stays while the flag stays on.
+    let mut muted = tap(2, "s1", "com.a", &[5]);
+    muted.mute = true;
+    let p = tap_plan(&[muted], &dev, &groups);
+    assert_eq!(p.keep, [0]);
+    assert!(p.remove.is_empty() && p.create.is_empty());
 }
 
 // ---- run() with hand-built buffer lists ----

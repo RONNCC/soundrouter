@@ -28,6 +28,7 @@ fn arb_source() -> impl Strategy<Value = Source> {
             channels,
             volume_db,
             muted,
+            mute_original: false,
         })
 }
 

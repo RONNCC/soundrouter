@@ -85,6 +85,8 @@ pub enum Edit {
     RemoveSource(usize, usize),
     SourceOn(usize, usize, bool),
     SourceVolume(usize, usize, f32),
+    /// App sources: silence the app's own output while it is tapped.
+    SourceMuteOriginal(usize, usize, bool),
     AddMonitor(usize, String, u16),
     RemoveMonitor(usize, usize),
     MonitorOn(usize, usize, bool),
@@ -189,6 +191,7 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
         | Edit::RemoveSource(d, _)
         | Edit::SourceOn(d, ..)
         | Edit::SourceVolume(d, ..)
+        | Edit::SourceMuteOriginal(d, ..)
         | Edit::AddMonitor(d, ..)
         | Edit::RemoveMonitor(d, _)
         | Edit::MonitorOn(d, ..)
@@ -238,6 +241,7 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
                 channels,
                 volume_db: 0.0,
                 muted: false,
+                mute_original: false,
             });
             auto_wire_source(dev, &id, channels);
         }
@@ -255,6 +259,11 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
         Edit::SourceVolume(_, s, db) => {
             if let Some(s) = dev.sources.get_mut(s) {
                 s.volume_db = db;
+            }
+        }
+        Edit::SourceMuteOriginal(_, s, on) => {
+            if let Some(s) = dev.sources.get_mut(s) {
+                s.mute_original = on && matches!(s.kind, SourceKind::App { .. });
             }
         }
         Edit::AddMonitor(_, uid, hw_out) => {
@@ -414,6 +423,27 @@ mod tests {
         apply(&mut c, Edit::NewDevice);
         let ids: Vec<_> = c.devices.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(ids, ["v1", "v3", "v2"]);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn mute_original_applies_to_app_sources_only() {
+        let mut c = cfg_with_dev();
+        apply(&mut c, Edit::AddSource(0, SourceKind::PassThru, 2));
+        let (app, pt) = (
+            c.devices[0].sources.len() - 2,
+            c.devices[0].sources.len() - 1,
+        );
+        assert!(matches!(
+            c.devices[0].sources[app].kind,
+            SourceKind::App { .. }
+        ));
+        apply(&mut c, Edit::SourceMuteOriginal(0, app, true));
+        apply(&mut c, Edit::SourceMuteOriginal(0, pt, true));
+        assert!(c.devices[0].sources[app].mute_original);
+        assert!(!c.devices[0].sources[pt].mute_original);
+        apply(&mut c, Edit::SourceMuteOriginal(0, app, false));
+        assert!(!c.devices[0].sources[app].mute_original);
         c.validate().unwrap();
     }
 
@@ -608,6 +638,8 @@ mod tests {
                 (d.clone(), i.clone(), any::<bool>()).prop_map(|(d, s, b)| Edit::SourceOn(d, s, b)),
                 (d.clone(), i.clone(), db.clone())
                     .prop_map(|(d, s, v)| Edit::SourceVolume(d, s, v)),
+                (d.clone(), i.clone(), any::<bool>())
+                    .prop_map(|(d, s, b)| Edit::SourceMuteOriginal(d, s, b)),
                 (d.clone(), "[a-c]{1,2}", 0u16..70).prop_map(|(d, u, c)| Edit::AddMonitor(d, u, c)),
                 (d.clone(), i.clone()).prop_map(|(d, m)| Edit::RemoveMonitor(d, m)),
                 (d.clone(), i.clone(), any::<bool>())

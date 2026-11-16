@@ -21,6 +21,7 @@ fn cfg(enabled: bool) -> Config {
                 channels: 2,
                 volume_db: 0.0,
                 muted: false,
+                mute_original: false,
             }],
             wires: vec![],
             monitors: vec![],

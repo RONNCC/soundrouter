@@ -62,6 +62,7 @@ fn cfg(volume_db: f32, muted: bool, wires: &[(u16, u16)]) -> Config {
                 channels: 2,
                 volume_db,
                 muted,
+                mute_original: false,
             }],
             wires: wires
                 .iter()

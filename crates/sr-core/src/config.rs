@@ -61,6 +61,9 @@ pub struct Source {
     pub volume_db: f32,
     #[serde(default)]
     pub muted: bool,
+    /// App sources only: silence the app's own output while it is tapped (`CATapMuteBehavior`).
+    #[serde(default)]
+    pub mute_original: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -236,6 +239,15 @@ mod tests {
     }
 
     #[test]
+    fn mute_original_defaults_false_and_round_trips() {
+        let mut cfg = example();
+        assert!(!cfg.devices[0].sources[0].mute_original);
+        cfg.devices[0].sources[0].mute_original = true;
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(cfg, serde_json::from_str::<Config>(&json).unwrap());
+    }
+
+    #[test]
     fn pass_thru_round_trips() {
         let mut cfg = example();
         cfg.devices[0].sources.push(Source {
@@ -244,6 +256,7 @@ mod tests {
             channels: 2,
             volume_db: 0.0,
             muted: false,
+            mute_original: false,
         });
         cfg.devices[0].wires.push(Wire {
             source: "p".into(),

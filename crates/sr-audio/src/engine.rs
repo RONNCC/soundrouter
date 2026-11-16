@@ -89,6 +89,8 @@ struct Tap {
     id: u32,
     uid: String,
     objs: Vec<u32>,
+    /// Part of the reuse key: flipping it rebuilds the tap (`CATapMuteBehavior` is fixed at creation).
+    mute: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -748,7 +750,7 @@ fn retap(g: &mut Inner) -> Result<()> {
     }
 }
 
-fn make_desc(name: &str, objs: &[u32]) -> Retained<CATapDescription> {
+fn make_desc(name: &str, objs: &[u32], mute: bool) -> Retained<CATapDescription> {
     let ids: Vec<Retained<NSNumber>> = objs.iter().map(|&o| NSNumber::new_u32(o)).collect();
     let desc = unsafe {
         CATapDescription::initStereoMixdownOfProcesses(
@@ -759,13 +761,17 @@ fn make_desc(name: &str, objs: &[u32]) -> Retained<CATapDescription> {
     unsafe {
         desc.setName(&NSString::from_str(name));
         desc.setPrivate(true);
-        desc.setMuteBehavior(CATapMuteBehavior::Unmuted);
+        desc.setMuteBehavior(if mute {
+            CATapMuteBehavior::MutedWhenTapped
+        } else {
+            CATapMuteBehavior::Unmuted
+        });
     }
     desc
 }
 
-fn create_tap(source_id: &str, bundle: &str, objs: Vec<u32>) -> Result<Tap> {
-    let desc = make_desc(&format!("sr-{source_id}"), &objs);
+fn create_tap(source_id: &str, bundle: &str, objs: Vec<u32>, mute: bool) -> Result<Tap> {
+    let desc = make_desc(&format!("sr-{source_id}"), &objs, mute);
     let mut id = 0u32;
     hal::check("AudioHardwareCreateProcessTap", unsafe {
         AudioHardwareCreateProcessTap(Some(&desc), &mut id)
@@ -783,6 +789,7 @@ fn create_tap(source_id: &str, bundle: &str, objs: Vec<u32>) -> Result<Tap> {
         id,
         uid,
         objs,
+        mute,
     })
 }
 
@@ -794,9 +801,10 @@ fn app_objs(groups: &[AppGroup], bundle: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-fn app_sources(dev: &VirtualDevice) -> impl Iterator<Item = (&str, &str)> {
+/// `(source id, bundle id, mute original output)` of every app source.
+fn app_sources(dev: &VirtualDevice) -> impl Iterator<Item = (&str, &str, bool)> {
     dev.sources.iter().filter_map(|s| match &s.kind {
-        SourceKind::App { bundle_id } => Some((s.id.as_str(), bundle_id.as_str())),
+        SourceKind::App { bundle_id } => Some((s.id.as_str(), bundle_id.as_str(), s.mute_original)),
         _ => None,
     })
 }
@@ -808,18 +816,20 @@ struct TapPlan {
     /// Same source, new process objects: rewrite the tap description.
     update: Vec<(usize, Vec<u32>)>,
     remove: Vec<usize>,
-    /// `(source id, bundle id, process objects)` of taps to create, in source order.
-    create: Vec<(String, String, Vec<u32>)>,
+    /// `(source id, bundle id, process objects, mute)` of taps to create, in source order.
+    create: Vec<(String, String, Vec<u32>, bool)>,
 }
 
 /// Pure diff of live taps against the config + running processes. A tap whose app has no
-/// processes is removed (app quit); it comes back as `create` once the app runs again.
+/// processes is removed (app quit); it comes back as `create` once the app runs again. A source
+/// whose app is not running has no tap at all: idle, not an error. A flipped mute flag removes the tap
+/// and creates it anew.
 fn tap_plan(current: &[Tap], dev: &VirtualDevice, groups: &[AppGroup]) -> TapPlan {
     let mut p = TapPlan::default();
     for (i, t) in current.iter().enumerate() {
         let objs = app_sources(dev)
-            .find(|(id, b)| *id == t.source_id && *b == t.bundle)
-            .map(|(_, b)| app_objs(groups, b))
+            .find(|(id, b, m)| *id == t.source_id && *b == t.bundle && *m == t.mute)
+            .map(|(_, b, _)| app_objs(groups, b))
             .unwrap_or_default();
         if objs.is_empty() {
             p.remove.push(i);
@@ -829,14 +839,14 @@ fn tap_plan(current: &[Tap], dev: &VirtualDevice, groups: &[AppGroup]) -> TapPla
             p.keep.push(i);
         }
     }
-    for (id, b) in app_sources(dev) {
+    for (id, b, mute) in app_sources(dev) {
         let live = current
             .iter()
             .enumerate()
             .any(|(i, t)| t.source_id == id && !p.remove.contains(&i));
         let objs = app_objs(groups, b);
         if !live && !objs.is_empty() {
-            p.create.push((id.to_owned(), b.to_owned(), objs));
+            p.create.push((id.to_owned(), b.to_owned(), objs, mute));
         }
     }
     p
@@ -860,7 +870,7 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
     let mut changed = v.tap_dirty || !plan.remove.is_empty();
     for (i, objs) in plan.update {
         let t = &v.taps[i];
-        let desc = make_desc(&format!("sr-{}", t.source_id), &objs);
+        let desc = make_desc(&format!("sr-{}", t.source_id), &objs, t.mute);
         match hal::set_object(t.id, kAudioTapPropertyDescription, &desc) {
             Ok(()) => v.taps[i].objs = objs,
             // Keep the old description (and `objs`) so the next sync retries.
@@ -874,8 +884,8 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
     for &i in plan.remove.iter().rev() {
         v.zombies.push(v.taps.remove(i));
     }
-    for (id, b, objs) in plan.create {
-        match create_tap(&id, &b, objs) {
+    for (id, b, objs, mute) in plan.create {
+        match create_tap(&id, &b, objs, mute) {
             Ok(t) => {
                 v.taps.push(t);
                 changed = true;
@@ -1018,12 +1028,12 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
 
 fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result<Vdev> {
     let mut taps = Vec::new();
-    for (id, b) in app_sources(dev) {
+    for (id, b, mute) in app_sources(dev) {
         let objs = app_objs(groups, b);
         if objs.is_empty() {
             continue;
         }
-        match create_tap(id, b, objs) {
+        match create_tap(id, b, objs, mute) {
             Ok(t) => taps.push(t),
             Err(e) => log::warn!("tap for '{b}' failed: {e:#}"),
         }

@@ -153,6 +153,58 @@ pub fn list_groups() -> Vec<AppGroup> {
     group(&process_list(), &SystemResolver)
 }
 
+/// Where `installed_apps` looks. shortcut: top level and `Utilities` only, no nested folders.
+pub const APP_DIRS: [&str; 4] = [
+    "/Applications",
+    "/Applications/Utilities",
+    "/System/Applications",
+    "/System/Applications/Utilities",
+];
+
+/// Installed `.app` bundles directly inside `dirs`, sorted by name, one entry per bundle id, so a user
+/// can wire an app that is not running. The id comes from `Info.plist` via `plutil` (reads binary
+/// and XML plists; ~1.5 ms per app). Bundles without an id are skipped.
+pub fn installed_apps_in(dirs: &[&std::path::Path]) -> Vec<AppInfo> {
+    let mut out: Vec<AppInfo> = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for path in rd.filter_map(|e| Some(e.ok()?.path())) {
+            if path.extension().is_none_or(|e| e != "app") {
+                continue;
+            }
+            let Some(name) = path.file_stem().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let id = std::process::Command::new("plutil")
+                .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+                .arg(path.join("Contents/Info.plist"))
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .filter(|id| !id.is_empty());
+            if let Some(bundle_id) = id
+                && !out.iter().any(|a| a.bundle_id == bundle_id)
+            {
+                out.push(AppInfo {
+                    bundle_id,
+                    name,
+                    running_output: false,
+                });
+            }
+        }
+    }
+    out.sort_by_cached_key(|a| a.name.to_lowercase());
+    out
+}
+
+pub fn installed_apps() -> Vec<AppInfo> {
+    let dirs: Vec<&std::path::Path> = APP_DIRS.iter().map(std::path::Path::new).collect();
+    installed_apps_in(&dirs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +280,39 @@ mod tests {
         assert!(ap.running_output && ap.members.is_empty());
         assert_eq!(g.len(), 4);
         assert_eq!(app_infos(&g).len(), 4);
+    }
+
+    #[test]
+    fn installed_apps_reads_bundle_ids_and_skips_the_rest() {
+        let dir = std::env::temp_dir().join(format!("sr-installed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plist = |name: &str, body: &str| {
+            let c = dir.join(format!("{name}.app/Contents"));
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(
+                c.join("Info.plist"),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>{body}</dict></plist>"
+                ),
+            )
+            .unwrap();
+        };
+        let id = |s: &str| format!("<key>CFBundleIdentifier</key><string>{s}</string>");
+        plist("Zed", &id("dev.zed.Zed"));
+        plist("alpha", &id("com.x.alpha"));
+        plist("Dup", &id("com.x.alpha"));
+        plist("NoId", "<key>CFBundleName</key><string>n</string>");
+        std::fs::create_dir_all(dir.join("Folder")).unwrap();
+        let got = installed_apps_in(&[dir.as_path(), std::path::Path::new("/nonexistent-dir")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let ids: Vec<_> = got
+            .iter()
+            .map(|a| (a.bundle_id.as_str(), a.name.as_str()))
+            .collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&("dev.zed.Zed", "Zed")));
+        assert!(ids.iter().any(|(b, _)| *b == "com.x.alpha"));
+        assert!(got.iter().all(|a| !a.running_output));
+        assert!(got[0].name.to_lowercase() < got[1].name.to_lowercase());
     }
 }

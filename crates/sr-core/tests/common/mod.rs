@@ -11,6 +11,7 @@ pub fn src(id: &str, channels: u16, volume_db: f32, muted: bool) -> Source {
         channels,
         volume_db,
         muted,
+        mute_original: false,
     }
 }
 
