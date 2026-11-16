@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
+ctrlc = "3.5"
 serde_json.workspace = true
 sr-core = { path = "../sr-core" }
 sr-audio = { path = "../sr-audio" }

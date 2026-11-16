@@ -50,14 +50,8 @@ enum DriverOp {
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
-extern "C" fn on_sigint(_: i32) {
-    STOP.store(true, Relaxed);
-}
-unsafe extern "C" {
-    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
-}
-fn install_ctrlc() {
-    unsafe { signal(2, on_sigint) };
+fn install_ctrlc() -> Result<()> {
+    Ok(ctrlc::set_handler(|| STOP.store(true, Relaxed))?)
 }
 
 fn full_uid(s: &str) -> String {
@@ -117,7 +111,7 @@ fn main() -> Result<()> {
         }
         Cmd::Run { config } => run(&config),
         Cmd::Meter { device_id } => {
-            install_ctrlc();
+            install_ctrlc()?;
             let p = loopback::Probe::start(&full_uid(&device_id), false)?;
             while !STOP.load(Relaxed) {
                 std::thread::sleep(Duration::from_millis(250));
@@ -174,7 +168,7 @@ fn run(path: &PathBuf) -> Result<()> {
     .context("parsing config")?;
     cfg.validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
-    install_ctrlc();
+    install_ctrlc()?;
     let mut engine = Engine::new()?;
     engine.apply(&cfg)?;
     let ids: Vec<&str> = cfg
