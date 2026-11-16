@@ -1,5 +1,5 @@
 //! Thin typed wrappers over the AudioObject property API.
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::ptr::{NonNull, null};
 
 use anyhow::{Result, bail};
@@ -217,6 +217,15 @@ pub fn dict(pairs: &[(&str, &AnyObject)]) -> Retained<NSDictionary<NSString, Any
     let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
     let vals: Vec<&AnyObject> = pairs.iter().map(|(_, v)| *v).collect();
     NSDictionary::from_slices(&key_refs, &vals)
+}
+
+/// [`dict`] keyed by CoreAudio's own `kAudio*Key` constants.
+pub fn cdict(pairs: &[(&CStr, &AnyObject)]) -> Retained<NSDictionary<NSString, AnyObject>> {
+    let pairs: Vec<(&str, &AnyObject)> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_str().expect("CoreAudio keys are ASCII"), *v))
+        .collect();
+    dict(&pairs)
 }
 
 pub fn bool_obj(b: bool) -> Retained<NSNumber> {

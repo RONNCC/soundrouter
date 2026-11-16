@@ -628,14 +628,20 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
         .chain(spec.subs.iter().map(|s| (s, true)))
         .map(|(uid, drift)| {
             let (u, d) = (NSString::from_str(uid), hal::bool_obj(drift));
-            hal::dict(&[("uid", &u), ("drift", &d)])
+            hal::cdict(&[
+                (kAudioSubDeviceUIDKey, &u),
+                (kAudioSubDeviceDriftCompensationKey, &d),
+            ])
         })
         .collect();
     let tap_dicts: Vec<Retained<_>> = taps
         .iter()
         .map(|t| {
             let (u, d) = (NSString::from_str(&t.uid), hal::bool_obj(true));
-            hal::dict(&[("uid", &u), ("drift", &d)])
+            hal::cdict(&[
+                (kAudioSubTapUIDKey, &u),
+                (kAudioSubTapDriftCompensationKey, &d),
+            ])
         })
         .collect();
     let (subs_arr, taps_arr) = (
@@ -646,16 +652,16 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
     let name = NSString::from_str(&format!("SoundRouter {}", dev.id));
     let main = NSString::from_str(&spec.main);
     let (yes, no) = (hal::bool_obj(true), hal::bool_obj(false));
-    let d = hal::dict(&[
-        ("uid", &agg_uid),
-        ("name", &name),
-        ("private", &yes),
-        ("master", &main),
-        ("clock", &main),
-        ("stacked", &no),
-        ("subdevices", &subs_arr),
-        ("taps", &taps_arr),
-        ("tapautostart", &no),
+    let d = hal::cdict(&[
+        (kAudioAggregateDeviceUIDKey, &agg_uid),
+        (kAudioAggregateDeviceNameKey, &name),
+        (kAudioAggregateDeviceIsPrivateKey, &yes),
+        (kAudioAggregateDeviceMainSubDeviceKey, &main),
+        (kAudioAggregateDeviceClockDeviceKey, &main),
+        (kAudioAggregateDeviceIsStackedKey, &no),
+        (kAudioAggregateDeviceSubDeviceListKey, &subs_arr),
+        (kAudioAggregateDeviceTapListKey, &taps_arr),
+        (kAudioAggregateDeviceTapAutoStartKey, &no),
     ]);
     let mut agg = 0u32;
     let st = unsafe {
