@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -18,29 +18,28 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Build driver
-        run: |
-          if [ -f packaging/build-driver.sh ]; then
-            packaging/build-driver.sh
-          fi
+        run: packaging/build-driver.sh
+      - name: Driver fakehost smoke
+        run: packaging/driver-dev.sh fakehost
       - name: Bundle app
-        run: |
-          if [ -f packaging/bundle-app.sh ]; then
-            packaging/bundle-app.sh
-          fi
+        run: packaging/bundle-app.sh
       - name: Verify signatures
         run: |
           for b in target/SoundRouter.app target/SoundRouter.driver; do
-            if [ -e "$b" ]; then
-              codesign --verify --deep --strict "$b"
-            fi
+            codesign --verify --deep --strict "$b"
           done
+      - name: Zip bundles
+        run: |
+          cd target
+          ditto -c -k --keepParent SoundRouter.app SoundRouter.app.zip
+          ditto -c -k --keepParent SoundRouter.driver SoundRouter.driver.zip
       - uses: actions/upload-artifact@v4
         with:
           name: soundrouter-bundles
-          if-no-files-found: ignore
+          if-no-files-found: error
           path: |
-            target/SoundRouter.app
-            target/SoundRouter.driver
+            target/SoundRouter.app.zip
+            target/SoundRouter.driver.zip
 
   driver-smoke:
     # Experimental: unverified whether coreaudiod loads the plug-in on hosted runners.
@@ -49,15 +48,13 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       - name: Build and install driver
         run: |
-          if [ -f packaging/build-driver.sh ]; then
-            packaging/build-driver.sh
-            sudo cp -R target/SoundRouter.driver /Library/Audio/Plug-Ins/HAL/
-            sudo killall coreaudiod || true
-          fi
+          packaging/build-driver.sh
+          sudo cp -R target/SoundRouter.driver /Library/Audio/Plug-Ins/HAL/
+          sudo killall coreaudiod || true
           sleep 5
       - name: Check device is listed
         run: system_profiler SPAudioDataType | grep -A3 SoundRouter

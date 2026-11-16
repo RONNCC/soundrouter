@@ -1,0 +1,5 @@
+# rustup honors this file; Homebrew's cargo ignores it, so put ~/.cargo/bin first in PATH.
+[toolchain]
+channel = "1.95"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

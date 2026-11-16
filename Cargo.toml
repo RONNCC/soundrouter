@@ -4,7 +4,7 @@ members = ["crates/sr-core", "crates/sr-audio", "crates/sr-cli", "driver", "app"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
