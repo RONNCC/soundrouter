@@ -5,9 +5,8 @@ cd "$(dirname "$0")/.."
 
 APP=target/SoundRouter.app
 
-# No rust-toolchain.toml: pin the toolchain (app needs 1.95) unless caller set one.
+# rustup shims first so rust-toolchain.toml selects the pinned toolchain
 export PATH="$HOME/.cargo/bin:$PATH"
-if command -v rustup >/dev/null 2>&1; then export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95}"; fi
 
 cargo build --release -p soundrouter-app -p sr-cli
 
@@ -18,10 +17,22 @@ cp target/release/SoundRouter "$APP/Contents/MacOS/SoundRouter"
 cp target/release/sr-cli "$APP/Contents/MacOS/sr-cli"
 cp app/assets/icon.icns "$APP/Contents/Resources/icon.icns"
 
+if command -v cargo-about >/dev/null 2>&1; then
+  cargo about generate -c packaging/about.toml packaging/about.hbs \
+    -o "$APP/Contents/Resources/ThirdPartyLicenses.html"
+elif [ "${REQUIRE_NOTICES:-}" = 1 ]; then
+  echo "cargo-about missing (cargo install --locked cargo-about)" >&2; exit 1
+else
+  echo "warning: cargo-about missing; ThirdPartyLicenses.html not generated" >&2
+fi
+
 if [ -n "${SIGN_ID:-}" ]; then
-  codesign --force --options runtime --timestamp \
-    --entitlements packaging/entitlements-app.plist \
-    --sign "$SIGN_ID" "$APP"
+  # inside-out: nested binary before the bundle
+  for f in "$APP/Contents/MacOS/sr-cli" "$APP"; do
+    codesign --force --options runtime --timestamp \
+      --entitlements packaging/entitlements-app.plist \
+      --sign "$SIGN_ID" "$f"
+  done
 else
   codesign --force --sign - "$APP"
 fi

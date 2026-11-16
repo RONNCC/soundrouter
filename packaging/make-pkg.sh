@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 DRIVER=target/SoundRouter.driver
 APP=target/SoundRouter.app
 OUT=target/SoundRouter.pkg
-VERSION=0.1.0
+VERSION=$(plutil -extract CFBundleShortVersionString raw packaging/Info-app.plist)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -34,7 +34,12 @@ pkgbuild --root "$WORK/hal" \
   --scripts "$WORK/scripts" \
   "$WORK/driver.pkg"
 
+# non-relocatable: Installer must not "upgrade" a stray SoundRouter.app elsewhere
+pkgbuild --analyze --root "$WORK/apps" "$WORK/app.plist"
+plutil -replace 0.BundleIsRelocatable -bool NO "$WORK/app.plist"
+
 pkgbuild --root "$WORK/apps" \
+  --component-plist "$WORK/app.plist" \
   --install-location /Applications \
   --identifier com.ronncc.soundrouter.app.pkg \
   --version "$VERSION" \

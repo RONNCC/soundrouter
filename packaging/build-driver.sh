@@ -12,6 +12,10 @@ cp target/release/libsoundrouter_driver.dylib "$OUT/Contents/MacOS/SoundRouter"
 plutil -lint "$OUT/Contents/Info.plist"
 # factory symbol named in Info.plist must be exported
 nm -gU "$OUT/Contents/MacOS/SoundRouter" | grep -q ' _SoundRouter_Create$' || { echo "missing _SoundRouter_Create" >&2; exit 1; }
-codesign --force --sign "${SIGN_ID:--}" --timestamp=none "$OUT"
+if [ -n "${SIGN_ID:-}" ]; then
+  codesign --force --timestamp --sign "$SIGN_ID" "$OUT"
+else
+  codesign --force --sign - --timestamp=none "$OUT"
+fi
 codesign --verify --strict --verbose=2 "$OUT"
 echo "built $OUT"
