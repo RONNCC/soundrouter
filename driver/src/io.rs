@@ -102,7 +102,8 @@ pub unsafe extern "C" fn begin_end(
     0
 }
 
-/// V.out -> ring A -> C.in, C.out -> ring B -> V.in.
+/// V.out -> ring A -> C.in, C.out -> ring B -> V.in. With no I/O running on C (no engine attached),
+/// V.in reads ring A instead: apps recording from V hear what is played into V (Soundflower-style).
 pub unsafe extern "C" fn do_io(
     _: AudioServerPlugInDriverRef,
     dev: AudioObjectID,
@@ -126,8 +127,11 @@ pub unsafe extern "C" fn do_io(
     if !write && op != kAudioServerPlugInIOOperationReadInput {
         return 0;
     }
-    // A writes: V output. A reads: C input. B writes: C output. B reads: V input.
-    let ring_a = (side == Side::Visible) == write;
+    // A writes: V output. A reads: C input, or V input while C is idle. B writes: C output.
+    // B reads: V input while C runs.
+    let direct =
+        side == Side::Visible && !write && slot.clients[Side::Engine as usize].load(Acquire) == 0;
+    let ring_a = (side == Side::Visible) == write || direct;
     let t = unsafe {
         if write {
             (*cycle).mOutputTime.mSampleTime
@@ -231,6 +235,7 @@ mod tests {
     #[test]
     fn channel_change_on_one_side_never_overruns_the_other_buffer() {
         let (v, c) = activate(15, 2);
+        SLOTS[15].clients[Side::Engine as usize].store(1, Release); // engine attached: B feeds V.in
         // V's format change lands first; C's I/O keeps running on its 2-channel buffer.
         change(v, Change::Channels(8));
         let mut out = ramp(8);
@@ -383,8 +388,54 @@ mod tests {
         // An earlier block is still readable after the others have read (nothing was consumed).
         run(c, READ, start, &mut buf, FRAMES * 2);
         assert_eq!(&buf[..FRAMES * 2], &block(0)[..]);
-        // V's own input is the other ring and stays silent.
+        // V's own input: with no engine on C, V hears what it played (ring A)...
+        run(v, READ, t, &mut buf, FRAMES * 2);
+        assert_eq!(&buf[..FRAMES * 2], &want[..]);
+        // ...and once C runs, V's input is ring B, which nobody wrote: silent.
+        SLOTS[10].clients[Side::Engine as usize].store(1, Release);
         run(v, READ, t, &mut buf, FRAMES * 2);
         assert!(buf[..FRAMES * 2].iter().all(|&x| x == 0.0));
+    }
+
+    /// One app doing output and input on V with no engine attached gets its own output back on its
+    /// input (srctl loop); when the engine starts C, V's input switches to C's output, and back.
+    #[test]
+    fn v_loops_to_itself_until_the_engine_runs_c() {
+        let (v, c) = activate(9, 2);
+        let start = |dev| unsafe { start_io(std::ptr::null_mut(), dev, 0) };
+        let stop = |dev| unsafe { stop_io(std::ptr::null_mut(), dev, 0) };
+        assert_eq!(start(v), 0);
+        let mut out = ramp(2);
+        assert_eq!(run(v, WRITE, 1024.0, &mut out, FRAMES * 2), 0);
+        let mut buf = vec![];
+        run(v, READ, 1024.0, &mut buf, FRAMES * 2);
+        assert_eq!(
+            &buf[..FRAMES * 2],
+            &out[..FRAMES * 2],
+            "V.out -> V.in while C is idle"
+        );
+        assert_eq!(start(c), 0);
+        let mut mix: Vec<f32> = ramp(2).iter().map(|x| -x).collect();
+        assert_eq!(run(c, WRITE, 1024.0, &mut mix, FRAMES * 2), 0);
+        run(v, READ, 1024.0, &mut buf, FRAMES * 2);
+        assert_eq!(
+            &buf[..FRAMES * 2],
+            &mix[..FRAMES * 2],
+            "C.out -> V.in while C runs"
+        );
+        run(c, READ, 1024.0, &mut buf, FRAMES * 2);
+        assert_eq!(
+            &buf[..FRAMES * 2],
+            &out[..FRAMES * 2],
+            "V.out still reaches C.in"
+        );
+        assert_eq!(stop(c), 0);
+        run(v, READ, 1024.0, &mut buf, FRAMES * 2);
+        assert_eq!(
+            &buf[..FRAMES * 2],
+            &out[..FRAMES * 2],
+            "back to the direct loop"
+        );
+        assert_eq!(stop(v), 0);
     }
 }

@@ -465,6 +465,19 @@ int main(int argc, char** argv) {
         CHECK(D->StopIO(gDrv, V, 1) == 0);
     }
     printf("ok ring cross-wiring, shared readers, silence past head\n");
+    {   // 5b. one app doing output and input on V, no engine on C: V hears itself. Once C runs, V.in is C.out.
+        float o[FR * 2], i2[FR * 2], z[FR * 2] = {0}; fill(o, 2, 3000.0f);
+        CHECK(D->StartIO(gDrv, V, 1) == 0);
+        CHECK(io(V, Vo, 1, kAudioServerPlugInIOOperationWriteMix, 3000, o) == 0);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 3000, memset(i2, 0xAA, sizeof i2)) == 0 && !memcmp(i2, o, sizeof i2)); // V.out -> V.in
+        CHECK(D->StartIO(gDrv, C, 7) == 0);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 3000, memset(i2, 0xAA, sizeof i2)) == 0 && !memcmp(i2, z, sizeof i2)); // engine path: C wrote nothing
+        CHECK(io(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 3000, memset(i2, 0xAA, sizeof i2)) == 0 && !memcmp(i2, o, sizeof i2)); // V.out -> C.in
+        CHECK(D->StopIO(gDrv, C, 7) == 0);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 3000, memset(i2, 0xAA, sizeof i2)) == 0 && !memcmp(i2, o, sizeof i2)); // direct loop again
+        CHECK(D->StopIO(gDrv, V, 1) == 0);
+        printf("ok V loops to itself while C is idle, engine path while C runs\n");
+    }
 
     // 8. WillDoIOOperation: only ReadInput and WriteMix, in place. Other ops are no-ops even if the host calls them.
     {

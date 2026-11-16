@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- Driver: an app that plays into a SoundRouter device now hears itself on that device's input while the engine is not running (V.out -> V.in, Soundflower-style); before, the input stayed silent until the engine attached. With the engine running the input carries the routed mix as before.
+
 ## [0.1.0]
 
 First release. Driver-in-`coreaudiod` and end-to-end tap behaviour are not yet verified in automation (see README, Status).

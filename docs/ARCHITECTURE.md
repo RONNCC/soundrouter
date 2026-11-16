@@ -15,7 +15,7 @@ For each virtual device V (what apps pick) the driver also publishes a hidden co
 - V.out -> ring A -> C.in: what apps play into V.
 - C.out -> ring B -> V.in: what apps record from V.
 
-The engine uses C, never V, so it can read the apps' mix and write the routed mix without feeding back into itself. Apps that play directly into V are looped to V's input by the driver.
+The engine uses C, never V, so it can read the apps' mix and write the routed mix without feeding back into itself. While no client runs I/O on C (engine not attached), V's input reads ring A instead, so apps that play into V hear themselves on V's input (Soundflower-style); once C runs, V's input is ring B. The switch is decided per I/O cycle from C's client count.
 
 ```mermaid
 flowchart LR
