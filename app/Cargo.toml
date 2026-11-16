@@ -1,0 +1,15 @@
+[package]
+name = "soundrouter-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "SoundRouter"
+path = "src/main.rs"
+
+[dependencies]
+sr-core = { path = "../crates/sr-core" }
+sr-audio = { path = "../crates/sr-audio" }
+anyhow.workspace = true

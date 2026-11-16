@@ -1,0 +1,16 @@
+[package]
+name = "sr-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sr-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+anyhow.workspace = true
+sr-core = { path = "../sr-core" }
+sr-audio = { path = "../sr-audio" }

@@ -1,0 +1,15 @@
+[package]
+name = "sr-audio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sr-core = { path = "../sr-core" }
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-audio.workspace = true
+objc2-core-audio-types.workspace = true
+anyhow.workspace = true
