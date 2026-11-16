@@ -3541,6 +3541,7 @@ name = "soundrouter-driver"
 version = "0.1.0"
 dependencies = [
  "coreaudio-sys",
+ "objc2-core-foundation",
  "proptest",
  "sr-core",
 ]

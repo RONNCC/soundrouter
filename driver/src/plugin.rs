@@ -1,12 +1,14 @@
 //! Non-real-time vtable entries: Initialize, property get/set, configuration changes, reconcile.
-use crate::cf::{cfstr, devices_to_plist, parse_devices, rstr};
+use crate::cf::{borrow, devices_to_plist, parse_devices, rstr};
 use crate::config::{Op, diff};
 use crate::props::*;
 use crate::state::*;
 use coreaudio_sys::*;
+use objc2_core_foundation::{CFRetained, CFString, CFType};
 use sr_core::driver_proto::{DriverDevice, STORAGE_KEY};
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::ptr::NonNull;
 use std::sync::atomic::Ordering::*;
 
 const UNKNOWN_PROP: OSStatus = kAudioHardwareUnknownPropertyError as OSStatus;
@@ -76,13 +78,15 @@ fn reconcile(announce: bool) {
 unsafe fn store(list: &[DriverDevice]) {
     let Some(h) = host() else { return };
     unsafe {
-        let key = cfstr(STORAGE_KEY);
+        let key = CFString::from_static_str(STORAGE_KEY);
         let plist = devices_to_plist(list);
         if let Some(f) = (*h).WriteToStorage {
-            f(h, key, plist as CFPropertyListRef);
+            f(
+                h,
+                (&*key as *const CFString).cast(),
+                (&*plist as *const _ as *const c_void).cast(),
+            );
         }
-        CFRelease(plist as CFTypeRef);
-        CFRelease(key as CFTypeRef);
     }
 }
 
@@ -97,16 +101,13 @@ pub unsafe extern "C" fn initialize(
     ticks_per_second();
     let list = unsafe {
         let mut stored: CFPropertyListRef = std::ptr::null();
-        let key = cfstr(STORAGE_KEY);
-        let st = (*host)
-            .CopyFromStorage
-            .map_or(-1, |f| f(host, key, &mut stored));
-        CFRelease(key as CFTypeRef);
-        let parsed = (st == 0 && !stored.is_null()).then(|| parse_devices(stored as CFTypeRef));
-        if !stored.is_null() {
-            CFRelease(stored as CFTypeRef);
-        }
-        match parsed {
+        let key = CFString::from_static_str(STORAGE_KEY);
+        let st = (*host).CopyFromStorage.map_or(-1, |f| {
+            f(host, (&*key as *const CFString).cast(), &mut stored)
+        });
+        // CopyFromStorage returns +1; wrap exactly once so Drop releases it.
+        let owned = NonNull::new(stored as *mut CFType).map(|p| CFRetained::from_raw(p));
+        match (st == 0).then(|| parse_devices(owned.as_deref())) {
             Some(Ok(l)) => l,
             _ => default_devices(), // nothing stored, or unreadable
         }
@@ -255,11 +256,17 @@ pub unsafe extern "C" fn get_data(
             V::Ranges(x) => copy(x.as_ptr().cast()),
             V::Ids(x) => copy(x.as_ptr().cast()),
             V::Custom(x) => copy(x.as_ptr().cast()),
-            V::Str(s) => *(out as *mut CFStringRef) = cfstr(&s),
-            V::DeviceList => *(out as *mut CFTypeRef) = devices_to_plist(&wanted()) as CFTypeRef,
+            V::Str(s) => {
+                *(out as *mut CFStringRef) =
+                    CFRetained::into_raw(CFString::from_str(&s)).as_ptr() as CFStringRef
+            }
+            V::DeviceList => {
+                *(out as *mut CFTypeRef) =
+                    CFRetained::into_raw(devices_to_plist(&wanted())).as_ptr() as CFTypeRef
+            }
             V::TranslateUid => {
                 let want = if qsz as usize == size_of::<CFStringRef>() && !q.is_null() {
-                    rstr(*(q as *const CFTypeRef))
+                    rstr(borrow(*(q as *const CFTypeRef)))
                 } else {
                     None
                 };
@@ -335,7 +342,7 @@ fn set_devices(sz: u32, data: *const c_void) -> OSStatus {
     if sz as usize != size_of::<CFPropertyListRef>() {
         return BAD_SIZE;
     }
-    let Ok(list) = (unsafe { parse_devices(*(data as *const CFTypeRef)) }) else {
+    let Ok(list) = (unsafe { parse_devices(borrow(*(data as *const CFTypeRef))) }) else {
         return ILLEGAL;
     };
     {

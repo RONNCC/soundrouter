@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 sr-core = { path = "../crates/sr-core" }
 coreaudio-sys = { version = "0.2.18", default-features = false, features = ["core_audio", "audio_server_plugin"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFBase", "CFString", "CFArray", "CFDictionary", "CFNumber"] }
 
 [dev-dependencies]
 proptest = "1"

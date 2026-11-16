@@ -1,147 +1,99 @@
 //! CoreFoundation helpers: strings and the device-list property list.
 use crate::config;
-use coreaudio_sys::*;
+use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use sr_core::driver_proto::{DriverDevice, MAX_DEVICES};
 use std::ffi::c_void;
 
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {}
+const MAX_STR_UTF16: isize = 65536;
 
-/// New CFString (+1). Interior NULs are fine: CF takes the byte length.
-pub unsafe fn cfstr(s: &str) -> CFStringRef {
-    unsafe {
-        CFStringCreateWithBytes(
-            kCFAllocatorDefault,
-            s.as_ptr(),
-            s.len() as CFIndex,
-            kCFStringEncodingUTF8,
-            0,
-        )
-    }
+/// Borrow a host-owned CF pointer (null -> None). Caller keeps it alive for `'a`.
+pub unsafe fn borrow<'a>(p: *const c_void) -> Option<&'a CFType> {
+    unsafe { p.cast::<CFType>().as_ref() }
 }
 
-pub unsafe fn rstr(v: CFTypeRef) -> Option<String> {
-    unsafe {
-        if v.is_null() || CFGetTypeID(v) != CFStringGetTypeID() {
-            return None;
-        }
-        let s = v as CFStringRef;
-        let max =
-            CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), kCFStringEncodingUTF8) + 1;
-        if !(1..=65536).contains(&max) {
-            return None; // absurd length: reject rather than allocate
-        }
-        let mut buf = vec![0u8; max as usize];
-        if CFStringGetCString(s, buf.as_mut_ptr().cast(), max, kCFStringEncodingUTF8) == 0 {
-            return None;
-        }
-        let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        buf.truncate(n);
-        String::from_utf8(buf).ok()
+pub fn rstr(v: Option<&CFType>) -> Option<String> {
+    let s = v?.downcast_ref::<CFString>()?;
+    if s.length() > MAX_STR_UTF16 {
+        return None;
     }
-}
-
-unsafe fn dict_get(d: CFDictionaryRef, key: &str) -> CFTypeRef {
-    unsafe {
-        let k = cfstr(key);
-        let v = CFDictionaryGetValue(d, k as *const c_void);
-        CFRelease(k as CFTypeRef);
-        v
-    }
+    Some(s.to_string())
 }
 
 /// Parse and validate a device-list property list (an untrusted CFArray of CFDictionary).
-pub unsafe fn parse_devices(plist: CFTypeRef) -> Result<Vec<DriverDevice>, String> {
-    unsafe {
-        if plist.is_null() || CFGetTypeID(plist) != CFArrayGetTypeID() {
-            return Err("not an array".into());
-        }
-        let arr = plist as CFArrayRef;
-        let n = CFArrayGetCount(arr) as usize;
-        if n > MAX_DEVICES {
-            return Err(format!("{n} devices, max {MAX_DEVICES}"));
-        }
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let d = CFArrayGetValueAtIndex(arr, i as CFIndex) as CFTypeRef;
-            if d.is_null() || CFGetTypeID(d) != CFDictionaryGetTypeID() {
-                return Err(format!("device {i}: not a dictionary"));
-            }
-            let d = d as CFDictionaryRef;
-            let (Some(uid), Some(name)) = (rstr(dict_get(d, "uid")), rstr(dict_get(d, "name")))
-            else {
-                return Err(format!("device {i}: uid/name must be strings"));
-            };
-            let num = dict_get(d, "channels");
-            let mut ch: i32 = 0;
-            if num.is_null()
-                || CFGetTypeID(num) != CFNumberGetTypeID()
-                || CFNumberGetValue(
-                    num as CFNumberRef,
-                    kCFNumberSInt32Type as CFNumberType,
-                    (&raw mut ch).cast(),
-                ) == 0
-            {
-                return Err(format!("device {i}: channels must be an integer"));
-            }
-            let channels =
-                u16::try_from(ch).map_err(|_| format!("device {i}: channels out of range"))?;
-            out.push(DriverDevice {
-                uid,
-                name,
-                channels,
-            });
-        }
-        config::validate(out)
+pub fn parse_devices(plist: Option<&CFType>) -> Result<Vec<DriverDevice>, String> {
+    let arr = plist
+        .and_then(|p| p.downcast_ref::<CFArray>())
+        .ok_or("not an array")?;
+    let n = arr.len();
+    if n > MAX_DEVICES {
+        return Err(format!("{n} devices, max {MAX_DEVICES}"));
     }
+    // SAFETY: element type is only used through downcast_ref, which checks the CF type id.
+    let arr = unsafe { arr.cast_unchecked::<CFType>() };
+    let (k_uid, k_name, k_ch) = (
+        CFString::from_static_str("uid"),
+        CFString::from_static_str("name"),
+        CFString::from_static_str("channels"),
+    );
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let d = arr
+            .get(i)
+            .ok_or_else(|| format!("device {i}: not a dictionary"))?;
+        let d = d
+            .downcast_ref::<CFDictionary>()
+            .ok_or_else(|| format!("device {i}: not a dictionary"))?;
+        // SAFETY: keys/values are only used through checked downcasts.
+        let d = unsafe { d.cast_unchecked::<CFString, CFType>() };
+        let (Some(uid), Some(name)) = (
+            rstr(d.get(&k_uid).as_deref()),
+            rstr(d.get(&k_name).as_deref()),
+        ) else {
+            return Err(format!("device {i}: uid/name must be strings"));
+        };
+        let ch = d
+            .get(&k_ch)
+            .and_then(|n| n.downcast::<CFNumber>().ok())
+            .and_then(|n| n.as_i32())
+            .ok_or_else(|| format!("device {i}: channels must be an integer"))?;
+        let channels =
+            u16::try_from(ch).map_err(|_| format!("device {i}: channels out of range"))?;
+        out.push(DriverDevice {
+            uid,
+            name,
+            channels,
+        });
+    }
+    config::validate(out)
 }
 
-/// Build the property list for a device list (+1 retained).
-pub unsafe fn devices_to_plist(list: &[DriverDevice]) -> CFArrayRef {
-    unsafe {
-        let arr = CFArrayCreateMutable(
-            kCFAllocatorDefault,
-            list.len() as CFIndex,
-            &kCFTypeArrayCallBacks,
-        );
-        let keys = [cfstr("uid"), cfstr("name"), cfstr("channels")];
-        for d in list {
-            let ch = d.channels as i32;
-            let num = CFNumberCreate(
-                kCFAllocatorDefault,
-                kCFNumberSInt32Type as CFNumberType,
-                (&raw const ch).cast(),
-            );
-            let vals = [
-                cfstr(&d.uid) as *const c_void,
-                cfstr(&d.name) as *const c_void,
-                num as *const c_void,
-            ];
-            let dict = CFDictionaryCreate(
-                kCFAllocatorDefault,
-                keys.as_ptr() as *mut *const c_void,
-                vals.as_ptr() as *mut *const c_void,
-                3,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks,
-            );
-            for v in vals {
-                CFRelease(v as CFTypeRef);
-            }
-            CFArrayAppendValue(arr, dict as *const c_void);
-            CFRelease(dict as CFTypeRef);
-        }
-        for k in keys {
-            CFRelease(k as CFTypeRef);
-        }
-        arr as CFArrayRef
-    }
+/// Build the property list for a device list.
+pub fn devices_to_plist(
+    list: &[DriverDevice],
+) -> CFRetained<CFArray<CFDictionary<CFString, CFType>>> {
+    let keys = [
+        CFString::from_static_str("uid"),
+        CFString::from_static_str("name"),
+        CFString::from_static_str("channels"),
+    ];
+    let dicts: Vec<_> = list
+        .iter()
+        .map(|d| {
+            let (uid, name) = (CFString::from_str(&d.uid), CFString::from_str(&d.name));
+            let num = CFNumber::new_i32(d.channels.into());
+            CFDictionary::from_slices(
+                &[&*keys[0], &*keys[1], &*keys[2]],
+                &[&**uid, &**name, &**num],
+            )
+        })
+        .collect();
+    CFArray::from_retained_objects(&dicts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ptr::null;
+    use proptest::prelude::*;
 
     fn d(uid: &str, name: &str, channels: u16) -> DriverDevice {
         DriverDevice {
@@ -157,43 +109,160 @@ mod tests {
             d("soundrouter:v1", "Loopback Audio", 2),
             d("x", "Ünïcode ✓", 64),
         ];
-        unsafe {
-            let p = devices_to_plist(&list);
-            assert_eq!(parse_devices(p as CFTypeRef).unwrap(), list);
-            CFRelease(p as CFTypeRef);
-            let empty = devices_to_plist(&[]);
-            assert_eq!(parse_devices(empty as CFTypeRef).unwrap(), vec![]);
-            CFRelease(empty as CFTypeRef);
-        }
+        let p = devices_to_plist(&list);
+        assert_eq!(parse_devices(Some(&p)).unwrap(), list);
+        let empty = devices_to_plist(&[]);
+        assert_eq!(parse_devices(Some(&empty)).unwrap(), vec![]);
     }
 
     #[test]
     fn parse_rejects_garbage() {
-        unsafe {
-            let s = cfstr("nope");
-            assert!(parse_devices(s as CFTypeRef).is_err());
-            assert!(parse_devices(null()).is_err());
-            CFRelease(s as CFTypeRef);
-            // array of strings instead of dictionaries
-            let s = cfstr("x");
-            let items = [s as *const c_void];
-            let arr = CFArrayCreate(
-                kCFAllocatorDefault,
-                items.as_ptr() as *mut *const c_void,
-                1,
-                &kCFTypeArrayCallBacks,
-            );
-            assert!(parse_devices(arr as CFTypeRef).is_err());
-            CFRelease(arr as CFTypeRef);
-            CFRelease(s as CFTypeRef);
-            // duplicate uid is rejected by validate
-            let dup = devices_to_plist(&[d("a", "n", 2), d("a", "m", 2)]);
-            assert!(
-                parse_devices(dup as CFTypeRef)
-                    .unwrap_err()
-                    .contains("duplicate")
-            );
-            CFRelease(dup as CFTypeRef);
+        let s = CFString::from_static_str("nope");
+        assert!(parse_devices(Some(&s)).is_err());
+        assert!(parse_devices(None).is_err());
+        let arr = CFArray::from_retained_objects(&[CFString::from_static_str("x")]);
+        assert!(parse_devices(Some(&arr)).is_err());
+        let dup = devices_to_plist(&[d("a", "n", 2), d("a", "m", 2)]);
+        assert!(parse_devices(Some(&dup)).unwrap_err().contains("duplicate"));
+    }
+
+    #[derive(Debug, Clone)]
+    enum Node {
+        Str(String),
+        Int(i64),
+        Dbl(f64),
+        Arr(Vec<Node>),
+        Dict(Vec<(String, Node)>),
+    }
+
+    fn build(n: &Node) -> CFRetained<CFType> {
+        match n {
+            Node::Str(s) => CFString::from_str(s).into(),
+            Node::Int(i) => CFNumber::new_i64(*i).into(),
+            Node::Dbl(f) => CFNumber::new_f64(*f).into(),
+            Node::Arr(v) => {
+                let items: Vec<_> = v.iter().map(build).collect();
+                unsafe { CFRetained::cast_unchecked(CFArray::from_retained_objects(&items)) }
+            }
+            Node::Dict(kv) => {
+                let keys: Vec<_> = kv.iter().map(|(k, _)| CFString::from_str(k)).collect();
+                let vals: Vec<_> = kv.iter().map(|(_, v)| build(v)).collect();
+                let kr: Vec<&CFString> = keys.iter().map(|k| &**k).collect();
+                let vr: Vec<&CFType> = vals.iter().map(|v| &**v).collect();
+                unsafe { CFRetained::cast_unchecked(CFDictionary::from_slices(&kr, &vr)) }
+            }
         }
+    }
+
+    fn arb_str() -> impl Strategy<Value = String> {
+        prop_oneof![
+            any::<String>(),
+            Just("a\0b".to_string()),
+            Just("😀✓é".to_string()),
+            Just("x".repeat(70_000)),
+            "[a-z:]{0,10}",
+        ]
+    }
+
+    fn arb_num() -> impl Strategy<Value = Node> {
+        prop_oneof![
+            any::<i64>().prop_map(Node::Int),
+            (-5i64..70_000).prop_map(Node::Int),
+            Just(Node::Int(i64::MIN)),
+            Just(Node::Dbl(f64::NAN)),
+            Just(Node::Dbl(f64::INFINITY)),
+            any::<f64>().prop_map(Node::Dbl),
+        ]
+    }
+
+    fn arb_leaf() -> impl Strategy<Value = Node> {
+        prop_oneof![arb_str().prop_map(Node::Str), arb_num()]
+    }
+
+    fn arb_key() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("uid".to_string()),
+            Just("name".to_string()),
+            Just("channels".to_string()),
+            arb_str(),
+        ]
+    }
+
+    /// A dictionary biased towards the real schema, with random value types.
+    fn arb_dev() -> impl Strategy<Value = Node> {
+        let val = prop_oneof![arb_leaf(), Just(Node::Arr(vec![]))];
+        prop::collection::vec((arb_key(), val), 0..5).prop_map(Node::Dict)
+    }
+
+    fn arb_tree() -> impl Strategy<Value = Node> {
+        prop_oneof![
+            arb_leaf(),
+            prop::collection::vec(arb_dev(), 0..8).prop_map(Node::Arr),
+            prop::collection::vec(arb_leaf(), 0..1000).prop_map(Node::Arr),
+            prop::collection::vec(arb_dev(), 1000..1001).prop_map(Node::Arr),
+            arb_dev(),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn parse_never_panics(t in arb_tree()) {
+            let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+            let cf = build(&t);
+            if let Ok(list) = parse_devices(Some(&cf)) {
+                // validated output must survive a round trip unchanged
+                let back = devices_to_plist(&list);
+                prop_assert_eq!(parse_devices(Some(&back)).unwrap(), list);
+            }
+        }
+
+        #[test]
+        fn valid_lists_round_trip(
+            n in 0usize..=MAX_DEVICES,
+            ch in 1u16..=2,
+            name in "[a-zA-Z0-9✓]{1,20}",
+        ) {
+            let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+            let list: Vec<_> = (0..n).map(|i| d(&format!("u{i}"), &name, ch)).collect();
+            let p = devices_to_plist(&list);
+            prop_assert_eq!(parse_devices(Some(&p)).unwrap(), list);
+        }
+    }
+
+    /// Serialises tests that allocate heavily so the RSS heuristic is not polluted.
+    static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn rss_kb() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// Heuristic: a leaked ref per round trip (~10k * 16 devices) would add tens of MB.
+    #[test]
+    fn round_trip_does_not_leak() {
+        let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+        let list: Vec<_> = (0..16)
+            .map(|i| d(&format!("uid-{i}"), "Loopback", 2))
+            .collect();
+        let run = || {
+            for _ in 0..2_000 {
+                let p = devices_to_plist(&list);
+                assert_eq!(parse_devices(Some(&p)).unwrap().len(), 16);
+            }
+        };
+        run(); // warm up allocator
+        let before = rss_kb();
+        for _ in 0..5 {
+            run();
+        }
+        let grown = rss_kb().saturating_sub(before);
+        assert!(
+            grown < 8 * 1024,
+            "RSS grew {grown} KiB over 10k round trips"
+        );
     }
 }
