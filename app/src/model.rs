@@ -368,11 +368,11 @@ pub fn can_link(from: Port, to: Port) -> bool {
     )
 }
 
-/// Channel row label: L/R for a stereo pair, the number otherwise.
+/// Channel row label: `1 (L)` / `2 (R)` for a stereo pair, the number otherwise.
+/// `total == 0` means an output-card row, which is always one half of a pair.
 pub fn ch_label(ch: u16, total: u16) -> String {
-    match (total, ch) {
-        (2, 0) => "L".into(),
-        (2, 1) => "R".into(),
+    match (total, ch % 2) {
+        (0 | 2, side) => format!("{} ({})", ch + 1, if side == 0 { "L" } else { "R" }),
         _ => (ch + 1).to_string(),
     }
 }
@@ -562,8 +562,9 @@ mod tests {
 
     #[test]
     fn labels() {
-        assert_eq!(ch_label(0, 2), "L");
-        assert_eq!(ch_label(1, 2), "R");
+        assert_eq!(ch_label(0, 2), "1 (L)");
+        assert_eq!(ch_label(1, 2), "2 (R)");
+        assert_eq!(ch_label(2, 0), "3 (L)");
         assert_eq!(ch_label(0, 1), "1");
         assert_eq!(ch_label(3, 4), "4");
     }

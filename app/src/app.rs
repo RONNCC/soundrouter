@@ -3,7 +3,9 @@ use crate::graph::{self, GraphCtx, GraphState};
 use crate::model::{Edit, apply, db_to_pct, pct_to_db};
 use crate::store;
 use crate::theme::{Tokens, semibold, tokens};
-use crate::widgets::{name_button, name_widget, pencil, plus_circle, plus_glyph, speaker, switch};
+use crate::widgets::{
+    name_button, name_widget, pencil, plus_circle, plus_glyph, slider_knob, speaker, switch,
+};
 use crate::worker::Worker;
 use eframe::egui::{
     self, Align2, CornerRadius, FontId, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit, Theme,
@@ -333,6 +335,7 @@ impl App {
             ui.add(Slider::new(&mut pct, 0.0..=100.0).show_value(false))
         });
         name_widget(ui, &slider.inner, &format!("{} volume", dev.name));
+        slider_knob(ui.painter(), slider.inner.rect, pct / 100.0, t);
         if (pct - before).abs() > 1e-3 {
             edits.push(Edit::Volume(i, pct_to_db(pct)));
         }
@@ -538,6 +541,8 @@ impl eframe::App for App {
             s.visuals.widgets.inactive.bg_fill = t.switch_off;
             s.interaction.selectable_labels = false;
             s.visuals.handle_shape = egui::style::HandleShape::Circle;
+            s.visuals.slider_trailing_fill = true;
+            s.spacing.slider_rail_height = 4.0;
         });
         ctx.request_repaint_after(Duration::from_millis(33));
 

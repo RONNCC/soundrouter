@@ -7,10 +7,13 @@ use crate::layout::{
 use crate::meter::{PeakHold, level};
 use crate::model::{Edit, Link, Port, can_link, ch_label, links};
 use crate::theme::{Tokens, semibold, tile_tint};
-use crate::widgets::{chevron, loops, meter, name_button, name_widget, plus_circle, switch, tile};
+use crate::widgets::{
+    chevron, loops, menu_hint, meter, name_button, name_widget, plus_circle, slider_knob, switch,
+    tile,
+};
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Id, Popup, Rect, Sense, Shadow, Slider, Stroke,
-    StrokeKind, Ui, UiBuilder, epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
+    self, Align2, Color32, CornerRadius, FontId, Id, Popup, Rect, Response, Sense, Shadow, Slider,
+    Stroke, StrokeKind, Ui, UiBuilder, epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
 };
 use sr_core::backend::{AppInfo, HwDevice, MeterReading};
 use sr_core::config::{Monitor, Source, SourceKind, VirtualDevice};
@@ -204,11 +207,16 @@ fn column_headers(ui: &mut Ui, g: &GraphCtx, layout: &Layout, edits: &mut Vec<Ed
             0 => {
                 let resp = plus_circle(
                     ui,
-                    pos2(right - 12.0, base - 28.0),
+                    pos2(right - 20.0, base - 28.0),
                     id,
                     t,
                     false,
                     "Add source",
+                );
+                menu_hint(
+                    ui.painter(),
+                    pos2(right - 4.0, base - 28.0),
+                    hint_color(&resp, t),
                 );
                 Popup::menu(&resp).show(|ui| source_menu(ui, g, edits));
             }
@@ -243,16 +251,25 @@ fn column_headers(ui: &mut Ui, g: &GraphCtx, layout: &Layout, edits: &mut Vec<Ed
             _ => {
                 let resp = plus_circle(
                     ui,
-                    pos2(right - 12.0, base - 28.0),
+                    pos2(right - 20.0, base - 28.0),
                     id,
                     t,
                     false,
                     "Add monitor",
                 );
+                menu_hint(
+                    ui.painter(),
+                    pos2(right - 4.0, base - 28.0),
+                    hint_color(&resp, t),
+                );
                 Popup::menu(&resp).show(|ui| monitor_menu(ui, g, edits));
             }
         }
     }
+}
+
+fn hint_color(resp: &Response, t: &Tokens) -> Color32 {
+    if resp.hovered() { t.text } else { t.text2 }
 }
 
 fn source_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
@@ -433,6 +450,12 @@ fn card(
         }
     }
 
+    painter.hline(
+        r.x_range(),
+        r.top() + HEAD_H,
+        Stroke::new(1.0, t.card_stroke),
+    );
+
     // Body: icon and channel rows with meters.
     let body_top = r.top() + HEAD_H;
     let body_h = body_height(c.rows, c.icon);
@@ -458,9 +481,11 @@ fn card(
                 tile(&painter, icon, tile_tint(&title), &glyph, 19.0, dim);
             }
         }
-        (r.left() + 62.0, r.left() + 74.0)
+        (r.left() + 62.0, r.left() + 98.0)
+    } else if matches!(c.id, CardId::Out(_)) {
+        (r.left() + 16.0, r.left() + 96.0)
     } else {
-        (r.left() + 16.0, r.left() + 30.0)
+        (r.left() + 16.0, r.left() + 52.0)
     };
     let total_rows = c.rows;
     for row in 0..c.rows {
@@ -469,7 +494,10 @@ fn card(
             CardId::Out(p) => (p as u16 * 2 + row, 0),
             _ => (row, total_rows),
         };
-        let lbl = ch_label(ch_for_label, lbl_total);
+        let lbl = match c.id {
+            CardId::Out(_) => format!("Channel {}", ch_label(ch_for_label, lbl_total)),
+            _ => ch_label(ch_for_label, lbl_total),
+        };
         painter.text(
             pos2(label_x, y),
             Align2::LEFT_CENTER,
@@ -495,6 +523,7 @@ fn card(
         return;
     }
     let y0 = body_top + body_h;
+    painter.hline(r.x_range(), y0, Stroke::new(1.0, t.card_stroke));
     let opt = Rect::from_min_size(pos2(r.left(), y0), vec2(r.width(), FOOT_H));
     let resp = ui.interact(opt, Id::unique(("opt", d, c.id)), Sense::click());
     name_button(&resp, &format!("{title} options"));
@@ -537,6 +566,7 @@ fn card(
         ui.add(Slider::new(&mut v, -60.0..=12.0).show_value(false))
     });
     name_widget(ui, &vol.inner, &format!("{title} volume"));
+    slider_knob(&painter, vol.inner.rect, (v - -60.0) / 72.0, t);
     painter.text(
         pos2(vrow.right(), vrow.center().y),
         Align2::RIGHT_CENTER,
@@ -717,7 +747,7 @@ fn wires_and_ports(
         if !src_active(l.from) || !dev.enabled {
             c = c.gamma_multiply(0.35);
         }
-        painter.add(wire_shape(a, b, c, if hot { 4.0 } else { 2.5 }));
+        painter.add(wire_shape(a, b, c, if hot { 3.5 } else { 2.0 }));
     }
     if let (Some(from), Some(pos)) = (st.drag, pointer)
         && let Some(a) = layout.port_pos(from)
@@ -727,7 +757,7 @@ fn wires_and_ports(
             a,
             end,
             port_color(from, t).gamma_multiply(0.75),
-            2.5,
+            2.0,
         ));
     }
     for &p in &ports {

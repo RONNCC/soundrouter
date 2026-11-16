@@ -13,7 +13,7 @@ pub const GAP: f32 = 16.0;
 /// Space above the first card for the column headers.
 pub const TOP: f32 = 54.0;
 pub const SIDE: f32 = 24.0;
-pub const PORT_R: f32 = 5.5;
+pub const PORT_R: f32 = 4.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CardId {

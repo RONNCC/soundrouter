@@ -1,4 +1,4 @@
-//! Small painted controls: switch, segmented meter, icons.
+//! Small painted controls: switch, meter, slider knob, icons.
 use crate::theme::Tokens;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Painter, Pos2, Rect, Response, Sense, Stroke,
@@ -39,12 +39,8 @@ pub fn switch(ui: &mut Ui, rect: Rect, id: Id, on: bool, t: &Tokens, label: &str
     new
 }
 
-/// Segmented bar: 0..=1 `level`, peak marker at `peak`. Segments turn yellow from 70 % and red from 90 %.
+/// Continuous bar: 0..=1 `level`, 2 px peak tick at `peak`. Colour turns yellow from 70 % and red from 90 %.
 pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) {
-    const SEG: f32 = 5.0;
-    const GAP: f32 = 2.0;
-    let n = ((r.width() + GAP) / (SEG + GAP)).floor().max(1.0) as usize;
-    let step = r.width() / n as f32;
     let color = |pos: f32| {
         t.meter[if pos > 0.9 {
             2
@@ -53,20 +49,37 @@ pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) 
         } else {
             0
         }]
+        .gamma_multiply(dim)
     };
-    let peak_seg = ((peak * n as f32).ceil() as usize).clamp(1, n) - 1;
-    for i in 0..n {
-        let pos = (i as f32 + 1.0) / n as f32;
-        let x = r.left() + i as f32 * step;
-        let seg = Rect::from_min_size(pos2(x, r.top()), vec2(step - GAP, r.height()));
-        let lit = level >= pos - 0.5 / n as f32 || (peak > 0.0 && i == peak_seg);
-        let c = if lit {
-            color(pos).gamma_multiply(dim)
-        } else {
-            t.track
-        };
-        p.rect_filled(seg, CornerRadius::same(1), c);
+    let round = CornerRadius::same((r.height() / 2.0) as u8);
+    p.rect_filled(r, round, t.track);
+    let w = r.width() * level.clamp(0.0, 1.0);
+    if w > 0.5 {
+        let fill = Rect::from_min_size(r.min, vec2(w.max(r.height()), r.height()));
+        p.rect_filled(fill, round, color(level));
     }
+    if peak > 0.0 {
+        let x =
+            (r.left() + r.width() * peak.clamp(0.0, 1.0)).clamp(r.left() + 1.0, r.right() - 1.0);
+        p.rect_filled(
+            Rect::from_x_y_ranges((x - 1.0)..=(x + 1.0), r.y_range()),
+            CornerRadius::ZERO,
+            color(peak),
+        );
+    }
+}
+
+/// White knob with a soft shadow, painted over egui's grey slider handle.
+/// `r` is the slider's response rect, `frac` the value in 0..=1.
+pub fn slider_knob(p: &Painter, r: Rect, frac: f32, t: &Tokens) {
+    let rad = r.height() / 2.5; // egui's handle radius
+    let c = pos2(
+        egui::lerp((r.left() + rad)..=(r.right() - rad), frac.clamp(0.0, 1.0)),
+        r.center().y,
+    );
+    p.circle_filled(c + vec2(0.0, 1.0), rad + 1.5, t.shadow);
+    p.circle_filled(c, rad + 1.0, Color32::WHITE);
+    p.circle_stroke(c, rad + 1.0, Stroke::new(0.5, t.card_stroke));
 }
 
 /// The ⊕ / ⊖ mark, without any interaction.
@@ -82,6 +95,19 @@ pub fn plus_glyph(p: &Painter, center: Pos2, c: Color32, minus: bool) {
             Stroke::new(1.5, c),
         );
     }
+}
+
+/// Small down-triangle beside a ⊕ that opens a menu.
+pub fn menu_hint(p: &Painter, center: Pos2, c: Color32) {
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            center + vec2(-3.0, -1.5),
+            center + vec2(3.0, -1.5),
+            center + vec2(0.0, 2.0),
+        ],
+        c,
+        Stroke::NONE,
+    ));
 }
 
 pub fn plus_circle(
