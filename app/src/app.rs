@@ -1,9 +1,11 @@
 //! Application state, sidebar and the window frame.
 use crate::graph::{self, GraphCtx, GraphState};
 use crate::icons::IconTextures;
+use crate::login;
 use crate::model::{Edit, apply, db_to_pct, pct_to_db};
 use crate::store;
 use crate::theme::{Tokens, semibold, tokens};
+use crate::tray::{self, Action, Event, Tray, WinState};
 use crate::widgets::{
     name_button, name_widget, pencil, plus_circle, plus_glyph, slider_knob, speaker, switch,
 };
@@ -40,6 +42,11 @@ pub struct App {
     save_pending: bool,
     vibrancy: bool,
     demo: bool,
+    /// Menu-bar item; None if it could not be created (tests, or the system refused).
+    tray: Option<Tray>,
+    win: WinState,
+    /// Passes left before hiding a `--background` window (eframe shows it after the first frame).
+    hide_in: u8,
 }
 
 /// Label and dot color for a device state; idle devices show no dot.
@@ -75,6 +82,78 @@ impl App {
             save_pending: false,
             vibrancy,
             demo,
+            tray: None,
+            win: WinState::default(),
+            hide_in: 0,
+        }
+    }
+
+    /// Keep routing when the window closes: menu-bar item plus close-to-hide state.
+    pub fn background(mut self, tray: Option<Tray>, win: WinState, start_hidden: bool) -> Self {
+        self.tray = tray;
+        self.win = win;
+        self.hide_in = if start_hidden { 2 } else { 0 };
+        self
+    }
+
+    fn handle_window(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if self.hide_in > 0 {
+            self.hide_in -= 1;
+            if self.hide_in == 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            events.push(Event::CloseRequested);
+        }
+        if tray::take_reopen() {
+            events.push(Event::Reopen);
+        }
+        let running = self
+            .engine_status()
+            .per_device
+            .iter()
+            .filter(|(_, s)| *s == DeviceState::Running)
+            .count();
+        if let Some(t) = &mut self.tray {
+            t.set_status(tray::status_text(running));
+            for cmd in t.poll() {
+                match cmd {
+                    tray::Cmd::Open => events.push(Event::Open),
+                    tray::Cmd::Quit => events.push(Event::Quit),
+                    tray::Cmd::Login(on) => {
+                        if let Err(e) = login::set_enabled(on) {
+                            t.set_login_checked(!on);
+                            self.toast = Some(format!("Could not change Start at Login: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        for e in events {
+            let (win, action) = tray::step(self.win, e);
+            self.win = win;
+            match action {
+                Action::Nothing => {}
+                Action::Hide { hint } => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    if hint {
+                        if let Some(t) = &mut self.tray {
+                            t.hint();
+                        }
+                        if !self.demo {
+                            tray::mark_hint_seen();
+                        }
+                    }
+                }
+                Action::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
         }
     }
 
@@ -531,6 +610,16 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_window(ctx);
+    }
+
+    /// Cmd-Q ends the process without dropping `App`: stop the worker so the engine shuts down.
+    fn on_exit(&mut self) {
+        log::info!("quitting: stopping the audio engine");
+        self.worker.stop();
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         if self.vibrancy {
             [0.0; 4]

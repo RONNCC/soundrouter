@@ -5,11 +5,13 @@ mod graph;
 mod icons;
 mod layout;
 mod logging;
+mod login;
 mod meter;
 mod model;
 mod setup;
 mod store;
 mod theme;
+mod tray;
 mod widgets;
 mod worker;
 
@@ -18,18 +20,24 @@ use sr_core::backend::Backend;
 
 struct Args {
     demo: bool,
+    /// Start with the window hidden (the Start-at-Login agent passes this).
+    background: bool,
+    help: bool,
     theme: egui::ThemePreference,
 }
 
-fn parse_args() -> Args {
+fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
     let mut a = Args {
         demo: false,
+        background: false,
+        help: false,
         theme: egui::ThemePreference::System,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--demo" => a.demo = true,
+            "--background" => a.background = true,
             "--theme" => {
                 a.theme = match it.next().as_deref() {
                     Some("dark") => egui::ThemePreference::Dark,
@@ -37,10 +45,7 @@ fn parse_args() -> Args {
                     _ => egui::ThemePreference::System,
                 }
             }
-            "-h" | "--help" => {
-                println!("usage: SoundRouter [--demo] [--theme dark|light]");
-                std::process::exit(0);
-            }
+            "-h" | "--help" => a.help = true,
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
@@ -53,7 +58,11 @@ fn real_backend() -> anyhow::Result<Box<dyn Backend + Send>> {
 }
 
 fn main() -> eframe::Result {
-    let args = parse_args();
+    let args = parse_args(std::env::args().skip(1));
+    if args.help {
+        println!("usage: SoundRouter [--demo] [--background] [--theme dark|light]");
+        return Ok(());
+    }
     let log_file = logging::init();
     logging::banner(log_file.as_deref());
     let demo = args.demo;
@@ -110,9 +119,71 @@ fn main() -> eframe::Result {
                 }
             };
             let worker = worker::Worker::spawn(backend, cc.egui_ctx.clone());
-            Ok(Box::new(app::App::new(
-                cfg, path, worker, toast, vibrancy, demo,
-            )))
+            if login::is_enabled() {
+                // The agent plist points at the executable that enabled it; follow the app if it moved.
+                let _ = login::set_enabled(true);
+            }
+            let tray = tray::Tray::new(&cc.egui_ctx, login::is_enabled())
+                .inspect_err(|e| log::warn!("menu-bar item unavailable: {e}"))
+                .ok();
+            if !tray::install_reopen_hook(&cc.egui_ctx) {
+                log::warn!("Dock-click reopen hook not installed");
+            }
+            let win = tray::WinState {
+                hint_seen: demo || tray::hint_seen(),
+                quitting: false,
+            };
+            Ok(Box::new(
+                app::App::new(cfg, path, worker, toast, vibrancy, demo).background(
+                    tray,
+                    win,
+                    args.background,
+                ),
+            ))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(a: &[&str]) -> Args {
+        parse_args(a.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn no_arguments_is_a_normal_launch() {
+        let a = parse(&[]);
+        assert!(!a.demo && !a.background && !a.help);
+        assert_eq!(a.theme, egui::ThemePreference::System);
+    }
+
+    #[test]
+    fn background_and_demo_flags() {
+        let a = parse(&["--background", "--demo"]);
+        assert!(a.background && a.demo);
+    }
+
+    #[test]
+    fn unknown_arguments_are_ignored() {
+        let a = parse(&["-psn_0_12345", "--frobnicate", "--background"]);
+        assert!(a.background && !a.demo);
+    }
+
+    #[test]
+    fn theme_takes_a_value() {
+        assert_eq!(
+            parse(&["--theme", "dark"]).theme,
+            egui::ThemePreference::Dark
+        );
+        assert_eq!(
+            parse(&["--theme", "light"]).theme,
+            egui::ThemePreference::Light
+        );
+        assert_eq!(
+            parse(&["--theme", "x"]).theme,
+            egui::ThemePreference::System
+        );
+    }
 }

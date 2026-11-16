@@ -6,6 +6,7 @@ use sr_core::config::{Config, SourceKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const METER_PERIOD: Duration = Duration::from_millis(33);
@@ -24,7 +25,8 @@ pub struct Snapshot {
 }
 
 pub struct Worker {
-    tx: Sender<Config>,
+    tx: Option<Sender<Config>>,
+    handle: Option<JoinHandle<()>>,
     pub shared: Arc<Mutex<Snapshot>>,
 }
 
@@ -119,7 +121,7 @@ impl Worker {
         let (tx, rx) = mpsc::channel::<Config>();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let snap = shared.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let mut pump = Pump {
                 backend,
                 cfg: Config::default(),
@@ -137,11 +139,32 @@ impl Worker {
                 ctx.request_repaint();
             }
         });
-        Worker { tx, shared }
+        Worker {
+            tx: Some(tx),
+            handle: Some(handle),
+            shared,
+        }
     }
 
     pub fn apply(&self, cfg: &Config) {
-        let _ = self.tx.send(cfg.clone());
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(cfg.clone());
+        }
+    }
+
+    /// Stop the thread and wait for it, so the backend (and its CoreAudio devices) is dropped
+    /// before the process exits. Cmd-Q never drops `App`, so this is also called from `on_exit`.
+    pub fn stop(&mut self) {
+        self.tx = None;
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
