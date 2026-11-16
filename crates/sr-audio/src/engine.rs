@@ -32,6 +32,7 @@ use crate::layout::{self, LayoutSpec, SCRATCH_LEN, SubDesc};
 /// shortcut: then pass-thru audio mixes with the engine output in the HAL; unverified until the driver is installed.
 pub const ALLOW_VISIBLE_FALLBACK: bool = true;
 pub const AGG_UID_PREFIX: &str = "soundrouter.agg.";
+static AGG_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// State of a vdev's IOProc start (AudioDeviceStart blocks while the TCC prompt is open).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,21 +85,48 @@ struct Vdev {
     layout: sr_core::mixer::IoLayout,
     subs: Vec<SubDesc>,
     taps: Vec<Tap>,
+    /// The `AudioDeviceStart` thread; `None` once joined.
+    starter: Option<JoinHandle<()>>,
 }
 // SAFETY: `cb` is only dereferenced by the IOProc thread; control-side access is limited to the atomics in `Shared`.
 unsafe impl Send for Vdev {}
 
+impl Vdev {
+    /// True while the starter thread is still inside `AudioDeviceStart` (TCC prompt open).
+    fn starting(&self) -> bool {
+        self.starter.as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
+/// Teardown first waits for the starter thread: `AudioDeviceStart` may still be running on the
+/// IOProc/aggregate we are about to destroy (F3). So **dropping a `Vdev` can block for as long as the TCC
+/// prompt is open**; code on a caller's thread uses [`retire`] instead.
 impl Drop for Vdev {
     fn drop(&mut self) {
+        if let Some(h) = self.starter.take() {
+            let _ = h.join();
+        }
         unsafe {
-            AudioDeviceStop(self.agg, self.proc_id);
-            AudioDeviceDestroyIOProcID(self.agg, self.proc_id);
+            if self.proc_id.is_some() {
+                AudioDeviceStop(self.agg, self.proc_id);
+                AudioDeviceDestroyIOProcID(self.agg, self.proc_id);
+            }
             AudioHardwareDestroyAggregateDevice(self.agg);
             for t in &self.taps {
                 AudioHardwareDestroyProcessTap(t.id);
             }
             drop(Box::from_raw(self.cb));
         }
+    }
+}
+
+/// Drop a vdev without blocking the caller: one still starting is torn down on a short-lived thread.
+fn retire(v: Option<Vdev>) {
+    let Some(v) = v else { return };
+    if v.starting() {
+        let _ = std::thread::Builder::new()
+            .name("sr-audio-reap".into())
+            .spawn(move || drop(v));
     }
 }
 
@@ -221,7 +249,9 @@ impl Drop for Engine {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
-        lock(&self.inner).vdevs.clear();
+        for (_, v) in lock(&self.inner).vdevs.drain() {
+            retire(Some(v));
+        }
     }
 }
 
@@ -444,7 +474,15 @@ fn apply_locked(g: &mut Inner, cfg: &Config) -> Result<()> {
         .filter(|d| d.enabled)
         .map(|d| d.id.as_str())
         .collect();
-    g.vdevs.retain(|id, _| enabled.contains(id.as_str()));
+    let gone: Vec<String> = g
+        .vdevs
+        .keys()
+        .filter(|id| !enabled.contains(id.as_str()))
+        .cloned()
+        .collect();
+    for id in gone {
+        retire(g.vdevs.remove(&id));
+    }
     let mut errors = Vec::new();
     for dev in cfg.devices.iter().filter(|d| d.enabled) {
         if let Err(e) = apply_vdev(g, dev, &groups) {
@@ -462,7 +500,7 @@ fn apply_locked(g: &mut Inner, cfg: &Config) -> Result<()> {
 fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result<()> {
     let cands = main_candidates(dev);
     if cands.is_empty() {
-        g.vdevs.remove(&dev.id);
+        retire(g.vdevs.remove(&dev.id));
         bail!(
             "neither the hidden companion nor the visible device is present (driver not loaded?)"
         );
@@ -474,7 +512,7 @@ fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result
             sync_taps(v, groups)?;
             return refresh_layout(v);
         }
-        g.vdevs.remove(&dev.id);
+        retire(g.vdevs.remove(&dev.id));
     }
     let mut last = anyhow!("no candidate main device");
     for main in cands {
@@ -772,7 +810,9 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
         NSArray::from_retained_slice(&sub_dicts),
         NSArray::from_retained_slice(&tap_dicts),
     );
-    let agg_uid = NSString::from_str(&format!("{AGG_UID_PREFIX}{}", dev.id));
+    // A retired vdev may still be tearing down on a reaper thread, so each build gets its own uid.
+    let seq = AGG_SEQ.fetch_add(1, Relaxed);
+    let agg_uid = NSString::from_str(&format!("{AGG_UID_PREFIX}{}.{seq}", dev.id));
     let name = NSString::from_str(&format!("SoundRouter {}", dev.id));
     let main = NSString::from_str(&spec.main);
     let (yes, no) = (hal::bool_obj(true), hal::bool_obj(false));
@@ -848,6 +888,7 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
         },
         subs: descs,
         taps,
+        starter: None,
     };
     // From here `Drop` cleans up the aggregate, taps and callback state.
     refresh_layout(&mut v)?;
@@ -862,19 +903,22 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
     hal::check("AudioDeviceCreateIOProcID", st).context("creating IOProc")?;
     let (proc_id, sh) = (v.proc_id, v.shared.clone());
     // AudioDeviceStart blocks until the TCC prompt is answered: keep it off the caller's thread.
-    std::thread::Builder::new()
-        .name("sr-audio-start".into())
-        .spawn(move || {
-            let st = unsafe { AudioDeviceStart(agg, proc_id) };
-            sh.state.store(
-                if st == 0 {
-                    1
-                } else {
-                    (1 << 32) | u64::from(st as u32)
-                },
-                Relaxed,
-            );
-        })?;
+    // `Drop` joins this thread before stopping or destroying anything it uses (F3).
+    v.starter = Some(
+        std::thread::Builder::new()
+            .name("sr-audio-start".into())
+            .spawn(move || {
+                let st = unsafe { AudioDeviceStart(agg, proc_id) };
+                sh.state.store(
+                    if st == 0 {
+                        1
+                    } else {
+                        (1 << 32) | u64::from(st as u32)
+                    },
+                    Relaxed,
+                );
+            })?,
+    );
     v.handle.flush();
     Ok(v)
 }
