@@ -89,6 +89,7 @@ static OSStatus setConfig(CFArrayRef arr) {
     OSStatus e = D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &a, 0, NULL, sizeof arr, &arr);
     if (e == 0) {
         for (int i = 0; i < 400 && gNotifies == before; i++) usleep(5000);
+        for (int i = 0; i < 400 && nDevices() != 2 * CFArrayGetCount(arr); i++) usleep(10000); // a second pass may place the rest
         usleep(30000);
     }
     return e;
@@ -497,6 +498,44 @@ int main(int argc, char** argv) {
         CHECK(io(V1, stream(V1, kAudioObjectPropertyScopeOutput), 1, kAudioServerPlugInIOOperationWriteMix, 4000, v8) == 0);
         CHECK(io(C1, stream(C1, kAudioObjectPropertyScopeInput), 7, kAudioServerPlugInIOOperationReadInput, 4000, memset(c8, 0xAA, sizeof c8)) == 0 && !memcmp(c8, v8, sizeof c8));
         printf("ok mismatched V/C channel change stays in bounds, then bit-exact at 8 ch\n");
+    }
+
+    // 6c. regression (heap overflow in coreaudiod): with all 16 slots used, swapping one device for a wider one must
+    // not hand the freed slot to the new device in the same pass. Until the removal had time to settle, the old ids
+    // must not exist as the new device, and a 2-channel ReadInput on them must stay inside its buffer.
+    {
+        char u[MAXDEV][16], n[MAXDEV][16]; const char* up[MAXDEV]; const char* np[MAXDEV]; int cc[MAXDEV];
+        for (int i = 0; i < MAXDEV; i++) { snprintf(u[i], 16, "sw:%d", i); snprintf(n[i], 16, "Sw %d", i); up[i] = u[i]; np[i] = n[i]; cc[i] = 2; }
+        CHECK(setConfig(CFArrayCreate(0, NULL, 0, &kCFTypeArrayCallBacks)) == 0);
+        for (int i = 0; i < 400 && nDevices() != 0; i++) usleep(10000);
+        usleep(1500000); // removal pass + any straggler
+        CHECK(setConfig(cfg(MAXDEV, up, np, cc)) == 0);
+        for (int i = 0; i < 400 && !byUID("sw:15"); i++) usleep(10000);
+        AudioObjectID oldV = byUID("sw:15"), oldC = byUID("sw:15.engine");
+        CHECK(nDevices() == 2 * MAXDEV && oldV && oldC);
+        up[15] = "sw:wide"; np[15] = "Wide"; cc[15] = 8;
+        AudioObjectPropertyAddress sa = addr('srcf', kAudioObjectPropertyScopeGlobal);
+        CFArrayRef want = cfg(MAXDEV, up, np, cc);
+        CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &sa, 0, NULL, sizeof want, &want) == 0);
+        enum { G = 4096 };
+        int sawGap = 0;
+        for (int i = 0; i < 400 && !byUID("sw:wide"); i++) {
+            float cb[FR * 2 + G];
+            AudioObjectID ids2[2] = { oldV, oldC };
+            for (int k = 0; k < 2; k++) {
+                for (int j = 0; j < FR * 2 + G; j++) cb[j] = -777.0f;
+                AudioObjectID st = stream(ids2[k], kAudioObjectPropertyScopeInput);
+                if (st) io(ids2[k], st, 7, kAudioServerPlugInIOOperationReadInput, 3000, cb);
+                for (int j = FR * 2; j < FR * 2 + G; j++) CHECK(cb[j] == -777.0f);
+            }
+            if (!byUID("sw:15") && !byUID("sw:wide")) sawGap = 1;
+            usleep(5000);
+        }
+        CHECK(sawGap); // the add came in a later pass than the removal
+        for (int i = 0; i < 400 && !byUID("sw:wide"); i++) usleep(10000);
+        AudioObjectID w = byUID("sw:wide");
+        CHECK(w && nDevices() == 2 * MAXDEV && chans(stream(w, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(byUID("sw:wide.engine"), kAudioObjectPropertyScopeInput)) == 8);
+        printf("ok full-pool swap: freed slot not reused in the same pass, no overrun\n");
     }
 
     // 7. remove all devices.

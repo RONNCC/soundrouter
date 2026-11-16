@@ -52,8 +52,9 @@ pub enum Op {
 /// then the longest-free ones, so the HAL can finish tearing a removed device down before its ids return.
 pub fn diff(slots: &[Option<DriverDevice>], freed: &[u64], want: &[DriverDevice]) -> Vec<Op> {
     let mut ops = vec![];
-    // Slots freed in this pass go last, so an id is not handed to a different device in the same pass.
-    let (mut empty, mut removed) = (vec![], vec![]);
+    // A slot freed in this pass is never handed out in it: the HAL may still use its ids until the
+    // removal was announced and processed, so the adds that did not fit wait for a later pass.
+    let mut empty = vec![];
     let mut kept = vec![false; want.len()];
     for (s, cur) in slots.iter().enumerate() {
         let Some(cur) = cur else {
@@ -63,7 +64,6 @@ pub fn diff(slots: &[Option<DriverDevice>], freed: &[u64], want: &[DriverDevice]
         match want.iter().position(|w| w.uid == cur.uid) {
             None => {
                 ops.push(Op::Remove(s));
-                removed.push(s);
             }
             Some(i) => {
                 kept[i] = true;
@@ -77,7 +77,7 @@ pub fn diff(slots: &[Option<DriverDevice>], freed: &[u64], want: &[DriverDevice]
         }
     }
     empty.sort_by_key(|&s| freed[s]); // stable: ties keep slot order
-    let mut free = empty.into_iter().chain(removed);
+    let mut free = empty.into_iter();
     for w in want
         .iter()
         .zip(&kept)
@@ -173,8 +173,37 @@ mod tests {
                 Op::Rename(3, "C2".into()),
                 Op::Channels(3, 16),
                 Op::Add(2, d("n", "N", 4)),
-                Op::Add(1, d("m", "M", 1)),
             ]
+        );
+        // "m" did not fit: slot 1 was freed in that pass, so it is only handed out in the next one.
+        let next = vec![
+            Some(d("a", "A", 2)),
+            None,
+            Some(d("n", "N", 4)),
+            Some(d("c", "C2", 16)),
+        ];
+        assert_eq!(
+            diff(&next, &[0, 1, 0, 0], &want),
+            vec![Op::Add(1, d("m", "M", 1))]
+        );
+    }
+
+    #[test]
+    fn full_pool_swap_never_changes_a_live_slot_in_place() {
+        // 16 devices, one swapped for a wider one: pass 1 only removes; the add comes in pass 2.
+        let mut slots: Vec<_> = (0..MAX_DEVICES)
+            .map(|i| Some(d(&format!("u{i}"), "n", 2)))
+            .collect();
+        let mut want: Vec<_> = slots.iter().flatten().cloned().collect();
+        want[15] = d("wide", "w", 8);
+        let ops = diff(&slots, &[0; MAX_DEVICES], &want);
+        assert_eq!(ops, vec![Op::Remove(15)]);
+        slots[15] = None;
+        let mut freed = [0; MAX_DEVICES];
+        freed[15] = 1;
+        assert_eq!(
+            diff(&slots, &freed, &want),
+            vec![Op::Add(15, d("wide", "w", 8))]
         );
     }
 
@@ -219,21 +248,33 @@ mod tests {
                 let before = slots.clone();
                 let freed_before = freed.clone();
                 let (mut removed, mut added) = (HashSet::new(), vec![]);
-                for op in diff(&slots, &freed, &want) {
-                    match op {
-                        Op::Remove(s) => {
-                            prop_assert!(slots[s].take().is_some(), "remove of empty slot {s}");
-                            epoch += 1;
-                            freed[s] = epoch;
-                            removed.insert(s);
+                // Pass 1, then (like `reconcile`) a second pass when some wanted devices did not fit.
+                for pass in 0..2 {
+                    let ops = diff(&slots, &freed, &want);
+                    if pass == 1 {
+                        prop_assert!(ops.iter().all(|o| matches!(o, Op::Add(..))), "second pass must only add");
+                    }
+                    for op in ops {
+                        match op {
+                            Op::Remove(s) => {
+                                prop_assert!(slots[s].take().is_some(), "remove of empty slot {s}");
+                                epoch += 1;
+                                freed[s] = epoch;
+                                removed.insert(s);
+                            }
+                            Op::Rename(s, n) => slots[s].as_mut().unwrap().name = n,
+                            Op::Channels(s, c) => slots[s].as_mut().unwrap().channels = c,
+                            Op::Add(s, dev) => {
+                                prop_assert!(slots[s].is_none(), "add into occupied slot {s}");
+                                slots[s] = Some(dev);
+                                if pass == 0 {
+                                    added.push(s);
+                                }
+                            }
                         }
-                        Op::Rename(s, n) => slots[s].as_mut().unwrap().name = n,
-                        Op::Channels(s, c) => slots[s].as_mut().unwrap().channels = c,
-                        Op::Add(s, dev) => {
-                            prop_assert!(slots[s].is_none(), "add into occupied slot {s}");
-                            slots[s] = Some(dev);
-                            added.push(s);
-                        }
+                    }
+                    if slots.iter().flatten().count() == want.len() {
+                        break;
                     }
                 }
                 // The pool now holds exactly the wanted devices, uids unique, never more than MAX_DEVICES.
@@ -251,16 +292,12 @@ mod tests {
                         prop_assert_eq!(slots[s].as_ref().map(|x| &x.uid), Some(&b.uid));
                     }
                 }
-                // Adds take the longest-free empty slots first; a slot removed in this very pass only
-                // comes back when every slot that was already empty is used up.
+                // Adds take the longest-free empty slots first and never a slot removed in this pass.
                 let empty: Vec<_> = (0..MAX_DEVICES).filter(|&s| before[s].is_none()).collect();
                 for &a in &added {
-                    if removed.contains(&a) {
-                        prop_assert!(empty.iter().all(|e| added.contains(e)), "slot {a} reused with free slots left");
-                    } else {
-                        for &e in empty.iter().filter(|&&e| freed_before[e] < freed_before[a]) {
-                            prop_assert!(added.contains(&e), "slot {a} taken before older-free slot {e}");
-                        }
+                    prop_assert!(!removed.contains(&a), "slot {a} removed and re-added in one pass");
+                    for &e in empty.iter().filter(|&&e| freed_before[e] < freed_before[a]) {
+                        prop_assert!(added.contains(&e), "slot {a} taken before older-free slot {e}");
                     }
                 }
             }

@@ -138,6 +138,22 @@ impl Slot {
         self.channels[0].load(Acquire) == self.channels[1].load(Acquire)
             && self.rate_idx[0].load(Acquire) == self.rate_idx[1].load(Acquire)
     }
+    /// Format changes that bring a pair with mismatched sides back in sync: channels follow the wanted
+    /// count, the rate follows V. Only sides that differ are listed.
+    pub fn lagging(&self, want_channels: Option<u16>) -> Vec<(Side, Change)> {
+        let mut out = vec![];
+        let target = want_channels.map_or(self.channels(Side::Visible), u32::from);
+        for side in [Side::Visible, Side::Engine] {
+            if self.channels(side) != target {
+                out.push((side, Change::Channels(target as u16)));
+            }
+        }
+        let rate = self.rate_idx[0].load(Acquire) as usize;
+        if self.rate_idx[1].load(Acquire) as usize != rate {
+            out.push((Side::Engine, Change::Rate(rate)));
+        }
+        out
+    }
     /// Mark this slot as just freed; `diff` hands out the longest-free slots first.
     pub fn mark_freed(&self) {
         self.freed_epoch
@@ -328,6 +344,28 @@ mod tests {
         let mut o = vec![0.0; 4096];
         ring.read(1, now - 8192, &mut o);
         assert!(o.iter().all(|&x| x == 1.0));
+    }
+
+    #[test]
+    fn lagging_side_is_asked_again() {
+        let s = Slot::new();
+        assert!(s.lagging(Some(2)).is_empty());
+        s.channels[0].store(8, Release); // V landed, C did not
+        assert_eq!(
+            s.lagging(Some(8)),
+            vec![(Side::Engine, Change::Channels(8))]
+        );
+        s.channels[1].store(8, Release);
+        s.rate_idx[0].store(2, Release); // rate landed on V only
+        assert_eq!(s.lagging(Some(8)), vec![(Side::Engine, Change::Rate(2))]);
+        s.channels[0].store(2, Release); // V lags the wanted count instead
+        assert_eq!(
+            s.lagging(Some(8)),
+            vec![
+                (Side::Visible, Change::Channels(8)),
+                (Side::Engine, Change::Rate(2))
+            ]
+        );
     }
 
     #[test]

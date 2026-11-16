@@ -5,7 +5,7 @@ use crate::props::*;
 use crate::state::*;
 use coreaudio_sys::*;
 use objc2_core_foundation::{CFRetained, CFString, CFType};
-use sr_core::driver_proto::{DriverDevice, STORAGE_KEY};
+use sr_core::driver_proto::{DriverDevice, MAX_DEVICES, STORAGE_KEY};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::NonNull;
@@ -24,14 +24,27 @@ pub fn default_devices() -> Vec<DriverDevice> {
     }]
 }
 
-/// Make the slots match `WANTED`. With `announce` the host is told (worker threads only);
-/// without it (Initialize) devices are simply there when the host first looks.
-fn reconcile(announce: bool) {
+/// How long the HAL gets to tear removed devices down before their slots are handed out again.
+const TEARDOWN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Make the slots match `WANTED`, in up to two passes: a slot freed in a pass is not reused in it, so
+/// when wanted devices are left over, the removals are announced, `settle` runs (the HAL tears the
+/// old devices down) and a second pass places the rest.
+fn reconcile(announce: bool, settle: impl FnOnce()) {
+    if pass(announce) && announce {
+        settle();
+        pass(true);
+    }
+}
+
+/// One pass. Returns true when wanted devices are still without a slot.
+fn pass(announce: bool) -> bool {
     let _g = apply_lock();
     let want = wanted().clone();
     let cur: Vec<_> = SLOTS.iter().map(Slot::snapshot).collect();
     let freed: Vec<_> = SLOTS.iter().map(|s| s.freed_epoch.load(Acquire)).collect();
     let mut list_changed = false;
+    let mut changing = [false; MAX_DEVICES];
     for op in diff(&cur, &freed, &want) {
         match op {
             Op::Remove(s) => {
@@ -49,6 +62,7 @@ fn reconcile(announce: bool) {
             }
             // The HAL applies a change per device, so both must be asked; until both land, I/O is silent.
             Op::Channels(s, n) if announce => {
+                changing[s] = true;
                 for side in [Side::Visible, Side::Engine] {
                     request_change(encode(s, side, Part::Device), &Change::Channels(n));
                 }
@@ -73,6 +87,20 @@ fn reconcile(announce: bool) {
             ],
         );
     }
+    if announce {
+        // A change the HAL applied to one side only leaves the pair silent for good: ask the laggard again.
+        for (s, slot) in SLOTS.iter().enumerate() {
+            let Some(d) = slot.snapshot().filter(|_| !changing[s]) else {
+                continue;
+            };
+            let want_ch = want.iter().find(|w| w.uid == d.uid).map(|w| w.channels);
+            for (side, c) in slot.lagging(want_ch) {
+                request_change(encode(s, side, Part::Device), &c);
+            }
+        }
+    }
+    let have: Vec<_> = SLOTS.iter().filter_map(Slot::snapshot).collect();
+    want.iter().any(|w| have.iter().all(|h| h.uid != w.uid))
 }
 
 unsafe fn store(list: &[DriverDevice]) {
@@ -113,7 +141,7 @@ pub unsafe extern "C" fn initialize(
         }
     };
     *wanted() = list;
-    reconcile(false);
+    reconcile(false, || {});
     0
 }
 
@@ -355,6 +383,6 @@ fn set_devices(sz: u32, data: *const c_void) -> OSStatus {
     }
     let _ = std::thread::Builder::new()
         .name("sr-reconcile".into())
-        .spawn(|| reconcile(true));
+        .spawn(|| reconcile(true, || std::thread::sleep(TEARDOWN)));
     0
 }
