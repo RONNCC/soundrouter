@@ -19,6 +19,8 @@ static AudioServerPlugInDriverRef gDrv;
 
 static struct { AudioObjectID o; UInt32 s; } gNL[256]; // every PropertiesChanged the driver sent since the last reset
 static volatile int gNLn;
+static volatile int gProbe, gGap; // 6c: while gProbe, a PLUGIN DeviceList notification runs gapProbe on the notifying (worker) thread
+static void gapProbe(void);
 
 static OSStatus PropsChanged(AudioServerPlugInHostRef h, AudioObjectID o, UInt32 n, const AudioObjectPropertyAddress* a) {
     for (UInt32 i = 0; i < n; i++) {
@@ -26,6 +28,7 @@ static OSStatus PropsChanged(AudioServerPlugInHostRef h, AudioObjectID o, UInt32
         printf("  host.PropertiesChanged obj=%u sel='%.4s'\n", o, (char*)&s);
         int k = __atomic_fetch_add(&gNLn, 1, __ATOMIC_SEQ_CST);
         if (k < 256) { gNL[k].o = o; gNL[k].s = a[i].mSelector; }
+        if (gProbe && o == kAudioObjectPlugInObject && a[i].mSelector == kAudioPlugInPropertyDeviceList) gapProbe();
     }
     __atomic_add_fetch(&gNotifies, 1, __ATOMIC_SEQ_CST);
     return 0;
@@ -158,6 +161,26 @@ static OSStatus io(AudioObjectID d, AudioObjectID st, UInt32 client, int op, dou
     return D->DoIOOperation(gDrv, d, st, client, op, FR, &gCi, buf, NULL);
 }
 static void fill(float* b, int ch, float base) { for (int i = 0; i < FR * ch; i++) b[i] = base + (float)i; }
+
+// 6c: 2-channel ReadInput on the ids of a removed slot (as a HAL that has not torn them down yet would do).
+// Returns 1 when the guard words behind the 2-channel region stayed untouched.
+enum { GUARD = 4096 };
+_Static_assert(FR * 8 <= FR * 2 + GUARD, "a legal 8-channel read must fit the buffer");
+static AudioObjectID gStaleDev[2], gStaleSt[2];
+static int staleReadClean(int k) {
+    float cb[FR * 2 + GUARD];
+    for (int j = 0; j < FR * 2 + GUARD; j++) cb[j] = -777.0f;
+    io(gStaleDev[k], gStaleSt[k], 7, kAudioServerPlugInIOOperationReadInput, 3000, cb);
+    for (int j = FR * 2; j < FR * 2 + GUARD; j++) if (cb[j] != -777.0f) return 0;
+    return 1;
+}
+static void gapProbe(void) {
+    // The worker's first pass just announced the removal and has not run its second pass: the slot is dead,
+    // so the stale ids must be refused and silent. Deterministic: no polling, no dependence on scheduling.
+    if (byUID("sw:15") || byUID("sw:wide")) return;
+    CHECK(staleReadClean(0) && staleReadClean(1));
+    gGap = 1;
+}
 
 int main(int argc, char** argv) {
     CHECK(argc > 1);
@@ -513,28 +536,30 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 400 && !byUID("sw:15"); i++) usleep(10000);
         AudioObjectID oldV = byUID("sw:15"), oldC = byUID("sw:15.engine");
         CHECK(nDevices() == 2 * MAXDEV && oldV && oldC);
+        gStaleDev[0] = oldV; gStaleDev[1] = oldC;
+        gStaleSt[0] = stream(oldV, kAudioObjectPropertyScopeInput); gStaleSt[1] = stream(oldC, kAudioObjectPropertyScopeInput);
+        CHECK(gStaleSt[0] && gStaleSt[1]);
         up[15] = "sw:wide"; np[15] = "Wide"; cc[15] = 8;
         AudioObjectPropertyAddress sa = addr('srcf', kAudioObjectPropertyScopeGlobal);
         CFArrayRef want = cfg(MAXDEV, up, np, cc);
+        gProbe = 1; // gapProbe runs on the worker when it announces the removal: that is where the gap is observed
         CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &sa, 0, NULL, sizeof want, &want) == 0);
-        enum { G = 4096 };
-        int sawGap = 0;
+        // Poll the stale ids while the old 2-channel device lives, through the gap, up to the re-creation. Once the freed
+        // slot is legitimately re-created as the 8-channel sw:wide, a 2-channel read on its old ids writes 8 channels:
+        // that is this test's own misuse, and it can start between the loop condition and the read. sw:wide never goes
+        // away again, so "absent after the read" proves it was absent during it; only then must the guard words be intact.
         for (int i = 0; i < 400 && !byUID("sw:wide"); i++) {
-            float cb[FR * 2 + G];
-            AudioObjectID ids2[2] = { oldV, oldC };
             for (int k = 0; k < 2; k++) {
-                for (int j = 0; j < FR * 2 + G; j++) cb[j] = -777.0f;
-                AudioObjectID st = stream(ids2[k], kAudioObjectPropertyScopeInput);
-                if (st) io(ids2[k], st, 7, kAudioServerPlugInIOOperationReadInput, 3000, cb);
-                for (int j = FR * 2; j < FR * 2 + G; j++) CHECK(cb[j] == -777.0f);
+                int clean = staleReadClean(k);
+                if (!byUID("sw:wide")) CHECK(clean);
             }
-            if (!byUID("sw:15") && !byUID("sw:wide")) sawGap = 1;
             usleep(5000);
         }
-        CHECK(sawGap); // the add came in a later pass than the removal
+        CHECK(gGap); // the add came in a later pass than the removal
         for (int i = 0; i < 400 && !byUID("sw:wide"); i++) usleep(10000);
         AudioObjectID w = byUID("sw:wide");
         CHECK(w && nDevices() == 2 * MAXDEV && chans(stream(w, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(byUID("sw:wide.engine"), kAudioObjectPropertyScopeInput)) == 8);
+        gProbe = 0;
         printf("ok full-pool swap: freed slot not reused in the same pass, no overrun\n");
     }
 
