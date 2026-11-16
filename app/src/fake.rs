@@ -1,8 +1,23 @@
 //! In-app backend for `--demo`: synthetic meters, fake apps and hardware.
 use crate::model::{Edit, apply, default_config};
-use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading};
+use sr_core::backend::{
+    AppInfo, Backend, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
+};
 use sr_core::config::{Config, SourceKind};
 use std::time::Instant;
+
+/// Driver version the fake reports; the GUI treats it as "no real driver to test or uninstall".
+pub const DEMO_DRIVER: &str = "demo";
+
+/// Healthy engine: driver present, every permission granted, nothing running.
+pub fn demo_status() -> EngineStatus {
+    EngineStatus {
+        tcc: TccStatus::Granted,
+        mic: TccStatus::Granted,
+        driver_version: Some(DEMO_DRIVER.into()),
+        ..EngineStatus::default()
+    }
+}
 
 pub struct FakeBackend {
     cfg: Config,
@@ -11,6 +26,8 @@ pub struct FakeBackend {
     frozen: Option<f32>,
     /// What `status()` reports; tests drive the GUI through each engine state with it.
     pub status: EngineStatus,
+    /// What `self_test` returns; `None` makes it fail.
+    pub self_test: Option<SelfTest>,
 }
 
 impl FakeBackend {
@@ -19,7 +36,13 @@ impl FakeBackend {
             cfg: Config::default(),
             start: Instant::now(),
             frozen: None,
-            status: EngineStatus::default(),
+            status: demo_status(),
+            self_test: Some(SelfTest {
+                rms_dbfs: -6.0,
+                dropouts: 0,
+                rate: 48_000.0,
+                passed: true,
+            }),
         }
     }
 
@@ -75,6 +98,12 @@ impl Backend for FakeBackend {
 
     fn status(&self) -> EngineStatus {
         self.status.clone()
+    }
+
+    fn self_test(&mut self, _id: &str) -> anyhow::Result<SelfTest> {
+        self.self_test
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no audio came back"))
     }
 
     fn meters(&self, device_id: &str) -> Option<MeterReading> {

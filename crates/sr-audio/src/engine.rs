@@ -21,7 +21,7 @@ use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSNumber, NSString};
 use sr_core::backend::{
-    AppInfo, Backend, DeviceState, EngineStatus, HwDevice, MeterReading, TccStatus,
+    AppInfo, Backend, DeviceState, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
 };
 use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice};
 use sr_core::driver_proto::{COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, companion_uid};
@@ -467,6 +467,15 @@ impl Backend for Engine {
             crate::tcc::CaptureStatus::Denied => TccStatus::Denied,
             crate::tcc::CaptureStatus::Unknown(_) => TccStatus::Unknown,
         };
+        let mic = match crate::tcc::microphone_status() {
+            crate::tcc::CaptureStatus::Granted => TccStatus::Granted,
+            crate::tcc::CaptureStatus::Denied => TccStatus::Denied,
+            // -1: private API missing, so we cannot tell; do not let onboarding wait on it forever.
+            crate::tcc::CaptureStatus::Unknown(-1) => TccStatus::Granted,
+            crate::tcc::CaptureStatus::Unknown(_) => TccStatus::Unknown,
+        };
+        let driver_version =
+            driver::find_plugin().map(|p| driver::version(p).unwrap_or_else(|| "?".into()));
         let mut per_device: Vec<(String, DeviceState)> = lock(&self.inner)
             .vdevs
             .iter()
@@ -478,7 +487,19 @@ impl Backend for Engine {
             warnings: self.warnings(),
             background_error: self.background_error(),
             tcc,
+            mic,
+            driver_version,
         }
+    }
+
+    fn self_test(&mut self, id: &str) -> Result<SelfTest> {
+        let r = crate::loopback::loopback_test(&format!("{DEVICE_UID_PREFIX}{id}"), 2)?;
+        Ok(SelfTest {
+            rms_dbfs: r.rms_dbfs,
+            dropouts: r.dropouts,
+            rate: r.rate,
+            passed: r.passed(),
+        })
     }
 
     fn meters(&self, device_id: &str) -> Option<MeterReading> {

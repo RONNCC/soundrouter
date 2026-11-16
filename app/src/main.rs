@@ -6,6 +6,7 @@ mod layout;
 mod logging;
 mod meter;
 mod model;
+mod setup;
 mod store;
 mod theme;
 mod widgets;

@@ -17,6 +17,15 @@ unsafe extern "C" {
 }
 
 pub fn audio_capture_status() -> CaptureStatus {
+    preflight("kTCCServiceAudioCapture")
+}
+
+/// Microphone permission, without prompting.
+pub fn microphone_status() -> CaptureStatus {
+    preflight("kTCCServiceMicrophone")
+}
+
+fn preflight(service: &str) -> CaptureStatus {
     const RTLD_NOW: c_int = 2;
     unsafe {
         let h = dlopen(
@@ -32,7 +41,7 @@ pub fn audio_capture_status() -> CaptureStatus {
         }
         let f: unsafe extern "C" fn(*const NSString, *const c_void) -> c_int =
             std::mem::transmute(f);
-        let svc = NSString::from_str("kTCCServiceAudioCapture");
+        let svc = NSString::from_str(service);
         match f(&*svc, std::ptr::null()) {
             0 => CaptureStatus::Granted,
             1 => CaptureStatus::Denied,
