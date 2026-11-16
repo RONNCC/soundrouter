@@ -343,7 +343,7 @@ impl App {
                     .or_else(|| self.worker.shared.lock().unwrap().apply_error.clone());
                 let (msg, color) = match status {
                     Some(m) if m.contains("driver not installed") => (
-                        "Driver not installed. Run `sudo packaging/install-driver-dev.sh`, then relaunch.".to_string(),
+                        "Driver not installed. Run `packaging/driver-dev.sh install`, then relaunch.".to_string(),
                         t.danger,
                     ),
                     Some(m) => (m, t.danger),
