@@ -296,4 +296,95 @@ mod tests {
         assert_eq!(ts(c), 10.0 * RING_FRAMES as f64);
         assert_eq!(ts(v), 21.0 * RING_FRAMES as f64);
     }
+
+    #[test]
+    fn zero_timestamp_is_the_latest_period_boundary_not_after_now() {
+        let (v, _) = activate(12, 2);
+        let per = ticks_per_second() / 48_000.0 * RING_FRAMES as f64;
+        let anchor = now_ticks() - (2.5 * per) as u64;
+        SLOTS[12].anchor.store(anchor, Release);
+        let (mut t, mut h, mut s) = (0.0, 0, 0);
+        let before = now_ticks(); // slack below: the thread may be preempted between reads
+        assert_eq!(
+            unsafe { zero_ts(std::ptr::null_mut(), v, 0, &mut t, &mut h, &mut s) },
+            0
+        );
+        let after = now_ticks();
+        assert_eq!(t, 2.0 * RING_FRAMES as f64);
+        assert!(h <= after, "timestamp is not in the future");
+        assert!(
+            before - h <= per as u64 + 1,
+            "timestamp is the latest boundary"
+        );
+        assert!(s >= 1, "seed is never 0");
+    }
+
+    #[test]
+    fn will_do_only_read_input_and_write_mix_in_place() {
+        let (v, _) = activate(11, 2);
+        for (op, expect) in [
+            (kAudioServerPlugInIOOperationThread, 0),
+            (kAudioServerPlugInIOOperationCycle, 0),
+            (kAudioServerPlugInIOOperationConvertInput, 0),
+            (kAudioServerPlugInIOOperationProcessInput, 0),
+            (kAudioServerPlugInIOOperationReadInput, 1),
+            (kAudioServerPlugInIOOperationProcessOutput, 0),
+            (kAudioServerPlugInIOOperationMixOutput, 0),
+            (kAudioServerPlugInIOOperationProcessMix, 0),
+            (kAudioServerPlugInIOOperationConvertMix, 0),
+            (kAudioServerPlugInIOOperationWriteMix, 1),
+        ] {
+            let (mut will, mut in_place) = (9, 9);
+            let st = unsafe { will_do(std::ptr::null_mut(), v, 0, op, &mut will, &mut in_place) };
+            assert_eq!((st, will, in_place), (0, expect, 1), "op {op}");
+            // Ops the driver declined must not touch the buffer even if the host calls anyway.
+            if expect == 0 {
+                let mut buf = vec![];
+                assert_eq!(run(v, op, 0.0, &mut buf, FRAMES * 2), 0);
+                assert!(buf[..FRAMES * 2].iter().all(|&x| x == SENTINEL), "op {op}");
+            }
+        }
+    }
+
+    #[test]
+    fn many_readers_share_a_wrapped_ring_without_consuming() {
+        let (v, c) = activate(10, 2);
+        let cap = 2.0 * RING_FRAMES as f64;
+        let block = |k: usize| -> Vec<f32> {
+            (0..FRAMES * 2)
+                .map(|i| (k * 1000 + i) as f32 + 1.0)
+                .collect()
+        };
+        // Four consecutive blocks around the physical wrap point at `cap`.
+        let start = cap - 2.0 * FRAMES as f64;
+        let mut out = vec![];
+        for k in 0..4 {
+            out.clear();
+            out.extend(block(k));
+            let t = start + (k * FRAMES) as f64;
+            assert_eq!(run(v, WRITE, t, &mut out, FRAMES * 2), 0);
+        }
+        // 64 frames starting mid-block-1: second half of block 1, first half of block 2.
+        let t = cap - FRAMES as f64 / 2.0;
+        let want: Vec<f32> = block(1)[FRAMES..]
+            .iter()
+            .chain(&block(2)[..FRAMES])
+            .copied()
+            .collect();
+        let mut buf = vec![];
+        for reader in 0..4 {
+            assert_eq!(run(c, READ, t, &mut buf, FRAMES * 2), 0, "reader {reader}");
+            assert_eq!(
+                &buf[..FRAMES * 2],
+                &want[..],
+                "reader {reader} saw different data"
+            );
+        }
+        // An earlier block is still readable after the others have read (nothing was consumed).
+        run(c, READ, start, &mut buf, FRAMES * 2);
+        assert_eq!(&buf[..FRAMES * 2], &block(0)[..]);
+        // V's own input is the other ring and stays silent.
+        run(v, READ, t, &mut buf, FRAMES * 2);
+        assert!(buf[..FRAMES * 2].iter().all(|&x| x == 0.0));
+    }
 }

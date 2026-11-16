@@ -188,4 +188,82 @@ mod tests {
         );
         assert_eq!(diff(&cur, &[0; 2], &[]), vec![Op::Remove(0)]);
     }
+
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    /// A requested list as `validate` would pass it: unique uids, at most MAX_DEVICES, small alphabets so
+    /// consecutive lists overlap (keeps, renames, channel changes, removals and adds all occur).
+    fn want_list() -> impl Strategy<Value = Vec<DriverDevice>> {
+        prop::collection::vec((0..24u8, 0..3u8, 1..=3u16), 0..=MAX_DEVICES + 4).prop_map(|v| {
+            let mut seen = HashSet::new();
+            let list = v
+                .into_iter()
+                .filter(|&(u, ..)| seen.insert(u))
+                .take(MAX_DEVICES)
+                .map(|(u, n, c)| d(&format!("u{u}"), &format!("name{n}"), c))
+                .collect();
+            validate(list).unwrap()
+        })
+    }
+
+    proptest! {
+        /// Replays `diff` the way `reconcile` does (ops in order, removals stamp a rising epoch) over any
+        /// sequence of lists and checks the pool after every step.
+        #[test]
+        fn diff_keeps_the_slot_pool_consistent(steps in prop::collection::vec(want_list(), 1..30)) {
+            let mut slots: Vec<Option<DriverDevice>> = vec![None; MAX_DEVICES];
+            let mut freed = vec![0u64; MAX_DEVICES];
+            let mut epoch = 0;
+            for want in steps {
+                let before = slots.clone();
+                let freed_before = freed.clone();
+                let (mut removed, mut added) = (HashSet::new(), vec![]);
+                for op in diff(&slots, &freed, &want) {
+                    match op {
+                        Op::Remove(s) => {
+                            prop_assert!(slots[s].take().is_some(), "remove of empty slot {s}");
+                            epoch += 1;
+                            freed[s] = epoch;
+                            removed.insert(s);
+                        }
+                        Op::Rename(s, n) => slots[s].as_mut().unwrap().name = n,
+                        Op::Channels(s, c) => slots[s].as_mut().unwrap().channels = c,
+                        Op::Add(s, dev) => {
+                            prop_assert!(slots[s].is_none(), "add into occupied slot {s}");
+                            slots[s] = Some(dev);
+                            added.push(s);
+                        }
+                    }
+                }
+                // The pool now holds exactly the wanted devices, uids unique, never more than MAX_DEVICES.
+                let mut have: Vec<_> = slots.iter().flatten().cloned().collect();
+                prop_assert!(have.len() <= MAX_DEVICES);
+                let uids: HashSet<_> = have.iter().map(|x| x.uid.clone()).collect();
+                prop_assert_eq!(uids.len(), have.len(), "duplicate uid in pool");
+                let mut want_sorted = want.clone();
+                have.sort_by(|a, b| a.uid.cmp(&b.uid));
+                want_sorted.sort_by(|a, b| a.uid.cmp(&b.uid));
+                prop_assert_eq!(have, want_sorted);
+                // Devices that stay keep their slot (their object ids must not change).
+                for (s, b) in before.iter().enumerate() {
+                    if let Some(b) = b.as_ref().filter(|b| want.iter().any(|w| w.uid == b.uid)) {
+                        prop_assert_eq!(slots[s].as_ref().map(|x| &x.uid), Some(&b.uid));
+                    }
+                }
+                // Adds take the longest-free empty slots first; a slot removed in this very pass only
+                // comes back when every slot that was already empty is used up.
+                let empty: Vec<_> = (0..MAX_DEVICES).filter(|&s| before[s].is_none()).collect();
+                for &a in &added {
+                    if removed.contains(&a) {
+                        prop_assert!(empty.iter().all(|e| added.contains(e)), "slot {a} reused with free slots left");
+                    } else {
+                        for &e in empty.iter().filter(|&&e| freed_before[e] < freed_before[a]) {
+                            prop_assert!(added.contains(&e), "slot {a} taken before older-free slot {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

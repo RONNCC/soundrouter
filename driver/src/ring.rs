@@ -177,4 +177,36 @@ mod tests {
         r.read(3, 0, &mut o);
         assert!(o.iter().all(|&x| x == 0.0));
     }
+
+    /// After several wraps, every frame a read returns is either silence or exactly what was written
+    /// for that sample time (never newer data aliased onto the same ring slot), and the most recent
+    /// half ring is always intact.
+    #[test]
+    fn stale_reads_after_wraps_are_silent_never_aliased() {
+        const CAP: i64 = 64;
+        let val = |t: i64, c: usize| (t + 1) as f32 * 10.0 + c as f32;
+        let r = Ring::new(CAP as usize, 2);
+        let end = 3 * CAP + 24; // three and a bit wraps, in blocks of 8
+        for t in (0..end).step_by(8) {
+            let w: Vec<f32> = (0..8)
+                .flat_map(|i| [val(t + i, 0), val(t + i, 1)])
+                .collect();
+            r.write(2, t, &w);
+        }
+        for t in -10..end + 10 {
+            for n in [1usize, 5, 16, 40] {
+                let mut o = vec![-1.0; n * 2];
+                r.read(2, t, &mut o);
+                for i in 0..n as i64 {
+                    let fr = &o[i as usize * 2..][..2];
+                    let ts = t + i;
+                    if (end - CAP / 2..end).contains(&ts) {
+                        assert_eq!(fr, [val(ts, 0), val(ts, 1)], "t={t} frame {ts}");
+                    } else {
+                        assert_eq!(fr, [0.0, 0.0], "t={t} frame {ts} is outside the window");
+                    }
+                }
+            }
+        }
+    }
 }
