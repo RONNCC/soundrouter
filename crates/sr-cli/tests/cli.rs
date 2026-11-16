@@ -1,0 +1,170 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+use std::io::Write;
+
+fn cli() -> Command {
+    Command::cargo_bin("sr-cli").unwrap()
+}
+
+fn file(content: &str) -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(content.as_bytes()).unwrap();
+    f
+}
+
+fn driver_installed() -> bool {
+    cli().arg("doctor").output().unwrap().status.success()
+}
+
+const GOOD_DEV: &str = r#"{"id":"v1","name":"V","enabled":true,"channels":2,"volume_db":0.0,
+ "muted":false,"sources":[],"wires":[],"monitors":[]}"#;
+
+#[test]
+fn help_exits_0() {
+    cli()
+        .arg("--help")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("doctor"));
+}
+
+#[test]
+fn unknown_subcommand_exits_2() {
+    cli().arg("frobnicate").assert().code(2);
+}
+
+#[test]
+fn missing_arg_exits_2() {
+    cli()
+        .arg("run")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("CONFIG"));
+    cli().arg("meter").assert().code(2);
+}
+
+#[test]
+fn run_missing_config_file_exits_1() {
+    cli()
+        .args(["run", "/nonexistent/sr-config.json"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "reading /nonexistent/sr-config.json",
+        ));
+}
+
+#[test]
+fn run_bad_json_exits_1() {
+    let f = file("{not json");
+    cli()
+        .arg("run")
+        .arg(f.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("parsing config"));
+}
+
+#[test]
+fn run_invalid_config_surfaces_validate_error() {
+    let f = file(&format!(
+        r#"{{"version":1,"devices":[{},{}]}}"#,
+        GOOD_DEV, GOOD_DEV
+    ));
+    cli()
+        .arg("run")
+        .arg(f.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "invalid config: duplicate device id 'v1'",
+        ));
+}
+
+#[test]
+fn driver_set_bad_json_exits_1() {
+    let f = file("[{\"uid\":");
+    cli()
+        .args(["driver", "set"])
+        .arg(f.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("parsing device list"));
+}
+
+#[test]
+fn driver_set_missing_file_exits_1() {
+    cli()
+        .args(["driver", "set", "/nonexistent/devs.json"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("reading /nonexistent/devs.json"));
+}
+
+#[test]
+fn meter_unknown_device_is_clear_error() {
+    cli()
+        .args(["meter", "zz-nope"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("cannot meter 'zz-nope'"))
+        .stderr(predicate::str::contains("no device with uid"));
+}
+
+#[test]
+fn doctor_exit_code_matches_driver_presence() {
+    let out = cli().arg("doctor").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.contains("NOT FOUND") {
+        assert_eq!(out.status.code(), Some(1));
+        assert!(stdout.contains("driver-dev.sh install") && stdout.contains(".pkg"));
+    } else {
+        assert!(stdout.contains("driver plug-in:  found"));
+    }
+}
+
+#[test]
+fn run_without_driver_says_not_installed() {
+    if driver_installed() {
+        return; // driver present: this scenario cannot occur on this machine
+    }
+    let f = file(&format!(r#"{{"version":1,"devices":[{GOOD_DEV}]}}"#));
+    cli()
+        .arg("run")
+        .arg(f.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("driver not installed"));
+}
+
+/// Needs the driver installed, BlackHole16ch, and SR_MAIN_UID_OVERRIDE support in sr-audio's
+/// engine. Set BLACKHOLE_UID to BlackHole16ch's uid from `sr-cli list`.
+#[test]
+#[ignore = "needs driver + BlackHole16ch + engine SR_MAIN_UID_OVERRIDE hook"]
+fn run_exits_0_on_sigint() {
+    let uid = std::env::var("BLACKHOLE_UID").expect("set BLACKHOLE_UID");
+    let cfg = format!(
+        r#"{{"version":1,"devices":[{{"id":"v1","name":"V","enabled":true,"channels":2,"volume_db":0.0,
+ "muted":false,"sources":[{{"id":"s","kind":{{"type":"device","uid":"{uid}"}},"channels":2,"volume_db":0.0,"muted":false}}],
+ "wires":[{{"source":"s","src_ch":0,"out_ch":0}}],"monitors":[]}}]}}"#
+    );
+    let f = file(&cfg);
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("sr-cli"))
+        .arg("run")
+        .arg(f.path())
+        .env("SR_MAIN_UID_OVERRIDE", &uid)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Wait for the "running" banner so the SIGINT handler is installed.
+    let mut line = String::new();
+    let mut r = std::io::BufReader::new(child.stdout.take().unwrap());
+    std::io::BufRead::read_line(&mut r, &mut line).unwrap();
+    assert!(line.starts_with("running"), "got: {line}");
+    let st = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+}

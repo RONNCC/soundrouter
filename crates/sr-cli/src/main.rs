@@ -112,7 +112,10 @@ fn main() -> Result<()> {
         Cmd::Run { config } => run(&config),
         Cmd::Meter { device_id } => {
             install_ctrlc()?;
-            let p = loopback::Probe::start(&full_uid(&device_id), false)?;
+            let uid = full_uid(&device_id);
+            let p = loopback::Probe::start(&uid, false).with_context(|| {
+                format!("cannot meter '{device_id}' (uid {uid}); run `sr-cli list` or `sr-cli driver get` for valid ids")
+            })?;
             while !STOP.load(Relaxed) {
                 std::thread::sleep(Duration::from_millis(250));
                 let peaks = p.stats.take_peaks(p.in_channels);
@@ -203,6 +206,7 @@ fn run(path: &PathBuf) -> Result<()> {
 }
 
 fn doctor() -> Result<()> {
+    let mut healthy = true;
     let ver = sr_audio::os_version();
     println!("macOS:           {ver}");
     match driver::find_plugin() {
@@ -223,13 +227,22 @@ fn doctor() -> Result<()> {
                         );
                     }
                 }
-                Err(e) => println!("driver devices:  error: {e:#}"),
+                Err(e) => {
+                    healthy = false;
+                    println!("driver devices:  error: {e:#}")
+                }
             }
         }
-        None => println!(
-            "driver plug-in:  NOT FOUND ({PLUGIN_BUNDLE_ID}); install: sudo cp -R target/SoundRouter.driver /Library/Audio/Plug-Ins/HAL/ && sudo killall coreaudiod"
-        ),
+        None => {
+            healthy = false;
+            println!(
+                "driver plug-in:  NOT FOUND ({PLUGIN_BUNDLE_ID}); install: packaging/driver-dev.sh install (dev) or the SoundRouter .pkg"
+            )
+        }
     }
     println!("TCC audio capture: {:?}", tcc::audio_capture_status());
+    if !healthy {
+        bail!("doctor: problems found (see above)");
+    }
     Ok(())
 }

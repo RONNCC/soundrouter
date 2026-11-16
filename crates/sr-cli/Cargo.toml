@@ -16,3 +16,8 @@ ctrlc = "3.5"
 serde_json.workspace = true
 sr-core = { path = "../sr-core" }
 sr-audio = { path = "../sr-audio" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
