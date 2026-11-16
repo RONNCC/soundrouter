@@ -2,7 +2,7 @@
 //! control is found by the name a screen reader would announce, then clicked/dragged/typed at.
 use super::*;
 use crate::fake::{FakeBackend, demo_config, demo_status};
-use crate::model::default_config;
+use crate::model::bare_config;
 use crate::setup::{Runner, SetupError};
 use crate::worker::SelfTestState;
 use egui_kittest::{Harness, kittest::Queryable};
@@ -163,7 +163,7 @@ fn select_all(h: &mut Harness<App>) {
 
 /// A device with one Safari source wired channel for channel, plus the demo hardware list.
 fn one_source() -> Config {
-    let mut cfg = default_config();
+    let mut cfg = bare_config();
     apply(
         &mut cfg,
         Edit::AddSource(

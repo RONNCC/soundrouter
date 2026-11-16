@@ -118,6 +118,10 @@ pub fn new_device(cfg: &mut Config) {
         wires: Vec::new(),
         monitors: Vec::new(),
     });
+    // Loopback-style: a new device starts as a plain loopback (1->1, 2->2), so apps playing into
+    // it reach its input with no setup. The Pass-Thru source is only the device's own output.
+    let last = cfg.devices.len() - 1;
+    apply(cfg, Edit::AddSource(last, SourceKind::PassThru, 0));
 }
 
 pub fn default_config() -> Config {
@@ -126,6 +130,15 @@ pub fn default_config() -> Config {
         devices: Vec::new(),
     };
     new_device(&mut cfg);
+    cfg
+}
+
+/// `default_config` with its device stripped to no sources and no wires, a blank canvas.
+#[cfg(any(test, feature = "snapshots"))]
+pub fn bare_config() -> Config {
+    let mut cfg = default_config();
+    cfg.devices[0].sources.clear();
+    cfg.devices[0].wires.clear();
     cfg
 }
 
@@ -391,7 +404,7 @@ mod tests {
     use super::*;
 
     fn cfg_with_dev() -> Config {
-        let mut c = default_config();
+        let mut c = bare_config();
         apply(
             &mut c,
             Edit::AddSource(
@@ -411,6 +424,21 @@ mod tests {
         assert_eq!(c.devices.len(), 1);
         assert_eq!(c.devices[0].id, "v1");
         assert_eq!(c.devices[0].channels, 2);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn new_device_starts_as_unit_loopback() {
+        let mut c = default_config();
+        apply(&mut c, Edit::NewDevice);
+        for d in &c.devices {
+            assert_eq!(d.sources.len(), 1);
+            assert_eq!(d.sources[0].kind, SourceKind::PassThru);
+            assert_eq!(d.sources[0].channels, 2);
+            let w: Vec<_> = d.wires.iter().map(|w| (w.src_ch, w.out_ch)).collect();
+            assert_eq!(w, [(0, 0), (1, 1)]);
+            assert!(d.monitors.is_empty());
+        }
         c.validate().unwrap();
     }
 

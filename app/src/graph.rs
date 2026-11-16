@@ -925,7 +925,7 @@ fn wires_and_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{apply, default_config};
+    use crate::model::{apply, bare_config};
     use crate::theme::{install_fonts, tokens};
     use egui_kittest::{Harness, kittest::Queryable};
 
@@ -989,7 +989,7 @@ mod tests {
     }
 
     fn device() -> VirtualDevice {
-        let mut c = default_config();
+        let mut c = bare_config();
         apply(
             &mut c,
             Edit::AddSource(

@@ -150,6 +150,8 @@ impl Backend for FakeBackend {
 /// Populated config for `--demo` and screenshots.
 pub fn demo_config() -> Config {
     let mut cfg = default_config();
+    cfg.devices[0].sources.clear();
+    cfg.devices[0].wires.clear();
     let app = |id: &str| SourceKind::App {
         bundle_id: id.into(),
     };
