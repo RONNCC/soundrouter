@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use block2::RcBlock;
@@ -369,16 +369,69 @@ fn sync_driver(cfg: &Config) -> Result<()> {
     };
     if driver::get_devices(plugin).ok().as_ref() != Some(&want) {
         driver::set_devices(plugin, &want)?;
-        let uids: Vec<String> = want.iter().map(|d| d.uid.clone()).collect();
-        let missing = driver::wait_for_uids(&uids, Duration::from_secs(2));
-        if !missing.is_empty() {
-            bail!("driver devices did not appear within 2 s: {missing:?}");
-        }
-        // Hidden companions are best-effort here: `main_candidates` falls back if absent.
-        let comps: Vec<String> = uids.iter().map(|u| companion_uid(u)).collect();
-        driver::wait_for_uids(&comps, Duration::from_millis(500));
+        wait_driver_settled(&want)?;
     }
     Ok(())
+}
+
+/// How long after `set_devices` the driver's devices may take to appear and take their channel counts.
+const DRIVER_SETTLE: Duration = Duration::from_secs(2);
+/// Poll step while settling.
+const SETTLE_STEP: Duration = Duration::from_millis(50);
+/// Hidden companions are best-effort: after this long without one, `main_candidates` falls back to the visible device.
+const COMPANION_GRACE: Duration = Duration::from_millis(500);
+
+/// Devices from `want` that are not ready: visible device and companion present, and each reporting
+/// exactly the configured channels on both scopes (the HAL applies a channel change asynchronously, F1b).
+/// `totals(uid)` = `(input, output)` channels, `None` when the device does not exist.
+fn unsettled(
+    want: &[DriverDevice],
+    totals: &dyn Fn(&str) -> Option<(u16, u16)>,
+    companion_optional: bool,
+) -> Vec<String> {
+    let check = |uid: &str, ch: u16| match totals(uid) {
+        None => Some(format!("{uid}: not present")),
+        Some((i, o)) if i != ch || o != ch => Some(format!("{uid}: {i} in / {o} out, want {ch}")),
+        Some(_) => None,
+    };
+    want.iter()
+        .flat_map(|d| {
+            let comp = companion_uid(&d.uid);
+            let comp_bad = match totals(&comp) {
+                None if companion_optional => None,
+                _ => check(&comp, d.channels),
+            };
+            [check(&d.uid, d.channels), comp_bad]
+        })
+        .flatten()
+        .collect()
+}
+
+fn wait_driver_settled(want: &[DriverDevice]) -> Result<()> {
+    let totals = |uid: &str| {
+        hal::device_by_uid(uid).map(|d| {
+            (
+                hal::total_channels(d, kAudioObjectPropertyScopeInput),
+                hal::total_channels(d, kAudioObjectPropertyScopeOutput),
+            )
+        })
+    };
+    let t0 = Instant::now();
+    loop {
+        let elapsed = t0.elapsed();
+        let bad = unsettled(want, &totals, elapsed >= COMPANION_GRACE);
+        if bad.is_empty() {
+            return Ok(());
+        }
+        if elapsed >= DRIVER_SETTLE {
+            bail!(
+                "driver devices not ready {} s after set_devices: {}",
+                DRIVER_SETTLE.as_secs(),
+                bad.join("; ")
+            );
+        }
+        std::thread::sleep(SETTLE_STEP);
+    }
 }
 
 fn apply_locked(g: &mut Inner, cfg: &Config) -> Result<()> {

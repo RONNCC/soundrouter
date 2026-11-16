@@ -530,3 +530,53 @@ fn run_null_input_list() {
     assert!(out.all_zero());
     assert_eq!(r.meters.mismatch_count(), 1);
 }
+
+// ---- driver settle (F1b) ----
+
+fn want_dev(id: &str, channels: u16) -> DriverDevice {
+    DriverDevice {
+        uid: format!("{DEVICE_UID_PREFIX}{id}"),
+        name: id.into(),
+        channels,
+    }
+}
+
+#[test]
+fn unsettled_waits_for_channel_change_on_visible_and_companion() {
+    let want = [want_dev("v1", 8)];
+    let vis = want[0].uid.clone();
+    let comp = companion_uid(&vis);
+    let all = |c: u16| {
+        let (vis, comp) = (vis.clone(), comp.clone());
+        move |u: &str| (u == vis || u == comp).then_some((c, c))
+    };
+    assert!(unsettled(&want, &all(8), false).is_empty());
+    // Companion still reports the old channel count.
+    let stale = |u: &str| {
+        if u == companion_uid(&want[0].uid) {
+            Some((2, 2))
+        } else {
+            Some((8, 8))
+        }
+    };
+    let bad = unsettled(&want, &stale, false);
+    assert_eq!(bad.len(), 1);
+    assert!(bad[0].contains("2 in / 2 out, want 8"), "{bad:?}");
+    // Input and output are checked separately.
+    let half = |_: &str| Some((8, 2));
+    assert_eq!(unsettled(&want, &half, false).len(), 2);
+}
+
+#[test]
+fn unsettled_missing_devices_and_companion_grace() {
+    let want = [want_dev("v1", 2)];
+    let vis = want[0].uid.clone();
+    let only_visible = |u: &str| (u == vis).then_some((2, 2));
+    // Inside the grace period a missing companion keeps us waiting, afterwards it is tolerated.
+    assert_eq!(unsettled(&want, &only_visible, false).len(), 1);
+    assert!(unsettled(&want, &only_visible, true).is_empty());
+    // The visible device itself is always required.
+    let none = |_: &str| None;
+    let bad = unsettled(&want, &none, true);
+    assert_eq!(bad, [format!("{}: not present", want[0].uid)]);
+}
