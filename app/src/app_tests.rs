@@ -493,6 +493,7 @@ mod snapshots {
         cfg: Config,
         toast: Option<&str>,
         before: impl FnOnce(&mut Harness<'static, App>),
+        results: &mut egui_kittest::SnapshotResults,
     ) {
         let suffix = if theme == Theme::Dark {
             "dark"
@@ -516,11 +517,13 @@ mod snapshots {
         // meters and peak markers have settled on the frozen readings
         h.run_steps(5);
         h.snapshot(format!("{name}_{suffix}"));
+        results.extend_harness(&mut h);
     }
 
     fn both(name: &str, cfg: impl Fn() -> Config, toast: Option<&str>, f: fn(&mut Harness<App>)) {
+        let mut results = egui_kittest::SnapshotResults::new();
         for theme in [Theme::Dark, Theme::Light] {
-            shot(name, theme, cfg(), toast, f);
+            shot(name, theme, cfg(), toast, f, &mut results);
         }
     }
 
