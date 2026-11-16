@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Build target/SoundRouter.pkg: driver into HAL, app into /Applications.
-# Needs target/SoundRouter.driver (build-driver.sh) and target/SoundRouter.app (bundle-app.sh).
+# Build target/SoundRouter.pkg: driver into HAL, app into /Applications, uninstall.sh into Application Support.
+# Needs target/SoundRouter.app (bundle-app.sh); the driver comes from the app's embedded copy,
+# falling back to target/SoundRouter.driver (build-driver.sh).
 # productsign only when INSTALLER_ID is set.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DRIVER=target/SoundRouter.driver
 APP=target/SoundRouter.app
+DRIVER=$APP/Contents/Resources/SoundRouter.driver
+[ -d "$DRIVER" ] || DRIVER=target/SoundRouter.driver
 OUT=target/SoundRouter.pkg
 VERSION=$(plutil -extract CFBundleShortVersionString raw packaging/Info-app.plist)
 WORK=$(mktemp -d)
@@ -16,9 +18,11 @@ for p in "$DRIVER" "$APP"; do
   [ -d "$p" ] || { echo "missing $p" >&2; exit 1; }
 done
 
-mkdir -p "$WORK/hal" "$WORK/apps" "$WORK/scripts"
+mkdir -p "$WORK/hal" "$WORK/apps" "$WORK/scripts" "$WORK/support"
 cp -R "$DRIVER" "$WORK/hal/"
 cp -R "$APP" "$WORK/apps/"
+cp packaging/uninstall.sh "$WORK/support/uninstall.sh"
+chmod 755 "$WORK/support/uninstall.sh"
 
 cat > "$WORK/scripts/postinstall" <<'EOF'
 #!/bin/sh
@@ -45,11 +49,17 @@ pkgbuild --root "$WORK/apps" \
   --version "$VERSION" \
   "$WORK/app.pkg"
 
+pkgbuild --root "$WORK/support" \
+  --install-location "/Library/Application Support/SoundRouter" \
+  --identifier com.ronncc.soundrouter.support.pkg \
+  --version "$VERSION" \
+  "$WORK/support.pkg"
+
 rm -f "$OUT"
 if [ -n "${INSTALLER_ID:-}" ]; then
-  productbuild --package "$WORK/driver.pkg" --package "$WORK/app.pkg" \
+  productbuild --package "$WORK/driver.pkg" --package "$WORK/app.pkg" --package "$WORK/support.pkg" \
     --sign "$INSTALLER_ID" "$OUT"
 else
-  productbuild --package "$WORK/driver.pkg" --package "$WORK/app.pkg" "$OUT"
+  productbuild --package "$WORK/driver.pkg" --package "$WORK/app.pkg" --package "$WORK/support.pkg" "$OUT"
 fi
 echo "built $OUT"

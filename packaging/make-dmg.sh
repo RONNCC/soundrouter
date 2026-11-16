@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build target/SoundRouter.dmg containing SoundRouter.app and an /Applications link.
+# Build target/SoundRouter.dmg containing SoundRouter.app, an /Applications link and uninstall.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -12,6 +12,8 @@ trap 'rm -rf "$WORK"' EXIT
 
 cp -R "$APP" "$WORK/"
 ln -s /Applications "$WORK/Applications"
+cp packaging/uninstall.sh "$WORK/uninstall.sh"
+chmod 755 "$WORK/uninstall.sh"
 
 rm -f "$OUT"
 hdiutil create -volname SoundRouter -srcfolder "$WORK" -ov -format UDZO "$OUT"
