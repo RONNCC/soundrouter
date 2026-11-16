@@ -62,9 +62,9 @@ Checked against the code (`crates/sr-core/src/config.rs`, `driver_proto.rs`, `sr
 | Driver logic and HAL entry points | Yes, outside coreaudiod | fake-host harness (`packaging/driver-dev.sh fakehost`), unit and proptests |
 | GUI rendering and interaction | Yes | kittest + GPU snapshots (`--features snapshots`), `--demo` backend |
 | Engine vs. an existing loopback device | Yes on a dev machine | BlackHole e2e (`#[ignore]`, needs BlackHole + permissions) |
-| Driver running inside `coreaudiod` | **Not verified in automation** | needs sudo install; `packaging/driver-dev.sh test` is the manual check |
-| Hidden companion joining an aggregate | **Not verified** | same |
-| TCC prompts and process taps, end to end with the installed driver | **Not verified** | manual checklist in [docs/TESTING.md](docs/TESTING.md) |
+| Driver running inside `coreaudiod` | Yes on a dev machine (macOS 14.7.1, Apple silicon, one 2 ch device) | `packaging/driver-dev.sh test` (sudo), `sr-cli loopback-test v1`; not run in CI |
+| Hidden companion joining an aggregate | Yes, same machine | `packaging/engine-live-test.sh`: engine log shows main device `soundrouter:v1.engine`; the companion never shows in `system_profiler` |
+| TCC and process taps, end to end with the installed driver | Yes for the `sr-cli` path with the terminal granted; the `.app`'s own prompts and grants **not verified** | `packaging/engine-live-test.sh`: `afplay` tap -> mixer -> V input, volume, mute, channel routing, stop reverts the input to the direct loop. Not covered: 44.1/96 kHz, more than one device, input-device sources and monitors through the installed driver, "Mute in original output" (the tap works with it set, that `afplay` goes silent on the speakers was not checked), long runs |
 | Notarized release builds | **Not verified** | needs Developer ID credentials |
 
 ## Tests
@@ -76,6 +76,7 @@ cargo test -- --ignored                                   # hardware tests: driv
 cargo test -p sr-audio --test blackhole -- --ignored      # BlackHole end-to-end
 packaging/driver-dev.sh fakehost                          # driver in a fake host, no sudo
 packaging/driver-dev.sh test                              # live checks against the installed driver (sudo)
+packaging/engine-live-test.sh                             # live engine check: afplay tap -> installed driver (no sudo)
 ```
 
 The BlackHole test sets `SR_MAIN_UID_OVERRIDE` so the engine routes into an installed BlackHole device instead of SoundRouter's driver and never touches the driver. Details: [docs/TESTING.md](docs/TESTING.md).

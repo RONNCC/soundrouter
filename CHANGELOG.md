@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- `packaging/engine-live-test.sh`: live check of the engine against the installed driver (app tap, volume, mute, channel routing, input reverts when the engine stops). The engine logs which main device each aggregate uses (`sr-cli -v run`).
+
 ### Fixed
 - Driver: an app that plays into a SoundRouter device now hears itself on that device's input while the engine is not running (V.out -> V.in, Soundflower-style); before, the input stayed silent until the engine attached. With the engine running the input carries the routed mix as before.
 

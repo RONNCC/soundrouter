@@ -10,6 +10,7 @@
 | Hardware (ignored) | Needs driver installed, permissions, audio hardware | `cargo test -- --ignored` |
 | BlackHole e2e | `afplay` -> process tap -> engine mixer -> BlackHole 16ch | `cargo test -p sr-audio --test blackhole -- --ignored` |
 | Live driver | Driver inside coreaudiod (sudo) | `packaging/driver-dev.sh test` |
+| Live engine | `afplay` -> process tap -> engine aggregate with the hidden companion -> `soundrouter:v1` input, installed driver, no sudo | `packaging/engine-live-test.sh` |
 
 The BlackHole test sets `SR_MAIN_UID_OVERRIDE=<device uid>` so the engine uses an existing loopback device as the main device and never touches the SoundRouter driver. It needs BlackHole installed (`brew install --cask blackhole-2ch`) and audio permissions; it plays a short quiet tone through the speakers.
 
@@ -23,11 +24,23 @@ Run on a Mac with the driver installed and permissions granted.
 
 1. `packaging/driver-dev.sh install`, then `packaging/driver-dev.sh test`. It checks, in order: driver loaded; runtime create without restart; companions hidden from `system_profiler`; loopback latency at 512/128/32 frames; channel change 8 to 16 during IO; rename; persistence across a coreaudiod restart; removal. Every step must print without `FAIL`.
 2. `sr-cli doctor` exits 0.
-3. `sr-cli loopback-test v1` reports the tone on the device's input.
-4. In the app: add a device, play audio from Music or Safari into it, and see the meter move; record from the device in QuickTime.
-5. Per-app source: add a running app, confirm the permission prompt, the audio arrives; toggle "Mute in original output" and confirm the app goes silent on speakers only.
-6. Choose App… with a non-running app: start the app afterwards and confirm capture begins.
-7. Monitor to headphones: audio plays and volume/mute work.
-8. Close the window: routing continues from the menu bar; Quit stops it. Start at Login: log out and in.
-9. Launch a second copy: it must defer to the first.
-10. Uninstall from the setup sheet; devices disappear.
+3. `packaging/engine-live-test.sh` (installed driver with `soundrouter:v1`, 2 ch; System Audio Recording granted to the terminal; no sudo). It plays a quiet 1 kHz tone through the default output (left peak 0.2, right peak 0.1, so channel routing is visible) and checks, with `sr-cli meter v1` (peaks per channel in dB, 4 Hz) while `sr-cli run <config>` is up:
+
+   | Case | Config | Expected V input (L R) |
+   |------|--------|------------------------|
+   | unity | wires 0->0, 1->1 | -14.0 -20.0 dB (0.2, 0.1) |
+   | volume | `volume_db` -6 | -20.0 -26.0 dB |
+   | mute | source `muted` | -inf -inf |
+   | route | wire 0->1 only | -inf -14.0 |
+   | swap | wires 0->1, 1->0 | -20.0 -14.0 |
+   | stop | `sr-cli run` stopped while `afplay` keeps playing | -inf -inf (V input back to the direct loop) |
+
+   It also checks that the run log says `aggregate main device 'soundrouter:v1.engine'` (the companion, not the visible-device fallback), that `sr-cli loopback-test v1` passes with no engine and fails while an empty engine runs (V input is ring B then), that `sr-cli doctor` exits 0 with the engine running, and that `system_profiler` lists only the visible device. Last line must be `PASS`. By hand: `sr-cli -v run cfg.json` in one terminal, `sr-cli meter v1` in another, `afplay tone.wav` in a third.
+4. `sr-cli loopback-test v1` reports the tone on the device's input.
+5. In the app: add a device, play audio from Music or Safari into it, and see the meter move; record from the device in QuickTime.
+6. Per-app source: add a running app, confirm the permission prompt, the audio arrives; toggle "Mute in original output" and confirm the app goes silent on speakers only.
+7. Choose App… with a non-running app: start the app afterwards and confirm capture begins.
+8. Monitor to headphones: audio plays and volume/mute work.
+9. Close the window: routing continues from the menu bar; Quit stops it. Start at Login: log out and in.
+10. Launch a second copy: it must defer to the first.
+11. Uninstall from the setup sheet; devices disappear.

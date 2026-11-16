@@ -34,7 +34,7 @@ use crate::hal::{self, SYSTEM};
 use crate::layout::{self, LayoutSpec, SCRATCH_LEN, SubDesc};
 
 /// If the hidden companion cannot be found or joined, run on the visible vdev instead.
-/// shortcut: then pass-thru audio mixes with the engine output in the HAL; unverified until the driver is installed.
+/// shortcut: then pass-thru audio mixes with the engine output in the HAL; the companion path is verified live (docs/TESTING.md), this fallback is not.
 pub const ALLOW_VISIBLE_FALLBACK: bool = true;
 pub const AGG_UID_PREFIX: &str = "soundrouter.agg.";
 static AGG_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -715,17 +715,21 @@ fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result
         match build_vdev(
             dev,
             AggSpec {
-                main,
+                main: main.clone(),
                 subs: subs.clone(),
                 channels: dev.channels,
             },
             groups,
         ) {
             Ok(v) => {
+                log::info!("device '{}': aggregate main device '{main}'", dev.id);
                 g.vdevs.insert(dev.id.clone(), v);
                 return Ok(());
             }
-            Err(e) => last = e,
+            Err(e) => {
+                log::warn!("device '{}': main '{main}' failed: {e:#}", dev.id);
+                last = e;
+            }
         }
     }
     Err(last)
