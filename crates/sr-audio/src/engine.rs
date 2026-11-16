@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -44,6 +47,8 @@ pub enum IoState {
 
 struct Shared {
     /// Expected `layout::shape_key` of the buffer lists; 0 = never matches (silence).
+    /// Release-stored after the matching plan is published and Acquire-loaded by the IOProc, so a new key
+    /// is never paired with an older plan.
     expected: AtomicU64,
     /// 0 starting, 1 running, `1<<32 | status` failed.
     state: AtomicU64,
@@ -371,8 +376,11 @@ impl Backend for Engine {
     }
 
     fn meters(&self, device_id: &str) -> Option<MeterReading> {
-        let g = lock(&self.inner);
-        let v = g.vdevs.get(device_id)?;
+        let mut g = lock(&self.inner);
+        let v = g.vdevs.get_mut(device_id)?;
+        // Deliver a plan the full queue refused while the IOProc was not consuming (F5): a stale plan
+        // can otherwise outlive the user's newer volume until the next apply.
+        v.handle.flush();
         Some(v.meters.take(&v.layout, &v.dev))
     }
 }
@@ -719,7 +727,7 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
         }
     }
     if changed {
-        v.shared.expected.store(0, Relaxed); // silence until the new layout is in
+        v.shared.expected.store(0, Release); // silence until the new layout is in
         let uids: Vec<String> = v.taps.iter().map(|t| t.uid.clone()).collect();
         let r = hal::set_object(
             v.agg,
@@ -819,7 +827,7 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
     v.layout = lay;
     v.shared
         .expected
-        .store(layout::shape_key_of(&ain, &aout), Relaxed);
+        .store(layout::shape_key_of(&ain, &aout), Release);
     Ok(())
 }
 
@@ -986,10 +994,23 @@ unsafe extern "C-unwind" fn ioproc(
     _ot: NonNull<AudioTimeStamp>,
     ud: *mut c_void,
 ) -> i32 {
-    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+    let r = catch_unwind(AssertUnwindSafe(|| unsafe {
         run(&mut *(ud as *mut Cb), input.as_ptr(), output.as_ptr())
     }));
+    if r.is_err() {
+        // A panic may have left half-written output: never hand that to the hardware.
+        unsafe { zero_buffers(bufs(output.as_ptr())) };
+    }
     0
+}
+
+/// Silence every output buffer that has data.
+unsafe fn zero_buffers(list: &mut [AudioBuffer]) {
+    for b in list {
+        if !b.mData.is_null() {
+            unsafe { std::ptr::write_bytes(b.mData as *mut u8, 0, b.mDataByteSize as usize) };
+        }
+    }
 }
 
 unsafe fn bufs<'a>(l: *mut AudioBufferList) -> &'a mut [AudioBuffer] {
@@ -1015,7 +1036,7 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
     let frames = outs.first().map_or(0, frames_of);
     let n_in: usize = ins.iter().map(|b| b.mNumberChannels as usize).sum();
     let n_out: usize = outs.iter().map(|b| b.mNumberChannels as usize).sum();
-    let expected = cb.shared.expected.load(Relaxed);
+    let expected = cb.shared.expected.load(Acquire);
     let ok = key == expected
         && n_in <= MAX_CH
         && n_out <= MAX_CH
@@ -1028,11 +1049,7 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
         if expected != 0 {
             cb.meters.mismatch_count.fetch_add(1, Relaxed);
         }
-        for b in outs.iter() {
-            if !b.mData.is_null() {
-                unsafe { std::ptr::write_bytes(b.mData as *mut u8, 0, b.mDataByteSize as usize) };
-            }
-        }
+        unsafe { zero_buffers(outs) };
         return;
     }
     let Cb {
