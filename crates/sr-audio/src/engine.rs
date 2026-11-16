@@ -90,6 +90,10 @@ struct Vdev {
     layout: sr_core::mixer::IoLayout,
     subs: Vec<SubDesc>,
     taps: Vec<Tap>,
+    /// Removed taps the aggregate may still reference; destroyed after its tap list is updated (F7).
+    zombies: Vec<Tap>,
+    /// The aggregate's tap list (or layout) may be out of date: the next sync must redo it (F7).
+    tap_dirty: bool,
     /// The `AudioDeviceStart` thread; `None` once joined.
     starter: Option<JoinHandle<()>>,
 }
@@ -117,7 +121,7 @@ impl Drop for Vdev {
                 AudioDeviceDestroyIOProcID(self.agg, self.proc_id);
             }
             AudioHardwareDestroyAggregateDevice(self.agg);
-            for t in &self.taps {
+            for t in self.taps.iter().chain(&self.zombies) {
                 AudioHardwareDestroyProcessTap(t.id);
             }
             drop(Box::from_raw(self.cb));
@@ -571,8 +575,14 @@ fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result
     if let Some(v) = g.vdevs.get_mut(&dev.id) {
         if v.spec.subs == subs && v.spec.channels == dev.channels && cands.contains(&v.spec.main) {
             v.dev = dev.clone();
-            sync_taps(v, groups)?;
-            return refresh_layout(v);
+            match sync_taps(v, groups).and_then(|()| refresh_layout(v)) {
+                Ok(()) => return Ok(()),
+                // F8: the live aggregate is out of step (e.g. a subdevice's streams changed): rebuild it.
+                Err(e) => log::warn!(
+                    "device '{}': in-place update failed, rebuilding: {e:#}",
+                    dev.id
+                ),
+            }
         }
         retire(g.vdevs.remove(&dev.id));
     }
@@ -597,12 +607,23 @@ fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result
     Err(last)
 }
 
+/// Re-sync the taps of every vdev; one vdev's failure does not stop the others.
 fn retap(g: &mut Inner) -> Result<()> {
     let groups = apps::list_groups();
-    for v in g.vdevs.values_mut() {
-        sync_taps(v, &groups)?;
+    let errors: Vec<String> = g
+        .vdevs
+        .iter_mut()
+        .filter_map(|(id, v)| {
+            sync_taps(v, &groups)
+                .err()
+                .map(|e| format!("device '{id}': {e:#}"))
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
     }
-    Ok(())
 }
 
 fn make_desc(name: &str, objs: &[u32]) -> Retained<CATapDescription> {
@@ -695,6 +716,10 @@ fn tap_plan(current: &[Tap], dev: &VirtualDevice, groups: &[AppGroup]) -> TapPla
 }
 
 /// Bring the live taps in line with the config + running processes (live tap-list edit, I/O keeps running).
+///
+/// Failure handling (F7): no step may lose a tap that is still referenced by the aggregate. Removed taps
+/// wait in `v.zombies` and are destroyed only once the aggregate's tap list no longer names them; a failed
+/// list update leaves `v.tap_dirty` so the next sync repeats it instead of seeing "no diff" and staying silent.
 fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
     let plan = tap_plan(&v.taps, &v.dev, groups);
     log::debug!(
@@ -705,17 +730,22 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
         plan.remove.len(),
         plan.create.len()
     );
-    let mut changed = !plan.remove.is_empty();
+    let mut changed = v.tap_dirty || !plan.remove.is_empty();
     for (i, objs) in plan.update {
         let t = &v.taps[i];
         let desc = make_desc(&format!("sr-{}", t.source_id), &objs);
-        hal::set_object(t.id, kAudioTapPropertyDescription, &desc)
-            .map_err(|s| anyhow!("set tap description: {}", hal::fourcc(s)))?;
-        v.taps[i].objs = objs;
+        match hal::set_object(t.id, kAudioTapPropertyDescription, &desc) {
+            Ok(()) => v.taps[i].objs = objs,
+            // Keep the old description (and `objs`) so the next sync retries.
+            Err(s) => log::warn!(
+                "set description of tap '{}' failed: {}",
+                t.source_id,
+                hal::fourcc(s)
+            ),
+        }
     }
-    let mut removed = Vec::new();
     for &i in plan.remove.iter().rev() {
-        removed.push(v.taps.remove(i));
+        v.zombies.push(v.taps.remove(i));
     }
     for (id, b, objs) in plan.create {
         match create_tap(&id, &b, objs) {
@@ -723,21 +753,23 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
                 v.taps.push(t);
                 changed = true;
             }
-            Err(e) => eprintln!("sr-audio: tap for '{b}' failed: {e:#}"),
+            Err(e) => log::warn!("tap for '{b}' failed: {e:#}"),
         }
     }
     if changed {
+        v.tap_dirty = true;
         v.shared.expected.store(0, Release); // silence until the new layout is in
         let uids: Vec<String> = v.taps.iter().map(|t| t.uid.clone()).collect();
-        let r = hal::set_object(
+        hal::set_object(
             v.agg,
             kAudioAggregateDevicePropertyTapList,
             &hal::string_array(&uids),
-        );
-        for t in removed {
+        )
+        .map_err(|s| anyhow!("set aggregate tap list: {}", hal::fourcc(s)))?;
+        // The aggregate no longer references the removed taps.
+        for t in v.zombies.drain(..) {
             unsafe { AudioHardwareDestroyProcessTap(t.id) };
         }
-        r.map_err(|s| anyhow!("set aggregate tap list: {}", hal::fourcc(s)))?;
         let want = v.subs.iter().map(|s| s.in_bufs.len()).sum::<usize>() + v.taps.len();
         for _ in 0..50 {
             if hal::stream_channels(v.agg, kAudioObjectPropertyScopeInput).len() == want {
@@ -746,6 +778,7 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
             std::thread::sleep(Duration::from_millis(10));
         }
         refresh_layout(v)?;
+        v.tap_dirty = false;
     }
     Ok(())
 }
@@ -840,7 +873,7 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
         }
         match create_tap(id, b, objs) {
             Ok(t) => taps.push(t),
-            Err(e) => eprintln!("sr-audio: tap for '{b}' failed: {e:#}"),
+            Err(e) => log::warn!("tap for '{b}' failed: {e:#}"),
         }
     }
     let destroy_taps = |taps: &[Tap]| {
@@ -951,6 +984,8 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
         subs: descs,
         taps,
         starter: None,
+        zombies: Vec::new(),
+        tap_dirty: false,
     };
     // From here `Drop` cleans up the aggregate, taps and callback state.
     refresh_layout(&mut v)?;
