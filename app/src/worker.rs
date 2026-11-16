@@ -48,6 +48,26 @@ pub struct Worker {
     tx: Option<Sender<Msg>>,
     handle: Option<JoinHandle<()>>,
     pub shared: Arc<Mutex<Snapshot>>,
+    /// Tests: no thread. The loop body runs on the caller's thread as soon as a message is sent,
+    /// so the reply is there before the next frame, whatever the scheduler does.
+    #[cfg(test)]
+    inline: Option<std::cell::RefCell<Core>>,
+}
+
+/// The worker loop's state; `iterate` is one wake-up.
+struct Core {
+    pump: Pump,
+    rx: Receiver<Msg>,
+    snap: Arc<Mutex<Snapshot>>,
+    ctx: Context,
+}
+
+impl Core {
+    fn iterate(&mut self, first: Option<Msg>) {
+        let batch = drain_latest(&self.rx, first);
+        self.pump.run(batch, Instant::now(), &self.snap);
+        self.ctx.request_repaint();
+    }
 }
 
 /// Everything queued since the last iteration. Bursts of configs (slider drags) collapse to the
@@ -166,37 +186,70 @@ impl Worker {
         Self::spawn_with(backend, ctx, Box::new(icons::resolve))
     }
 
+    fn core(
+        backend: Box<dyn Backend + Send>,
+        ctx: Context,
+        resolve_icon: IconResolver,
+    ) -> (Sender<Msg>, Arc<Mutex<Snapshot>>, Core) {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let snap = Arc::new(Mutex::new(Snapshot::default()));
+        let pump = Pump {
+            backend,
+            cfg: Config::default(),
+            next_refresh: Instant::now(),
+            resolve_icon,
+            icons_tried: HashSet::new(),
+        };
+        let core = Core {
+            pump,
+            rx,
+            snap: snap.clone(),
+            ctx,
+        };
+        (tx, snap, core)
+    }
+
     /// `spawn` with a custom icon source (tests use none, so snapshots keep letter tiles).
     pub fn spawn_with(
         backend: Box<dyn Backend + Send>,
         ctx: Context,
         resolve_icon: IconResolver,
     ) -> Worker {
-        let (tx, rx) = mpsc::channel::<Msg>();
-        let shared = Arc::new(Mutex::new(Snapshot::default()));
-        let snap = shared.clone();
+        let (tx, shared, mut core) = Self::core(backend, ctx, resolve_icon);
         let handle = std::thread::spawn(move || {
-            let mut pump = Pump {
-                backend,
-                cfg: Config::default(),
-                next_refresh: Instant::now(),
-                resolve_icon,
-                icons_tried: HashSet::new(),
-            };
             loop {
-                let first = match rx.recv_timeout(METER_PERIOD) {
+                let first = match core.rx.recv_timeout(METER_PERIOD) {
                     Ok(c) => Some(c),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
-                pump.run(drain_latest(&rx, first), Instant::now(), &snap);
-                ctx.request_repaint();
+                core.iterate(first);
             }
         });
         Worker {
             tx: Some(tx),
             handle: Some(handle),
             shared,
+            #[cfg(test)]
+            inline: None,
+        }
+    }
+
+    /// `spawn_with` minus the thread (see `Worker::inline`). The first refresh is published before
+    /// this returns; later ones repeat it, the fake backends being constant.
+    #[cfg(test)]
+    pub fn spawn_inline(
+        backend: Box<dyn Backend + Send>,
+        ctx: Context,
+        resolve_icon: IconResolver,
+    ) -> Worker {
+        let (tx, shared, mut core) = Self::core(backend, ctx, resolve_icon);
+        core.iterate(None);
+        Worker {
+            tx: Some(tx),
+            handle: None,
+            shared,
+            inline: Some(std::cell::RefCell::new(core)),
         }
     }
 
@@ -207,6 +260,10 @@ impl Worker {
     fn send(&self, m: Msg) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(m);
+        }
+        #[cfg(test)]
+        if let Some(core) = &self.inline {
+            core.borrow_mut().iterate(None);
         }
     }
 
@@ -230,6 +287,10 @@ impl Worker {
     /// before the process exits. Cmd-Q never drops `App`, so this is also called from `on_exit`.
     pub fn stop(&mut self) {
         self.tx = None;
+        #[cfg(test)]
+        {
+            self.inline = None;
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -477,5 +538,20 @@ mod tests {
             s.status.driver_version.as_deref(),
             Some(crate::fake::DEMO_DRIVER)
         );
+    }
+
+    /// The one test of the real thread. `stop` joins it, and a hung-up channel still yields what
+    /// was queued, so no wait for a reply is needed.
+    #[test]
+    fn the_thread_answers_everything_queued_before_it_is_stopped() {
+        let backend = Box::new(FakeBackend::frozen(1.5));
+        let mut w = Worker::spawn_with(backend, Context::default(), Box::new(|_| None));
+        w.apply(&crate::fake::demo_config());
+        w.self_test("v1");
+        w.stop();
+        let s = w.shared.lock().unwrap();
+        assert!(s.status_ready);
+        assert_eq!(s.meters.len(), 2); // the demo config's two enabled devices
+        assert!(matches!(s.self_test, SelfTestState::Done(Ok(_))));
     }
 }

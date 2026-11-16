@@ -227,10 +227,16 @@ impl Setup {
     fn spawn(&mut self, ctx: &Context, busy: Busy, script: String) {
         let (tx, rx) = mpsc::channel();
         let (runner, ctx) = (self.runner.clone(), ctx.clone());
-        std::thread::spawn(move || {
+        let job = move || {
             let _ = tx.send(runner(&script));
             ctx.request_repaint();
-        });
+        };
+        // Tests run the job here, so its result is there for the next frame whatever the scheduler does.
+        if cfg!(test) {
+            job();
+        } else {
+            std::thread::spawn(job);
+        }
         self.busy = Some(busy);
         self.rx = Some(rx);
         self.error = None;

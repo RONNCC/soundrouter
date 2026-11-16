@@ -33,16 +33,20 @@ impl Backend for Failing {
     }
 }
 
-/// Step the window until `done` holds, without timers: the worker thread answers in between.
+/// Frames `until` may run: the 10 s driver deadline is 200 frames of 0.05 s.
+const MAX_FRAMES: u32 = 1_000;
+
+/// Step the window until `done` holds. The worker and the setup runner answer inside the call that
+/// asks them (see `Worker::spawn_inline`), so what is awaited here arrives in frames, never in
+/// wall time: no thread to race, no timer, the same result on a loaded machine.
 fn until(h: &mut Harness<App>, what: &str, done: impl Fn(&Harness<App>) -> bool) {
-    for _ in 0..20_000u32 {
+    for _ in 0..MAX_FRAMES {
         if done(h) {
             return;
         }
         h.step();
-        std::thread::yield_now();
     }
-    panic!("never happened: {what}");
+    panic!("not within {MAX_FRAMES} frames: {what}");
 }
 
 /// Block until the worker thread has published what the window needs: its first refresh (status,
@@ -96,7 +100,7 @@ fn window_with(
         .with_theme(theme)
         .with_context_setup(crate::theme::install_fonts)
         .build_eframe(move |cc| {
-            let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
+            let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
             let mut app = App::new(cfg, None, w, toast, false, demo);
             app.setup = Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()));
             app
@@ -576,7 +580,7 @@ mod snapshots {
             .wgpu()
             .build_eframe(move |cc| {
                 let backend = Box::new(FakeBackend::frozen(1.5));
-                let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
+                let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
                 App::new(cfg, None, w, toast.map(str::to_string), false, false)
             });
         wait_published(&mut h);
@@ -673,7 +677,7 @@ mod snapshots {
                 .wgpu()
                 .build_eframe(|cc| {
                     let backend = Box::new(FakeBackend::frozen(1.5));
-                    let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
+                    let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
                     App::new(demo_config(), None, w, None, false, true)
                 });
             wait_published(&mut h);
@@ -872,7 +876,6 @@ fn a_failed_self_test_offers_diagnostics() {
     let mut h = setup_run(installed(), None);
     click(&mut h, "Continue");
     until(&mut h, "self-test", |h| has(h, "Copy diagnostics"));
-    settle(&mut h); // the sheet re-centres for its new height; click where the button ends up
     h.get_by_label_contains("no audio came back");
     click(&mut h, "Copy diagnostics");
     h.get_by_label("Copied to clipboard");
