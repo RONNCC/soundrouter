@@ -580,3 +580,34 @@ fn unsettled_missing_devices_and_companion_grace() {
     let bad = unsettled(&want, &none, true);
     assert_eq!(bad, [format!("{}: not present", want[0].uid)]);
 }
+
+// ---- device-event filter and backoff (F4) ----
+
+#[test]
+fn uid_set_ignores_own_aggregates_and_order() {
+    let a = |u: &str| u.to_owned();
+    let before = uid_set([a("mic"), a("spk"), a("soundrouter.agg.v1.0")]);
+    let echo = uid_set([
+        a("spk"),
+        a("soundrouter.agg.v1.0"),
+        a("soundrouter.agg.v1.1"),
+        a("mic"),
+        a("mic"),
+    ]);
+    assert_eq!(before, ["mic", "spk"]);
+    assert_eq!(
+        before, echo,
+        "creating/destroying our aggregates is not a hot-plug"
+    );
+    let plugged = uid_set([a("mic"), a("spk"), a("usb")]);
+    assert_ne!(before, plugged);
+}
+
+#[test]
+fn backoff_grows_and_is_capped() {
+    assert_eq!(backoff(0), EVENT_DEBOUNCE);
+    assert_eq!(backoff(1), EVENT_DEBOUNCE * 2);
+    assert_eq!(backoff(3), EVENT_DEBOUNCE * 8);
+    assert_eq!(backoff(5), MAX_BACKOFF);
+    assert_eq!(backoff(u32::MAX), MAX_BACKOFF);
+}

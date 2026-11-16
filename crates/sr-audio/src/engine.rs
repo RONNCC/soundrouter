@@ -134,6 +134,9 @@ fn retire(v: Option<Vdev>) {
 struct Inner {
     cfg: Option<Config>,
     vdevs: HashMap<String, Vdev>,
+    /// [`current_device_set`] as of the last apply; device events that leave it unchanged are echoes.
+    dev_set: Vec<String>,
+    bg_error: Option<String>,
 }
 
 enum Event {
@@ -240,6 +243,12 @@ impl Engine {
             .get(device_id)
             .map_or(0, |v| v.meters.mismatch_count())
     }
+
+    /// The last background (event-driven) update failure, until a later update succeeds.
+    /// Logged once at error level; this lets a UI show it as well.
+    pub fn background_error(&self) -> Option<String> {
+        lock(&self.inner).bg_error.clone()
+    }
 }
 
 impl Drop for Engine {
@@ -255,7 +264,35 @@ impl Drop for Engine {
     }
 }
 
+/// Quiet period that batches HAL events before the worker reacts.
+const EVENT_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Upper bound of the debounce growth after repeated background failures.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Debounce window after `fails` consecutive background failures: doubles each time, capped.
+fn backoff(fails: u32) -> Duration {
+    (EVENT_DEBOUNCE * 2u32.saturating_pow(fails.min(8))).min(MAX_BACKOFF)
+}
+
+/// Sorted uids of the devices that are not our own private aggregates. Creating or destroying an
+/// aggregate fires `kAudioHardwarePropertyDevices` in our own process; comparing this set tells such
+/// echoes from real hot-plugs (F4).
+fn uid_set(uids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut v: Vec<String> = uids
+        .into_iter()
+        .filter(|u| !u.starts_with(AGG_UID_PREFIX))
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+fn current_device_set() -> Vec<String> {
+    uid_set(hal::all_devices().into_iter().map(hal::device_uid))
+}
+
 fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
+    let mut fails = 0u32;
     while let Ok(first) = rx.recv() {
         let (mut devs, mut procs) = (false, false);
         let mut ev = first;
@@ -265,13 +302,14 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
                 Event::Devices => devs = true,
                 Event::Processes => procs = true,
             }
-            match rx.recv_timeout(Duration::from_millis(200)) {
+            match rx.recv_timeout(backoff(fails)) {
                 Ok(e) => ev = e,
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
         let mut g = lock(&inner);
+        let devs = devs && current_device_set() != g.dev_set;
         let r = if devs {
             match g.cfg.clone() {
                 Some(cfg) => apply_locked(&mut g, &cfg),
@@ -282,8 +320,22 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
         } else {
             Ok(())
         };
-        if let Err(e) = r {
-            eprintln!("sr-audio: background update failed: {e:#}");
+        match r {
+            Ok(()) => {
+                fails = 0;
+                g.bg_error = None;
+            }
+            Err(e) => {
+                fails = fails.saturating_add(1);
+                let msg = format!("{e:#}");
+                // One error per distinct failure; repeats stay at debug level.
+                if g.bg_error.as_deref() == Some(&msg) {
+                    log::debug!("background update still failing (x{fails}): {msg}");
+                } else {
+                    log::error!("background update failed: {msg}");
+                    g.bg_error = Some(msg);
+                }
+            }
         }
     }
 }
@@ -467,6 +519,8 @@ fn wait_driver_settled(want: &[DriverDevice]) -> Result<()> {
 fn apply_locked(g: &mut Inner, cfg: &Config) -> Result<()> {
     cfg.validate().map_err(|e| anyhow!("invalid config: {e}"))?;
     sync_driver(cfg)?;
+    // Taken before any aggregate is built: our own create/destroy events must compare equal (F4).
+    g.dev_set = current_device_set();
     let groups = apps::list_groups();
     let enabled: HashSet<&str> = cfg
         .devices
