@@ -6,12 +6,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use objc2_core_audio::*;
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
 use sr_core::config::MAX_CH;
 
 use crate::hal;
+
+/// The tone may only go to a virtual device (driver or BlackHole): never a speaker or headphones.
+/// Unknown transport fails closed.
+fn tone_allowed(transport: Option<u32>) -> bool {
+    transport == Some(kAudioDeviceTransportTypeVirtual)
+}
 
 pub const TONE_HZ: f32 = 1000.0;
 pub const TONE_AMP: f32 = 0.5;
@@ -171,6 +177,9 @@ impl Probe {
     /// Start an IOProc on the device with `uid`. Blocks while a TCC prompt is open.
     pub fn start(uid: &str, tone: bool) -> Result<Probe> {
         let dev = hal::device_by_uid(uid).ok_or_else(|| anyhow!("no device with uid '{uid}'"))?;
+        if tone && !tone_allowed(hal::get_global(dev, kAudioDevicePropertyTransportType).ok()) {
+            bail!("refusing to play a tone on '{uid}': not a virtual device");
+        }
         let stats = Arc::new(Stats::new());
         let rate = hal::nominal_rate(dev);
         let ctx = Box::into_raw(Box::new(Ctx {
@@ -279,6 +288,42 @@ mod tests {
             }
             let peak = all.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             assert!((peak - TONE_AMP).abs() < 0.01);
+        }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn tone_only_on_virtual_transport() {
+        assert!(tone_allowed(Some(kAudioDeviceTransportTypeVirtual)));
+        for t in [
+            kAudioDeviceTransportTypeBuiltIn,
+            kAudioDeviceTransportTypeUSB,
+            kAudioDeviceTransportTypeBluetooth,
+            kAudioDeviceTransportTypeHDMI,
+            kAudioDeviceTransportTypeAggregate,
+        ] {
+            assert!(!tone_allowed(Some(t)), "{t:#x}");
+        }
+        assert!(!tone_allowed(None));
+    }
+
+    /// Needs the SoundRouter driver installed. Reads transport types only: never starts a tone.
+    #[test]
+    #[ignore = "needs installed driver"]
+    fn driver_device_is_virtual() {
+        let dev = hal::device_by_uid("soundrouter:v1").expect("soundrouter:v1 installed");
+        assert!(tone_allowed(
+            hal::get_global(dev, kAudioDevicePropertyTransportType).ok()
+        ));
+        for d in hal::all_devices() {
+            let t = hal::get_global::<u32>(d, kAudioDevicePropertyTransportType).ok();
+            if t == Some(kAudioDeviceTransportTypeBuiltIn) {
+                assert!(!tone_allowed(t), "{}", hal::device_uid(d));
+            }
         }
     }
 }

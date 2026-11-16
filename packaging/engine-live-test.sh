@@ -1,34 +1,53 @@
 #!/bin/bash
-# Live engine check against the INSTALLED driver (no sudo): afplay -> process tap -> engine aggregate
-# (hidden companion C + tap) -> mixer -> C.out -> ring B -> V.in, measured with `sr-cli meter`.
-# Needs soundrouter:v1 (2 ch) installed and System Audio Recording granted to this terminal.
-# Plays a quiet 1 kHz tone (L peak 0.2, R peak 0.1) on the default output; sets nothing system-wide.
+# Live engine check against the INSTALLED driver (no sudo), silent by design: srtone -> process tap ->
+# engine aggregate (hidden companion C + tap) -> mixer -> C.out -> ring B -> V.in, measured with `sr-cli meter`.
+# Needs soundrouter:v1 installed and System Audio Recording granted to this terminal.
+# Nothing here can reach a speaker: the 1 kHz tone (L peak 0.2, R peak 0.1) is played by `srtone` into the
+# virtual device soundrouter:v2 (srtone refuses any other than soundrouter:* / BlackHole), the engine taps
+# that process and routes the tap into v1. No default device is changed. The driver device list is set to
+# v1 + v2 for the run and restored to what it was on exit (also on failure or Ctrl-C).
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build -q -p sr-cli || exit 1
 CLI=$PWD/target/debug/sr-cli
-W=$(mktemp -d)
-trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$W"' EXIT
+W=$(mktemp -d) && W=$(cd "$W" && pwd -P) || exit 1 # physical path: the tap keys the player by its real executable path
+SRTONE=$W/srtone
+clang -O2 -Wall -framework CoreAudio -framework CoreFoundation -o "$SRTONE" packaging/srtone.c || exit 1
+PLAYER=soundrouter:v2 # player target: a virtual device that nothing reads, so the tap is feedback-free
+case $PLAYER in soundrouter:*) ;; *) echo "refusing: player target '$PLAYER' is not a soundrouter: device"; exit 1 ;; esac
+"$CLI" driver get >"$W/orig.json" || { echo "driver not installed"; rm -rf "$W"; exit 1; }
+# shellcheck disable=SC2046
+cleanup() { kill $(jobs -p) 2>/dev/null; "$CLI" driver set "$W/orig.json" >/dev/null 2>&1; rm -rf "$W"; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 fails=0
 check() { # name got want
   if [ "$2" = "$3" ]; then echo "ok   $1: $2"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi
 }
+play() { # start the tone player on $PLAYER (sets $ap) and prove from its own output that it opened that device
+  "$SRTONE" "$PLAYER" 30 0.2 0.1 >"$W/play.log" 2>&1 & ap=$!
+  sleep 0.5
+  grep -q "($PLAYER) ch 0-1" "$W/play.log" || { echo "FAIL player did not open $PLAYER: $(cat "$W/play.log")"; fails=$((fails + 1)); }
+}
 
-python3 - "$W" <<'PY'
-import json, math, struct, sys, wave
-w = sys.argv[1]
-wv = wave.open(f"{w}/tone.wav", "wb"); wv.setnchannels(2); wv.setsampwidth(2); wv.setframerate(48000)
-wv.writeframes(b"".join(struct.pack("<hh", round(s * 0.2 * 32767), round(s * 0.1 * 32767))
-                        for s in (math.sin(2 * math.pi * 1000 * i / 48000) for i in range(48000 * 30))))
-wv.close()
+# v1 = device under test, v2 = player target. The engine syncs the driver list to the config, so the config lists both.
+cat >"$W/devices.json" <<'JSON'
+[{"uid":"soundrouter:v1","name":"Loopback Audio","channels":2},{"uid":"soundrouter:v2","name":"SR Test Player","channels":2}]
+JSON
+"$CLI" driver set "$W/devices.json" >/dev/null || { echo "FAIL driver set"; exit 1; }
+
+python3 - "$W" "$SRTONE" <<'PY'
+import json, sys
+w, player = sys.argv[1], sys.argv[2]
 both = [(0, 0), (1, 1)]
+v2 = {"id": "v2", "name": "SR Test Player", "channels": 2, "sources": [], "wires": []}
 def cfg(name, vol=0.0, muted=False, wires=both, sources=None):
-    src = sources if sources is not None else [{"id": "s1", "kind": {"type": "app", "bundle_id": "path:/usr/bin/afplay"},
+    src = sources if sources is not None else [{"id": "s1", "kind": {"type": "app", "bundle_id": f"path:{player}"},
                                                "channels": 2, "volume_db": vol, "muted": muted}]
     dev = {"id": "v1", "name": "Loopback Audio", "channels": 2, "sources": src,
            "wires": [{"source": src[0]["id"], "src_ch": s, "out_ch": o} for s, o in wires] if src else []}
-    json.dump({"version": 1, "devices": [dev]}, open(f"{w}/{name}.json", "w"))
+    json.dump({"version": 1, "devices": [dev, v2]}, open(f"{w}/{name}.json", "w"))
 cfg("unity"); cfg("minus6", vol=-6.0); cfg("muted", muted=True)
 cfg("route01", wires=[(0, 1)]); cfg("swap", wires=[(0, 1), (1, 0)]); cfg("empty", sources=[])
 PY
@@ -36,8 +55,7 @@ PY
 # Meter lines (dB per channel, 4 Hz) must settle on exactly `want` for the last 3 lines.
 # L -14.0 dB = 0.2, R -20.0 dB = 0.1; -6 dB gain gives -20.0 / -26.0.
 while read -r name want; do
-  afplay "$W/tone.wav" & ap=$!
-  sleep 0.5
+  play
   "$CLI" -v run "$W/$name.json" >"$W/$name.run" 2>&1 & run=$!
   sleep 4
   "$CLI" meter v1 >"$W/$name.meter" 2>&1 & mt=$!
@@ -53,9 +71,8 @@ route01 -inf -14.0
 swap -20.0 -14.0
 EOF
 
-# Stopping `sr-cli run` must drop V's input back to the direct loop (silent while only afplay plays elsewhere).
-afplay "$W/tone.wav" & ap=$!
-sleep 0.5
+# Stopping `sr-cli run` must drop V's input back to the direct loop (silent while only the player plays, into v2).
+play
 "$CLI" run "$W/unity.json" >/dev/null 2>&1 & run=$!
 sleep 4
 "$CLI" meter v1 >"$W/revert.meter" 2>&1 & mt=$!

@@ -1,6 +1,7 @@
-//! End-to-end engine test through BlackHole 16ch: afplay -> process tap -> engine mixer -> BlackHole.
-//! Plays a short, quiet 440 Hz tone through the speakers. Run with
-//! `cargo test -p sr-audio --test blackhole -- --ignored`.
+//! End-to-end engine test through BlackHole 16ch: srtone -> process tap -> engine mixer -> BlackHole.
+//! Silent by design: the 1 kHz tone goes only into BlackHole (channels 8-9, tapped by process), never to a
+//! physical output. Run with `cargo test -p sr-audio --test blackhole -- --ignored`.
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -10,30 +11,31 @@ use sr_core::backend::Backend;
 use sr_core::config::*;
 
 const AMP: f32 = 0.1;
-const AFPLAY: &str = "path:/usr/bin/afplay";
+/// The player writes BlackHole channels 8-9. The engine's routed mix goes to channels 0-1 and the probe
+/// reads only those, so the player never leaks into the measurement and nothing loops back.
+const PLAYER_FIRST_CH: &str = "8";
 
-/// 16-bit mono 48 kHz sine WAV, written by hand.
-fn write_tone(path: &std::path::Path, secs: u32) {
-    let rate = 48_000u32;
-    let n = rate * secs;
-    let mut w = Vec::with_capacity(44 + 2 * n as usize);
-    w.extend(b"RIFF");
-    w.extend((36 + 2 * n).to_le_bytes());
-    w.extend(b"WAVEfmt ");
-    w.extend(16u32.to_le_bytes());
-    w.extend(1u16.to_le_bytes()); // PCM
-    w.extend(1u16.to_le_bytes()); // mono
-    w.extend(rate.to_le_bytes());
-    w.extend((rate * 2).to_le_bytes());
-    w.extend(2u16.to_le_bytes());
-    w.extend(16u16.to_le_bytes());
-    w.extend(b"data");
-    w.extend((2 * n).to_le_bytes());
-    for i in 0..n {
-        let s = (f64::from(i) * 440.0 * std::f64::consts::TAU / f64::from(rate)).sin();
-        w.extend(((s * f64::from(AMP) * 32767.0) as i16).to_le_bytes());
-    }
-    std::fs::write(path, w).unwrap();
+/// Build `packaging/srtone.c`: it plays into a virtual device only (refuses anything but soundrouter:* or
+/// BlackHole), so this test can never make sound on speakers. Returns the binary's physical path, which is
+/// also how the engine's process tap finds it (`path:<exe>`).
+fn build_srtone() -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packaging/srtone.c");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("srtone");
+    let st = Command::new("clang")
+        .args([
+            "-O2",
+            "-framework",
+            "CoreAudio",
+            "-framework",
+            "CoreFoundation",
+            "-o",
+        ])
+        .arg(&out)
+        .arg(src)
+        .status()
+        .expect("clang (Xcode command line tools) is needed to build srtone");
+    assert!(st.success(), "building srtone failed");
+    out.canonicalize().unwrap()
 }
 
 struct Player(Child);
@@ -44,7 +46,7 @@ impl Drop for Player {
     }
 }
 
-fn cfg(volume_db: f32, muted: bool, wires: &[(u16, u16)]) -> Config {
+fn cfg(player_key: &str, volume_db: f32, muted: bool, wires: &[(u16, u16)]) -> Config {
     Config {
         version: 1,
         devices: vec![VirtualDevice {
@@ -57,7 +59,7 @@ fn cfg(volume_db: f32, muted: bool, wires: &[(u16, u16)]) -> Config {
             sources: vec![Source {
                 id: "s1".into(),
                 kind: SourceKind::App {
-                    bundle_id: AFPLAY.into(),
+                    bundle_id: player_key.into(),
                 },
                 channels: 2,
                 volume_db,
@@ -116,7 +118,7 @@ fn expect(e: &mut Engine, p: &Probe, c: &Config, what: &str, want: [f32; 2]) {
 
 #[test]
 #[ignore = "needs BlackHole 16ch installed + audio capture permission"]
-fn afplay_through_engine_into_blackhole() {
+fn srtone_through_engine_into_blackhole() {
     let mut e = Engine::new().unwrap();
     let Some(bh) = e
         .hardware()
@@ -129,17 +131,34 @@ fn afplay_through_engine_into_blackhole() {
     // SAFETY: the only test in this binary, so no other thread reads the environment concurrently.
     unsafe { std::env::set_var("SR_MAIN_UID_OVERRIDE", &bh.uid) };
 
-    let wav = std::env::temp_dir().join(format!("sr-e2e-{}.wav", std::process::id()));
-    write_tone(&wav, 60);
-    let player = Player(
-        Command::new("/usr/bin/afplay")
-            .arg(&wav)
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap(),
+    let srtone = build_srtone();
+    let key = format!("path:{}", srtone.display());
+    let c = |volume_db: f32, muted: bool, wires: &[(u16, u16)]| cfg(&key, volume_db, muted, wires);
+    // Only ever BlackHole (found by name above); srtone itself also refuses any non-virtual device.
+    let mut child = Command::new(&srtone)
+        .args([
+            &bh.uid,
+            "60",
+            &AMP.to_string(),
+            &AMP.to_string(),
+            PLAYER_FIRST_CH,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut banner = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+        &mut banner,
+    )
+    .unwrap();
+    let player = Player(child);
+    assert!(
+        banner.contains(&format!("({}) ch 8-9", bh.uid)),
+        "srtone did not open BlackHole channels 8-9: {banner:?}"
     );
 
-    e.apply(&cfg(0.0, false, &[(0, 0), (1, 1)])).unwrap();
+    e.apply(&c(0.0, false, &[(0, 0), (1, 1)])).unwrap();
     wait_for("IoState::Running", 30, || match e.io_state("e2e") {
         Some(IoState::Failed(s)) => panic!("IO failed: {s}"),
         Some(IoState::Running) => Some(()),
@@ -147,35 +166,47 @@ fn afplay_through_engine_into_blackhole() {
     });
     let probe = Probe::start(&bh.uid, false).unwrap();
 
+    // The stereo-mixdown tap scales a many-channel player device (BlackHole 16ch measured 1/8), so take the
+    // unity level from the first stable non-silent reading and check every case relative to it.
+    let unit = wait_for("tone through the tap", 15, || {
+        let (a, b) = (peaks(&probe), peaks(&probe));
+        (a[0] > 1e-3 && near(a[0], a[1]) && near(a[0], b[0])).then_some(a[0])
+    });
+    assert!(
+        (AMP / 32.0..=AMP * 1.01).contains(&unit),
+        "implausible tap gain {}",
+        unit / AMP
+    );
+    println!("tap gain {:.4} (unit peak {unit})", unit / AMP);
+
     let both = [(0, 0), (1, 1)];
-    expect(&mut e, &probe, &cfg(0.0, false, &both), "unity", [AMP, AMP]);
-    expect(&mut e, &probe, &cfg(0.0, true, &both), "muted", [0.0, 0.0]);
+    expect(&mut e, &probe, &c(0.0, false, &both), "unity", [unit, unit]);
+    expect(&mut e, &probe, &c(0.0, true, &both), "muted", [0.0, 0.0]);
     expect(
         &mut e,
         &probe,
-        &cfg(-6.0, false, &both),
+        &c(-6.0, false, &both),
         "-6 dB",
-        [AMP * 0.501_187, AMP * 0.501_187],
+        [unit * 0.501_187, unit * 0.501_187],
     );
     expect(
         &mut e,
         &probe,
-        &cfg(0.0, false, &[(0, 1)]),
+        &c(0.0, false, &[(0, 1)]),
         "ch0->out1 only",
-        [0.0, AMP],
+        [0.0, unit],
     );
 
     // Source process dies: tap goes away, output silent, engine keeps running and accepts applies.
     drop(player);
-    wait_for("silence after afplay exit", 15, || {
+    wait_for("silence after srtone exit", 15, || {
         let p = peaks(&probe);
         (p == [0.0, 0.0]).then_some(())
     });
-    e.apply(&cfg(0.0, false, &both)).unwrap();
+    e.apply(&c(0.0, false, &both)).unwrap();
     assert_eq!(e.io_state("e2e"), Some(IoState::Running));
     assert_eq!(e.mismatches("e2e"), 0);
 
     drop(probe);
     drop(e);
-    let _ = std::fs::remove_file(wav);
 }

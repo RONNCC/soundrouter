@@ -64,7 +64,7 @@ Checked against the code (`crates/sr-core/src/config.rs`, `driver_proto.rs`, `sr
 | Engine vs. an existing loopback device | Yes on a dev machine | BlackHole e2e (`#[ignore]`, needs BlackHole + permissions) |
 | Driver running inside `coreaudiod` | Yes on a dev machine (macOS 14.7.1, Apple silicon, one 2 ch device) | `packaging/driver-dev.sh test` (sudo), `sr-cli loopback-test v1`; not run in CI |
 | Hidden companion joining an aggregate | Yes, same machine | `packaging/engine-live-test.sh`: engine log shows main device `soundrouter:v1.engine`; the companion never shows in `system_profiler` |
-| TCC and process taps, end to end with the installed driver | Yes for the `sr-cli` path with the terminal granted; the `.app`'s own prompts and grants **not verified** | `packaging/engine-live-test.sh`: `afplay` tap -> mixer -> V input, volume, mute, channel routing, stop reverts the input to the direct loop. Not covered: 44.1/96 kHz, more than one device, input-device sources and monitors through the installed driver, "Mute in original output" (the tap works with it set, that `afplay` goes silent on the speakers was not checked), long runs |
+| TCC and process taps, end to end with the installed driver | Yes for the `sr-cli` path with the terminal granted; the `.app`'s own prompts and grants **not verified** | `packaging/engine-live-test.sh`: `srtone` (into `soundrouter:v2`, silent) tap -> mixer -> V input, volume, mute, channel routing, stop reverts the input to the direct loop. Not covered: 44.1/96 kHz, more than one device, input-device sources and monitors through the installed driver, "Mute in original output" (the tap works with it set, that the original app goes silent on the speakers was not checked), long runs |
 | Notarized release builds | **Not verified** | needs Developer ID credentials |
 
 ## Tests
@@ -76,10 +76,10 @@ cargo test -- --ignored                                   # hardware tests: driv
 cargo test -p sr-audio --test blackhole -- --ignored      # BlackHole end-to-end
 packaging/driver-dev.sh fakehost                          # driver in a fake host, no sudo
 packaging/driver-dev.sh test                              # live checks against the installed driver (sudo)
-packaging/engine-live-test.sh                             # live engine check: afplay tap -> installed driver (no sudo)
+packaging/engine-live-test.sh                             # live engine check: srtone tap -> installed driver (silent, no sudo)
 ```
 
-The BlackHole test sets `SR_MAIN_UID_OVERRIDE` so the engine routes into an installed BlackHole device instead of SoundRouter's driver and never touches the driver. Details: [docs/TESTING.md](docs/TESTING.md).
+The BlackHole test sets `SR_MAIN_UID_OVERRIDE` so the engine routes into an installed BlackHole device instead of SoundRouter's driver and never touches the driver. All tests are silent by design (tones only go into virtual devices). Details: [docs/TESTING.md](docs/TESTING.md).
 
 Regenerate the screenshots: `cargo test -p soundrouter-app --features snapshots -- --ignored docs_screenshots`.
 

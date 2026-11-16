@@ -113,6 +113,7 @@ jobs:
 
   blackhole-e2e:
     # Experimental: hosted runners may deny audio-capture TCC, so this can fail for reasons unrelated to the code.
+    # Silent by design: the test builds packaging/srtone.c (clang) and plays only into BlackHole ch 8-9.
     runs-on: macos-15
     continue-on-error: true
     timeout-minutes: 10 # an unanswerable audio-capture TCC prompt blocks the tap forever
