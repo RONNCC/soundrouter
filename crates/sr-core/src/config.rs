@@ -196,7 +196,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_values() {
-        let bad: [(&str, fn(&mut Config)); 10] = [
+        type Mutate = fn(&mut Config);
+        let bad: [(&str, Mutate); 10] = [
             ("dup device", |c| {
                 let d = c.devices[0].clone();
                 c.devices.push(d);
