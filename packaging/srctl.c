@@ -63,10 +63,18 @@ int main(int argc, char** argv) {
     if (!strcmp(argv[1], "set")) {
         CFMutableArrayRef arr = CFArrayCreateMutable(0, 0, &kCFTypeArrayCallBacks);
         for (int k = 2; k < argc; k++) {
-            char uid[128], name[128]; int ch;
-            if (sscanf(argv[k], "%127[^:]:%127[^:]:%d", uid, name, &ch) != 3) { fprintf(stderr, "bad spec %s\n", argv[k]); return 1; }
+            // parse from the right: uid may itself contain ':' (soundrouter:v1)
+            char uid[128], name[128], *end; long ch; const char* sp = argv[k];
+            const char* c2 = strrchr(sp, ':'); const char* c1 = NULL;
+            if (c2) for (const char* q = c2; q-- > sp;) if (*q == ':') { c1 = q; break; }
+            if (!c1) { fprintf(stderr, "bad spec %s\n", sp); return 1; }
+            ch = strtol(c2 + 1, &end, 10);
+            if (end == c2 + 1 || *end || ch < 1 || ch > 16 || c1 == sp || (size_t)(c1 - sp) >= sizeof uid || (size_t)(c2 - c1 - 1) >= sizeof name) { fprintf(stderr, "bad spec %s\n", sp); return 1; }
+            memcpy(uid, sp, c1 - sp); uid[c1 - sp] = 0;
+            memcpy(name, c1 + 1, c2 - c1 - 1); name[c2 - c1 - 1] = 0;
+            int chi = (int)ch;
             CFStringRef keys[3] = { CFSTR("uid"), CFSTR("name"), CFSTR("channels") };
-            CFTypeRef vals[3] = { CFStringCreateWithCString(0, uid, kCFStringEncodingUTF8), CFStringCreateWithCString(0, name, kCFStringEncodingUTF8), CFNumberCreate(0, kCFNumberIntType, &ch) };
+            CFTypeRef vals[3] = { CFStringCreateWithCString(0, uid, kCFStringEncodingUTF8), CFStringCreateWithCString(0, name, kCFStringEncodingUTF8), CFNumberCreate(0, kCFNumberIntType, &chi) };
             CFArrayAppendValue(arr, CFDictionaryCreate(0, (const void**)keys, vals, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
         }
         OSStatus e = AudioObjectSetPropertyData(plugin(), &a, 0, NULL, sizeof(CFPropertyListRef), &arr);

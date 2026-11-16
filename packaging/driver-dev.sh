@@ -30,8 +30,10 @@ uninstall() { sudo rm -rf "$DEST"; restart; }
 step() { printf '\n== %s\n' "$*"; }
 fail() { echo "FAIL: $*"; exit 1; }
 profiler() { system_profiler SPAudioDataType; }
+# capture first: grep -q closing the pipe early would SIGPIPE system_profiler and fail under pipefail
+inprof() { local o; o=$(profiler); grep -q -- "$1" <<<"$o"; }
 test_live() {
-  [ -x "$TOOLS/srctl" ] || tools
+  tools  # always rebuild: a stale srctl hides parser fixes
   local srctl=$TOOLS/srctl log=/tmp/sr-coreaudiod.log lp
   log stream --level debug --predicate 'process == "coreaudiod" AND (eventMessage CONTAINS[c] "SoundRouter" OR eventMessage CONTAINS "PlugIn")' >"$log" 2>&1 &
   lp=$!; trap 'kill $lp 2>/dev/null || true' EXIT; sleep 1
@@ -40,26 +42,26 @@ test_live() {
   "$srctl" get || fail "not loaded; see $log and: codesign -dv $DEST"
   step "2/8 runtime create (no restart)"
   "$srctl" set "soundrouter:v1:SoundRouter 1:2" "soundrouter:v2:SoundRouter 2:8"; sleep 1
-  profiler | grep -q "SoundRouter 2" || fail "device not listed"
+  inprof "SoundRouter 2" || fail "device not listed"
   step "3/8 companions hidden"
   "$srctl" list
   [ "$("$srctl" list | grep -c '\.engine$')" = 0 ] || fail "companion visible"
-  profiler | grep -q "\.engine" && fail "companion in system_profiler"
+  inprof "\.engine" && fail "companion in system_profiler"
   step "4/8 loopback latency (expect ~2x buffer)"
   for n in 512 128 32; do "$srctl" loop soundrouter:v1 "$n"; done
   step "5/8 channel change 8->16 while IO runs"
   "$srctl" loop soundrouter:v2 128 & sleep 1
   "$srctl" set "soundrouter:v1:SoundRouter 1:2" "soundrouter:v2:SoundRouter 2:16"; wait || true
   "$srctl" loop soundrouter:v2 128
-  profiler | grep -A8 "SoundRouter 2" | grep -i -E "channels|SoundRouter"
+  { profiler | grep -A8 "SoundRouter 2" | grep -i -E "channels|SoundRouter"; } || true
   step "6/8 rename"
   "$srctl" set "soundrouter:v1:Renamed 1:2" "soundrouter:v2:SoundRouter 2:16"; sleep 1
-  profiler | grep -q "Renamed 1" || fail "rename not visible"
+  inprof "Renamed 1" || fail "rename not visible"
   step "7/8 persistence across coreaudiod restart (sudo)"
-  restart; "$srctl" get; profiler | grep -q "SoundRouter 2" || fail "devices lost after restart"
+  restart; "$srctl" get; inprof "SoundRouter 2" || fail "devices lost after restart"
   step "8/8 remove all"
   "$srctl" set; sleep 1
-  profiler | grep -q "SoundRouter 2" && fail "devices still present"
+  inprof "SoundRouter 2" && fail "devices still present"
   echo "removed OK; log: $log"
 }
 
