@@ -341,27 +341,27 @@ impl App {
                     .toast
                     .clone()
                     .or_else(|| self.worker.shared.lock().unwrap().apply_error.clone());
-                match status {
-                    Some(msg) => {
-                        ui.painter().text(
-                            pos2(r.right() - 18.0, r.center().y),
-                            Align2::RIGHT_CENTER,
-                            msg,
-                            FontId::proportional(12.0),
-                            t.danger,
-                        );
-                    }
-                    None if self.demo => {
-                        ui.painter().text(
-                            pos2(r.right() - 18.0, r.center().y),
-                            Align2::RIGHT_CENTER,
-                            "Demo mode: synthetic audio, nothing is saved",
-                            FontId::proportional(12.0),
-                            t.text2,
-                        );
-                    }
-                    None => {}
-                }
+                let (msg, color) = match status {
+                    Some(m) if m.contains("driver not installed") => (
+                        "Driver not installed. Run `sudo packaging/install-driver-dev.sh`, then relaunch.".to_string(),
+                        t.danger,
+                    ),
+                    Some(m) => (m, t.danger),
+                    None if self.demo => (
+                        "Demo mode: synthetic audio, nothing is saved".to_string(),
+                        t.text2,
+                    ),
+                    None => return,
+                };
+                let x = btn.right() + 18.0;
+                let width = r.right() - 18.0 - x;
+                graph::text_left(ui, x, r.center().y, &msg, FontId::proportional(12.0), color, width);
+                ui.interact(
+                    Rect::from_min_max(pos2(x, r.top()), pos2(r.right() - 18.0, r.bottom())),
+                    Id::unique("status"),
+                    Sense::hover(),
+                )
+                .on_hover_text(msg);
             });
 
         egui::CentralPanel::default()
@@ -483,30 +483,28 @@ impl eframe::App for App {
             && !shot.sent
             && ctx.input(|i| i.time) > 1.6
         {
-            {
-                shot.sent = true;
-                let path = shot.path.clone();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
-                    egui::ScreenshotCallback::new(move |img| {
-                        let rgba: Vec<u8> = img
-                            .pixels
-                            .iter()
-                            .flat_map(|c| c.to_srgba_unmultiplied())
-                            .collect();
-                        let saved = image::save_buffer(
-                            &path,
-                            &rgba,
-                            img.size[0] as u32,
-                            img.size[1] as u32,
-                            image::ExtendedColorType::Rgba8,
-                        );
-                        if let Err(e) = &saved {
-                            eprintln!("screenshot failed: {e}");
-                        }
-                        std::process::exit(i32::from(saved.is_err()));
-                    }),
-                ));
-            }
+            shot.sent = true;
+            let path = shot.path.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                egui::ScreenshotCallback::new(move |img| {
+                    let rgba: Vec<u8> = img
+                        .pixels
+                        .iter()
+                        .flat_map(|c| c.to_srgba_unmultiplied())
+                        .collect();
+                    let saved = image::save_buffer(
+                        &path,
+                        &rgba,
+                        img.size[0] as u32,
+                        img.size[1] as u32,
+                        image::ExtendedColorType::Rgba8,
+                    );
+                    if let Err(e) = &saved {
+                        eprintln!("screenshot failed: {e}");
+                    }
+                    std::process::exit(i32::from(saved.is_err()));
+                }),
+            ));
         }
     }
 }

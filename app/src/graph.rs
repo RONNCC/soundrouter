@@ -118,13 +118,13 @@ fn fitted(
     ui.painter().layout_job(job)
 }
 
-fn text_left(ui: &Ui, x: f32, cy: f32, text: &str, font: FontId, color: Color32, max_w: f32) {
+pub fn text_left(ui: &Ui, x: f32, cy: f32, text: &str, font: FontId, color: Color32, max_w: f32) {
     let g = fitted(ui, text, font, color, max_w);
     ui.painter()
         .galley(pos2(x, cy - g.size().y / 2.0), g, color);
 }
 
-pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>) {
+pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>) -> Layout {
     let dev = g.dev;
     let dt = ui.input(|i| i.stable_dt).min(0.1);
     let key = |s: &str| format!("{}/{s}", dev.id);
@@ -160,6 +160,7 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
         card(ui, g, st, edits, c, dt, &key);
     }
     wires_and_ports(ui, g, st, edits, &layout);
+    layout
 }
 
 fn column_headers(ui: &mut Ui, g: &GraphCtx, layout: &Layout, edits: &mut Vec<Edit>) {
@@ -691,6 +692,188 @@ fn wires_and_ports(
             radius,
             if linked || hot { c } else { t.card },
             Stroke::new(1.5, c),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{apply, default_config};
+    use crate::theme::tokens;
+    use eframe::egui::{Context, Event, PointerButton, Pos2, RawInput};
+
+    struct Rig {
+        ctx: Context,
+        st: GraphState,
+        t: f64,
+        dev: VirtualDevice,
+    }
+
+    impl Rig {
+        fn new(dev: VirtualDevice) -> Self {
+            Rig {
+                ctx: Context::default(),
+                st: GraphState::default(),
+                t: 0.0,
+                dev,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<Event>) -> (Vec<Edit>, Layout) {
+            self.t += 0.05;
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0))),
+                time: Some(self.t),
+                events,
+                ..Default::default()
+            };
+            let tk = tokens(true);
+            let mut edits = Vec::new();
+            let mut layout = None;
+            let out = self.ctx.run_ui(input, |ui| {
+                let g = GraphCtx {
+                    dev_idx: 0,
+                    dev: &self.dev,
+                    hw: &[],
+                    apps: &[],
+                    reading: None,
+                    t: &tk,
+                    min_h: 500.0,
+                };
+                layout = Some(show(ui, &g, &mut self.st, &mut edits));
+            });
+            out.drop_without_applying_deltas();
+            (edits, layout.unwrap())
+        }
+
+        /// Press at `from`, move through `to`, release; returns every edit emitted.
+        fn drag(&mut self, from: Pos2, to: Pos2) -> Vec<Edit> {
+            let btn = |pos, pressed| Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let mid = from + (to - from) * 0.5;
+            let mut all = Vec::new();
+            for ev in [
+                vec![Event::PointerMoved(from)],
+                vec![btn(from, true)],
+                vec![Event::PointerMoved(mid)],
+                vec![Event::PointerMoved(to)],
+                vec![],
+                vec![btn(to, false)],
+                vec![],
+            ] {
+                all.extend(self.frame(ev).0);
+            }
+            all
+        }
+    }
+
+    fn device() -> VirtualDevice {
+        let mut c = default_config();
+        apply(
+            &mut c,
+            Edit::AddSource(
+                0,
+                SourceKind::App {
+                    bundle_id: "x.y".into(),
+                },
+                2,
+            ),
+        );
+        apply(&mut c, Edit::AddMonitor(0, "spk".into(), 2));
+        c.devices.remove(0)
+    }
+
+    #[test]
+    fn dragging_output_port_to_input_port_connects() {
+        let mut dev = device();
+        dev.wires.clear();
+        let mut rig = Rig::new(dev);
+        let layout = rig.frame(vec![]).1;
+        let from = layout.port_pos(Port::Src { src: 0, ch: 0 }).unwrap();
+        let to = layout.port_pos(Port::OutIn { ch: 1 }).unwrap();
+        let edits = rig.drag(from, to + vec2(3.0, 2.0));
+        let want = Link {
+            from: Port::Src { src: 0, ch: 0 },
+            to: Port::OutIn { ch: 1 },
+        };
+        assert_eq!(edits, vec![Edit::Connect(0, want)]);
+    }
+
+    #[test]
+    fn dropping_on_empty_space_creates_nothing() {
+        let mut dev = device();
+        dev.wires.clear();
+        let mut rig = Rig::new(dev);
+        let layout = rig.frame(vec![]).1;
+        let from = layout.port_pos(Port::Src { src: 0, ch: 0 }).unwrap();
+        assert!(rig.drag(from, pos2(600.0, 500.0)).is_empty());
+    }
+
+    #[test]
+    fn output_channel_drags_to_monitor_only() {
+        let mut dev = device();
+        dev.monitors[0].wires.clear();
+        let mut rig = Rig::new(dev);
+        let layout = rig.frame(vec![]).1;
+        let from = layout.port_pos(Port::OutOut { ch: 0 }).unwrap();
+        let to = layout.port_pos(Port::Mon { mon: 0, ch: 1 }).unwrap();
+        let edits = rig.drag(from, to);
+        let want = Link {
+            from: Port::OutOut { ch: 0 },
+            to: Port::Mon { mon: 0, ch: 1 },
+        };
+        assert_eq!(edits, vec![Edit::Connect(0, want)]);
+        // a source port may not drop straight onto a monitor
+        let from = layout.port_pos(Port::Src { src: 0, ch: 0 }).unwrap();
+        assert!(rig.drag(from, to).is_empty());
+    }
+
+    #[test]
+    fn dragging_an_input_end_rewires() {
+        let mut rig = Rig::new(device());
+        let layout = rig.frame(vec![]).1;
+        let grab = layout.port_pos(Port::OutIn { ch: 0 }).unwrap();
+        let drop = layout.port_pos(Port::OutIn { ch: 1 }).unwrap();
+        let edits = rig.drag(grab, drop);
+        let old = Link {
+            from: Port::Src { src: 0, ch: 0 },
+            to: Port::OutIn { ch: 0 },
+        };
+        let new = Link {
+            from: Port::Src { src: 0, ch: 0 },
+            to: Port::OutIn { ch: 1 },
+        };
+        assert_eq!(edits, vec![Edit::Unlink(0, old), Edit::Connect(0, new)]);
+    }
+
+    #[test]
+    fn clicking_an_input_port_disconnects_it() {
+        let mut rig = Rig::new(device());
+        let layout = rig.frame(vec![]).1;
+        let p = layout.port_pos(Port::Mon { mon: 0, ch: 0 }).unwrap();
+        let btn = |pressed| Event::PointerButton {
+            pos: p,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let mut edits = Vec::new();
+        for ev in [
+            vec![Event::PointerMoved(p)],
+            vec![btn(true)],
+            vec![btn(false)],
+            vec![],
+        ] {
+            edits.extend(rig.frame(ev).0);
+        }
+        assert_eq!(
+            edits,
+            vec![Edit::Disconnect(0, Port::Mon { mon: 0, ch: 0 })]
         );
     }
 }
