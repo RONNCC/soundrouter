@@ -4,6 +4,9 @@ pub const DEVICE_UID_PREFIX: &str = "soundrouter:";
 pub const MANUFACTURER: &str = "SoundRouter";
 /// Protocol version, read-only, data = CFString "1".
 pub const PROP_VERSION: u32 = u32::from_be_bytes(*b"srvr");
+/// Late-write counter, read-only, on each device object (V and C), type 'plst' (CFNumber, 64-bit): how many
+/// WriteMix calls on that device arrived after their output time or exceeded the ring. Resets when the slot is reused.
+pub const PROP_OVERLOADS: u32 = u32::from_be_bytes(*b"srov");
 /// Device list, on the plug-in object (global scope, element main). Type 'plst' (CFPropertyList), settable.
 /// Value = CFArray of CFDictionary {uid: CFString, name: CFString, channels: CFNumber 1..=64}, at most `MAX_DEVICES`.
 /// Set replaces the whole list. The driver persists it via host storage under `STORAGE_KEY`.

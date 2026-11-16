@@ -60,6 +60,7 @@ pub unsafe extern "C" fn zero_ts(
     if sample_time.is_null() || host_time.is_null() || seed.is_null() {
         return BAD_OBJECT;
     }
+    // Shared anchor and seed, but each device's own rate: identical to the peer while the rates agree.
     let per = ticks_per_second() / slot.rate(side) * RING_FRAMES as f64; // host ticks per period
     let anchor = slot.anchor.load(Acquire);
     let n = (now_ticks().saturating_sub(anchor) as f64 / per) as u64;
@@ -141,6 +142,14 @@ pub unsafe extern "C" fn do_io(
     } as i64;
     // SAFETY: the HAL hands us `frames` interleaved frames of the stream format we advertised.
     let buf = unsafe { std::slice::from_raw_parts_mut(buf as *mut f32, frames as usize * ch) };
+    if write {
+        // Late (scheduled before the device's current time) or too big for the ring: counted. Real-time safe.
+        // SAFETY: checked non-null above.
+        let late = t < unsafe { (*cycle).mCurrentTime.mSampleTime } as i64;
+        if late || frames > RING_FRAMES / 2 {
+            slot.overloads[side as usize].fetch_add(1, Relaxed);
+        }
+    }
     // While V and C disagree (a format change landed on one side only) the pair stays silent.
     let ring = slot
         .ring(ring_a)
@@ -152,9 +161,22 @@ pub unsafe extern "C" fn do_io(
         return 0;
     };
     if write {
-        ring.write(ch, t, buf)
-    } else {
-        ring.read(ch, t, buf)
+        ring.write(ch, t, buf);
+        return 0;
+    }
+    ring.read(ch, t, buf);
+    // V's levels are applied on the read side, so both consumers of what apps play (the engine on C.in and
+    // V.in's direct loop) and what apps record from V honour them. C itself has no controls.
+    let out = || slot.levels[1].effective();
+    let g = match (side, direct) {
+        (Side::Engine, _) => out(),
+        (Side::Visible, true) => out() * slot.levels[0].effective(),
+        (Side::Visible, false) => slot.levels[0].effective(),
+    };
+    if g == 0.0 {
+        buf.fill(0.0); // exact silence, also for non-finite input
+    } else if g != 1.0 {
+        buf.iter_mut().for_each(|x| *x *= g);
     }
     0
 }
@@ -199,11 +221,16 @@ mod tests {
     /// One WriteMix/ReadInput call on `buf` (`n` real samples). Returns the guard words that were
     /// overwritten, which must be none.
     fn run(dev: u32, op: u32, t: f64, buf: &mut Vec<f32>, n: usize) -> usize {
+        run_at(dev, op, t, 0.0, buf, n)
+    }
+    /// `now` is the device's current sample time in the cycle info.
+    fn run_at(dev: u32, op: u32, t: f64, now: f64, buf: &mut Vec<f32>, n: usize) -> usize {
         buf.resize(n + GUARD, SENTINEL);
         buf[n..].fill(SENTINEL);
         let mut cycle: AudioServerPlugInIOCycleInfo = unsafe { std::mem::zeroed() };
         cycle.mInputTime.mSampleTime = t;
         cycle.mOutputTime.mSampleTime = t;
+        cycle.mCurrentTime.mSampleTime = now;
         let st = unsafe {
             do_io(
                 std::ptr::null_mut(),
@@ -437,5 +464,115 @@ mod tests {
             "back to the direct loop"
         );
         assert_eq!(stop(v), 0);
+    }
+
+    fn zero_time(dev: u32) -> (f64, u64, u64) {
+        let (mut t, mut h, mut s) = (0.0, 0, 0);
+        assert_eq!(
+            unsafe { zero_ts(std::ptr::null_mut(), dev, 0, &mut t, &mut h, &mut s) },
+            0
+        );
+        (t, h, s)
+    }
+
+    /// V and C share anchor and seed; at one rate they also report one timestamp (the HAL syncs the
+    /// pair as one clock domain), while a rate change moves only the device that changed.
+    #[test]
+    fn v_and_c_report_identical_zero_timestamps_at_one_rate() {
+        let (v, c) = activate(5, 2);
+        let per = ticks_per_second() / 48_000.0 * RING_FRAMES as f64;
+        SLOTS[5]
+            .anchor
+            .store(now_ticks() - (7.5 * per) as u64, Release);
+        // Both calls land in the same period unless a boundary passes in between; retry across one.
+        let same = (0..50).any(|_| {
+            let a = zero_time(v);
+            let b = zero_time(c);
+            let a2 = zero_time(v);
+            a == a2 && a == b
+        });
+        assert!(same, "V and C disagree at the same rate");
+    }
+
+    /// The engine path (V.out -> C.in) and the direct loop (V.out -> V.in) both apply V's output level;
+    /// V.in via the engine applies V's input level only; C.out is stored untouched.
+    #[test]
+    fn levels_apply_on_the_read_side_bit_exactly() {
+        let (v, c) = activate(8, 2);
+        let n = FRAMES * 2;
+        let out = ramp(2);
+        let mut buf = vec![];
+        let db = -6.0206f32;
+        let g = 10f64.powf(db as f64 / 20.0) as f32;
+        assert!((g - 0.5).abs() < 1e-4);
+        let scaled = |x: &[f32], g: f32| x.iter().map(|&s| s * g).collect::<Vec<_>>();
+
+        // Defaults: unity, bit-exact pass-through.
+        assert_eq!(run(v, WRITE, 1000.0, &mut out.clone(), n), 0);
+        run(c, READ, 1000.0, &mut buf, n);
+        assert_eq!(&buf[..n], &out[..]);
+
+        // Engine path honours the output level; the stored samples stay raw.
+        SLOTS[8].levels[1].set_db(db);
+        run(c, READ, 1000.0, &mut buf, n);
+        assert_eq!(&buf[..n], &scaled(&out, g)[..]);
+        SLOTS[8].levels[1].set_db(0.0);
+        run(c, READ, 1000.0, &mut buf, n);
+        assert_eq!(&buf[..n], &out[..], "stored data is not attenuated");
+
+        // Direct loop (C idle): output level times input level.
+        SLOTS[8].levels[1].set_db(db);
+        SLOTS[8].levels[0].set_db(db);
+        run(v, READ, 1000.0, &mut buf, n);
+        assert_eq!(&buf[..n], &scaled(&out, g * g)[..]);
+        SLOTS[8].levels[0].set_db(0.0);
+        run(v, READ, 1000.0, &mut buf, n);
+        assert_eq!(&buf[..n], &scaled(&out, g)[..]);
+
+        // Engine running: V.in is ring B, which only the input level touches; C.out is not scaled.
+        SLOTS[8].clients[Side::Engine as usize].store(1, Release);
+        let mix = ramp(2).iter().map(|x| -x).collect::<Vec<_>>();
+        assert_eq!(run(c, WRITE, 2000.0, &mut mix.clone(), n), 0);
+        run(v, READ, 2000.0, &mut buf, n);
+        assert_eq!(&buf[..n], &mix[..], "output level must not touch V.in");
+        SLOTS[8].levels[0].set_db(db);
+        run(v, READ, 2000.0, &mut buf, n);
+        assert_eq!(&buf[..n], &scaled(&mix, g)[..]);
+
+        // Mute: exact zeros, on either scope, with and without a non-finite sample in the data.
+        SLOTS[8].levels[0].set_db(0.0);
+        SLOTS[8].levels[0].set_muted(true);
+        run(v, READ, 2000.0, &mut buf, n);
+        assert!(buf[..n].iter().all(|&x| x.to_bits() == 0));
+        SLOTS[8].levels[0].set_muted(false);
+        SLOTS[8].levels[1].set_muted(true);
+        let mut nan = out.clone();
+        nan[0] = f32::NAN;
+        assert_eq!(run(v, WRITE, 3000.0, &mut nan, n), 0);
+        run(c, READ, 3000.0, &mut buf, n);
+        assert!(buf[..n].iter().all(|&x| x.to_bits() == 0));
+        SLOTS[8].levels[1].set_muted(false);
+        run(c, READ, 3000.0, &mut buf, n);
+        assert!(buf[0].is_nan(), "unmuted unity passes data through");
+    }
+
+    #[test]
+    fn writes_scheduled_in_the_past_or_too_big_are_counted() {
+        let (v, c) = activate(6, 2);
+        let n = FRAMES * 2;
+        let mut out = ramp(2);
+        let count = |side: Side| SLOTS[6].overloads[side as usize].load(Relaxed);
+        assert_eq!(run_at(v, WRITE, 5000.0, 4000.0, &mut out, n), 0); // ahead of now: on time
+        assert_eq!(run_at(v, WRITE, 5000.0, 5000.0, &mut out, n), 0); // exactly now: on time
+        assert_eq!(count(Side::Visible), 0);
+        assert_eq!(run_at(v, WRITE, 5000.0, 5001.0, &mut out, n), 0); // behind now: late
+        assert_eq!(count(Side::Visible), 1);
+        let mut big = vec![0.0; (RING_FRAMES as usize / 2 + 1) * 2];
+        let k = big.len();
+        assert_eq!(run_at(c, WRITE, 9000.0, 0.0, &mut big, k), 0); // C.out has its own counter
+        assert_eq!((count(Side::Visible), count(Side::Engine)), (1, 1));
+        // Reads never count.
+        run_at(c, READ, 5000.0, 9999.0, &mut out, n);
+        assert_eq!((count(Side::Visible), count(Side::Engine)), (1, 1));
     }
 }

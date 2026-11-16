@@ -13,9 +13,11 @@ pub const RING_FRAMES: u32 = 16384;
 pub const COMPANION_HIDDEN: bool = true;
 
 // Object ids per slot s: base = 16 + 8s. Visible device V at +0 (streams +1 in, +2 out),
-// engine companion C at +4 (streams +5 in, +6 out).
+// engine companion C at +4 (streams +5 in, +6 out). V's four controls live after all slot blocks:
+// `CTRL_BASE + 4s + k` (k = input volume, input mute, output volume, output mute); C has none.
 const BASE: u32 = 16;
 const STRIDE: u32 = 8;
+const CTRL_BASE: u32 = BASE + STRIDE * MAX_DEVICES as u32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
@@ -29,15 +31,27 @@ pub enum Part {
     Device,
     Input,
     Output,
+    VolumeIn,
+    MuteIn,
+    VolumeOut,
+    MuteOut,
 }
+const CONTROLS: [Part; 4] = [Part::VolumeIn, Part::MuteIn, Part::VolumeOut, Part::MuteOut];
 
 pub fn encode(slot: usize, side: Side, part: Part) -> u32 {
+    if let Some(k) = CONTROLS.iter().position(|&c| c == part) {
+        return CTRL_BASE + 4 * slot as u32 + k as u32;
+    }
     let side = if side == Side::Engine { 4 } else { 0 };
     BASE + STRIDE * slot as u32 + side + part as u32
 }
 
 /// Structure only; callers check `Slot::alive`.
 pub fn decode(id: u32) -> Option<(usize, Side, Part)> {
+    if let Some(n) = id.checked_sub(CTRL_BASE) {
+        let slot = (n / 4) as usize;
+        return (slot < MAX_DEVICES).then(|| (slot, Side::Visible, CONTROLS[(n % 4) as usize]));
+    }
     let n = id.checked_sub(BASE)?;
     let slot = (n / STRIDE) as usize;
     let (side, part) = match n % STRIDE {
@@ -88,6 +102,74 @@ pub fn rate_index(rate: f64) -> Option<usize> {
     SAMPLE_RATES.iter().position(|&r| r == rate)
 }
 
+/// Lowest level of V's volume controls; at this value the gain is exactly 0.
+pub const MIN_DB: f32 = -64.0;
+
+/// dB is the primary value and scalar its linear-in-dB view (0 -> `MIN_DB`, 1 -> 0 dB), like the
+/// HAL's default level-control mapping. `gain` is derived on the (non-real-time) set path so that
+/// `do_io` only does one atomic load.
+pub fn scalar_to_db(s: f32) -> f32 {
+    MIN_DB * (1.0 - s.clamp(0.0, 1.0))
+}
+pub fn db_to_scalar(db: f32) -> f32 {
+    1.0 - db.clamp(MIN_DB, 0.0) / MIN_DB
+}
+
+/// Volume + mute of one scope of V. Defaults: 0 dB, unmuted.
+pub struct Level {
+    db: AtomicU32,
+    gain: AtomicU32,
+    mute: AtomicU32,
+}
+impl Level {
+    const fn new() -> Self {
+        Level {
+            db: AtomicU32::new(0),             // 0.0f32 bits
+            gain: AtomicU32::new(0x3f80_0000), // 1.0f32 bits
+            mute: AtomicU32::new(0),
+        }
+    }
+    pub fn db(&self) -> f32 {
+        f32::from_bits(self.db.load(Relaxed))
+    }
+    pub fn scalar(&self) -> f32 {
+        db_to_scalar(self.db())
+    }
+    /// Out-of-range values clamp; NaN is ignored.
+    pub fn set_db(&self, db: f32) {
+        if db.is_nan() {
+            return;
+        }
+        let db = db.clamp(MIN_DB, 0.0);
+        let gain = if db <= MIN_DB {
+            0.0
+        } else {
+            10f64.powf(db as f64 / 20.0) as f32
+        };
+        self.gain.store(gain.to_bits(), Relaxed);
+        self.db.store(db.to_bits(), Relaxed);
+    }
+    pub fn set_scalar(&self, s: f32) {
+        if !s.is_nan() {
+            self.set_db(scalar_to_db(s));
+        }
+    }
+    pub fn muted(&self) -> bool {
+        self.mute.load(Relaxed) != 0
+    }
+    pub fn set_muted(&self, m: bool) {
+        self.mute.store(m as u32, Relaxed);
+    }
+    /// Multiplier for `do_io`: 0 when muted. Real-time safe.
+    pub fn effective(&self) -> f32 {
+        if self.muted() {
+            0.0
+        } else {
+            f32::from_bits(self.gain.load(Relaxed))
+        }
+    }
+}
+
 /// One device pair. Memory lives forever so stale I/O after removal stays memory-safe.
 pub struct Slot {
     pub alive: AtomicBool,
@@ -100,9 +182,15 @@ pub struct Slot {
     pub meta: Mutex<(String, String)>, // (uid, name)
     /// Clients with I/O running per side (index = `Side as usize`).
     pub clients: [AtomicU32; 2],
-    /// Shared by V and C so both report identical timestamps. Only set when the first client starts.
+    /// Shared by V and C (like `seed`): one timeline origin, set when the first client starts. Each
+    /// device derives its sample time from its own rate, so V and C report identical timestamps
+    /// while their rates agree; see docs/ARCHITECTURE.md, "Clock and zero timestamps".
     pub anchor: AtomicU64,
     pub seed: AtomicU64,
+    /// Volume/mute on V, applied when reading: [input scope, output scope]. C has none.
+    pub levels: [Level; 2],
+    /// WriteMix calls that arrived late or were too big for the ring, per side. Read-only property `srov`.
+    pub overloads: [AtomicU64; 2],
     /// V.out -> C.in
     pub ring_a: OnceLock<Ring>,
     /// C.out -> V.in
@@ -120,6 +208,8 @@ impl Slot {
             clients: [AtomicU32::new(0), AtomicU32::new(0)],
             anchor: AtomicU64::new(0),
             seed: AtomicU64::new(0),
+            levels: [const { Level::new() }; 2],
+            overloads: [AtomicU64::new(0), AtomicU64::new(0)],
             ring_a: OnceLock::new(),
             ring_b: OnceLock::new(),
         }
@@ -195,6 +285,13 @@ impl Slot {
         }
         for c in &self.clients {
             c.store(0, Release);
+        }
+        for l in &self.levels {
+            l.set_db(0.0);
+            l.set_muted(false);
+        }
+        for o in &self.overloads {
+            o.store(0, Relaxed);
         }
         *self.meta() = (d.uid, d.name);
         self.alive.store(true, Release);
@@ -306,10 +403,24 @@ mod tests {
                     assert_eq!(decode(id), Some((s, side, part)));
                 }
             }
+            for part in CONTROLS {
+                let id = encode(s, Side::Visible, part);
+                assert!(seen.insert(id));
+                assert_eq!(decode(id), Some((s, Side::Visible, part)));
+            }
         }
         assert_eq!(encode(0, Side::Visible, Part::Device), 16);
         assert_eq!(encode(1, Side::Engine, Part::Output), 16 + 8 + 6);
-        for bad in [0, 1, 15, 19, 23, 16 + 8 * MAX_DEVICES as u32] {
+        assert_eq!(encode(1, Side::Visible, Part::MuteOut), CTRL_BASE + 4 + 3);
+        for bad in [
+            0,
+            1,
+            15,
+            19,
+            23,
+            CTRL_BASE - 1,
+            CTRL_BASE + 4 * MAX_DEVICES as u32,
+        ] {
             assert_eq!(decode(bad), None, "{bad}");
         }
     }
@@ -373,5 +484,49 @@ mod tests {
         assert_eq!(rate_index(48_000.0), Some(1));
         assert_eq!(rate_index(47_999.0), None);
         assert!(ticks_per_second() > 0.0);
+    }
+
+    #[test]
+    fn level_maps_scalar_and_db_linearly_and_derives_the_gain() {
+        assert_eq!(scalar_to_db(1.0), 0.0);
+        assert_eq!(scalar_to_db(0.0), MIN_DB);
+        assert_eq!(scalar_to_db(0.5), -32.0);
+        assert_eq!((db_to_scalar(0.0), db_to_scalar(MIN_DB)), (1.0, 0.0));
+        assert_eq!(db_to_scalar(-100.0), 0.0); // out of range clamps
+        assert_eq!(db_to_scalar(6.0), 1.0);
+        let l = Level::new();
+        assert_eq!(
+            (l.effective(), l.scalar(), l.db(), l.muted()),
+            (1.0, 1.0, 0.0, false)
+        );
+        l.set_db(-6.0206);
+        assert!((l.effective() - 0.5).abs() < 1e-4);
+        assert_eq!(l.db(), -6.0206);
+        l.set_scalar(0.0);
+        assert_eq!((l.db(), l.effective()), (MIN_DB, 0.0)); // bottom of the slider is silence
+        l.set_db(f32::NAN);
+        l.set_scalar(f32::NAN);
+        assert_eq!(l.db(), MIN_DB, "NaN is ignored");
+        l.set_db(0.0);
+        l.set_muted(true);
+        assert_eq!((l.effective(), l.db()), (0.0, 0.0));
+        l.set_muted(false);
+        assert_eq!(l.effective(), 1.0);
+    }
+
+    #[test]
+    fn activate_resets_levels_and_counters() {
+        let s = Slot::new();
+        s.levels[1].set_db(-10.0);
+        s.levels[0].set_muted(true);
+        s.overloads[1].store(3, Relaxed);
+        s.activate(DriverDevice {
+            uid: "u".into(),
+            name: "n".into(),
+            channels: 2,
+        });
+        assert_eq!(s.levels[1].effective(), 1.0);
+        assert_eq!(s.levels[0].effective(), 1.0);
+        assert_eq!(s.overloads[1].load(Relaxed), 0);
     }
 }

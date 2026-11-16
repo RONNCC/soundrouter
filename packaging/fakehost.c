@@ -160,6 +160,28 @@ static OSStatus io(AudioObjectID d, AudioObjectID st, UInt32 client, int op, dou
     gCi.mInputTime.mSampleTime = gCi.mOutputTime.mSampleTime = t;
     return D->DoIOOperation(gDrv, d, st, client, op, FR, &gCi, buf, NULL);
 }
+
+// Level/mute controls and the overload counter (props on V's control objects).
+static OSStatus getBytes(AudioObjectID o, UInt32 sel, UInt32 scope, void* out, UInt32 size) {
+    AudioObjectPropertyAddress a = addr(sel, scope); UInt32 sz = size;
+    return D->GetPropertyData(gDrv, o, 0, &a, 0, NULL, size, &sz, out);
+}
+static Float32 f32(AudioObjectID o, UInt32 sel) { Float32 v = -999; CHECK(getBytes(o, sel, 0, &v, 4) == 0); return v; }
+static OSStatus setBytes(AudioObjectID o, UInt32 sel, UInt32 size, const void* v) {
+    AudioObjectPropertyAddress a = addr(sel, 0);
+    return D->SetPropertyData(gDrv, o, 0, &a, 0, NULL, size, v);
+}
+static void setF32(AudioObjectID o, UInt32 sel, Float32 v) { CHECK(setBytes(o, sel, 4, &v) == 0); }
+static void setMute(AudioObjectID o, UInt32 m) { CHECK(setBytes(o, kAudioBooleanControlPropertyValue, 4, &m) == 0); }
+static Float32 convert(AudioObjectID o, UInt32 sel, Float32 in) { Float32 v = in; CHECK(getBytes(o, sel, 0, &v, 4) == 0); return v; }
+static SInt64 overloads(AudioObjectID d) {
+    AudioObjectPropertyAddress a = addr('srov', kAudioObjectPropertyScopeGlobal); CFNumberRef n = NULL; UInt32 sz = sizeof n; SInt64 v = -1;
+    CHECK(D->GetPropertyData(gDrv, d, 0, &a, 0, NULL, sz, &sz, &n) == 0 && n && CFGetTypeID(n) == CFNumberGetTypeID());
+    CFNumberGetValue(n, kCFNumberSInt64Type, &v); CFRelease(n);
+    return v;
+}
+// What the driver should multiply by for a dB value: the same libm pow, rounded to float once.
+static Float32 gainOf(Float32 db) { return db <= -64.0f ? 0.0f : (Float32)pow(10.0, (double)db / 20.0); }
 static void fill(float* b, int ch, float base) { for (int i = 0; i < FR * ch; i++) b[i] = base + (float)i; }
 
 // 6c: 2-channel ReadInput on the ids of a removed slot (as a HAL that has not torn them down yet would do).
@@ -477,6 +499,100 @@ int main(int argc, char** argv) {
         CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 3000, memset(i2, 0xAA, sizeof i2)) == 0 && !memcmp(i2, o, sizeof i2)); // direct loop again
         CHECK(D->StopIO(gDrv, V, 1) == 0);
         printf("ok V loops to itself while C is idle, engine path while C runs\n");
+    }
+
+
+    // 5c. V's volume and mute controls (input and output scope), applied on the read side; C has none.
+    {
+        AudioObjectID ci[4], co[4], cg[8], cc[4], own[8];
+        CHECK(ids(V, kAudioObjectPropertyControlList, kAudioObjectPropertyScopeInput, ci) == 2);
+        CHECK(ids(V, kAudioObjectPropertyControlList, kAudioObjectPropertyScopeOutput, co) == 2);
+        CHECK(ids(V, kAudioObjectPropertyControlList, kAudioObjectPropertyScopeGlobal, cg) == 4);
+        CHECK(ids(V, kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, own) == 6); // 2 streams + 4 controls
+        CHECK(ids(V, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeGlobal, own) == 2);
+        CHECK(ids(C, kAudioObjectPropertyControlList, kAudioObjectPropertyScopeGlobal, cc) == 0);
+        AudioObjectID vIn = ci[0], mIn = ci[1], vOut = co[0], mOut = co[1];
+        CHECK(u32(vOut, kAudioObjectPropertyClass, 0) == kAudioVolumeControlClassID && u32(vOut, kAudioObjectPropertyBaseClass, 0) == kAudioLevelControlClassID);
+        CHECK(u32(mOut, kAudioObjectPropertyClass, 0) == kAudioMuteControlClassID && u32(mOut, kAudioObjectPropertyBaseClass, 0) == kAudioBooleanControlClassID);
+        CHECK(u32(vIn, kAudioObjectPropertyOwner, 0) == V && u32(vIn, kAudioControlPropertyScope, 0) == kAudioObjectPropertyScopeInput);
+        CHECK(u32(vOut, kAudioControlPropertyScope, 0) == kAudioObjectPropertyScopeOutput && u32(vOut, kAudioControlPropertyElement, 0) == kAudioObjectPropertyElementMain);
+        // Defaults: full volume, unmuted.
+        CHECK(f32(vOut, kAudioLevelControlPropertyScalarValue) == 1.0f && f32(vOut, kAudioLevelControlPropertyDecibelValue) == 0.0f);
+        CHECK(f32(vIn, kAudioLevelControlPropertyScalarValue) == 1.0f && u32(mIn, kAudioBooleanControlPropertyValue, 0) == 0 && u32(mOut, kAudioBooleanControlPropertyValue, 0) == 0);
+        AudioValueRange rg; CHECK(getBytes(vOut, kAudioLevelControlPropertyDecibelRange, 0, &rg, sizeof rg) == 0 && rg.mMinimum == -64 && rg.mMaximum == 0);
+        CHECK(convert(vOut, kAudioLevelControlPropertyConvertScalarToDecibels, 0.5f) == -32.0f && convert(vOut, kAudioLevelControlPropertyConvertDecibelsToScalar, -16.0f) == 0.75f);
+        // Settable: values yes, class/range no; wrong sizes refused.
+        Boolean st = 0; AudioObjectPropertyAddress sa = addr(kAudioLevelControlPropertyScalarValue, 0);
+        CHECK(D->IsPropertySettable(gDrv, vOut, 0, &sa, &st) == 0 && st);
+        sa = addr(kAudioLevelControlPropertyDecibelRange, 0); CHECK(D->IsPropertySettable(gDrv, vOut, 0, &sa, &st) == 0 && !st);
+        sa = addr(kAudioBooleanControlPropertyValue, 0); CHECK(D->IsPropertySettable(gDrv, mOut, 0, &sa, &st) == 0 && st);
+        Float64 bad = 0.5; CHECK(setBytes(vOut, kAudioLevelControlPropertyScalarValue, 8, &bad) != 0 && setBytes(mOut, kAudioBooleanControlPropertyValue, 1, &bad) != 0);
+        CHECK(setBytes(vOut, kAudioLevelControlPropertyDecibelRange, 16, &rg) != 0);
+        CHECK(f32(vOut, kAudioLevelControlPropertyScalarValue) == 1.0f && u32(mOut, kAudioBooleanControlPropertyValue, 0) == 0);
+        // Writes land, convert both ways, clamp, and notify.
+        gNLn = 0;
+        setF32(vOut, kAudioLevelControlPropertyScalarValue, 0.5f);
+        CHECK(f32(vOut, kAudioLevelControlPropertyDecibelValue) == -32.0f && f32(vOut, kAudioLevelControlPropertyScalarValue) == 0.5f);
+        CHECK(notified(vOut, kAudioLevelControlPropertyScalarValue) && notified(vOut, kAudioLevelControlPropertyDecibelValue));
+        setF32(vOut, kAudioLevelControlPropertyDecibelValue, -200.0f); CHECK(f32(vOut, kAudioLevelControlPropertyScalarValue) == 0.0f && f32(vOut, kAudioLevelControlPropertyDecibelValue) == -64.0f);
+        setF32(vOut, kAudioLevelControlPropertyScalarValue, 7.0f); CHECK(f32(vOut, kAudioLevelControlPropertyDecibelValue) == 0.0f);
+        gNLn = 0; setMute(mOut, 1); CHECK(u32(mOut, kAudioBooleanControlPropertyValue, 0) == 1 && notified(mOut, kAudioBooleanControlPropertyValue)); setMute(mOut, 0);
+        CHECK(u32(mIn, kAudioBooleanControlPropertyValue, 0) == 0 && f32(vIn, kAudioLevelControlPropertyScalarValue) == 1.0f); // scopes independent
+
+        // Gain on the data: -6.0206 dB on the output scope, bit-exact against one float multiply by the same factor.
+        const Float32 DB = -6.0206f; setF32(vOut, kAudioLevelControlPropertyDecibelValue, DB);
+        CHECK(f32(vOut, kAudioLevelControlPropertyDecibelValue) == DB);
+        Float32 g = gainOf(DB), gi, gg; CHECK(fabsf(g - 0.5f) < 1e-4f);
+        float raw[FR * 2], want[FR * 2], rd[FR * 2], zr[FR * 2] = {0}; fill(raw, 2, 1.0f);
+        #define SCALED(dst, src, k) for (int q = 0; q < FR * 2; q++) (dst)[q] = (src)[q] * (k)
+        // Engine path: V.out -> C.in is scaled; the next read after resetting to 0 dB is raw again (stored data untouched).
+        CHECK(D->StartIO(gDrv, V, 1) == 0 && D->StartIO(gDrv, C, 7) == 0);
+        CHECK(io(V, Vo, 1, kAudioServerPlugInIOOperationWriteMix, 8000, raw) == 0);
+        SCALED(want, raw, g);
+        CHECK(io(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, want, sizeof rd));
+        setMute(mOut, 1);
+        CHECK(io(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
+        setMute(mOut, 0); setF32(vOut, kAudioLevelControlPropertyScalarValue, 1.0f);
+        CHECK(io(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, raw, sizeof rd));
+        // V.in via the engine (ring B) carries the input scope only; the output level does not leak into it, and C.out is stored raw.
+        setF32(vOut, kAudioLevelControlPropertyDecibelValue, DB);
+        fill(want, 2, 9000.0f);
+        CHECK(io(C, Co, 7, kAudioServerPlugInIOOperationWriteMix, 9000, want) == 0);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, want, sizeof rd));
+        setF32(vIn, kAudioLevelControlPropertyDecibelValue, -12.0f); gi = gainOf(-12.0f);
+        float w2[FR * 2]; SCALED(w2, want, gi);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, w2, sizeof rd));
+        setMute(mIn, 1);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
+        setMute(mIn, 0);
+        // V -> V loop (C idle): output level times input level, one multiply by their product.
+        CHECK(D->StopIO(gDrv, C, 7) == 0);
+        gg = gi * g; SCALED(w2, raw, gg);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, w2, sizeof rd));
+        setMute(mOut, 1);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
+        setMute(mOut, 0); setF32(vIn, kAudioLevelControlPropertyScalarValue, 1.0f); setF32(vOut, kAudioLevelControlPropertyScalarValue, 1.0f);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, raw, sizeof rd)); // back to bit-exact unity
+
+        // Overload counter: a WriteMix scheduled before the device's current time is counted per device; reads and on-time writes are not.
+        CHECK(overloads(V) == 0 && overloads(C) == 0);
+        CHECK(io(V, Vo, 1, kAudioServerPlugInIOOperationWriteMix, 8000, raw) == 0 && overloads(V) == 0); // on time (current time 0)
+        gCi.mCurrentTime.mSampleTime = 1e6;
+        CHECK(io(V, Vo, 1, kAudioServerPlugInIOOperationWriteMix, 8000, raw) == 0 && overloads(V) == 1 && overloads(C) == 0);
+        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, rd) == 0 && overloads(V) == 1);
+        gCi.mCurrentTime.mSampleTime = 0;
+        {   // the property is advertised as a custom property, read-only
+            AudioObjectPropertyAddress la = addr(kAudioObjectPropertyCustomPropertyInfoList, 0); UInt32 lsz = 0; AudioServerPlugInCustomPropertyInfo inf[2];
+            CHECK(D->GetPropertyDataSize(gDrv, V, 0, &la, 0, NULL, &lsz) == 0 && lsz == sizeof inf[0]);
+            CHECK(D->GetPropertyData(gDrv, V, 0, &la, 0, NULL, lsz, &lsz, inf) == 0 && inf[0].mSelector == 'srov');
+            AudioObjectPropertyAddress oa = addr('srov', 0); Boolean os = 1;
+            CHECK(D->IsPropertySettable(gDrv, V, 0, &oa, &os) == 0 && !os);
+        }
+        CHECK(D->StopIO(gDrv, V, 1) == 0);
+        // CanBeDefault: V can be the default device but not the system-sound device; C never.
+        CHECK(u32(V, kAudioDevicePropertyDeviceCanBeDefaultDevice, 0) == 1 && u32(V, kAudioDevicePropertyDeviceCanBeDefaultSystemDevice, 0) == 0);
+        CHECK(u32(C, kAudioDevicePropertyDeviceCanBeDefaultDevice, 0) == 0 && u32(C, kAudioDevicePropertyDeviceCanBeDefaultSystemDevice, 0) == 0);
+        printf("ok level/mute controls: gain bit-exact on engine path and V loop, mute zeros, overload counter, default-device flags\n");
     }
 
     // 8. WillDoIOOperation: only ReadInput and WriteMix, in place. Other ops are no-ops even if the host calls them.

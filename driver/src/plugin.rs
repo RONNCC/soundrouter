@@ -4,7 +4,7 @@ use crate::config::{Op, diff};
 use crate::props::*;
 use crate::state::*;
 use coreaudio_sys::*;
-use objc2_core_foundation::{CFRetained, CFString, CFType};
+use objc2_core_foundation::{CFNumber, CFRetained, CFString, CFType};
 use sr_core::driver_proto::{DriverDevice, MAX_DEVICES, STORAGE_KEY};
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -277,6 +277,7 @@ pub unsafe extern "C" fn get_data(
     unsafe {
         match v {
             V::U32(x) => copy((&raw const x).cast()),
+            V::F32(x) => copy((&raw const x).cast()),
             V::F64(x) => copy((&raw const x).cast()),
             V::Pair(x) => copy(x.as_ptr().cast()),
             V::Asbd(x) => copy((&raw const x).cast()),
@@ -292,6 +293,13 @@ pub unsafe extern "C" fn get_data(
                 *(out as *mut CFTypeRef) =
                     CFRetained::into_raw(devices_to_plist(&wanted())).as_ptr() as CFTypeRef
             }
+            V::Count(n) => {
+                *(out as *mut CFTypeRef) =
+                    CFRetained::into_raw(CFNumber::new_i64(n as i64)).as_ptr() as CFTypeRef
+            }
+            // The caller passes the value to convert in its output buffer and gets the result back there.
+            V::ScalarToDb => *(out as *mut f32) = scalar_to_db(*(out as *const f32)),
+            V::DbToScalar => *(out as *mut f32) = db_to_scalar(*(out as *const f32)),
             V::TranslateUid => {
                 let want = if qsz as usize == size_of::<CFStringRef>() && !q.is_null() {
                     rstr(borrow(*(q as *const CFTypeRef)))
@@ -328,9 +336,12 @@ pub unsafe extern "C" fn set_data(
     if obj == PLUGIN {
         return set_devices(sz, data);
     }
-    let Some((slot, s, side, _)) = lookup(obj) else {
+    let Some((slot, s, side, part)) = lookup(obj) else {
         return BAD_OBJECT;
     };
+    if let Some((_, scope)) = control_kind(part) {
+        return set_control(&slot.levels[scope], obj, sel, sz, data);
+    }
     let rate = if sel == kAudioDevicePropertyNominalSampleRate {
         if sz as usize != size_of::<f64>() {
             return BAD_SIZE;
@@ -361,6 +372,34 @@ pub unsafe extern "C" fn set_data(
             request_change(encode(s, side, Part::Device), &Change::Rate(i));
         }
     }
+    0
+}
+
+/// Volume and mute writes take effect on the next I/O cycle. The host is told which values moved with
+/// them: a scalar write changes the dB value too, and vice versa.
+fn set_control(level: &Level, obj: u32, sel: u32, sz: u32, data: *const c_void) -> OSStatus {
+    if sz as usize != 4 {
+        return BAD_SIZE;
+    }
+    let changed: &[u32] = match sel {
+        kAudioLevelControlPropertyScalarValue | kAudioLevelControlPropertyDecibelValue => {
+            let v = unsafe { std::ptr::read_unaligned(data as *const f32) };
+            if sel == kAudioLevelControlPropertyScalarValue {
+                level.set_scalar(v)
+            } else {
+                level.set_db(v)
+            }
+            &[
+                kAudioLevelControlPropertyScalarValue,
+                kAudioLevelControlPropertyDecibelValue,
+            ]
+        }
+        _ => {
+            level.set_muted(unsafe { std::ptr::read_unaligned(data as *const u32) } != 0);
+            &[kAudioBooleanControlPropertyValue]
+        }
+    };
+    notify(obj, changed);
     0
 }
 
