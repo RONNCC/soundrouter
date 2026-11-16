@@ -65,8 +65,9 @@ fn install_ctrlc() -> Result<()> {
     Ok(ctrlc::set_handler(|| STOP.store(true, Relaxed))?)
 }
 
+/// A short id like `v1` becomes the driver uid; a uid of an existing device (BlackHole, ...) stays as is.
 fn full_uid(s: &str) -> String {
-    if s.contains(':') {
+    if s.contains(':') || sr_audio::hal::device_by_uid(s).is_some() {
         s.to_owned()
     } else {
         format!("{DEVICE_UID_PREFIX}{s}")

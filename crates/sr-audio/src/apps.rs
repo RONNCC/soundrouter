@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::OnceLock;
 
-use objc2_app_kit::NSRunningApplication;
+use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
 use objc2_core_audio::*;
 use sr_core::backend::AppInfo;
 
@@ -23,8 +23,9 @@ pub struct ProcInfo {
 pub trait Resolver {
     /// Pid of the responsible process (may equal `pid`; <= 0 when unknown).
     fn responsible_pid(&self, pid: i32) -> i32;
-    /// (bundle id, display name) of the running GUI app with this pid.
-    fn app_of_pid(&self, pid: i32) -> Option<(String, String)>;
+    /// The running app with this pid: bundle id, display name, and whether it is a regular GUI app
+    /// (activation policy `.regular`, as opposed to a daemon or agent).
+    fn app_of_pid(&self, pid: i32) -> Option<(String, String, bool)>;
     /// Executable path of the process, used as a source key (`path:<exe>`) for processes with no bundle id.
     fn exe_path(&self, pid: i32) -> Option<String>;
 }
@@ -34,6 +35,8 @@ pub struct AppGroup {
     pub bundle_id: String,
     pub name: String,
     pub running_output: bool,
+    /// The owning app is a regular GUI app.
+    pub regular: bool,
     pub objs: Vec<u32>,
     pub pids: Vec<i32>,
     /// Own bundle ids of the member processes (helpers), sorted, deduped.
@@ -48,17 +51,18 @@ pub fn group(procs: &[ProcInfo], r: &dyn Resolver) -> Vec<AppGroup> {
             .into_iter()
             .filter(|&x| x > 0)
             .find_map(|pid| r.app_of_pid(pid));
-        let (bundle_id, name) = match app {
+        let (bundle_id, name, regular) = match app {
             Some(a) => a,
             None if !p.bundle_id.is_empty() => (
                 p.bundle_id.clone(),
                 p.bundle_id.rsplit('.').next().unwrap_or("").to_owned(),
+                false,
             ),
             // Command-line players (afplay, sox, ffplay, python) have no bundle id: key them by executable.
             None => match r.exe_path(p.pid) {
                 Some(exe) => {
                     let name = exe.rsplit('/').next().unwrap_or(&exe).to_owned();
-                    (format!("path:{exe}"), name)
+                    (format!("path:{exe}"), name, false)
                 }
                 None => continue,
             },
@@ -67,6 +71,7 @@ pub fn group(procs: &[ProcInfo], r: &dyn Resolver) -> Vec<AppGroup> {
             bundle_id,
             name,
             running_output: false,
+            regular,
             objs: vec![],
             pids: vec![],
             members: vec![],
@@ -90,6 +95,7 @@ pub fn app_infos(groups: &[AppGroup]) -> Vec<AppInfo> {
             bundle_id: g.bundle_id.clone(),
             name: g.name.clone(),
             running_output: g.running_output,
+            regular: g.regular,
         })
         .collect()
 }
@@ -122,13 +128,14 @@ impl Resolver for SystemResolver {
         let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
         (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
     }
-    fn app_of_pid(&self, pid: i32) -> Option<(String, String)> {
+    fn app_of_pid(&self, pid: i32) -> Option<(String, String, bool)> {
         let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
         let bundle = app.bundleIdentifier()?.to_string();
         let name = app
             .localizedName()
             .map_or_else(|| bundle.clone(), |n| n.to_string());
-        Some((bundle, name))
+        let regular = app.activationPolicy() == NSApplicationActivationPolicy::Regular;
+        Some((bundle, name, regular))
     }
 }
 
@@ -192,6 +199,7 @@ pub fn installed_apps_in(dirs: &[&std::path::Path]) -> Vec<AppInfo> {
                     bundle_id,
                     name,
                     running_output: false,
+                    regular: true,
                 });
             }
         }
@@ -212,7 +220,7 @@ mod tests {
 
     struct Fake(
         HashMap<i32, i32>,
-        HashMap<i32, (&'static str, &'static str)>,
+        HashMap<i32, (&'static str, &'static str, bool)>,
     );
     impl Resolver for Fake {
         fn responsible_pid(&self, pid: i32) -> i32 {
@@ -221,10 +229,10 @@ mod tests {
         fn exe_path(&self, pid: i32) -> Option<String> {
             (pid == 50 || pid == 51).then(|| "/usr/bin/afplay".to_owned())
         }
-        fn app_of_pid(&self, pid: i32) -> Option<(String, String)> {
+        fn app_of_pid(&self, pid: i32) -> Option<(String, String, bool)> {
             self.1
                 .get(&pid)
-                .map(|(b, n)| (b.to_string(), n.to_string()))
+                .map(|(b, n, r)| (b.to_string(), n.to_string(), *r))
         }
     }
     fn p(obj: u32, pid: i32, b: &str, out: bool) -> ProcInfo {
@@ -241,8 +249,9 @@ mod tests {
         let r = Fake(
             HashMap::from([(20, 10), (21, 10), (30, -1)]),
             HashMap::from([
-                (10, ("com.google.Chrome", "Chrome")),
-                (40, ("com.apple.Safari", "Safari")),
+                (10, ("com.google.Chrome", "Chrome", true)),
+                (40, ("com.apple.Safari", "Safari", true)),
+                (60, ("com.apple.CoreSpeech", "CoreSpeech", false)),
             ]),
         );
         let procs = [
@@ -254,6 +263,7 @@ mod tests {
             p(7, 50, "", true),                    // afplay: no bundle id, keyed by path
             p(8, 51, "", false),                   // second afplay joins the same group
             p(6, 40, "com.apple.WebKit.GPU", false), // pid itself is an app
+            p(9, 60, "com.apple.CoreSpeech", false), // an agent: not a regular app
         ];
         let g = group(&procs, &r);
         let chrome = g
@@ -278,8 +288,14 @@ mod tests {
             .unwrap();
         assert_eq!((ap.name.as_str(), ap.objs.clone()), ("afplay", vec![7, 8]));
         assert!(ap.running_output && ap.members.is_empty());
-        assert_eq!(g.len(), 4);
-        assert_eq!(app_infos(&g).len(), 4);
+        assert_eq!(g.len(), 5);
+        // Only GUI apps are `regular`: agents, bundle-id-only daemons and CLI players are not.
+        let regular: Vec<_> = app_infos(&g)
+            .into_iter()
+            .filter(|a| a.regular)
+            .map(|a| a.bundle_id)
+            .collect();
+        assert_eq!(regular, ["com.apple.Safari", "com.google.Chrome"]);
     }
 
     #[test]
@@ -312,7 +328,7 @@ mod tests {
         assert_eq!(ids.len(), 2, "{ids:?}");
         assert!(ids.contains(&("dev.zed.Zed", "Zed")));
         assert!(ids.iter().any(|(b, _)| *b == "com.x.alpha"));
-        assert!(got.iter().all(|a| !a.running_output));
+        assert!(got.iter().all(|a| !a.running_output && a.regular));
         assert!(got[0].name.to_lowercase() < got[1].name.to_lowercase());
     }
 }

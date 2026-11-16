@@ -11,6 +11,9 @@ pub struct AppInfo {
     pub bundle_id: String,
     pub name: String,
     pub running_output: bool,
+    /// A regular GUI app (shows in the Dock, activation policy `.regular`); false for daemons,
+    /// agents, helpers and command-line players, which the source picker hides by default.
+    pub regular: bool,
 }
 #[derive(Clone, Debug, Default)]
 pub struct MeterReading {

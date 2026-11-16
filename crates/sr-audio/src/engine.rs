@@ -617,10 +617,7 @@ impl Backend for Engine {
             .into_iter()
             .filter_map(|d| {
                 let uid = hal::device_uid(d);
-                if uid.starts_with(DEVICE_UID_PREFIX)
-                    || uid.starts_with(AGG_UID_PREFIX)
-                    || uid.ends_with(COMPANION_SUFFIX)
-                {
+                if is_own_uid(&uid) {
                     return None;
                 }
                 Some(HwDevice {
@@ -715,6 +712,14 @@ pub fn mic_status() -> TccStatus {
         crate::tcc::CaptureStatus::Unknown(-1) => TccStatus::Granted,
         crate::tcc::CaptureStatus::Unknown(_) => TccStatus::Unknown,
     }
+}
+
+/// Our own virtual devices (visible or companion) and the aggregates the engine builds. Picking one
+/// as a source or monitor would feed a device back into itself.
+pub fn is_own_uid(uid: &str) -> bool {
+    uid.starts_with(DEVICE_UID_PREFIX)
+        || uid.starts_with(AGG_UID_PREFIX)
+        || uid.ends_with(COMPANION_SUFFIX)
 }
 
 /// Subdevice uids (besides the main): Device sources then enabled monitors, deduped, present only.

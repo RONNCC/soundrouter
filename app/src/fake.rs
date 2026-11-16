@@ -84,15 +84,19 @@ impl Backend for FakeBackend {
     }
 
     fn apps(&self) -> Vec<AppInfo> {
-        let app = |id: &str, name: &str, running_output| AppInfo {
+        let app = |id: &str, name: &str, running_output, regular| AppInfo {
             bundle_id: id.into(),
             name: name.into(),
             running_output,
+            regular,
         };
         vec![
-            app("com.apple.Safari", "Safari", true),
-            app("com.spotify.client", "Spotify", true),
-            app("us.zoom.xos", "Zoom", false),
+            app("com.apple.CoreSpeech", "CoreSpeech", false, false),
+            app("com.apple.Safari", "Safari", true, true),
+            app("com.apple.PowerChime", "PowerChime", false, false),
+            app("com.spotify.client", "Spotify", true, true),
+            app("us.zoom.xos", "Zoom", false, true),
+            app("com.apple.finder", "Finder", false, true),
         ]
     }
 

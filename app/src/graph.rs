@@ -13,11 +13,11 @@ use crate::widgets::{
     tile,
 };
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Id, Popup, Rect, Response, Sense, Shadow, Slider,
-    Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo, epaint::CubicBezierShape, pos2,
-    text::LayoutJob, vec2,
+    self, Align2, Color32, CornerRadius, FontId, Id, Popup, PopupCloseBehavior, Rect, Response,
+    Sense, Shadow, Slider, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo,
+    epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
 };
-use sr_core::backend::{AppInfo, HwDevice, MeterReading};
+use sr_core::backend::{AppInfo, HwDevice, MeterReading, TccStatus};
 use sr_core::config::{Monitor, Source, SourceKind, VirtualDevice};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -35,6 +35,8 @@ pub struct GraphCtx<'a> {
     pub installed: &'a [AppInfo],
     pub reading: Option<&'a MeterReading>,
     pub t: &'a Tokens,
+    /// Microphone permission, which Audio Input sources need.
+    pub mic: TccStatus,
     /// Minimum height of the graph area (so it fills the pane).
     pub min_h: f32,
 }
@@ -47,6 +49,11 @@ pub struct GraphState {
     /// Filled once by a background scan (started on the first frame), see `sr_audio::apps::installed_apps`.
     pub installed: Arc<OnceLock<Vec<AppInfo>>>,
     pub scan_started: bool,
+    /// Sources popup: search text, whether it takes focus on the next open, and whether
+    /// daemons/agents are listed.
+    pub filter: String,
+    pub focus_search: bool,
+    pub show_background: bool,
 }
 
 fn mon_rows(m: &Monitor, hw: &[HwDevice]) -> u16 {
@@ -182,7 +189,7 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
     );
     ui.allocate_exact_size(vec2(width, layout.size.y.max(g.min_h)), Sense::hover());
 
-    column_headers(ui, g, &layout, edits);
+    column_headers(ui, g, st, &layout, edits);
     for c in &layout.cards {
         card(ui, g, st, edits, c, dt, &key);
     }
@@ -190,7 +197,13 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
     layout
 }
 
-fn column_headers(ui: &mut Ui, g: &GraphCtx, layout: &Layout, edits: &mut Vec<Edit>) {
+fn column_headers(
+    ui: &mut Ui,
+    g: &GraphCtx,
+    st: &mut GraphState,
+    layout: &Layout,
+    edits: &mut Vec<Edit>,
+) {
     let (dev, t, d) = (g.dev, g.t, g.dev_idx);
     let base = layout.origin.y + TOP;
     let heads: [(&str, String); 3] = [
@@ -242,7 +255,13 @@ fn column_headers(ui: &mut Ui, g: &GraphCtx, layout: &Layout, edits: &mut Vec<Ed
                     pos2(right - 4.0, base - 28.0),
                     hint_color(&resp, t),
                 );
-                Popup::menu(&resp).show(|ui| source_menu(ui, g, edits));
+                let shown = Popup::menu(&resp)
+                    .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| source_menu(ui, g, st, edits));
+                if shown.is_none() {
+                    st.filter.clear();
+                    st.focus_search = true;
+                }
             }
             1 => {
                 let resp = plus_circle(
@@ -302,20 +321,17 @@ fn menu_row(
     t: &Tokens,
     enabled: bool,
     label: &str,
+    detail: &str,
     icon: impl FnOnce(&egui::Painter, Rect),
 ) -> bool {
     const ICON: f32 = 18.0;
     let font = TextStyle::Button.resolve(ui.style());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER);
-    let w = (ICON + 24.0 + galley.size().x).max(ui.available_width());
     let sense = if enabled {
         Sense::click()
     } else {
         Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 24.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), sense);
     resp.widget_info(|| WidgetInfo::labeled(egui::Role::Button, enabled, label));
     let hot = enabled && resp.hovered();
     let p = ui.painter();
@@ -332,7 +348,26 @@ fn menu_row(
         vec2(ICON, ICON),
     );
     icon(p, icon_rect);
-    p.galley(
+    let mut text_w = rect.width() - ICON - 22.0;
+    if !detail.is_empty() {
+        let d = p.layout_no_wrap(
+            detail.to_string(),
+            FontId::proportional(11.0),
+            Color32::PLACEHOLDER,
+        );
+        text_w -= d.size().x + 8.0;
+        let dc = if hot { color } else { t.text2 };
+        p.galley(
+            pos2(
+                rect.right() - 8.0 - d.size().x,
+                rect.center().y - d.size().y / 2.0,
+            ),
+            d,
+            dc,
+        );
+    }
+    let galley = fitted(ui, label, font, color, text_w);
+    ui.painter().galley(
         pos2(
             rect.left() + ICON + 14.0,
             rect.center().y - galley.size().y / 2.0,
@@ -373,31 +408,137 @@ fn glyph_tile(
     glyph(p, r, t.accent.gamma_multiply(alpha));
 }
 
-fn source_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
-    let (dev, d, t) = (g.dev, g.dev_idx, g.t);
-    ui.set_min_width(210.0);
-    ui.label(
-        egui::RichText::new("Applications")
-            .size(11.0)
-            .color(t.text2),
-    );
-    for a in g.apps {
-        let kind = SourceKind::App {
-            bundle_id: a.bundle_id.clone(),
-        };
-        let exists = dev.sources.iter().any(|s| s.kind == kind);
-        let label = if a.running_output {
-            format!("{}  (playing)", a.name)
-        } else {
-            a.name.clone()
-        };
-        let alpha = if exists { 0.5 } else { 1.0 };
-        let paint =
-            |p: &egui::Painter, r: Rect| app_icon(p, r, g.icons, &a.bundle_id, &a.name, alpha);
-        if menu_row(ui, t, !exists, &label, paint) {
-            edits.push(Edit::AddSource(d, kind, 2));
-        }
+const MENU_W: f32 = 280.0;
+/// Room kept under the scrolling list for the footer rows (Pass-Thru, Choose App, the toggle).
+const MENU_FOOT_H: f32 = 110.0;
+const NOT_CONNECTED: &str = "Not connected";
+
+/// A device source's problem, shown on its card: the hardware is absent, or macOS denied the microphone.
+fn source_note(g: &GraphCtx, s: &Source) -> Option<&'static str> {
+    let SourceKind::Device { uid } = &s.kind else {
+        return None;
+    };
+    if !g.hw.iter().any(|h| &h.uid == uid) {
+        Some(NOT_CONNECTED)
+    } else if g.mic == TccStatus::Denied {
+        Some("Microphone denied")
+    } else {
+        None
     }
+}
+
+/// What the Sources popup offers for a search text.
+pub struct Picks<'a> {
+    /// Input devices (never our own virtual devices, which would feed back into themselves).
+    pub inputs: Vec<&'a HwDevice>,
+    /// Apps playing audio first, then regular GUI apps, each group sorted by name.
+    pub apps: Vec<&'a AppInfo>,
+    /// Daemons, agents and helpers that are not playing; hidden unless asked for.
+    pub background: Vec<&'a AppInfo>,
+}
+
+pub fn picks<'a>(hw: &'a [HwDevice], apps: &'a [AppInfo], query: &str) -> Picks<'a> {
+    let q = query.trim().to_lowercase();
+    let hit = |name: &str| q.is_empty() || name.to_lowercase().contains(&q);
+    let inputs = hw
+        .iter()
+        .filter(|h| h.in_ch > 0 && !sr_audio::engine::is_own_uid(&h.uid) && hit(&h.name))
+        .collect();
+    let (mut apps, mut background): (Vec<&AppInfo>, Vec<&AppInfo>) = apps
+        .iter()
+        .filter(|a| hit(&a.name))
+        .partition(|a| a.running_output || a.regular);
+    apps.sort_by_cached_key(|a| (!a.running_output, a.name.to_lowercase()));
+    background.sort_by_cached_key(|a| a.name.to_lowercase());
+    Picks {
+        inputs,
+        apps,
+        background,
+    }
+}
+
+fn app_row(ui: &mut Ui, g: &GraphCtx, a: &AppInfo, edits: &mut Vec<Edit>) {
+    let kind = SourceKind::App {
+        bundle_id: a.bundle_id.clone(),
+    };
+    let exists = g.dev.sources.iter().any(|s| s.kind == kind);
+    let label = if a.running_output {
+        format!("{}  (playing)", a.name)
+    } else {
+        a.name.clone()
+    };
+    let alpha = if exists { 0.5 } else { 1.0 };
+    let paint = |p: &egui::Painter, r: Rect| app_icon(p, r, g.icons, &a.bundle_id, &a.name, alpha);
+    if menu_row(ui, g.t, !exists, &label, "", paint) {
+        edits.push(Edit::AddSource(g.dev_idx, kind, 2));
+        ui.close();
+    }
+}
+
+/// The Sources popup: search field, then a scrolling list (Audio Inputs, Applications, optionally
+/// Background processes) capped to the window, then Pass-Thru, Choose App… and the background toggle.
+fn source_menu(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>) {
+    let (dev, d, t) = (g.dev, g.dev_idx, g.t);
+    ui.set_width(MENU_W);
+    let search = ui.add(
+        egui::TextEdit::singleline(&mut st.filter)
+            .hint_text("Search")
+            .desired_width(f32::INFINITY),
+    );
+    name_widget(ui, &search, "Search sources");
+    if std::mem::take(&mut st.focus_search) {
+        search.request_focus();
+    }
+    let searching = !st.filter.trim().is_empty();
+    let p = picks(g.hw, g.apps, &st.filter);
+    let room = ui.ctx().content_rect().bottom() - ui.cursor().top() - MENU_FOOT_H;
+    let heading = |ui: &mut Ui, text: &str| {
+        ui.label(egui::RichText::new(text).size(11.0).color(t.text2));
+    };
+    egui::ScrollArea::vertical()
+        .max_height(room.clamp(96.0, 420.0))
+        .show(ui, |ui| {
+            if !p.inputs.is_empty() || !searching {
+                heading(ui, "Audio Inputs");
+            }
+            for h in &p.inputs {
+                let kind = SourceKind::Device { uid: h.uid.clone() };
+                let exists = dev.sources.iter().any(|s| s.kind == kind);
+                let alpha = if exists { 0.5 } else { 1.0 };
+                let paint = |pt: &egui::Painter, r: Rect| glyph_tile(pt, r, t, alpha, icons::mic);
+                if menu_row(ui, t, !exists, &h.name, &format!("{} ch", h.in_ch), paint) {
+                    edits.push(Edit::AddSource(d, kind, h.in_ch.min(MAX_ROWS)));
+                    ui.close();
+                }
+            }
+            if p.inputs.is_empty() && !searching {
+                ui.label("No input devices");
+            }
+            if !p.apps.is_empty() || !searching {
+                heading(ui, "Applications");
+            }
+            for a in &p.apps {
+                app_row(ui, g, a, edits);
+            }
+            if st.show_background && !p.background.is_empty() {
+                heading(ui, "Background processes");
+                for a in &p.background {
+                    app_row(ui, g, a, edits);
+                }
+            }
+            if searching && p.inputs.is_empty() && p.apps.is_empty() && p.background.is_empty() {
+                ui.label("No matches");
+            }
+        });
+    ui.separator();
+    let exists = dev.sources.iter().any(|s| s.kind == SourceKind::PassThru);
+    let alpha = if exists { 0.5 } else { 1.0 };
+    let paint = |pt: &egui::Painter, r: Rect| glyph_tile(pt, r, t, alpha, loops);
+    if menu_row(ui, t, !exists, "Pass-Thru", "", paint) {
+        edits.push(Edit::AddSource(d, SourceKind::PassThru, dev.channels));
+        ui.close();
+    }
+    let mut picked = false;
     ui.menu_button("Choose App…", |ui| {
         ui.set_min_width(210.0);
         if g.installed.is_empty() {
@@ -416,33 +557,16 @@ fn source_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
                         .clicked()
                     {
                         edits.push(Edit::AddSource(d, kind, 2));
+                        picked = true;
                         ui.close();
                     }
                 }
             });
     });
-    ui.separator();
-    ui.label(
-        egui::RichText::new("Input Devices")
-            .size(11.0)
-            .color(t.text2),
-    );
-    for h in g.hw.iter().filter(|h| h.in_ch > 0) {
-        let kind = SourceKind::Device { uid: h.uid.clone() };
-        let exists = dev.sources.iter().any(|s| s.kind == kind);
-        let alpha = if exists { 0.5 } else { 1.0 };
-        let paint = |p: &egui::Painter, r: Rect| glyph_tile(p, r, t, alpha, icons::mic);
-        if menu_row(ui, t, !exists, &h.name, paint) {
-            edits.push(Edit::AddSource(d, kind, h.in_ch.min(MAX_ROWS)));
-        }
+    if picked {
+        ui.close();
     }
-    ui.separator();
-    let exists = dev.sources.iter().any(|s| s.kind == SourceKind::PassThru);
-    let alpha = if exists { 0.5 } else { 1.0 };
-    let paint = |p: &egui::Painter, r: Rect| glyph_tile(p, r, t, alpha, loops);
-    if menu_row(ui, t, !exists, "Pass-Thru", paint) {
-        edits.push(Edit::AddSource(d, SourceKind::PassThru, dev.channels));
-    }
+    ui.checkbox(&mut st.show_background, "Show background processes");
 }
 
 fn monitor_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
@@ -458,7 +582,7 @@ fn monitor_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
         let exists = g.dev.monitors.iter().any(|m| m.device_uid == h.uid);
         let alpha = if exists { 0.5 } else { 1.0 };
         let paint = |p: &egui::Painter, r: Rect| glyph_tile(p, r, g.t, alpha, icons::speaker);
-        if menu_row(ui, g.t, !exists, &h.name, paint) {
+        if menu_row(ui, g.t, !exists, &h.name, "", paint) {
             edits.push(Edit::AddMonitor(
                 g.dev_idx,
                 h.uid.clone(),
@@ -514,8 +638,17 @@ fn card(
             )
         }
     };
+    // A device source whose hardware is gone (or whose microphone access is off) says so, dimmed.
+    let note = match c.id {
+        CardId::Src(i) => source_note(g, &dev.sources[i]),
+        _ => None,
+    };
     let active = on.unwrap_or(true) && dev.enabled;
-    let dim = if on.unwrap_or(true) { 1.0 } else { 0.45 };
+    let dim = if on.unwrap_or(true) && note != Some(NOT_CONNECTED) {
+        1.0
+    } else {
+        0.45
+    };
     let painter = ui.painter().clone();
     painter.add(
         Shadow {
@@ -535,7 +668,20 @@ fn card(
     );
 
     // Header: title and On/Off switch.
-    let title_w = r.width() - 28.0 - if on.is_some() { 62.0 } else { 0.0 };
+    let note_w = note.map_or(0.0, |n| {
+        painter
+            .layout_no_wrap(n.to_string(), FontId::proportional(11.0), t.text2)
+            .size()
+            .x
+            - 14.0
+    });
+    let title_w = r.width()
+        - 28.0
+        - if on.is_some() {
+            62.0 + note_w.max(0.0)
+        } else {
+            0.0
+        };
     text_left(
         ui,
         r.left() + 14.0,
@@ -545,6 +691,11 @@ fn card(
         t.text,
         title_w,
     );
+    if let Some(n) = note {
+        let hit = Rect::from_min_size(pos2(r.left() + 14.0, r.top()), vec2(title_w, HEAD_H));
+        ui.interact(hit, Id::unique(("card_note", d, c.id)), Sense::hover())
+            .widget_info(|| WidgetInfo::labeled(egui::Role::Label, true, format!("{title}: {n}")));
+    }
     if let Some(on_now) = on {
         let sw = Rect::from_center_size(
             pos2(r.right() - 14.0 - 16.0, r.top() + HEAD_H / 2.0),
@@ -558,12 +709,13 @@ fn card(
             t,
             &format!("{title} enabled"),
         );
+        let note_color = t.meter[1];
         painter.text(
             pos2(sw.left() - 6.0, sw.center().y),
             Align2::RIGHT_CENTER,
-            if new { "On" } else { "Off" },
+            note.unwrap_or(if new { "On" } else { "Off" }),
             FontId::proportional(11.0),
-            t.text2,
+            if note.is_some() { note_color } else { t.text2 },
         );
         if new != on_now {
             edits.push(match c.id {
@@ -953,6 +1105,7 @@ mod tests {
                         installed: &[],
                         reading: None,
                         t: &tk,
+                        mic: TccStatus::Granted,
                         min_h: 500.0,
                     };
                     s.layout = Some(show(ui, &g, &mut s.st, &mut s.edits));
@@ -1093,5 +1246,58 @@ mod tests {
             let at = h.get_by_label(label).rect().center();
             assert!(at.distance(port(&h, p)) < 1.0, "{label}: {at:?}");
         }
+    }
+
+    #[test]
+    fn picks_offer_inputs_but_never_our_own_devices() {
+        let hw = |uid: &str, in_ch, out_ch| HwDevice {
+            uid: uid.into(),
+            name: uid.into(),
+            in_ch,
+            out_ch,
+        };
+        let devices = [
+            hw("BuiltInMicrophoneDevice", 1, 0),
+            hw("BuiltInSpeakerDevice", 0, 2),
+            hw("soundrouter:v1", 4, 4),
+            hw("soundrouter:v1.engine", 4, 4),
+            hw("soundrouter.agg.v1.3", 4, 4),
+            hw("BlackHole2ch_UID", 2, 2),
+        ];
+        let got: Vec<_> = picks(&devices, &[], "")
+            .inputs
+            .iter()
+            .map(|h| h.uid.as_str())
+            .collect();
+        assert_eq!(got, ["BuiltInMicrophoneDevice", "BlackHole2ch_UID"]);
+        let got = picks(&devices, &[], " black ").inputs.len();
+        assert_eq!(got, 1);
+    }
+
+    #[test]
+    fn picks_put_playing_apps_first_then_gui_apps_and_hide_daemons() {
+        let app = |name: &str, running_output, regular| AppInfo {
+            bundle_id: format!("id.{name}"),
+            name: name.into(),
+            running_output,
+            regular,
+        };
+        let apps = [
+            app("zeta", false, true),
+            app("heard", false, false),
+            app("Beta", false, true),
+            app("daemon-player", true, false),
+            app("Alpha", true, true),
+            app("assistantd", false, false),
+        ];
+        let names = |v: &[&AppInfo]| v.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
+        let p = picks(&[], &apps, "");
+        // A playing process is always shown, even a daemon; the rest of the GUI apps follow by name.
+        assert_eq!(names(&p.apps), ["Alpha", "daemon-player", "Beta", "zeta"]);
+        assert_eq!(names(&p.background), ["assistantd", "heard"]);
+        let p = picks(&[], &apps, "ASSIST");
+        assert!(p.apps.is_empty());
+        assert_eq!(names(&p.background), ["assistantd"]);
+        assert!(picks(&[], &apps, "nothing like this").apps.is_empty());
     }
 }

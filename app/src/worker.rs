@@ -351,6 +351,7 @@ mod tests {
                 bundle_id: "com.fake.player".into(),
                 name: "Player".into(),
                 running_output: true,
+                regular: true,
             }]
         }
         fn meters(&self, id: &str) -> Option<MeterReading> {

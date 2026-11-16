@@ -457,6 +457,7 @@ fn choose_app_wires_an_installed_app_that_is_not_running() {
             bundle_id: "com.example.sketch".into(),
             name: "Sketchbook".into(),
             running_output: false,
+            regular: true,
         }])
         .unwrap();
     click(&mut h, "Add source");
@@ -551,6 +552,207 @@ fn demo_mode_says_so_and_nothing_else_by_default() {
     h.get_by_label("Demo mode: synthetic audio, nothing is saved");
     let h = open(demo_config());
     assert!(h.query_by_label_contains("Demo mode").is_none());
+}
+
+/// Fake backend with many apps, to overflow the Sources popup.
+struct Crowded(FakeBackend);
+
+impl Backend for Crowded {
+    fn apply(&mut self, cfg: &Config) -> anyhow::Result<()> {
+        self.0.apply(cfg)
+    }
+    fn hardware(&self) -> Vec<HwDevice> {
+        self.0.hardware()
+    }
+    fn apps(&self) -> Vec<AppInfo> {
+        (0..60)
+            .map(|i| AppInfo {
+                bundle_id: format!("com.example.app{i}"),
+                name: format!("Example {i:02}"),
+                running_output: false,
+                regular: true,
+            })
+            .collect()
+    }
+    fn meters(&self, id: &str) -> Option<MeterReading> {
+        self.0.meters(id)
+    }
+    fn status(&self) -> EngineStatus {
+        self.0.status()
+    }
+}
+
+fn top(h: &Harness<App>, label: &str) -> f32 {
+    h.get_by_label(label).rect().top()
+}
+
+#[test]
+fn the_source_menu_lists_inputs_first_then_playing_apps_then_gui_apps() {
+    let mut h = open(demo_config());
+    click(&mut h, "Add source");
+    let order = [
+        "MacBook Pro Microphone",
+        "USB Headset",
+        "Safari  (playing)",
+        "Spotify  (playing)",
+        "Finder",
+        "Zoom",
+        "Pass-Thru",
+    ];
+    let ys: Vec<f32> = order.iter().map(|l| top(&h, l)).collect();
+    assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?} at {ys:?}");
+    // The speakers have no input, so they are no source.
+    assert!(h.query_by_label("MacBook Pro Speakers").is_none());
+}
+
+#[test]
+fn the_source_menu_hides_background_processes_until_asked() {
+    let mut h = open(demo_config());
+    click(&mut h, "Add source");
+    for daemon in ["CoreSpeech", "PowerChime"] {
+        assert!(h.query_by_label(daemon).is_none(), "{daemon} listed");
+    }
+    click(&mut h, "Show background processes");
+    // the menu stays open and lists them after the regular apps
+    assert!(top(&h, "CoreSpeech") > top(&h, "Zoom"));
+    assert!(top(&h, "PowerChime") > top(&h, "CoreSpeech"));
+    click(&mut h, "CoreSpeech");
+    assert_eq!(
+        h.state().cfg.devices[0].sources.last().unwrap().kind,
+        SourceKind::App {
+            bundle_id: "com.apple.CoreSpeech".into()
+        }
+    );
+}
+
+#[test]
+fn the_source_menu_search_filters_inputs_and_apps() {
+    let mut h = open(demo_config());
+    click(&mut h, "Add source");
+    h.get_by_label("Search sources").type_text("USB");
+    settle(&mut h);
+    h.get_by_label("USB Headset");
+    for gone in ["Safari  (playing)", "Zoom", "MacBook Pro Microphone"] {
+        assert!(h.query_by_label(gone).is_none(), "{gone} still listed");
+    }
+    h.get_by_label("Search sources").type_text("zzz");
+    settle(&mut h);
+    assert!(h.query_by_label("USB Headset").is_none());
+    // the search starts empty again on the next open
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    click(&mut h, "Add source");
+    h.get_by_label("Safari  (playing)");
+}
+
+#[test]
+fn choosing_the_microphone_adds_a_mono_input_wired_to_channel_one() {
+    let mut h = open(demo_config());
+    click(&mut h, "Add source");
+    click(&mut h, "MacBook Pro Microphone");
+    let dev = &h.state().cfg.devices[0];
+    let src = dev.sources.last().unwrap();
+    assert_eq!(
+        src.kind,
+        SourceKind::Device {
+            uid: "BuiltInMicrophoneDevice".into()
+        }
+    );
+    assert_eq!(src.channels, 1);
+    assert!(
+        dev.wires
+            .iter()
+            .any(|w| w.source == src.id && w.src_ch == 0 && w.out_ch == 0)
+    );
+    // listed again, it is taken: greyed out, so it cannot be added twice
+    click(&mut h, "Add source");
+    let before = h.state().cfg.devices[0].sources.len();
+    h.get_by_label("MacBook Pro Microphone").click();
+    settle(&mut h);
+    assert_eq!(h.state().cfg.devices[0].sources.len(), before);
+}
+
+#[test]
+fn an_unplugged_input_stays_a_source_and_says_not_connected() {
+    let mut cfg = bare_config();
+    apply(
+        &mut cfg,
+        Edit::AddSource(
+            0,
+            SourceKind::Device {
+                uid: "GoneMic".into(),
+            },
+            1,
+        ),
+    );
+    let h = open(cfg);
+    h.get_by_label("GoneMic: Not connected");
+    let granted = open(demo_config());
+    assert!(
+        granted
+            .query_by_label("MacBook Pro Microphone: Not connected")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_denied_microphone_is_flagged_on_the_input_card() {
+    let status = EngineStatus {
+        mic: TccStatus::Denied,
+        ..installed()
+    };
+    let mut b = FakeBackend::frozen(1.5);
+    b.status = status;
+    let h = window(stream_mix(), Box::new(b), None, Theme::Dark, false);
+    h.get_by_label("MacBook Pro Microphone: Microphone denied");
+}
+
+/// The demo's "Stream Mix" device (a microphone source) selected.
+fn stream_mix() -> Config {
+    let mut cfg = demo_config();
+    cfg.devices.swap(0, 1);
+    cfg
+}
+
+#[test]
+fn adding_a_microphone_before_macos_was_asked_holds_the_apply_for_the_sheet() {
+    for (mic, held) in [(TccStatus::Unknown, true), (TccStatus::Granted, false)] {
+        let status = EngineStatus { mic, ..installed() };
+        let mut h = with_runner(status, never_run());
+        // `applied` stands for "the sheet has let the first apply through"
+        h.state_mut().applied = true;
+        h.state_mut().commit(vec![Edit::AddSource(
+            0,
+            SourceKind::Device {
+                uid: "BuiltInMicrophoneDevice".into(),
+            },
+            1,
+        )]);
+        assert_eq!(!h.state().applied, held, "{mic:?}");
+    }
+}
+
+#[test]
+fn the_source_menu_stays_inside_the_window_and_scrolls() {
+    let mut h = window(
+        demo_config(),
+        Box::new(Crowded(FakeBackend::frozen(1.5))),
+        None,
+        Theme::Dark,
+        false,
+    );
+    click(&mut h, "Add source");
+    let win = h.ctx.content_rect();
+    for label in ["Search sources", "Pass-Thru", "Show background processes"] {
+        let r = h.get_by_label(label).rect();
+        assert!(win.contains_rect(r), "{label} at {r:?} leaves {win:?}");
+    }
+    // A scrolling list, not 60 rows: the last app is scrolled out of view.
+    assert!(
+        h.query_by_label("Example 59")
+            .is_none_or(|n| !win.contains_rect(n.rect()))
+    );
+    assert!(h.get_by_label("Search sources").rect().width() <= 300.0);
 }
 
 /// GPU snapshots: `cargo test -p soundrouter-app --features snapshots`
@@ -648,6 +850,28 @@ mod snapshots {
             cfg(),
             None,
             monitors,
+            &mut results,
+        );
+    }
+
+    #[test]
+    fn source_menu_open() {
+        both("source_menu", demo_config, None, |h| click(h, "Add source"));
+    }
+
+    #[test]
+    fn source_menu_with_background_processes() {
+        let mut results = egui_kittest::SnapshotResults::new();
+        let open = |h: &mut Harness<'static, App>| {
+            click(h, "Add source");
+            click(h, "Show background processes");
+        };
+        shot(
+            "source_menu_background",
+            Theme::Dark,
+            demo_config(),
+            None,
+            open,
             &mut results,
         );
     }

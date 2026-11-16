@@ -16,7 +16,7 @@ use eframe::egui::{
     UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
-use sr_core::config::Config;
+use sr_core::config::{Config, SourceKind};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -255,6 +255,9 @@ impl App {
             }
             return;
         }
+        let adds_input = edits
+            .iter()
+            .any(|e| matches!(e, Edit::AddSource(_, SourceKind::Device { .. }, _)));
         let prev = self.cfg.clone();
         let mut select_new = false;
         for e in edits {
@@ -267,6 +270,11 @@ impl App {
             return;
         }
         self.toast = blank_rename.then(|| BLANK_NAME.to_string());
+        // A microphone is read through the Microphone permission: if macOS has not been asked yet,
+        // hold the apply and let the setup sheet explain and ask first.
+        if adds_input && self.engine_status().mic == TccStatus::Unknown {
+            self.applied = false;
+        }
         if select_new {
             self.selected = self.cfg.devices.len() - 1;
         }
@@ -688,6 +696,7 @@ impl App {
 
                 let snap = self.worker.shared.lock().unwrap();
                 let hw = snap.hardware.clone();
+                let mic = snap.status.mic;
                 let apps = snap.apps.clone();
                 let installed = self.graph.installed.clone();
                 let reading = snap.meters.get(&dev.id).cloned();
@@ -707,6 +716,7 @@ impl App {
                                 installed: installed.get().map_or(&[], Vec::as_slice),
                                 reading: reading.as_ref(),
                                 t,
+                                mic,
                                 min_h: area.height(),
                             };
                             graph::show(ui, &g, &mut self.graph, edits);

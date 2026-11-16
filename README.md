@@ -43,6 +43,18 @@ Distribution builds (Developer ID signing, notarization, the tag-triggered GitHu
 
 **Uninstall:** the setup sheet's Uninstall…, or `packaging/uninstall.sh [--purge]`.
 
+## Use the Mac's microphone as a source
+
+Example: Zoom hears your microphone plus Spotify.
+
+1. Create a virtual device (or use the first-run "Loopback Audio"), select it, and click **+** above Sources.
+2. Under **Audio Inputs** choose "MacBook Pro Microphone" (or any other input: a USB mic, an interface, BlackHole). Its channels are wired 1 -> 1 automatically. SoundRouter's own virtual devices are never listed.
+3. Under **Applications** choose Spotify (apps that are playing audio are listed first; daemons and agents are hidden until you tick "Show background processes"; the search field filters both lists). Spotify is a stereo source, wired 1 -> 1, 2 -> 2.
+4. Re-wire if needed: drag from a source's channel to an output channel. A mono microphone on channel 1 usually wants a second wire to channel 2 so both sides carry it.
+5. In Zoom pick the virtual device as the microphone. Do not add the microphone as a monitor unless you want to hear yourself.
+
+macOS asks for Microphone access the first time (the setup sheet explains it); if it is denied the microphone's card says "Microphone denied" and the input stays silent until you allow it in System Settings > Privacy & Security > Microphone. An input source whose device is unplugged stays in the config and shows "Not connected"; it starts carrying audio again when the device returns.
+
 ## Limits
 
 Checked against the code (`crates/sr-core/src/config.rs`, `driver_proto.rs`, `sr-audio/src/engine.rs`):

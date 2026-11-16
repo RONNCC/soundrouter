@@ -63,6 +63,21 @@ fn subs_deduped_and_filtered() {
     assert_eq!(plan_subs(&dev, &|u| u != "gone"), ["mic", "spk"]);
 }
 
+#[test]
+fn own_devices_are_never_offered_as_hardware() {
+    let vis = format!("{DEVICE_UID_PREFIX}v1");
+    for own in [companion_uid(&vis), vis, format!("{AGG_UID_PREFIX}v1.3")] {
+        assert!(is_own_uid(&own), "{own}");
+    }
+    for other in [
+        "BuiltInMicrophoneDevice",
+        "BlackHole2ch_UID",
+        "AppleUSBAudioEngine:1:2",
+    ] {
+        assert!(!is_own_uid(other), "{other}");
+    }
+}
+
 // ---- main_candidates ----
 
 #[test]
@@ -159,6 +174,7 @@ fn group(bundle: &str, objs: &[u32]) -> AppGroup {
         bundle_id: bundle.into(),
         name: bundle.into(),
         running_output: true,
+        regular: true,
         objs: objs.to_vec(),
         pids: vec![],
         members: vec![],

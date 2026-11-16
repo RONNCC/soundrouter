@@ -723,7 +723,7 @@ fn permission_rows<'a>(v: &View, explain: bool) -> [Row<'a>; 2] {
             title: "Microphone",
             status: tcc_word(mic),
             detail: if explain {
-                "Reads the virtual device's input to check that audio flows. macOS asks the first time."
+                "Reads the virtual device's input to check that audio flows, and any microphone or input device you add as a source. macOS asks the first time."
             } else {
                 ""
             },
