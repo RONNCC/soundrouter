@@ -34,8 +34,10 @@ static OSStatus WriteStore(AudioServerPlugInHostRef h, CFStringRef k, CFProperty
     return 0;
 }
 static OSStatus DelStore(AudioServerPlugInHostRef h, CFStringRef k) { return 0; }
-static int gChanges;
+static int gChanges, gDefer, gQn;
+static struct { AudioObjectID d; UInt64 a; } gQ[8]; // requests held back while gDefer, to run them one device at a time
 static OSStatus ReqChange(AudioServerPlugInHostRef h, AudioObjectID d, UInt64 act, void* info) {
+    if (gDefer) { if (gQn < 8) { gQ[gQn].d = d; gQ[gQn++].a = act; } return 0; }
     printf("  host.RequestDeviceConfigurationChange dev=%u action=%llu -> Perform\n", d, act);
     gChanges++;
     return D->PerformDeviceConfigurationChange(gDrv, d, act, info); // real host stops IO first
@@ -177,6 +179,37 @@ int main(int argc, char** argv) {
     V2 = byUID("soundrouter:v2"); C2 = byUID("soundrouter:v2.engine");
     CHECK(V2 && C2 && chans(stream(V2, kAudioObjectPropertyScopeOutput)) == 16 && chans(stream(C2, kAudioObjectPropertyScopeInput)) == 16);
     printf("ok channel change 8->16\n");
+
+    // 6b. regression (heap overflow in coreaudiod): the HAL applies a channel change per device. After V changed
+    // 2 -> 8 but before C did, I/O on C (still 2 ch) must stay inside its buffer and read silence.
+    {
+        int ch4[] = { 8, 16 }; gDefer = 1; gQn = 0;
+        CFArrayRef want = cfg(2, uid2, nm2, ch4); AudioObjectPropertyAddress sa = addr('srcf', kAudioObjectPropertyScopeGlobal);
+        CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &sa, 0, NULL, sizeof want, &want) == 0);
+        for (int i = 0; i < 400 && gQn < 2; i++) usleep(5000); // only v1 changes: its V and C
+        usleep(30000); CHECK(gQn == 2);
+        AudioObjectID V1 = byUID("soundrouter:v1"), C1 = byUID("soundrouter:v1.engine");
+        CHECK(V1 && C1 && chans(stream(V1, kAudioObjectPropertyScopeOutput)) == 2);
+        int qv = -1, qc = -1;
+        for (int i = 0; i < gQn; i++) { if (gQ[i].d == V1) qv = i; if (gQ[i].d == C1) qc = i; }
+        CHECK(qv >= 0 && qc >= 0);
+        CHECK(D->PerformDeviceConfigurationChange(gDrv, V1, gQ[qv].a, NULL) == 0); // only V1 is 8 ch now
+        CHECK(chans(stream(V1, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(C1, kAudioObjectPropertyScopeInput)) == 2);
+        enum { G = 4096 };
+        float v8[FR * 8], cb[FR * 2 + G]; fill(v8, 8, 1.0f);
+        CHECK(io(V1, stream(V1, kAudioObjectPropertyScopeOutput), 1, kAudioServerPlugInIOOperationWriteMix, 3000, v8) == 0);
+        for (int i = 0; i < FR * 2 + G; i++) cb[i] = -777.0f;
+        CHECK(io(C1, stream(C1, kAudioObjectPropertyScopeInput), 7, kAudioServerPlugInIOOperationReadInput, 3000, cb) == 0);
+        for (int i = 0; i < FR * 2; i++) CHECK(cb[i] == 0.0f);   // mismatched pair is silent
+        for (int i = FR * 2; i < FR * 2 + G; i++) CHECK(cb[i] == -777.0f); // guard words untouched
+        CHECK(D->PerformDeviceConfigurationChange(gDrv, C1, gQ[qc].a, NULL) == 0);
+        for (int i = 0; i < gQn; i++) if (i != qv && i != qc) CHECK(D->PerformDeviceConfigurationChange(gDrv, gQ[i].d, gQ[i].a, NULL) == 0);
+        gDefer = 0;
+        float c8[FR * 8];
+        CHECK(io(V1, stream(V1, kAudioObjectPropertyScopeOutput), 1, kAudioServerPlugInIOOperationWriteMix, 4000, v8) == 0);
+        CHECK(io(C1, stream(C1, kAudioObjectPropertyScopeInput), 7, kAudioServerPlugInIOOperationReadInput, 4000, memset(c8, 0xAA, sizeof c8)) == 0 && !memcmp(c8, v8, sizeof c8));
+        printf("ok mismatched V/C channel change stays in bounds, then bit-exact at 8 ch\n");
+    }
 
     // 7. remove all devices.
     CHECK(setConfig(CFArrayCreate(0, NULL, 0, &kCFTypeArrayCallBacks)) == 0);

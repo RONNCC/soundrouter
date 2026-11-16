@@ -28,11 +28,13 @@ fn reconcile(announce: bool) {
     let _g = apply_lock();
     let want = wanted().clone();
     let cur: Vec<_> = SLOTS.iter().map(Slot::snapshot).collect();
+    let freed: Vec<_> = SLOTS.iter().map(|s| s.freed_epoch.load(Acquire)).collect();
     let mut list_changed = false;
-    for op in diff(&cur, &want) {
+    for op in diff(&cur, &freed, &want) {
         match op {
             Op::Remove(s) => {
                 SLOTS[s].alive.store(false, Release);
+                SLOTS[s].mark_freed();
                 list_changed = true;
             }
             Op::Rename(s, name) => {
@@ -43,10 +45,17 @@ fn reconcile(announce: bool) {
                     }
                 }
             }
+            // The HAL applies a change per device, so both must be asked; until both land, I/O is silent.
             Op::Channels(s, n) if announce => {
-                request_change(encode(s, Side::Visible, Part::Device), &Change::Channels(n))
+                for side in [Side::Visible, Side::Engine] {
+                    request_change(encode(s, side, Part::Device), &Change::Channels(n));
+                }
             }
-            Op::Channels(s, n) => SLOTS[s].channels.store(n as u32, Release),
+            Op::Channels(s, n) => {
+                for c in &SLOTS[s].channels {
+                    c.store(n as u32, Release);
+                }
+            }
             Op::Add(s, d) => {
                 SLOTS[s].activate(d);
                 list_changed = true;
@@ -136,12 +145,12 @@ pub unsafe extern "C" fn perform_change(
     action: u64,
     _: *mut c_void,
 ) -> OSStatus {
-    let (Some((slot, ..)), Some(change)) = (lookup(dev), parse_action(action)) else {
+    let (Some((slot, _, side, _)), Some(change)) = (lookup(dev), parse_action(action)) else {
         return BAD_OBJECT;
     };
     match change {
-        Change::Channels(n) => slot.channels.store(n as u32, Release),
-        Change::Rate(i) => slot.rate_idx.store(i as u32, Release),
+        Change::Channels(n) => slot.channels[side as usize].store(n as u32, Release),
+        Change::Rate(i) => slot.rate_idx[side as usize].store(i as u32, Release),
     }
     slot.reset_rings();
     0
@@ -284,7 +293,7 @@ pub unsafe extern "C" fn set_data(
     if obj == PLUGIN {
         return set_devices(sz, data);
     }
-    let Some((slot, s, ..)) = lookup(obj) else {
+    let Some((slot, s, side, _)) = lookup(obj) else {
         return BAD_OBJECT;
     };
     let rate = if sel == kAudioDevicePropertyNominalSampleRate {
@@ -297,7 +306,7 @@ pub unsafe extern "C" fn set_data(
             return BAD_SIZE;
         }
         let f = unsafe { *(data as *const AudioStreamBasicDescription) };
-        let want = asbd(slot.channels.load(Acquire), f.mSampleRate);
+        let want = asbd(slot.channels(side), f.mSampleRate);
         let same = f.mFormatID == want.mFormatID
             && f.mFormatFlags == want.mFormatFlags
             && f.mChannelsPerFrame == want.mChannelsPerFrame
@@ -311,8 +320,11 @@ pub unsafe extern "C" fn set_data(
     let Some(i) = rate_index(rate) else {
         return kAudioDeviceUnsupportedFormatError as OSStatus;
     };
-    if i as u32 != slot.rate_idx.load(Acquire) {
-        request_change(encode(s, Side::Visible, Part::Device), &Change::Rate(i));
+    // Both devices of the pair must follow, or one side would run at a different rate.
+    for side in [Side::Visible, Side::Engine] {
+        if i as u32 != slot.rate_idx[side as usize].load(Acquire) {
+            request_change(encode(s, side, Part::Device), &Change::Rate(i));
+        }
     }
     0
 }

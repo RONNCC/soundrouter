@@ -103,8 +103,8 @@ pub fn prop(obj: u32, a: &AudioObjectPropertyAddress) -> Option<V> {
         });
     }
     let (slot, s, side, part) = lookup(obj)?;
-    let ch = slot.channels.load(Acquire);
-    let rate = slot.rate();
+    let ch = slot.channels(side);
+    let rate = slot.rate(side);
     let engine = side == Side::Engine;
     let dev = encode(s, side, Part::Device);
     Some(match (part, sel) {

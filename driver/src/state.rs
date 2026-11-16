@@ -91,8 +91,12 @@ pub fn rate_index(rate: f64) -> Option<usize> {
 /// One device pair. Memory lives forever so stale I/O after removal stays memory-safe.
 pub struct Slot {
     pub alive: AtomicBool,
-    pub channels: AtomicU32,
-    pub rate_idx: AtomicU32,
+    /// Per side (index = `Side as usize`): the HAL changes each device's format separately, while
+    /// that device's I/O is stopped, so a device must only ever trust its own side.
+    pub channels: [AtomicU32; 2],
+    pub rate_idx: [AtomicU32; 2],
+    /// `FREED` counter value when this slot was last removed; 0 = never used.
+    pub freed_epoch: AtomicU64,
     pub meta: Mutex<(String, String)>, // (uid, name)
     /// Clients with I/O running per side (index = `Side as usize`).
     pub clients: [AtomicU32; 2],
@@ -109,8 +113,9 @@ impl Slot {
     const fn new() -> Self {
         Slot {
             alive: AtomicBool::new(false),
-            channels: AtomicU32::new(2),
-            rate_idx: AtomicU32::new(0),
+            channels: [AtomicU32::new(2), AtomicU32::new(2)],
+            rate_idx: [AtomicU32::new(0), AtomicU32::new(0)],
+            freed_epoch: AtomicU64::new(0),
             meta: Mutex::new((String::new(), String::new())),
             clients: [AtomicU32::new(0), AtomicU32::new(0)],
             anchor: AtomicU64::new(0),
@@ -122,8 +127,21 @@ impl Slot {
     pub fn meta(&self) -> MutexGuard<'_, (String, String)> {
         self.meta.lock().unwrap_or_else(PoisonError::into_inner)
     }
-    pub fn rate(&self) -> f64 {
-        SAMPLE_RATES[self.rate_idx.load(Relaxed) as usize % SAMPLE_RATES.len()]
+    pub fn channels(&self, side: Side) -> u32 {
+        self.channels[side as usize].load(Acquire)
+    }
+    pub fn rate(&self, side: Side) -> f64 {
+        SAMPLE_RATES[self.rate_idx[side as usize].load(Acquire) as usize % SAMPLE_RATES.len()]
+    }
+    /// V and C agree on format. While a change has landed on one side only, I/O must stay silent.
+    pub fn in_sync(&self) -> bool {
+        self.channels[0].load(Acquire) == self.channels[1].load(Acquire)
+            && self.rate_idx[0].load(Acquire) == self.rate_idx[1].load(Acquire)
+    }
+    /// Mark this slot as just freed; `diff` hands out the longest-free slots first.
+    pub fn mark_freed(&self) {
+        self.freed_epoch
+            .store(FREED.fetch_add(1, Relaxed) + 1, Release);
     }
     pub fn ring(&self, a: bool) -> Option<&Ring> {
         if a {
@@ -145,26 +163,36 @@ impl Slot {
             DriverDevice {
                 uid: m.0.clone(),
                 name: m.1.clone(),
-                channels: self.channels.load(Relaxed) as u16,
+                channels: self.channels(Side::Visible) as u16,
             }
         })
     }
     /// Publish a device in this (dead) slot. Not real-time; ring memory is allocated once per slot.
     pub fn activate(&self, d: DriverDevice) {
-        self.ring_a
-            .get_or_init(|| Ring::new(RING_FRAMES as usize, MAX_CHANNELS as usize));
-        self.ring_b
-            .get_or_init(|| Ring::new(RING_FRAMES as usize, MAX_CHANNELS as usize));
+        self.ring_a.get_or_init(new_ring);
+        self.ring_b.get_or_init(new_ring);
         self.reset_rings();
-        self.channels.store(d.channels as u32, Release);
         let default = rate_index(DEFAULT_RATE).unwrap_or(0) as u32;
-        self.rate_idx.store(default, Release);
+        for side in 0..2 {
+            self.channels[side].store(d.channels as u32, Release);
+            self.rate_idx[side].store(default, Release);
+        }
         for c in &self.clients {
             c.store(0, Release);
         }
         *self.meta() = (d.uid, d.name);
         self.alive.store(true, Release);
     }
+}
+
+/// Counts slot removals; see `Slot::freed_epoch`.
+static FREED: AtomicU64 = AtomicU64::new(0);
+
+/// Readable window is half the ring and must cover WriteMix running ~2 client buffers ahead of now plus
+/// ReadInput starting ~1 behind, for client buffers up to 4096 frames. Sized for `MAX_CHANNELS`:
+/// calloc'd zero pages cost nothing until a channel's samples are first written.
+fn new_ring() -> Ring {
+    Ring::new(2 * RING_FRAMES as usize, MAX_CHANNELS as usize)
 }
 
 pub static SLOTS: [Slot; MAX_DEVICES] = [const { Slot::new() }; MAX_DEVICES];
@@ -283,6 +311,23 @@ mod tests {
         assert_eq!(parse_action(KIND_CHANNELS | 65), None);
         assert_eq!(parse_action(KIND_RATE | 3), None);
         assert_eq!(parse_action(5), None);
+    }
+
+    #[test]
+    fn ring_window_covers_4096_frame_clients() {
+        let ring = new_ring();
+        let now = 100_000i64;
+        // WriteMix lands 2 buffers ahead of now, in 4096-frame blocks, ending at now + 8192.
+        for k in 0..4 {
+            ring.write(1, now - 8192 + k * 4096, &[(k + 1) as f32; 4096]);
+        }
+        // ReadInput starts 512 behind now.
+        let mut o = vec![0.0; 512];
+        ring.read(1, now - 512, &mut o);
+        assert!(o.iter().all(|&x| x == 2.0), "{:?}", &o[..4]);
+        let mut o = vec![0.0; 4096];
+        ring.read(1, now - 8192, &mut o);
+        assert!(o.iter().all(|&x| x == 1.0));
     }
 
     #[test]

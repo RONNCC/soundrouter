@@ -54,13 +54,13 @@ pub unsafe extern "C" fn zero_ts(
     host_time: *mut u64,
     seed: *mut u64,
 ) -> OSStatus {
-    let Some((slot, _, _, Part::Device)) = lookup(dev) else {
+    let Some((slot, _, side, Part::Device)) = lookup(dev) else {
         return BAD_OBJECT;
     };
     if sample_time.is_null() || host_time.is_null() || seed.is_null() {
         return BAD_OBJECT;
     }
-    let per = ticks_per_second() / slot.rate() * RING_FRAMES as f64; // host ticks per period
+    let per = ticks_per_second() / slot.rate(side) * RING_FRAMES as f64; // host ticks per period
     let anchor = slot.anchor.load(Acquire);
     let n = (now_ticks().saturating_sub(anchor) as f64 / per) as u64;
     unsafe {
@@ -120,7 +120,8 @@ pub unsafe extern "C" fn do_io(
     if buf.is_null() || cycle.is_null() || frames == 0 {
         return 0;
     }
-    let ch = slot.channels.load(Acquire) as usize;
+    // Own side only: the buffer matches the format the HAL last configured on this device.
+    let ch = slot.channels(side) as usize;
     let write = op == kAudioServerPlugInIOOperationWriteMix;
     if !write && op != kAudioServerPlugInIOOperationReadInput {
         return 0;
@@ -136,7 +137,10 @@ pub unsafe extern "C" fn do_io(
     } as i64;
     // SAFETY: the HAL hands us `frames` interleaved frames of the stream format we advertised.
     let buf = unsafe { std::slice::from_raw_parts_mut(buf as *mut f32, frames as usize * ch) };
-    let ring = slot.ring(ring_a).filter(|_| frames <= RING_FRAMES / 2);
+    // While V and C disagree (a format change landed on one side only) the pair stays silent.
+    let ring = slot
+        .ring(ring_a)
+        .filter(|_| frames <= RING_FRAMES / 2 && slot.in_sync());
     let Some(ring) = ring else {
         if !write {
             buf.fill(0.0);
@@ -149,4 +153,147 @@ pub unsafe extern "C" fn do_io(
         ring.read(ch, t, buf)
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::perform_change;
+    use sr_core::driver_proto::DriverDevice;
+
+    const FRAMES: usize = 64;
+    const GUARD: usize = 1024;
+    const SENTINEL: f32 = -12345.5;
+
+    /// Each test owns one slot of the global pool, so parallel tests cannot interfere.
+    fn activate(slot: usize, channels: u16) -> (u32, u32) {
+        SLOTS[slot].activate(DriverDevice {
+            uid: format!("t{slot}"),
+            name: "t".into(),
+            channels,
+        });
+        (
+            encode(slot, Side::Visible, Part::Device),
+            encode(slot, Side::Engine, Part::Device),
+        )
+    }
+
+    fn change(dev: u32, c: Change) {
+        assert_eq!(
+            unsafe {
+                perform_change(
+                    std::ptr::null_mut(),
+                    dev,
+                    change_action(&c),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+    }
+
+    /// One WriteMix/ReadInput call on `buf` (`n` real samples). Returns the guard words that were
+    /// overwritten, which must be none.
+    fn run(dev: u32, op: u32, t: f64, buf: &mut Vec<f32>, n: usize) -> usize {
+        buf.resize(n + GUARD, SENTINEL);
+        buf[n..].fill(SENTINEL);
+        let mut cycle: AudioServerPlugInIOCycleInfo = unsafe { std::mem::zeroed() };
+        cycle.mInputTime.mSampleTime = t;
+        cycle.mOutputTime.mSampleTime = t;
+        let st = unsafe {
+            do_io(
+                std::ptr::null_mut(),
+                dev,
+                0,
+                0,
+                op,
+                (n / ch_of(dev)) as u32,
+                &cycle,
+                buf.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(st, 0);
+        buf[n..].iter().filter(|&&x| x != SENTINEL).count()
+    }
+    fn ch_of(dev: u32) -> usize {
+        let (slot, _, side, _) = lookup(dev).unwrap();
+        slot.channels(side) as usize
+    }
+
+    const WRITE: u32 = kAudioServerPlugInIOOperationWriteMix;
+    const READ: u32 = kAudioServerPlugInIOOperationReadInput;
+
+    fn ramp(ch: usize) -> Vec<f32> {
+        (0..FRAMES * ch).map(|i| 1.0 + i as f32).collect()
+    }
+
+    #[test]
+    fn channel_change_on_one_side_never_overruns_the_other_buffer() {
+        let (v, c) = activate(15, 2);
+        // V's format change lands first; C's I/O keeps running on its 2-channel buffer.
+        change(v, Change::Channels(8));
+        let mut out = ramp(8);
+        assert_eq!(run(v, WRITE, 1000.0, &mut out, FRAMES * 8), 0);
+        let mut buf = vec![];
+        assert_eq!(
+            run(c, READ, 1000.0, &mut buf, FRAMES * 2),
+            0,
+            "guard words overwritten"
+        );
+        assert!(
+            buf[..FRAMES * 2].iter().all(|&x| x == 0.0),
+            "mismatched pair must be silent"
+        );
+        // C -> V direction: C's 2-channel write must not reach V's 8-channel reader.
+        let mut w = ramp(2);
+        assert_eq!(run(c, WRITE, 5000.0, &mut w, FRAMES * 2), 0);
+        assert_eq!(run(v, READ, 5000.0, &mut buf, FRAMES * 8), 0);
+        assert!(buf[..FRAMES * 8].iter().all(|&x| x == 0.0));
+        // Once C follows, the pair is bit-exact again in both directions.
+        change(c, Change::Channels(8));
+        assert_eq!(run(v, WRITE, 2000.0, &mut out, FRAMES * 8), 0);
+        assert_eq!(run(c, READ, 2000.0, &mut buf, FRAMES * 8), 0);
+        assert_eq!(&buf[..FRAMES * 8], &out[..FRAMES * 8]);
+        let mut w = ramp(8);
+        assert_eq!(run(c, WRITE, 3000.0, &mut w, FRAMES * 8), 0);
+        assert_eq!(run(v, READ, 3000.0, &mut buf, FRAMES * 8), 0);
+        assert_eq!(&buf[..FRAMES * 8], &w[..FRAMES * 8]);
+    }
+
+    #[test]
+    fn rate_change_on_one_side_silences_the_pair() {
+        let (v, c) = activate(14, 2);
+        let mut out = ramp(2);
+        assert_eq!(run(v, WRITE, 100.0, &mut out, FRAMES * 2), 0);
+        let mut buf = vec![];
+        run(c, READ, 100.0, &mut buf, FRAMES * 2);
+        assert_eq!(&buf[..FRAMES * 2], &out[..FRAMES * 2]);
+        change(v, Change::Rate(2));
+        assert!(!SLOTS[14].in_sync());
+        run(c, READ, 100.0, &mut buf, FRAMES * 2);
+        assert!(buf[..FRAMES * 2].iter().all(|&x| x == 0.0));
+        change(c, Change::Rate(2));
+        assert!(SLOTS[14].in_sync());
+    }
+
+    #[test]
+    fn zero_timestamp_uses_the_devices_own_rate() {
+        let (v, c) = activate(13, 2);
+        change(v, Change::Rate(2)); // V 96 kHz, C stays 48 kHz
+        let per48 = ticks_per_second() / 48_000.0 * RING_FRAMES as f64;
+        SLOTS[13]
+            .anchor
+            .store(now_ticks() - (10.5 * per48) as u64, Release);
+        let ts = |dev| {
+            let (mut t, mut h, mut s) = (0.0, 0, 0);
+            assert_eq!(
+                unsafe { zero_ts(std::ptr::null_mut(), dev, 0, &mut t, &mut h, &mut s) },
+                0
+            );
+            t
+        };
+        assert_eq!(ts(c), 10.0 * RING_FRAMES as f64);
+        assert_eq!(ts(v), 21.0 * RING_FRAMES as f64);
+    }
 }

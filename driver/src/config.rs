@@ -48,7 +48,9 @@ pub enum Op {
 }
 
 /// Steps that turn the live slots into `want` (already validated, so `want.len() <= slots.len()`).
-pub fn diff(slots: &[Option<DriverDevice>], want: &[DriverDevice]) -> Vec<Op> {
+/// `freed[s]` is the removal epoch of slot `s` (0 = never used). Adds take never-used slots first,
+/// then the longest-free ones, so the HAL can finish tearing a removed device down before its ids return.
+pub fn diff(slots: &[Option<DriverDevice>], freed: &[u64], want: &[DriverDevice]) -> Vec<Op> {
     let mut ops = vec![];
     // Slots freed in this pass go last, so an id is not handed to a different device in the same pass.
     let (mut empty, mut removed) = (vec![], vec![]);
@@ -74,6 +76,7 @@ pub fn diff(slots: &[Option<DriverDevice>], want: &[DriverDevice]) -> Vec<Op> {
             }
         }
     }
+    empty.sort_by_key(|&s| freed[s]); // stable: ties keep slot order
     let mut free = empty.into_iter().chain(removed);
     for w in want
         .iter()
@@ -132,6 +135,24 @@ mod tests {
     }
 
     #[test]
+    fn diff_does_not_reuse_just_freed_slot() {
+        // Slot 0 was freed in the previous pass (epoch 5), slot 1 never used, slot 2 freed long ago (epoch 2).
+        let slots = vec![None, None, None];
+        assert_eq!(
+            diff(
+                &slots,
+                &[5, 0, 2],
+                &[d("a", "A", 2), d("b", "B", 2), d("c", "C", 2)]
+            ),
+            vec![
+                Op::Add(1, d("a", "A", 2)),
+                Op::Add(2, d("b", "B", 2)),
+                Op::Add(0, d("c", "C", 2)),
+            ]
+        );
+    }
+
+    #[test]
     fn diff_add_remove_change() {
         let slots = vec![
             Some(d("a", "A", 2)),
@@ -146,7 +167,7 @@ mod tests {
             d("m", "M", 1),
         ];
         assert_eq!(
-            diff(&slots, &want),
+            diff(&slots, &[0; 4], &want),
             vec![
                 Op::Remove(1),
                 Op::Rename(3, "C2".into()),
@@ -160,11 +181,11 @@ mod tests {
     #[test]
     fn diff_noop_and_full_replace() {
         let cur = vec![Some(d("a", "A", 2)), None];
-        assert!(diff(&cur, &[d("a", "A", 2)]).is_empty());
+        assert!(diff(&cur, &[0; 2], &[d("a", "A", 2)]).is_empty());
         assert_eq!(
-            diff(&cur, &[d("z", "Z", 2)]),
+            diff(&cur, &[0; 2], &[d("z", "Z", 2)]),
             vec![Op::Remove(0), Op::Add(1, d("z", "Z", 2))]
         );
-        assert_eq!(diff(&cur, &[]), vec![Op::Remove(0)]);
+        assert_eq!(diff(&cur, &[0; 2], &[]), vec![Op::Remove(0)]);
     }
 }
