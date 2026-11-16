@@ -25,7 +25,9 @@ tray-icon = "0.26.1"
 window-vibrancy = "0.8.1"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL", "NSGeometry"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSColorSpace"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSColorSpace", "NSResponder", "NSView", "NSVisualEffectView", "objc2-quartz-core"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "objc2-core-foundation"] }
+raw-window-handle = "0.6"
 
 [features]
 # GPU (Metal) snapshot tests and the docs screenshots; off by default so plain `cargo test` needs no GPU.

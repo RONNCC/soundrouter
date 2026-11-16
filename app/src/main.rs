@@ -107,7 +107,8 @@ fn main() -> eframe::Result {
                     None,
                     None,
                 )
-                .is_ok();
+                .is_ok()
+                && blur_under_content(cc);
             #[cfg(not(target_os = "macos"))]
             let vibrancy = false;
 
@@ -157,6 +158,36 @@ fn main() -> eframe::Result {
             ))
         }),
     )
+}
+
+/// window-vibrancy puts its blur view inside winit's view, but wgpu draws into a `CAMetalLayer`
+/// that is a plain sublayer of that view, and AppKit appends the blur view's layer after it when
+/// the window first shows: the blur then covers every frame and the window looks blank. A
+/// negative `zPosition` keeps the blur underneath; if that fails the blur is removed again.
+#[cfg(target_os = "macos")]
+fn blur_under_content(cc: &eframe::CreationContext<'_>) -> bool {
+    use objc2::{ClassType, runtime::NSObjectProtocol};
+    use objc2_app_kit::{NSView, NSVisualEffectView};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let mut sunk = false;
+    if let Ok(RawWindowHandle::AppKit(h)) = cc.window_handle().map(|h| h.as_raw()) {
+        // SAFETY: winit's AppKit handle is its live content view; the creator runs on the main thread.
+        let view: &NSView = unsafe { h.ns_view.cast().as_ref() };
+        for blur in view.subviews().to_vec() {
+            if blur.isKindOfClass(NSVisualEffectView::class()) {
+                blur.setWantsLayer(true);
+                if let Some(layer) = blur.layer() {
+                    layer.setZPosition(-1.0);
+                    sunk = true;
+                }
+            }
+        }
+    }
+    if !sunk {
+        log::warn!("vibrancy off: could not put the blur view under the drawing layer");
+        let _ = window_vibrancy::clear_vibrancy(cc);
+    }
+    sunk
 }
 
 #[cfg(test)]
