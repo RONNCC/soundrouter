@@ -15,7 +15,7 @@ The BlackHole test sets `SR_MAIN_UID_OVERRIDE=<device uid>` so the engine uses a
 
 ## CI jobs
 
-`.github/workflows/ci.yml`: `build` (deny, fmt, clippy `-D warnings`, workspace tests, driver build, fakehost, app bundle, signature check), `coverage` (llvm-cov, non-blocking), `snapshots` (non-blocking, uploads diffs), `blackhole-e2e` (experimental: hosted runners may deny audio-capture TCC), and a non-blocking `driver-smoke`.
+`.github/workflows/ci.yml`: `build` (deny, fmt, clippy `-D warnings`, workspace tests, driver build, fakehost, app bundle, signature check), `coverage` (llvm-cov, non-blocking), `snapshots` (non-blocking: baselines come from a local GPU, so hosted-runner glyph antialiasing differs; uploads diffs), `blackhole-e2e` (experimental: hosted runners may deny audio-capture TCC), and a non-blocking `driver-smoke`.
 
 ## Manual hardware checklist
 

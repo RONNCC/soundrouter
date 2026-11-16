@@ -121,7 +121,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install BlackHole
         run: |
-          brew install --cask blackhole-2ch
+          brew install --cask blackhole-16ch
           sudo killall coreaudiod || true
           sleep 5
-      - run: cargo test -p sr-audio --test blackhole -- --ignored
+      - name: Run e2e (a SKIP means the device never appeared; fail instead of passing silently)
+        run: |
+          set -o pipefail
+          cargo test -p sr-audio --test blackhole -- --ignored --nocapture 2>&1 | tee blackhole.log
+          ! grep -q '^SKIP' blackhole.log
