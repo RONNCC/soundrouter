@@ -94,6 +94,8 @@ struct Vdev {
     zombies: Vec<Tap>,
     /// The aggregate's tap list (or layout) may be out of date: the next sync must redo it (F7).
     tap_dirty: bool,
+    /// Non-fatal config problems found by the last layout refresh, see [`Engine::warnings`].
+    warnings: Vec<String>,
     /// The `AudioDeviceStart` thread; `None` once joined.
     starter: Option<JoinHandle<()>>,
 }
@@ -257,6 +259,19 @@ impl Engine {
     /// Logged once at error level; this lets a UI show it as well.
     pub fn background_error(&self) -> Option<String> {
         lock(&self.inner).bg_error.clone()
+    }
+
+    /// Configuration problems that do not stop routing, e.g. monitor wires beyond the hardware's
+    /// channel count. Updated by every apply; each is also logged once when it first appears.
+    pub fn warnings(&self) -> Vec<String> {
+        let g = lock(&self.inner);
+        let mut w: Vec<String> = g
+            .vdevs
+            .values()
+            .flat_map(|v| v.warnings.iter().cloned())
+            .collect();
+        w.sort();
+        w
     }
 }
 
@@ -819,6 +834,26 @@ fn layout_inputs(dev: &VirtualDevice) -> LayoutInputs {
     }
 }
 
+/// Enabled monitors' wires whose `dst_ch` is beyond the hardware's output channels: the mixer cannot
+/// route them, so say so instead of dropping them silently (bug 7). Absent devices are not reported.
+fn monitor_warnings(dev: &VirtualDevice, subs: &[SubDesc]) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in dev.monitors.iter().filter(|m| m.enabled) {
+        let Some(sub) = subs.iter().find(|s| s.uid == m.device_uid) else {
+            continue;
+        };
+        let n = sub.out_bufs.iter().sum::<u16>();
+        for w in m.wires.iter().filter(|w| w.dst_ch >= n) {
+            out.push(format!(
+                "device '{}': monitor '{}' wire from channel {} to output channel {} is not routed: \
+                 the hardware has {n} output channels",
+                dev.id, m.device_uid, w.out_ch, w.dst_ch
+            ));
+        }
+    }
+    out
+}
+
 /// The mixer handles at most `MAX_CH` channels per direction. Fail loudly rather than drop channels:
 /// the aggregate's inputs are the device's own channels + hardware sources + 2 per app tap, its
 /// outputs the device's channels + enabled monitors' channels.
@@ -856,6 +891,11 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
             v.taps.len()
         )
     })?;
+    let warnings = monitor_warnings(&v.dev, &v.subs);
+    for w in warnings.iter().filter(|w| !v.warnings.contains(w)) {
+        log::warn!("{w}");
+    }
+    v.warnings = warnings;
     v.handle.set_plan(MixPlan::compile(&v.dev, &lay));
     v.layout = lay;
     v.shared
@@ -986,6 +1026,7 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
         starter: None,
         zombies: Vec::new(),
         tap_dirty: false,
+        warnings: Vec::new(),
     };
     // From here `Drop` cleans up the aggregate, taps and callback state.
     refresh_layout(&mut v)?;

@@ -611,3 +611,46 @@ fn backoff_grows_and_is_capped() {
     assert_eq!(backoff(5), MAX_BACKOFF);
     assert_eq!(backoff(u32::MAX), MAX_BACKOFF);
 }
+
+// ---- monitor wire warnings (bug 7) ----
+
+#[test]
+fn monitor_wire_beyond_hardware_channels_is_reported() {
+    let mut m = mon("spk", true);
+    m.wires = vec![
+        MonitorWire {
+            out_ch: 0,
+            dst_ch: 1,
+        },
+        MonitorWire {
+            out_ch: 1,
+            dst_ch: 2,
+        },
+        MonitorWire {
+            out_ch: 0,
+            dst_ch: 9,
+        },
+    ];
+    let mut off = mon("off", false);
+    off.wires = vec![MonitorWire {
+        out_ch: 0,
+        dst_ch: 50,
+    }];
+    let mut gone = mon("unplugged", true);
+    gone.wires = vec![MonitorWire {
+        out_ch: 0,
+        dst_ch: 50,
+    }];
+    let dev = vdev(vec![], vec![], vec![m, off, gone]);
+    let subs = [
+        sub("comp", true, &[2], &[2]),
+        sub("spk", false, &[], &[1, 1]),
+        sub("off", false, &[], &[2]),
+    ];
+    let w = monitor_warnings(&dev, &subs);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("output channel 2") && w[0].contains("has 2 output channels"));
+    assert!(w[1].contains("output channel 9"));
+    // In range: nothing to report.
+    assert!(monitor_warnings(&dev, &[sub("spk", false, &[], &[16])]).is_empty());
+}
