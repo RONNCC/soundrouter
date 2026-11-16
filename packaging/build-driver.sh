@@ -9,6 +9,8 @@ rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS"
 cp driver/Info.plist "$OUT/Contents/Info.plist"
 cp target/release/libsoundrouter_driver.dylib "$OUT/Contents/MacOS/SoundRouter"
+# the cargo dylib carries an absolute build-dir install name; make it bundle-relative
+install_name_tool -id "@loader_path/SoundRouter" "$OUT/Contents/MacOS/SoundRouter"
 plutil -lint "$OUT/Contents/Info.plist"
 # factory symbol named in Info.plist must be exported
 nm -gU "$OUT/Contents/MacOS/SoundRouter" | grep -q ' _SoundRouter_Create$' || { echo "missing _SoundRouter_Create" >&2; exit 1; }
