@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    env:
+      CERT_P12: ${{ secrets.CERT_P12 }}
+      CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+      SIGN_ID: ${{ secrets.SIGN_ID }}
+      INSTALLER_ID: ${{ secrets.INSTALLER_ID }}
+      NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+      NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+      NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-about
+      - name: Import signing certificates
+        if: env.CERT_P12 != '' && env.SIGN_ID != ''
+        run: |
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci "$RUNNER_TEMP/ci.keychain"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/ci.keychain"
+          security unlock-keychain -p ci "$RUNNER_TEMP/ci.keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/ci.keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$RUNNER_TEMP/ci.keychain"
+          security list-keychains -d user -s "$RUNNER_TEMP/ci.keychain" login.keychain
+      - name: Build driver
+        run: packaging/build-driver.sh
+      - name: Bundle app (generates ThirdPartyLicenses)
+        run: packaging/bundle-app.sh
+      - name: Build pkg and dmg
+        run: |
+          packaging/make-pkg.sh
+          packaging/make-dmg.sh
+      - name: Notarize
+        if: env.NOTARY_APPLE_ID != '' && env.NOTARY_TEAM_ID != '' && env.NOTARY_PASSWORD != '' && env.INSTALLER_ID != ''
+        run: |
+          xcrun notarytool store-credentials sr-ci --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" --password "$NOTARY_PASSWORD"
+          export NOTARY_PROFILE=sr-ci
+          packaging/notarize.sh target/SoundRouter.pkg
+          packaging/notarize.sh target/SoundRouter.dmg
+      - name: Zip bundles
+        run: |
+          cd target
+          ditto -c -k --keepParent SoundRouter.app SoundRouter.app.zip
+          ditto -c -k --keepParent SoundRouter.driver SoundRouter.driver.zip
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME" \
+            target/SoundRouter.pkg target/SoundRouter.dmg \
+            target/SoundRouter.app.zip target/SoundRouter.driver.zip
