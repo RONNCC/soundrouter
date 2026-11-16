@@ -314,7 +314,21 @@ fn plan_subs(dev: &VirtualDevice, present: &dyn Fn(&str) -> bool) -> Vec<String>
     out
 }
 
+/// Test/advanced hook: when `SR_MAIN_UID_OVERRIDE` names a device uid, the engine routes into that
+/// existing loopback device (e.g. BlackHole) instead of our driver's devices, and never touches the driver.
+const MAIN_UID_OVERRIDE: &str = "SR_MAIN_UID_OVERRIDE";
+
 fn main_candidates(dev: &VirtualDevice) -> Vec<String> {
+    if let Some(uid) = std::env::var(MAIN_UID_OVERRIDE)
+        .ok()
+        .filter(|u| !u.is_empty())
+    {
+        return if hal::device_by_uid(&uid).is_some() {
+            vec![uid]
+        } else {
+            vec![]
+        };
+    }
     let vis = format!("{DEVICE_UID_PREFIX}{}", dev.id);
     let mut c = vec![companion_uid(&vis)];
     if ALLOW_VISIBLE_FALLBACK {
@@ -325,6 +339,9 @@ fn main_candidates(dev: &VirtualDevice) -> Vec<String> {
 }
 
 fn sync_driver(cfg: &Config) -> Result<()> {
+    if std::env::var_os(MAIN_UID_OVERRIDE).is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
     let want: Vec<DriverDevice> = cfg
         .devices
         .iter()
