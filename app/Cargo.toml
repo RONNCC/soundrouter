@@ -19,3 +19,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 window-vibrancy = "0.8.1"
+
+[dev-dependencies]
+proptest = "1"
