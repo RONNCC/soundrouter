@@ -4,10 +4,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use sr_audio::engine::mic_status;
 use sr_audio::{Engine, IoState, apps, driver, loopback, tcc};
-use sr_core::backend::Backend;
+use sr_core::backend::{Backend, TccStatus};
 use sr_core::config::Config;
 use sr_core::driver_proto::{DEVICE_UID_PREFIX, DriverDevice, PLUGIN_BUNDLE_ID, companion_uid};
+use sr_core::selftest;
 
 #[derive(Parser)]
 #[command(name = "sr-cli", version, about = "SoundRouter headless tool")]
@@ -36,7 +38,13 @@ enum Cmd {
         secs: u64,
     },
     /// Apply a config and print meters at 4 Hz until Ctrl-C
-    Run { config: PathBuf },
+    Run {
+        config: PathBuf,
+        /// After applying, run the app's Test Setup tone through the running engine for this device id
+        /// (temporary Pass-Thru route, routing restored afterwards), print the result and exit
+        #[arg(long, value_name = "ID")]
+        self_test: Option<String>,
+    },
     /// Print per-channel input peaks of a virtual device (what apps record from it) at 4 Hz
     Meter { device_id: String },
     /// Check driver, plug-in, TCC and system state
@@ -105,21 +113,8 @@ fn main() -> Result<()> {
             println!("ok: {} device(s)", list.len());
             Ok(())
         }
-        Cmd::LoopbackTest { uid, secs } => {
-            let uid = full_uid(&uid);
-            let r = loopback::loopback_test(&uid, secs)?;
-            println!(
-                "{uid}: rate {} Hz, {} callbacks, rms {:.1} dBFS, dropouts {}",
-                r.rate, r.callbacks, r.rms_dbfs, r.dropouts
-            );
-            if r.passed() {
-                println!("PASS");
-                Ok(())
-            } else {
-                bail!("FAIL (need rms > -20 dBFS and 0 dropouts)")
-            }
-        }
-        Cmd::Run { config } => run(&config),
+        Cmd::LoopbackTest { uid, secs } => loopback_test(&full_uid(&uid), secs),
+        Cmd::Run { config, self_test } => run(&config, self_test.as_deref()),
         Cmd::Meter { device_id } => {
             install_ctrlc()?;
             let uid = full_uid(&device_id);
@@ -137,6 +132,41 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Doctor => doctor(),
+    }
+}
+
+/// Without an engine the driver loops the device's output straight back; with one running (in another
+/// process, since this one has none) the input carries that engine's mix, which is silent unless a
+/// Pass-Thru source is wired. This process cannot change another engine's routing, so say so.
+fn loopback_test(uid: &str, secs: u64) -> Result<()> {
+    let held = loopback::engine_holds_companion(uid);
+    let r = loopback::loopback_test(uid, secs)?;
+    println!(
+        "{uid}: rate {} Hz, {} callbacks, rms {:.1} dBFS, dropouts {}",
+        r.rate, r.callbacks, r.rms_dbfs, r.dropouts
+    );
+    let mic = mic_status();
+    if let Err(e) = selftest::verdict(r.to_self_test(), mic) {
+        if held && mic == TccStatus::Granted {
+            bail!(
+                "FAIL: an engine (the SoundRouter app or `sr-cli run`) is running for {uid}, so its input \
+                 carries that engine's mix, not the driver's direct loop; this probe only passes while a \
+                 Pass-Thru source is wired channel 0->0 and 1->1 there. Quit that engine and rerun, or \
+                 test through it: `sr-cli run <config> --self-test <id>` or the app's Test Setup."
+            );
+        }
+        return Err(e);
+    }
+    if held {
+        println!(
+            "(an engine is running for {uid}; the tone came back through its Pass-Thru route)"
+        );
+    }
+    if r.passed() {
+        println!("PASS");
+        Ok(())
+    } else {
+        bail!("FAIL (need rms > -20 dBFS and 0 dropouts)")
     }
 }
 
@@ -174,7 +204,7 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn run(path: &PathBuf) -> Result<()> {
+fn run(path: &PathBuf, self_test: Option<&str>) -> Result<()> {
     let cfg: Config = serde_json::from_str(
         &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
     )
@@ -190,6 +220,20 @@ fn run(path: &PathBuf) -> Result<()> {
         .filter(|d| d.enabled)
         .map(|d| d.id.as_str())
         .collect();
+    if let Some(id) = self_test {
+        // The IOProc starts asynchronously (and may wait on a TCC prompt): give it a moment first.
+        std::thread::sleep(Duration::from_secs(1));
+        let t = engine.self_test(id)?;
+        println!(
+            "self-test {id}: {:.1} dBFS, {} dropouts, passed={}",
+            t.rms_dbfs, t.dropouts, t.passed
+        );
+        return if t.passed {
+            Ok(())
+        } else {
+            bail!("self-test FAILED")
+        };
+    }
     println!("running {} device(s); Ctrl-C to stop", ids.len());
     while !STOP.load(Relaxed) {
         std::thread::sleep(Duration::from_millis(250));
@@ -251,6 +295,7 @@ fn doctor() -> Result<()> {
         }
     }
     println!("TCC audio capture: {:?}", tcc::audio_capture_status());
+    println!("TCC microphone:    {:?}", tcc::microphone_status());
     if !healthy {
         bail!("doctor: problems found (see above)");
     }

@@ -233,6 +233,24 @@ impl LoopbackReport {
     pub fn passed(&self) -> bool {
         self.rms_dbfs > -20.0 && self.dropouts == 0
     }
+
+    pub fn to_self_test(&self) -> sr_core::backend::SelfTest {
+        sr_core::backend::SelfTest {
+            rms_dbfs: self.rms_dbfs,
+            dropouts: self.dropouts,
+            rate: self.rate,
+            passed: self.passed(),
+        }
+    }
+}
+
+/// True while some process (an engine) has IO running on `uid`'s hidden companion. Then the device's
+/// input carries that engine's mix, not the driver's direct loop of its output.
+pub fn engine_holds_companion(uid: &str) -> bool {
+    hal::device_by_uid(&sr_core::driver_proto::companion_uid(uid)).is_some_and(|d| {
+        hal::get_global::<u32>(d, kAudioDevicePropertyDeviceIsRunningSomewhere)
+            .is_ok_and(|v| v != 0)
+    })
 }
 
 /// Play the tone into `uid`'s output and measure what comes back on its input.

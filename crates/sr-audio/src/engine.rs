@@ -27,6 +27,7 @@ use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice};
 use sr_core::driver_proto::{COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, companion_uid};
 use sr_core::meters::Meters;
 use sr_core::mixer::{IoLayout, MixPlan, Mixer, MixerHandle, mixer};
+use sr_core::selftest;
 
 use crate::apps::{self, AppGroup};
 use crate::driver;
@@ -469,13 +470,7 @@ impl Backend for Engine {
             crate::tcc::CaptureStatus::Denied => TccStatus::Denied,
             crate::tcc::CaptureStatus::Unknown(_) => TccStatus::Unknown,
         };
-        let mic = match crate::tcc::microphone_status() {
-            crate::tcc::CaptureStatus::Granted => TccStatus::Granted,
-            crate::tcc::CaptureStatus::Denied => TccStatus::Denied,
-            // -1: private API missing, so we cannot tell; do not let onboarding wait on it forever.
-            crate::tcc::CaptureStatus::Unknown(-1) => TccStatus::Granted,
-            crate::tcc::CaptureStatus::Unknown(_) => TccStatus::Unknown,
-        };
+        let mic = mic_status();
         let driver_version =
             driver::find_plugin().map(|p| driver::version(p).unwrap_or_else(|| "?".into()));
         let mut per_device: Vec<(String, DeviceState)> = lock(&self.inner)
@@ -495,13 +490,22 @@ impl Backend for Engine {
     }
 
     fn self_test(&mut self, id: &str) -> Result<SelfTest> {
-        let r = crate::loopback::loopback_test(&format!("{DEVICE_UID_PREFIX}{id}"), 2)?;
-        Ok(SelfTest {
-            rms_dbfs: r.rms_dbfs,
-            dropouts: r.dropouts,
-            rate: r.rate,
-            passed: r.passed(),
-        })
+        let uid = format!("{DEVICE_UID_PREFIX}{id}");
+        let (cfg, running) = {
+            let g = lock(&self.inner);
+            (g.cfg.clone(), g.vdevs.contains_key(id))
+        };
+        // A virtual device's input reads silence until the microphone question is answered: ask now.
+        if mic_status() == TccStatus::Unknown {
+            crate::tcc::request_microphone(MIC_PROMPT_WAIT);
+        }
+        let probe = || Ok(crate::loopback::loopback_test(&uid, 2)?.to_self_test());
+        let t = match cfg {
+            // A running engine owns the device's input: route the tone through it, as a user would.
+            Some(cfg) => selftest::run_routed(self, &cfg, id, running, probe)?,
+            None => probe()?,
+        };
+        selftest::verdict(t, mic_status())
     }
 
     fn meters(&self, device_id: &str) -> Option<MeterReading> {
@@ -511,6 +515,20 @@ impl Backend for Engine {
         // can otherwise outlive the user's newer volume until the next apply.
         v.handle.flush();
         Some(v.meters.take(&v.layout, &v.dev))
+    }
+}
+
+/// How long a self-test waits for the user to answer the microphone prompt.
+const MIC_PROMPT_WAIT: Duration = Duration::from_secs(120);
+
+/// Microphone permission, which reading a virtual device's input needs.
+pub fn mic_status() -> TccStatus {
+    match crate::tcc::microphone_status() {
+        crate::tcc::CaptureStatus::Granted => TccStatus::Granted,
+        crate::tcc::CaptureStatus::Denied => TccStatus::Denied,
+        // -1: private API missing, so we cannot tell; do not let onboarding wait on it forever.
+        crate::tcc::CaptureStatus::Unknown(-1) => TccStatus::Granted,
+        crate::tcc::CaptureStatus::Unknown(_) => TccStatus::Unknown,
     }
 }
 
