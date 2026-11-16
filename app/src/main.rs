@@ -12,25 +12,21 @@ mod worker;
 
 use eframe::egui;
 use sr_core::backend::Backend;
-use std::path::PathBuf;
 
 struct Args {
     demo: bool,
-    screenshot: Option<PathBuf>,
     theme: egui::ThemePreference,
 }
 
 fn parse_args() -> Args {
     let mut a = Args {
         demo: false,
-        screenshot: None,
         theme: egui::ThemePreference::System,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--demo" => a.demo = true,
-            "--screenshot" => a.screenshot = it.next().map(PathBuf::from),
             "--theme" => {
                 a.theme = match it.next().as_deref() {
                     Some("dark") => egui::ThemePreference::Dark,
@@ -39,7 +35,7 @@ fn parse_args() -> Args {
                 }
             }
             "-h" | "--help" => {
-                println!("usage: SoundRouter [--demo] [--screenshot out.png] [--theme dark|light]");
+                println!("usage: SoundRouter [--demo] [--theme dark|light]");
                 std::process::exit(0);
             }
             other => eprintln!("ignoring unknown argument {other}"),
@@ -55,9 +51,8 @@ fn real_backend() -> anyhow::Result<Box<dyn Backend + Send>> {
 
 fn main() -> eframe::Result {
     let args = parse_args();
-    // A screenshot always renders the populated demo.
-    let demo = args.demo || args.screenshot.is_some();
-    let vibrancy_wanted = cfg!(target_os = "macos") && args.screenshot.is_none();
+    let demo = args.demo;
+    let vibrancy_wanted = cfg!(target_os = "macos");
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SoundRouter")
@@ -87,7 +82,7 @@ fn main() -> eframe::Result {
             #[cfg(not(target_os = "macos"))]
             let vibrancy = false;
 
-            let (cfg, path, mut toast, backend): (_, _, _, Box<dyn Backend + Send>) = if demo {
+            let (cfg, path, toast, backend): (_, _, _, Box<dyn Backend + Send>) = if demo {
                 (
                     fake::demo_config(),
                     None,
@@ -110,10 +105,8 @@ fn main() -> eframe::Result {
                 }
             };
             let worker = worker::Worker::spawn(backend, cc.egui_ctx.clone());
-            let shot = args.screenshot.clone().map(app::Shot::new);
-            toast = toast.take();
             Ok(Box::new(app::App::new(
-                cfg, path, worker, toast, vibrancy, demo, shot,
+                cfg, path, worker, toast, vibrancy, demo,
             )))
         }),
     )

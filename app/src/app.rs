@@ -3,11 +3,11 @@ use crate::graph::{self, GraphCtx, GraphState};
 use crate::model::{Edit, apply, db_to_pct, pct_to_db};
 use crate::store;
 use crate::theme::{Tokens, semibold, tokens};
-use crate::widgets::{pencil, plus_circle, speaker, switch};
+use crate::widgets::{name_button, name_widget, pencil, plus_circle, plus_glyph, speaker, switch};
 use crate::worker::Worker;
 use eframe::egui::{
     self, Align2, CornerRadius, FontId, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit, Theme,
-    UiBuilder, pos2, vec2,
+    UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 use sr_core::config::Config;
 use std::path::PathBuf;
@@ -15,19 +15,9 @@ use std::time::Duration;
 
 const SIDEBAR_W: f32 = 250.0;
 const ROW_H: f32 = 78.0;
+const BLANK_NAME: &str = "A device name can't be empty.";
 /// Room for the traffic lights in the unified titlebar.
 const TITLEBAR_H: f32 = 46.0;
-
-pub struct Shot {
-    pub path: PathBuf,
-    sent: bool,
-}
-
-impl Shot {
-    pub fn new(path: PathBuf) -> Self {
-        Shot { path, sent: false }
-    }
-}
 
 pub struct App {
     cfg: Config,
@@ -41,11 +31,9 @@ pub struct App {
     save_pending: bool,
     vibrancy: bool,
     demo: bool,
-    shot: Option<Shot>,
 }
 
 impl App {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: Config,
         path: Option<PathBuf>,
@@ -53,7 +41,6 @@ impl App {
         toast: Option<String>,
         vibrancy: bool,
         demo: bool,
-        shot: Option<Shot>,
     ) -> Self {
         worker.apply(&cfg);
         Self {
@@ -67,12 +54,24 @@ impl App {
             save_pending: false,
             vibrancy,
             demo,
-            shot,
         }
     }
 
     fn commit(&mut self, edits: Vec<Edit>) {
+        // A blank name can never be valid (the driver rejects it and then drops every device).
+        let mut blank_rename = false;
+        let edits: Vec<Edit> = edits
+            .into_iter()
+            .filter(|e| {
+                let blank = matches!(e, Edit::Rename(_, n) if n.trim().is_empty());
+                blank_rename |= blank;
+                !blank
+            })
+            .collect();
         if edits.is_empty() {
+            if blank_rename {
+                self.toast = Some(BLANK_NAME.into());
+            }
             return;
         }
         let prev = self.cfg.clone();
@@ -86,7 +85,7 @@ impl App {
             self.toast = Some(e);
             return;
         }
-        self.toast = None;
+        self.toast = blank_rename.then(|| BLANK_NAME.to_string());
         if select_new {
             self.selected = self.cfg.devices.len() - 1;
         }
@@ -151,14 +150,9 @@ impl App {
                     Id::unique("new_dev"),
                     Sense::click(),
                 );
+                name_button(&new, "New Virtual Device");
                 let c = if new.hovered() { t.text } else { t.text2 };
-                plus_circle(
-                    ui,
-                    pos2(foot.left() + 22.0, cy),
-                    Id::unique("new_dev_icon"),
-                    t,
-                    false,
-                );
+                plus_glyph(ui.painter(), pos2(foot.left() + 22.0, cy), c, false);
                 ui.painter().text(
                     pos2(foot.left() + 38.0, cy),
                     Align2::LEFT_CENTER,
@@ -175,6 +169,7 @@ impl App {
                     Id::unique("del_dev_icon"),
                     t,
                     true,
+                    "Delete selected device",
                 );
                 if minus.clicked() && self.selected < self.cfg.devices.len() {
                     edits.push(Edit::RemoveDevice(self.selected));
@@ -186,6 +181,7 @@ impl App {
     fn device_row(&mut self, ui: &mut egui::Ui, i: usize, t: &Tokens, edits: &mut Vec<Edit>) {
         let dev = &self.cfg.devices[i];
         let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+        name_button(&resp, &format!("Select {}", dev.name));
         if resp.clicked() {
             self.selected = i;
         }
@@ -218,6 +214,7 @@ impl App {
                     .frame(egui::Frame::NONE)
                     .text_color(t.text),
             );
+            name_widget(ui, &te, "Rename device");
             te.request_focus();
             let esc = ui.input(|k| k.key_pressed(egui::Key::Escape));
             if te.lost_focus() || esc {
@@ -243,6 +240,7 @@ impl App {
                 Id::unique(("name", i)),
                 Sense::click(),
             );
+            name_button(&hit, &format!("Rename {}", dev.name));
             if hit.double_clicked() {
                 self.renaming = Some((i, dev.name.clone()));
             }
@@ -260,7 +258,14 @@ impl App {
             pos2(inner.right() - 8.0 - 16.0, inner.top() + 18.0),
             vec2(32.0, 18.0),
         );
-        let on = switch(ui, sw, Id::unique(("dev_on", i)), dev.enabled, t);
+        let on = switch(
+            ui,
+            sw,
+            Id::unique(("dev_on", i)),
+            dev.enabled,
+            t,
+            &format!("Enable {}", dev.name),
+        );
         if on != dev.enabled {
             edits.push(Edit::Enable(i, on));
         }
@@ -272,6 +277,7 @@ impl App {
             Id::unique(("mute", i)),
             dev.muted,
             t,
+            &format!("Mute {}", dev.name),
         );
         if mute.clicked() {
             edits.push(Edit::Mute(i, !dev.muted));
@@ -282,10 +288,11 @@ impl App {
             (inner.left() + 36.0)..=(inner.right() - 52.0),
             (vy - 10.0)..=(vy + 10.0),
         );
-        ui.scope_builder(UiBuilder::new().max_rect(sl), |ui| {
+        let slider = ui.scope_builder(UiBuilder::new().max_rect(sl), |ui| {
             ui.spacing_mut().slider_width = sl.width() - 4.0;
-            ui.add(Slider::new(&mut pct, 0.0..=100.0).show_value(false));
+            ui.add(Slider::new(&mut pct, 0.0..=100.0).show_value(false))
         });
+        name_widget(ui, &slider.inner, &format!("{} volume", dev.name));
         if (pct - before).abs() > 1e-3 {
             edits.push(Edit::Volume(i, pct_to_db(pct)));
         }
@@ -314,6 +321,7 @@ impl App {
                 let btn =
                     Rect::from_center_size(pos2(r.left() + 58.0, r.center().y), vec2(72.0, 26.0));
                 let resp = ui.interact(btn, Id::unique("delete"), Sense::click());
+                name_button(&resp, "Delete");
                 let fill = if resp.hovered() && has {
                     t.card_stroke
                 } else {
@@ -356,12 +364,13 @@ impl App {
                 let x = btn.right() + 18.0;
                 let width = r.right() - 18.0 - x;
                 graph::text_left(ui, x, r.center().y, &msg, FontId::proportional(12.0), color, width);
-                ui.interact(
+                let status = ui.interact(
                     Rect::from_min_max(pos2(x, r.top()), pos2(r.right() - 18.0, r.bottom())),
                     Id::unique("status"),
                     Sense::hover(),
-                )
-                .on_hover_text(msg);
+                );
+                status.widget_info(|| WidgetInfo::labeled(Role::Label, true, &msg));
+                status.on_hover_text(msg);
             });
 
         egui::CentralPanel::default()
@@ -392,6 +401,7 @@ impl App {
                         .frame(egui::Frame::NONE)
                         .text_color(t.text),
                 );
+                name_widget(ui, &te, "Device name");
                 let w = ui
                     .painter()
                     .layout_no_wrap(name.clone(), FontId::new(19.0, semibold()), t.text)
@@ -477,34 +487,6 @@ impl eframe::App for App {
             {
                 self.toast = Some(format!("Could not save config: {e}"));
             }
-        }
-
-        if let Some(shot) = &mut self.shot
-            && !shot.sent
-            && ctx.input(|i| i.time) > 1.6
-        {
-            shot.sent = true;
-            let path = shot.path.clone();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
-                egui::ScreenshotCallback::new(move |img| {
-                    let rgba: Vec<u8> = img
-                        .pixels
-                        .iter()
-                        .flat_map(|c| c.to_srgba_unmultiplied())
-                        .collect();
-                    let saved = image::save_buffer(
-                        &path,
-                        &rgba,
-                        img.size[0] as u32,
-                        img.size[1] as u32,
-                        image::ExtendedColorType::Rgba8,
-                    );
-                    if let Err(e) = &saved {
-                        eprintln!("screenshot failed: {e}");
-                    }
-                    std::process::exit(i32::from(saved.is_err()));
-                }),
-            ));
         }
     }
 }

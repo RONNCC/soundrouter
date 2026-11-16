@@ -1,6 +1,6 @@
 //! Geometry of the three-column graph: card rects, port positions, hit-testing, wire curves.
 use crate::model::Port;
-use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
+use eframe::egui::{Color32, Pos2, Rect, Stroke, Vec2, epaint::CubicBezierShape, pos2, vec2};
 
 pub const HEAD_H: f32 = 34.0;
 /// Minimum body height of a card with a big icon.
@@ -205,18 +205,10 @@ pub fn wire_points(a: Pos2, b: Pos2) -> [Pos2; 4] {
     [a, a + vec2(dx, 0.0), b - vec2(dx, 0.0), b]
 }
 
-pub fn bezier_at(p: &[Pos2; 4], t: f32) -> Pos2 {
-    let u = 1.0 - t;
-    let w = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
-    pos2(
-        p.iter().zip(w).map(|(p, w)| p.x * w).sum(),
-        p.iter().zip(w).map(|(p, w)| p.y * w).sum(),
-    )
-}
-
 /// Approximate distance from `pos` to the curve (polyline of 32 samples).
 pub fn wire_distance(p: &[Pos2; 4], pos: Pos2) -> f32 {
-    let pts: Vec<Pos2> = (0..=32).map(|i| bezier_at(p, i as f32 / 32.0)).collect();
+    let curve = CubicBezierShape::from_points_stroke(*p, false, Color32::TRANSPARENT, Stroke::NONE);
+    let pts: Vec<Pos2> = (0..=32).map(|i| curve.sample(i as f32 / 32.0)).collect();
     pts.windows(2)
         .map(|s| {
             let (a, b) = (s[0], s[1]);
@@ -341,13 +333,12 @@ mod tests {
     }
 
     #[test]
-    fn bezier_endpoints_and_midpoint() {
+    fn wire_passes_through_both_ends_and_midpoint() {
         let (a, b) = (pos2(0.0, 0.0), pos2(200.0, 100.0));
         let p = wire_points(a, b);
-        assert_eq!(bezier_at(&p, 0.0), a);
-        assert_eq!(bezier_at(&p, 1.0), b);
-        let mid = bezier_at(&p, 0.5);
-        assert!((mid.x - 100.0).abs() < 1e-3 && (mid.y - 50.0).abs() < 1e-3);
+        for on_curve in [a, b, pos2(100.0, 50.0)] {
+            assert!(wire_distance(&p, on_curve) < 1e-3, "{on_curve:?}");
+        }
         // handles stay horizontal
         assert_eq!(p[1].y, a.y);
         assert_eq!(p[2].y, b.y);

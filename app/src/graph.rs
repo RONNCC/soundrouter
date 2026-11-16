@@ -7,7 +7,7 @@ use crate::layout::{
 use crate::meter::{PeakHold, level};
 use crate::model::{Edit, Link, Port, can_link, ch_label, links};
 use crate::theme::{Tokens, semibold, tile_tint};
-use crate::widgets::{chevron, loops, meter, plus_circle, switch, tile};
+use crate::widgets::{chevron, loops, meter, name_button, name_widget, plus_circle, switch, tile};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Popup, Rect, Sense, Shadow, Slider, Stroke,
     StrokeKind, Ui, UiBuilder, epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
@@ -202,11 +202,25 @@ fn column_headers(ui: &mut Ui, g: &GraphCtx, layout: &Layout, edits: &mut Vec<Ed
         let id = Id::unique(("hdr", d, i));
         match i {
             0 => {
-                let resp = plus_circle(ui, pos2(right - 12.0, base - 28.0), id, t, false);
+                let resp = plus_circle(
+                    ui,
+                    pos2(right - 12.0, base - 28.0),
+                    id,
+                    t,
+                    false,
+                    "Add source",
+                );
                 Popup::menu(&resp).show(|ui| source_menu(ui, g, edits));
             }
             1 => {
-                let resp = plus_circle(ui, pos2(right - 12.0, base - 28.0), id, t, false);
+                let resp = plus_circle(
+                    ui,
+                    pos2(right - 12.0, base - 28.0),
+                    id,
+                    t,
+                    false,
+                    "Add channel pair",
+                );
                 if resp.clicked() {
                     edits.push(Edit::GrowChannels(d));
                 }
@@ -218,6 +232,7 @@ fn column_headers(ui: &mut Ui, g: &GraphCtx, layout: &Layout, edits: &mut Vec<Ed
                         id.with("minus"),
                         t,
                         true,
+                        "Remove channel pair",
                     );
                     if resp.clicked() {
                         edits.push(Edit::ShrinkChannels(d));
@@ -226,7 +241,14 @@ fn column_headers(ui: &mut Ui, g: &GraphCtx, layout: &Layout, edits: &mut Vec<Ed
                 }
             }
             _ => {
-                let resp = plus_circle(ui, pos2(right - 12.0, base - 28.0), id, t, false);
+                let resp = plus_circle(
+                    ui,
+                    pos2(right - 12.0, base - 28.0),
+                    id,
+                    t,
+                    false,
+                    "Add monitor",
+                );
                 Popup::menu(&resp).show(|ui| monitor_menu(ui, g, edits));
             }
         }
@@ -387,7 +409,14 @@ fn card(
             pos2(r.right() - 14.0 - 16.0, r.top() + HEAD_H / 2.0),
             vec2(32.0, 18.0),
         );
-        let new = switch(ui, sw, Id::unique(("card_on", d, c.id)), on_now, t);
+        let new = switch(
+            ui,
+            sw,
+            Id::unique(("card_on", d, c.id)),
+            on_now,
+            t,
+            &format!("{title} enabled"),
+        );
         painter.text(
             pos2(sw.left() - 6.0, sw.center().y),
             Align2::RIGHT_CENTER,
@@ -468,6 +497,7 @@ fn card(
     let y0 = body_top + body_h;
     let opt = Rect::from_min_size(pos2(r.left(), y0), vec2(r.width(), FOOT_H));
     let resp = ui.interact(opt, Id::unique(("opt", d, c.id)), Sense::click());
+    name_button(&resp, &format!("{title} options"));
     let col = if resp.hovered() { t.text } else { t.text2 };
     chevron(
         &painter,
@@ -502,10 +532,11 @@ fn card(
     let mut v = vol_db.clamp(-60.0, 12.0);
     let slider =
         Rect::from_x_y_ranges((vrow.left() + 46.0)..=(vrow.right() - 52.0), vrow.y_range());
-    ui.scope_builder(UiBuilder::new().max_rect(slider), |ui| {
+    let vol = ui.scope_builder(UiBuilder::new().max_rect(slider), |ui| {
         ui.spacing_mut().slider_width = slider.width();
-        ui.add(Slider::new(&mut v, -60.0..=12.0).show_value(false));
+        ui.add(Slider::new(&mut v, -60.0..=12.0).show_value(false))
     });
+    name_widget(ui, &vol.inner, &format!("{title} volume"));
     painter.text(
         pos2(vrow.right(), vrow.center().y),
         Align2::RIGHT_CENTER,
@@ -527,6 +558,7 @@ fn card(
         CardId::Mon(i) => ("Remove Monitor", Edit::RemoveMonitor(d, i)),
         CardId::Out(_) => return,
     };
+    name_button(&resp, &format!("{label} {title}"));
     painter.text(
         rm.left_center(),
         Align2::LEFT_CENTER,
@@ -586,6 +618,24 @@ fn port_color(p: Port, t: &Tokens) -> Color32 {
     link_color(Link { from: p, to: p }, t)
 }
 
+/// Accessible name of a port, e.g. "Safari channel 1 output".
+fn port_label(g: &GraphCtx, p: Port) -> String {
+    match p {
+        Port::Src { src, ch } => format!(
+            "{} channel {} output",
+            source_title(&g.dev.sources[src], g.hw, g.apps).0,
+            ch + 1
+        ),
+        Port::OutIn { ch } => format!("Output channel {} input", ch + 1),
+        Port::OutOut { ch } => format!("Output channel {} output", ch + 1),
+        Port::Mon { mon, ch } => format!(
+            "{} channel {} input",
+            monitor_title(&g.dev.monitors[mon], g.hw),
+            ch + 1
+        ),
+    }
+}
+
 fn wire_shape(a: egui::Pos2, b: egui::Pos2, color: Color32, w: f32) -> CubicBezierShape {
     CubicBezierShape::from_points_stroke(
         wire_points(a, b),
@@ -614,6 +664,7 @@ fn wires_and_ports(
             Id::unique(("port", d, p)),
             Sense::click_and_drag(),
         );
+        name_button(&resp, &port_label(g, p));
         if resp.drag_started() {
             if p.is_output() {
                 st.drag = Some(p);
@@ -700,76 +751,64 @@ fn wires_and_ports(
 mod tests {
     use super::*;
     use crate::model::{apply, default_config};
-    use crate::theme::tokens;
-    use eframe::egui::{Context, Event, PointerButton, Pos2, RawInput};
+    use crate::theme::{install_fonts, tokens};
+    use egui_kittest::{Harness, kittest::Queryable};
 
-    struct Rig {
-        ctx: Context,
+    struct S {
         st: GraphState,
-        t: f64,
         dev: VirtualDevice,
+        edits: Vec<Edit>,
+        layout: Option<Layout>,
     }
 
-    impl Rig {
-        fn new(dev: VirtualDevice) -> Self {
-            Rig {
-                ctx: Context::default(),
-                st: GraphState::default(),
-                t: 0.0,
-                dev,
-            }
-        }
+    fn rig(dev: VirtualDevice) -> Harness<'static, S> {
+        Harness::builder()
+            .with_size(vec2(1000.0, 600.0))
+            .with_step_dt(0.05)
+            .with_context_setup(install_fonts)
+            .build_ui_state(
+                |ui, s: &mut S| {
+                    let tk = tokens(true);
+                    let g = GraphCtx {
+                        dev_idx: 0,
+                        dev: &s.dev,
+                        hw: &[],
+                        apps: &[],
+                        reading: None,
+                        t: &tk,
+                        min_h: 500.0,
+                    };
+                    s.layout = Some(show(ui, &g, &mut s.st, &mut s.edits));
+                },
+                S {
+                    st: GraphState::default(),
+                    dev,
+                    edits: Vec::new(),
+                    layout: None,
+                },
+            )
+    }
 
-        fn frame(&mut self, events: Vec<Event>) -> (Vec<Edit>, Layout) {
-            self.t += 0.05;
-            let input = RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0))),
-                time: Some(self.t),
-                events,
-                ..Default::default()
-            };
-            let tk = tokens(true);
-            let mut edits = Vec::new();
-            let mut layout = None;
-            let out = self.ctx.run_ui(input, |ui| {
-                let g = GraphCtx {
-                    dev_idx: 0,
-                    dev: &self.dev,
-                    hw: &[],
-                    apps: &[],
-                    reading: None,
-                    t: &tk,
-                    min_h: 500.0,
-                };
-                layout = Some(show(ui, &g, &mut self.st, &mut edits));
-            });
-            out.drop_without_applying_deltas();
-            (edits, layout.unwrap())
-        }
+    fn port(h: &Harness<S>, p: Port) -> egui::Pos2 {
+        h.state().layout.as_ref().unwrap().port_pos(p).unwrap()
+    }
 
-        /// Press at `from`, move through `to`, release; returns every edit emitted.
-        fn drag(&mut self, from: Pos2, to: Pos2) -> Vec<Edit> {
-            let btn = |pos, pressed| Event::PointerButton {
-                pos,
-                button: PointerButton::Primary,
-                pressed,
-                modifiers: Default::default(),
-            };
-            let mid = from + (to - from) * 0.5;
-            let mut all = Vec::new();
-            for ev in [
-                vec![Event::PointerMoved(from)],
-                vec![btn(from, true)],
-                vec![Event::PointerMoved(mid)],
-                vec![Event::PointerMoved(to)],
-                vec![],
-                vec![btn(to, false)],
-                vec![],
-            ] {
-                all.extend(self.frame(ev).0);
-            }
-            all
-        }
+    /// Press at `from`, move through `to`, release; returns every edit emitted.
+    fn drag(h: &mut Harness<S>, from: egui::Pos2, to: egui::Pos2) -> Vec<Edit> {
+        h.state_mut().edits.clear();
+        h.hover_at(from);
+        h.step();
+        h.drag_at(from);
+        h.step();
+        h.hover_at(from + (to - from) * 0.5);
+        h.step();
+        h.hover_at(to);
+        h.step();
+        h.step();
+        h.drop_at(to);
+        h.step();
+        h.step();
+        std::mem::take(&mut h.state_mut().edits)
     }
 
     fn device() -> VirtualDevice {
@@ -792,11 +831,10 @@ mod tests {
     fn dragging_output_port_to_input_port_connects() {
         let mut dev = device();
         dev.wires.clear();
-        let mut rig = Rig::new(dev);
-        let layout = rig.frame(vec![]).1;
-        let from = layout.port_pos(Port::Src { src: 0, ch: 0 }).unwrap();
-        let to = layout.port_pos(Port::OutIn { ch: 1 }).unwrap();
-        let edits = rig.drag(from, to + vec2(3.0, 2.0));
+        let mut h = rig(dev);
+        let from = port(&h, Port::Src { src: 0, ch: 0 });
+        let to = port(&h, Port::OutIn { ch: 1 });
+        let edits = drag(&mut h, from, to + vec2(3.0, 2.0));
         let want = Link {
             from: Port::Src { src: 0, ch: 0 },
             to: Port::OutIn { ch: 1 },
@@ -808,38 +846,35 @@ mod tests {
     fn dropping_on_empty_space_creates_nothing() {
         let mut dev = device();
         dev.wires.clear();
-        let mut rig = Rig::new(dev);
-        let layout = rig.frame(vec![]).1;
-        let from = layout.port_pos(Port::Src { src: 0, ch: 0 }).unwrap();
-        assert!(rig.drag(from, pos2(600.0, 500.0)).is_empty());
+        let mut h = rig(dev);
+        let from = port(&h, Port::Src { src: 0, ch: 0 });
+        assert!(drag(&mut h, from, pos2(600.0, 500.0)).is_empty());
     }
 
     #[test]
     fn output_channel_drags_to_monitor_only() {
         let mut dev = device();
         dev.monitors[0].wires.clear();
-        let mut rig = Rig::new(dev);
-        let layout = rig.frame(vec![]).1;
-        let from = layout.port_pos(Port::OutOut { ch: 0 }).unwrap();
-        let to = layout.port_pos(Port::Mon { mon: 0, ch: 1 }).unwrap();
-        let edits = rig.drag(from, to);
+        let mut h = rig(dev);
+        let from = port(&h, Port::OutOut { ch: 0 });
+        let to = port(&h, Port::Mon { mon: 0, ch: 1 });
+        let edits = drag(&mut h, from, to);
         let want = Link {
             from: Port::OutOut { ch: 0 },
             to: Port::Mon { mon: 0, ch: 1 },
         };
         assert_eq!(edits, vec![Edit::Connect(0, want)]);
         // a source port may not drop straight onto a monitor
-        let from = layout.port_pos(Port::Src { src: 0, ch: 0 }).unwrap();
-        assert!(rig.drag(from, to).is_empty());
+        let from = port(&h, Port::Src { src: 0, ch: 0 });
+        assert!(drag(&mut h, from, to).is_empty());
     }
 
     #[test]
     fn dragging_an_input_end_rewires() {
-        let mut rig = Rig::new(device());
-        let layout = rig.frame(vec![]).1;
-        let grab = layout.port_pos(Port::OutIn { ch: 0 }).unwrap();
-        let drop = layout.port_pos(Port::OutIn { ch: 1 }).unwrap();
-        let edits = rig.drag(grab, drop);
+        let mut h = rig(device());
+        let grab = port(&h, Port::OutIn { ch: 0 });
+        let drop = port(&h, Port::OutIn { ch: 1 });
+        let edits = drag(&mut h, grab, drop);
         let old = Link {
             from: Port::Src { src: 0, ch: 0 },
             to: Port::OutIn { ch: 0 },
@@ -853,27 +888,33 @@ mod tests {
 
     #[test]
     fn clicking_an_input_port_disconnects_it() {
-        let mut rig = Rig::new(device());
-        let layout = rig.frame(vec![]).1;
-        let p = layout.port_pos(Port::Mon { mon: 0, ch: 0 }).unwrap();
-        let btn = |pressed| Event::PointerButton {
-            pos: p,
-            button: PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        };
-        let mut edits = Vec::new();
-        for ev in [
-            vec![Event::PointerMoved(p)],
-            vec![btn(true)],
-            vec![btn(false)],
-            vec![],
-        ] {
-            edits.extend(rig.frame(ev).0);
-        }
+        let mut h = rig(device());
+        let p = port(&h, Port::Mon { mon: 0, ch: 0 });
+        h.hover_at(p);
+        h.step();
+        h.drag_at(p);
+        h.step();
+        h.drop_at(p);
+        h.step();
+        h.step();
         assert_eq!(
-            edits,
+            h.state().edits,
             vec![Edit::Disconnect(0, Port::Mon { mon: 0, ch: 0 })]
         );
+    }
+
+    /// A screen reader (and the tests above) reach a port by name; it must sit on the painted port.
+    #[test]
+    fn ports_are_named_where_they_are_painted() {
+        let h = rig(device());
+        for (label, p) in [
+            ("y channel 1 output", Port::Src { src: 0, ch: 0 }),
+            ("Output channel 2 input", Port::OutIn { ch: 1 }),
+            ("Output channel 1 output", Port::OutOut { ch: 0 }),
+            ("spk channel 2 input", Port::Mon { mon: 0, ch: 1 }),
+        ] {
+            let at = h.get_by_label(label).rect().center();
+            assert!(at.distance(port(&h, p)) < 1.0, "{label}: {at:?}");
+        }
     }
 }

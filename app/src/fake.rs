@@ -7,6 +7,8 @@ use std::time::Instant;
 pub struct FakeBackend {
     cfg: Config,
     start: Instant,
+    /// Meter clock pinned to this many seconds, so snapshots are deterministic.
+    frozen: Option<f32>,
 }
 
 impl FakeBackend {
@@ -14,6 +16,7 @@ impl FakeBackend {
         Self {
             cfg: Config::default(),
             start: Instant::now(),
+            frozen: None,
         }
     }
 }
@@ -60,7 +63,9 @@ impl Backend for FakeBackend {
 
     fn meters(&self, device_id: &str) -> Option<MeterReading> {
         let dev = self.cfg.devices.iter().find(|d| d.id == device_id)?;
-        let t = self.start.elapsed().as_secs_f32();
+        let t = self
+            .frozen
+            .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
         let mut channels = vec![0.0f32; usize::from(dev.channels)];
         let mut sources = Vec::new();
         for (i, s) in dev.sources.iter().enumerate() {

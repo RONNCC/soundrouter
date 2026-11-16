@@ -15,10 +15,14 @@ sr-audio = { path = "../crates/sr-audio" }
 anyhow.workspace = true
 serde_json.workspace = true
 eframe = "=0.37.0"
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 window-vibrancy = "0.8.1"
 
+[features]
+# GPU (Metal) snapshot tests and the docs screenshots; off by default so plain `cargo test` needs no GPU.
+snapshots = []
+
 [dev-dependencies]
 proptest = "1"
+egui_kittest = { version = "=0.37.0", features = ["eframe", "wgpu", "snapshot"] }

@@ -2,11 +2,23 @@
 use crate::theme::Tokens;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Painter, Pos2, Rect, Response, Sense, Stroke,
-    Ui, pos2, vec2,
+    Ui, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 
-pub fn switch(ui: &mut Ui, rect: Rect, id: Id, on: bool, t: &Tokens) -> bool {
+/// Names a painted button so screen readers (and tests) can find it.
+pub fn name_button(resp: &Response, label: &str) {
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
+}
+
+/// Names a widget that reports its own info (slider, text field) without a label.
+pub fn name_widget(ui: &Ui, resp: &Response, label: &str) {
+    ui.ctx()
+        .accesskit_node_builder(resp.id, |n| n.set_label(label));
+}
+
+pub fn switch(ui: &mut Ui, rect: Rect, id: Id, on: bool, t: &Tokens, label: &str) -> bool {
     let resp = ui.interact(rect, id, Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, on, label));
     let new = if resp.clicked() { !on } else { on };
     let k = ui.ctx().animate_bool_responsive(id, new);
     let p = ui.painter();
@@ -57,11 +69,8 @@ pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) 
     }
 }
 
-pub fn plus_circle(ui: &mut Ui, center: Pos2, id: Id, t: &Tokens, minus: bool) -> Response {
-    let rect = Rect::from_center_size(center, vec2(22.0, 22.0));
-    let resp = ui.interact(rect, id, Sense::click());
-    let c = if resp.hovered() { t.text } else { t.text2 };
-    let p = ui.painter();
+/// The ⊕ / ⊖ mark, without any interaction.
+pub fn plus_glyph(p: &Painter, center: Pos2, c: Color32, minus: bool) {
     p.circle_stroke(center, 8.0, Stroke::new(1.3, c));
     p.line_segment(
         [center - vec2(4.0, 0.0), center + vec2(4.0, 0.0)],
@@ -73,6 +82,21 @@ pub fn plus_circle(ui: &mut Ui, center: Pos2, id: Id, t: &Tokens, minus: bool) -
             Stroke::new(1.5, c),
         );
     }
+}
+
+pub fn plus_circle(
+    ui: &mut Ui,
+    center: Pos2,
+    id: Id,
+    t: &Tokens,
+    minus: bool,
+    label: &str,
+) -> Response {
+    let rect = Rect::from_center_size(center, vec2(22.0, 22.0));
+    let resp = ui.interact(rect, id, Sense::click());
+    name_button(&resp, label);
+    let c = if resp.hovered() { t.text } else { t.text2 };
+    plus_glyph(ui.painter(), center, c, minus);
     resp
 }
 
@@ -87,9 +111,17 @@ pub fn chevron(p: &Painter, center: Pos2, open: bool, color: Color32) {
     p.line_segment([center + b, center + c], s);
 }
 
-pub fn speaker(ui: &mut Ui, center: Pos2, id: Id, muted: bool, t: &Tokens) -> Response {
+pub fn speaker(
+    ui: &mut Ui,
+    center: Pos2,
+    id: Id,
+    muted: bool,
+    t: &Tokens,
+    label: &str,
+) -> Response {
     let rect = Rect::from_center_size(center, vec2(22.0, 22.0));
     let resp = ui.interact(rect, id, Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, muted, label));
     let c = if muted {
         t.danger
     } else if resp.hovered() {
