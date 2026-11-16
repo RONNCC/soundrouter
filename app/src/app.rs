@@ -1,0 +1,512 @@
+//! Application state, sidebar and the window frame.
+use crate::graph::{self, GraphCtx, GraphState};
+use crate::model::{Edit, apply, db_to_pct, pct_to_db};
+use crate::store;
+use crate::theme::{Tokens, semibold, tokens};
+use crate::widgets::{pencil, plus_circle, speaker, switch};
+use crate::worker::Worker;
+use eframe::egui::{
+    self, Align2, CornerRadius, FontId, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit, Theme,
+    UiBuilder, pos2, vec2,
+};
+use sr_core::config::Config;
+use std::path::PathBuf;
+use std::time::Duration;
+
+const SIDEBAR_W: f32 = 250.0;
+const ROW_H: f32 = 78.0;
+/// Room for the traffic lights in the unified titlebar.
+const TITLEBAR_H: f32 = 46.0;
+
+pub struct Shot {
+    pub path: PathBuf,
+    sent: bool,
+}
+
+impl Shot {
+    pub fn new(path: PathBuf) -> Self {
+        Shot { path, sent: false }
+    }
+}
+
+pub struct App {
+    cfg: Config,
+    /// None in demo mode: nothing is persisted.
+    path: Option<PathBuf>,
+    worker: Worker,
+    selected: usize,
+    graph: GraphState,
+    renaming: Option<(usize, String)>,
+    toast: Option<String>,
+    save_pending: bool,
+    vibrancy: bool,
+    demo: bool,
+    shot: Option<Shot>,
+}
+
+impl App {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cfg: Config,
+        path: Option<PathBuf>,
+        worker: Worker,
+        toast: Option<String>,
+        vibrancy: bool,
+        demo: bool,
+        shot: Option<Shot>,
+    ) -> Self {
+        worker.apply(&cfg);
+        Self {
+            cfg,
+            path,
+            worker,
+            selected: 0,
+            graph: GraphState::default(),
+            renaming: None,
+            toast,
+            save_pending: false,
+            vibrancy,
+            demo,
+            shot,
+        }
+    }
+
+    fn commit(&mut self, edits: Vec<Edit>) {
+        if edits.is_empty() {
+            return;
+        }
+        let prev = self.cfg.clone();
+        let mut select_new = false;
+        for e in edits {
+            select_new |= e == Edit::NewDevice;
+            apply(&mut self.cfg, e);
+        }
+        if let Err(e) = self.cfg.validate() {
+            self.cfg = prev;
+            self.toast = Some(e);
+            return;
+        }
+        self.toast = None;
+        if select_new {
+            self.selected = self.cfg.devices.len() - 1;
+        }
+        let last = self.cfg.devices.len().saturating_sub(1);
+        if self.selected > last {
+            self.selected = last;
+        }
+        self.worker.apply(&self.cfg);
+        self.save_pending = true;
+    }
+
+    fn sidebar(&mut self, ui: &mut egui::Ui, t: &Tokens, edits: &mut Vec<Edit>) {
+        let fill = if self.vibrancy {
+            t.sidebar.gamma_multiply(0.55)
+        } else {
+            t.sidebar
+        };
+        egui::Panel::left("devices")
+            .exact_size(SIDEBAR_W)
+            .resizable(false)
+            .frame(egui::Frame::default().fill(fill))
+            .show(ui, |ui| {
+                let full = ui.max_rect();
+                ui.painter().text(
+                    pos2(full.left() + 84.0, full.top() + 23.0),
+                    Align2::LEFT_CENTER,
+                    "Devices",
+                    FontId::new(13.0, semibold()),
+                    t.text,
+                );
+                ui.painter().hline(
+                    full.x_range(),
+                    full.top() + TITLEBAR_H + 0.5,
+                    Stroke::new(1.0, t.card_stroke.gamma_multiply(0.6)),
+                );
+                let footer_h = 48.0;
+                let list = Rect::from_min_max(
+                    pos2(full.left(), full.top() + TITLEBAR_H + 1.0),
+                    pos2(full.right(), full.bottom() - footer_h),
+                );
+                ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for i in 0..self.cfg.devices.len() {
+                                self.device_row(ui, i, t, edits);
+                            }
+                        });
+                });
+                // Footer: New Virtual Device and remove.
+                let foot =
+                    Rect::from_min_max(pos2(full.left(), full.bottom() - footer_h), full.max);
+                ui.painter().hline(
+                    foot.x_range(),
+                    foot.top() + 0.5,
+                    Stroke::new(1.0, t.card_stroke.gamma_multiply(0.6)),
+                );
+                let cy = foot.center().y;
+                let new = ui.interact(
+                    Rect::from_min_size(pos2(foot.left() + 8.0, cy - 14.0), vec2(170.0, 28.0)),
+                    Id::unique("new_dev"),
+                    Sense::click(),
+                );
+                let c = if new.hovered() { t.text } else { t.text2 };
+                plus_circle(
+                    ui,
+                    pos2(foot.left() + 22.0, cy),
+                    Id::unique("new_dev_icon"),
+                    t,
+                    false,
+                );
+                ui.painter().text(
+                    pos2(foot.left() + 38.0, cy),
+                    Align2::LEFT_CENTER,
+                    "New Virtual Device",
+                    FontId::proportional(12.5),
+                    c,
+                );
+                if new.clicked() {
+                    edits.push(Edit::NewDevice);
+                }
+                let minus = plus_circle(
+                    ui,
+                    pos2(foot.right() - 24.0, cy),
+                    Id::unique("del_dev_icon"),
+                    t,
+                    true,
+                );
+                if minus.clicked() && self.selected < self.cfg.devices.len() {
+                    edits.push(Edit::RemoveDevice(self.selected));
+                }
+                minus.on_hover_text("Delete the selected device");
+            });
+    }
+
+    fn device_row(&mut self, ui: &mut egui::Ui, i: usize, t: &Tokens, edits: &mut Vec<Edit>) {
+        let dev = &self.cfg.devices[i];
+        let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+        if resp.clicked() {
+            self.selected = i;
+        }
+        let inner = row.shrink2(vec2(8.0, 4.0));
+        if i == self.selected {
+            ui.painter()
+                .rect_filled(inner, CornerRadius::same(9), t.row_sel);
+        }
+        let dim = if dev.enabled { 1.0 } else { 0.55 };
+        let icon = Rect::from_min_size(
+            pos2(inner.left() + 8.0, inner.top() + 9.0),
+            vec2(30.0, 30.0),
+        );
+        crate::widgets::tile(ui.painter(), icon, t.accent, "∞", 19.0, dim);
+        let name_pos = pos2(icon.right() + 10.0, inner.top() + 16.0);
+        let name_rect = Rect::from_min_size(
+            pos2(name_pos.x, name_pos.y - 10.0),
+            vec2(inner.right() - 58.0 - name_pos.x, 20.0),
+        );
+        let renaming_here = matches!(&self.renaming, Some((r, _)) if *r == i);
+        if renaming_here {
+            let Some((_, buf)) = &mut self.renaming else {
+                return;
+            };
+            let te = ui.put(
+                name_rect,
+                TextEdit::singleline(buf)
+                    .font(FontId::new(13.5, semibold()))
+                    .margin(Margin::ZERO)
+                    .frame(egui::Frame::NONE)
+                    .text_color(t.text),
+            );
+            te.request_focus();
+            let esc = ui.input(|k| k.key_pressed(egui::Key::Escape));
+            if te.lost_focus() || esc {
+                if !esc {
+                    edits.push(Edit::Rename(i, buf.trim().to_string()));
+                }
+                self.renaming = None;
+            }
+        } else {
+            let g = ui.painter().layout_no_wrap(
+                dev.name.clone(),
+                FontId::new(13.5, semibold()),
+                t.text.gamma_multiply(dim),
+            );
+            let shown = g.size().x.min(name_rect.width());
+            ui.painter().with_clip_rect(name_rect).galley(
+                pos2(name_pos.x, name_pos.y - g.size().y / 2.0),
+                g,
+                t.text,
+            );
+            let hit = ui.interact(
+                Rect::from_min_size(name_rect.min, vec2(shown.max(40.0), 20.0)),
+                Id::unique(("name", i)),
+                Sense::click(),
+            );
+            if hit.double_clicked() {
+                self.renaming = Some((i, dev.name.clone()));
+            }
+            hit.on_hover_text("Double-click to rename");
+        }
+        let chans = format!("{} channels", dev.channels);
+        ui.painter().text(
+            pos2(name_pos.x, inner.top() + 34.0),
+            Align2::LEFT_CENTER,
+            chans,
+            FontId::proportional(11.0),
+            t.text2.gamma_multiply(dim),
+        );
+        let sw = Rect::from_center_size(
+            pos2(inner.right() - 8.0 - 16.0, inner.top() + 18.0),
+            vec2(32.0, 18.0),
+        );
+        let on = switch(ui, sw, Id::unique(("dev_on", i)), dev.enabled, t);
+        if on != dev.enabled {
+            edits.push(Edit::Enable(i, on));
+        }
+        // Volume row: mute, slider, percent.
+        let vy = inner.top() + 56.0;
+        let mute = speaker(
+            ui,
+            pos2(inner.left() + 20.0, vy),
+            Id::unique(("mute", i)),
+            dev.muted,
+            t,
+        );
+        if mute.clicked() {
+            edits.push(Edit::Mute(i, !dev.muted));
+        }
+        let mut pct = db_to_pct(dev.volume_db).clamp(0.0, 100.0);
+        let before = pct;
+        let sl = Rect::from_x_y_ranges(
+            (inner.left() + 36.0)..=(inner.right() - 52.0),
+            (vy - 10.0)..=(vy + 10.0),
+        );
+        ui.scope_builder(UiBuilder::new().max_rect(sl), |ui| {
+            ui.spacing_mut().slider_width = sl.width() - 4.0;
+            ui.add(Slider::new(&mut pct, 0.0..=100.0).show_value(false));
+        });
+        if (pct - before).abs() > 1e-3 {
+            edits.push(Edit::Volume(i, pct_to_db(pct)));
+        }
+        ui.painter().text(
+            pos2(inner.right() - 10.0, vy),
+            Align2::RIGHT_CENTER,
+            format!("{pct:.0}%"),
+            FontId::proportional(11.0),
+            t.text2,
+        );
+    }
+
+    fn main_pane(&mut self, ui: &mut egui::Ui, t: &Tokens, edits: &mut Vec<Edit>) {
+        egui::Panel::bottom("bottom")
+            .exact_size(44.0)
+            .resizable(false)
+            .frame(egui::Frame::default().fill(t.window))
+            .show(ui, |ui| {
+                let r = ui.max_rect();
+                ui.painter().hline(
+                    r.x_range(),
+                    r.top() + 0.5,
+                    Stroke::new(1.0, t.card_stroke.gamma_multiply(0.6)),
+                );
+                let has = self.selected < self.cfg.devices.len();
+                let btn =
+                    Rect::from_center_size(pos2(r.left() + 58.0, r.center().y), vec2(72.0, 26.0));
+                let resp = ui.interact(btn, Id::unique("delete"), Sense::click());
+                let fill = if resp.hovered() && has {
+                    t.card_stroke
+                } else {
+                    t.card
+                };
+                let a = if has { 1.0 } else { 0.4 };
+                ui.painter().rect(
+                    btn,
+                    CornerRadius::same(6),
+                    fill.gamma_multiply(a),
+                    Stroke::new(1.0, t.card_stroke),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    btn.center(),
+                    Align2::CENTER_CENTER,
+                    "Delete",
+                    FontId::proportional(12.5),
+                    t.text.gamma_multiply(a),
+                );
+                if has && resp.clicked() {
+                    edits.push(Edit::RemoveDevice(self.selected));
+                }
+                let status = self
+                    .toast
+                    .clone()
+                    .or_else(|| self.worker.shared.lock().unwrap().apply_error.clone());
+                match status {
+                    Some(msg) => {
+                        ui.painter().text(
+                            pos2(r.right() - 18.0, r.center().y),
+                            Align2::RIGHT_CENTER,
+                            msg,
+                            FontId::proportional(12.0),
+                            t.danger,
+                        );
+                    }
+                    None if self.demo => {
+                        ui.painter().text(
+                            pos2(r.right() - 18.0, r.center().y),
+                            Align2::RIGHT_CENTER,
+                            "Demo mode: synthetic audio, nothing is saved",
+                            FontId::proportional(12.0),
+                            t.text2,
+                        );
+                    }
+                    None => {}
+                }
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(t.window))
+            .show(ui, |ui| {
+                let full = ui.max_rect();
+                let Some(dev) = self.cfg.devices.get(self.selected) else {
+                    ui.painter().text(
+                        full.center(),
+                        Align2::CENTER_CENTER,
+                        "No virtual devices.\nUse “New Virtual Device” to create one.",
+                        FontId::proportional(14.0),
+                        t.text2,
+                    );
+                    return;
+                };
+                // Title (editable) in the titlebar zone.
+                let title_rect = Rect::from_min_size(
+                    pos2(full.left() + 26.0, full.top() + 12.0),
+                    vec2(360.0, 26.0),
+                );
+                let mut name = dev.name.clone();
+                let te = ui.put(
+                    title_rect,
+                    TextEdit::singleline(&mut name)
+                        .font(FontId::new(19.0, semibold()))
+                        .margin(Margin::ZERO)
+                        .frame(egui::Frame::NONE)
+                        .text_color(t.text),
+                );
+                let w = ui
+                    .painter()
+                    .layout_no_wrap(name.clone(), FontId::new(19.0, semibold()), t.text)
+                    .size()
+                    .x;
+                pencil(
+                    ui.painter(),
+                    pos2(
+                        title_rect.left() + w.min(330.0) + 16.0,
+                        title_rect.center().y,
+                    ),
+                    if te.hovered() || te.has_focus() {
+                        t.text
+                    } else {
+                        t.text2
+                    },
+                );
+                if name != dev.name {
+                    edits.push(Edit::Rename(self.selected, name));
+                }
+
+                let snap = self.worker.shared.lock().unwrap();
+                let hw = snap.hardware.clone();
+                let apps = snap.apps.clone();
+                let reading = snap.meters.get(&dev.id).cloned();
+                drop(snap);
+                let area = Rect::from_min_max(pos2(full.left(), full.top() + 44.0), full.max);
+                ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            let g = GraphCtx {
+                                dev_idx: self.selected,
+                                dev,
+                                hw: &hw,
+                                apps: &apps,
+                                reading: reading.as_ref(),
+                                t,
+                                min_h: area.height(),
+                            };
+                            graph::show(ui, &g, &mut self.graph, edits);
+                        });
+                });
+            });
+    }
+}
+
+impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.vibrancy {
+            [0.0; 4]
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let t = tokens(ctx.theme() == Theme::Dark);
+        ctx.global_style_mut(|s| {
+            s.visuals.selection.bg_fill = t.accent;
+            s.visuals.override_text_color = Some(t.text);
+            s.visuals.widgets.inactive.bg_fill = t.switch_off;
+            s.interaction.selectable_labels = false;
+            s.visuals.handle_shape = egui::style::HandleShape::Circle;
+        });
+        ctx.request_repaint_after(Duration::from_millis(33));
+
+        let prev_selected = self.selected;
+        let mut edits = Vec::new();
+        self.sidebar(ui, &t, &mut edits);
+        self.main_pane(ui, &t, &mut edits);
+        if self.selected != prev_selected {
+            self.graph.peaks.clear();
+            self.graph.drag = None;
+        }
+        self.commit(edits);
+
+        if self.save_pending && !ctx.input(|i| i.pointer.any_down()) {
+            self.save_pending = false;
+            if let Some(p) = &self.path
+                && let Err(e) = store::save(p, &self.cfg)
+            {
+                self.toast = Some(format!("Could not save config: {e}"));
+            }
+        }
+
+        if let Some(shot) = &mut self.shot
+            && !shot.sent
+            && ctx.input(|i| i.time) > 1.6
+        {
+            {
+                shot.sent = true;
+                let path = shot.path.clone();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                    egui::ScreenshotCallback::new(move |img| {
+                        let rgba: Vec<u8> = img
+                            .pixels
+                            .iter()
+                            .flat_map(|c| c.to_srgba_unmultiplied())
+                            .collect();
+                        let saved = image::save_buffer(
+                            &path,
+                            &rgba,
+                            img.size[0] as u32,
+                            img.size[1] as u32,
+                            image::ExtendedColorType::Rgba8,
+                        );
+                        if let Err(e) = &saved {
+                            eprintln!("screenshot failed: {e}");
+                        }
+                        std::process::exit(i32::from(saved.is_err()));
+                    }),
+                ));
+            }
+        }
+    }
+}
