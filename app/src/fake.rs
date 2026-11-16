@@ -19,6 +19,15 @@ impl FakeBackend {
             frozen: None,
         }
     }
+
+    /// Meters pinned to second `t`: same readings every call, for snapshot tests.
+    #[cfg(test)]
+    pub fn frozen(t: f32) -> Self {
+        Self {
+            frozen: Some(t),
+            ..Self::new()
+        }
+    }
 }
 
 /// Bouncy linear peak, different per seed.

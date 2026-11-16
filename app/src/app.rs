@@ -215,13 +215,15 @@ impl App {
                     .text_color(t.text),
             );
             name_widget(ui, &te, "Rename device");
-            te.request_focus();
             let esc = ui.input(|k| k.key_pressed(egui::Key::Escape));
             if te.lost_focus() || esc {
                 if !esc {
                     edits.push(Edit::Rename(i, buf.trim().to_string()));
                 }
                 self.renaming = None;
+            } else {
+                // Only while still editing: re-requesting after Enter would undo the focus loss.
+                te.request_focus();
             }
         } else {
             let g = ui.painter().layout_no_wrap(
@@ -490,3 +492,7 @@ impl eframe::App for App {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

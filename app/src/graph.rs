@@ -269,7 +269,7 @@ fn source_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
         };
         let exists = dev.sources.iter().any(|s| s.kind == kind);
         let label = if a.running_output {
-            format!("{}  ♪", a.name)
+            format!("{}  (playing)", a.name)
         } else {
             a.name.clone()
         };
