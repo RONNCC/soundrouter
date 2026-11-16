@@ -702,3 +702,99 @@ fn background_errors_are_keyed() {
     e.remove(&Op::Retap);
     assert_eq!(background_message(&e).as_deref(), Some("a"));
 }
+
+// ---- sleep/wake and rate recovery ----
+
+fn set(items: &[&str]) -> BTreeSet<String> {
+    items.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn rates(items: &[(&str, f64)]) -> Vec<(String, f64)> {
+    items.iter().map(|(u, r)| ((*u).to_owned(), *r)).collect()
+}
+
+#[test]
+fn settle_waits_longer_after_wake() {
+    assert_eq!(settle(false, 0), EVENT_DEBOUNCE);
+    assert_eq!(settle(true, 0), WAKE_SETTLE);
+    assert_eq!(settle(true, 8), MAX_BACKOFF);
+}
+
+#[test]
+fn pending_absorbs_events_until_shutdown() {
+    let mut p = Pending::default();
+    assert!(p.absorb(Event::Devices));
+    assert!(p.absorb(Event::Wake));
+    assert!(p.absorb(Event::Rate("mic".into())));
+    assert!(p.absorb(Event::Rate("mic".into())));
+    assert!(p.absorb(Event::IoStart {
+        id: "v1".into(),
+        build: 7,
+        ok: false
+    }));
+    assert!(!p.absorb(Event::Shutdown));
+    assert_eq!(
+        p,
+        Pending {
+            devs: true,
+            procs: false,
+            wake: true,
+            rates: set(&["mic"]),
+            io: vec![("v1".into(), 7, false)],
+        }
+    );
+}
+
+#[test]
+fn wake_rebuilds_every_vdev() {
+    let (a, b) = (rates(&[("a", 48e3)]), rates(&[("b", 48e3)]));
+    let v: Vec<(&str, &[(String, f64)])> = vec![("v1", &a), ("v2", &b)];
+    let t = rebuild_targets(true, &set(&[]), &set(&[]), &v, &|_| 48e3);
+    assert_eq!(t, set(&["v1", "v2"]));
+}
+
+#[test]
+fn rate_change_rebuilds_only_vdevs_built_on_that_device() {
+    let (a, b) = (
+        rates(&[("c1", 48e3), ("mic", 48e3)]),
+        rates(&[("c2", 48e3)]),
+    );
+    let v: Vec<(&str, &[(String, f64)])> = vec![("v1", &a), ("v2", &b)];
+    let now = |u: &str| if u == "mic" { 44.1e3 } else { 48e3 };
+    let t = rebuild_targets(false, &set(&["mic"]), &set(&[]), &v, &now);
+    assert_eq!(t, set(&["v1"]));
+}
+
+#[test]
+fn rate_event_matching_the_built_rate_is_an_echo() {
+    let a = rates(&[("mic", 48e3)]);
+    let v: Vec<(&str, &[(String, f64)])> = vec![("v1", &a)];
+    // Changed and changed back before the worker looked; or our own aggregate touched it.
+    assert!(rebuild_targets(false, &set(&["mic"]), &set(&[]), &v, &|_| 48e3).is_empty());
+    // A device that vanished reads 0: the device-list path handles that, not a rate rebuild.
+    assert!(rebuild_targets(false, &set(&["mic"]), &set(&[]), &v, &|_| 0.0).is_empty());
+    // Nothing reported: nothing rebuilt, even if a rate drifted.
+    assert!(rebuild_targets(false, &set(&[]), &set(&[]), &v, &|_| 44.1e3).is_empty());
+}
+
+#[test]
+fn failed_start_rebuilds_that_vdev() {
+    let (a, b) = (rates(&[]), rates(&[]));
+    let v: Vec<(&str, &[(String, f64)])> = vec![("v1", &a), ("v2", &b)];
+    let t = rebuild_targets(false, &set(&[]), &set(&["v2", "gone"]), &v, &|_| 48e3);
+    assert_eq!(t, set(&["v2"]));
+}
+
+#[test]
+fn io_retry_is_bounded_and_reset_by_success() {
+    let mut f = HashMap::new();
+    let id = vec!["v1".to_string()];
+    for _ in 0..MAX_RETRIES {
+        assert_eq!(io_retry(&mut f, &id, &[]), set(&["v1"]));
+    }
+    // The next failure exceeds the budget: stay Failed instead of rebuilding forever.
+    assert!(io_retry(&mut f, &id, &[]).is_empty());
+    // A start that works gives the vdev a fresh budget.
+    assert!(io_retry(&mut f, &[], &id).is_empty());
+    assert_eq!(io_retry(&mut f, &id, &[]), set(&["v1"]));
+}

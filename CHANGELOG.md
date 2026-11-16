@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Driver: late or oversized `WriteMix` calls are counted per device and readable through the custom property `'srov'`.
 - Docs: driver clock/zero-timestamp contract, volume/mute gain placement and the default-device decisions in `docs/ARCHITECTURE.md`.
 - `packaging/engine-live-test.sh`: live check of the engine against the installed driver (app tap, volume, mute, channel routing, input reverts when the engine stops). The engine logs which main device each aggregate uses (`sr-cli -v run`).
+- Engine: recovers from system sleep/wake and from a changed nominal sample rate on a virtual device's main or sub devices by rebuilding the affected aggregates (off the realtime thread, with backoff). A vdev whose IOProc fails to start is rebuilt a bounded number of times. While a vdev is rebuilt it reports `Starting`; after the retries run out the error is shown.
 
 ### Changed
 - Packaging: with `SIGN_ID` the driver, `sr-cli`, app and dmg get the hardened runtime and a secure timestamp; the version comes from `[workspace.package]` in `Cargo.toml` and is stamped into both `Info.plist` files; the driver pkg removes an older driver before installing; `notarize.sh` checks signatures first and reports Apple's log on rejection; release workflow checks the tag, attaches checksums and labels unsigned builds. See `docs/RELEASING.md`.

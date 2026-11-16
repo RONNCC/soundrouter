@@ -1,5 +1,5 @@
 //! The routing engine: one private aggregate + IOProc per enabled virtual device.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
@@ -33,6 +33,7 @@ use crate::apps::{self, AppGroup};
 use crate::driver;
 use crate::hal::{self, SYSTEM};
 use crate::layout::{self, LayoutSpec, SCRATCH_LEN, SubDesc};
+use crate::power::PowerWatch;
 
 /// If the hidden companion cannot be found or joined, run on the visible vdev instead.
 /// shortcut: then pass-thru audio mixes with the engine output in the HAL; the companion path is verified live (docs/TESTING.md), this fallback is not.
@@ -121,6 +122,13 @@ struct Vdev {
     warnings: Vec<String>,
     /// The `AudioDeviceStart` thread; `None` once joined.
     starter: Option<JoinHandle<()>>,
+    /// Build number (the aggregate uid suffix); ignores [`Event::IoStart`] of a retired build.
+    build: u64,
+    /// Nominal rate of the main and sub devices at build / start; a rate event that leaves these
+    /// unchanged is an echo of our own aggregate.
+    rates: Vec<(String, f64)>,
+    /// Rate listeners on the main and sub devices; removed with the vdev.
+    _listeners: Vec<Listener>,
 }
 // SAFETY: `cb` is only dereferenced by the IOProc thread; control-side access is limited to the atomics in `Shared`.
 unsafe impl Send for Vdev {}
@@ -171,11 +179,27 @@ struct Inner {
     /// [`current_device_set`] as of the last apply; device events that leave it unchanged are echoes.
     dev_set: Vec<String>,
     bg_errors: BTreeMap<Op, String>,
+    /// Where vdevs report their IOProc start; `None` in tests that never build one.
+    tx: Option<Sender<Event>>,
+    /// Vdevs torn down by a recovery and not yet rebuilt; shown as [`DeviceState::Starting`].
+    recovering: BTreeSet<String>,
+    /// Consecutive failed IOProc starts per vdev id, see [`io_retry`].
+    io_fails: HashMap<String, u32>,
 }
 
 enum Event {
     Devices,
     Processes,
+    /// The system woke from sleep.
+    Wake,
+    /// The nominal sample rate of the device with this uid changed.
+    Rate(String),
+    /// A vdev's `AudioDeviceStart` returned; `build` tells a stale build from the current one.
+    IoStart {
+        id: String,
+        build: u64,
+        ok: bool,
+    },
     Shutdown,
 }
 
@@ -188,7 +212,12 @@ struct Listener {
 unsafe impl Send for Listener {}
 
 impl Listener {
-    fn new(obj: u32, sel: u32, tx: Sender<Event>, ev: fn() -> Event) -> Result<Listener> {
+    fn new(
+        obj: u32,
+        sel: u32,
+        tx: Sender<Event>,
+        ev: impl Fn() -> Event + 'static,
+    ) -> Result<Listener> {
         let addr = hal::addr(sel, kAudioObjectPropertyScopeGlobal);
         let tx = Mutex::new(tx);
         let block: RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>)> =
@@ -227,6 +256,8 @@ pub struct Engine {
     tx: Sender<Event>,
     worker: Option<JoinHandle<()>>,
     listeners: Vec<Listener>,
+    /// `None` when the IOKit registration failed (logged); wake recovery is then off.
+    power: Option<PowerWatch>,
 }
 
 fn lock(m: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
@@ -237,6 +268,7 @@ impl Engine {
     pub fn new() -> Result<Engine> {
         let inner = Arc::new(Mutex::new(Inner::default()));
         let (tx, rx) = channel();
+        lock(&inner).tx = Some(tx.clone());
         let listeners = vec![
             Listener::new(SYSTEM, kAudioHardwarePropertyDevices, tx.clone(), || {
                 Event::Devices
@@ -248,6 +280,12 @@ impl Engine {
                 || Event::Processes,
             )?,
         ];
+        let wake_tx = tx.clone();
+        let power = PowerWatch::start(move || {
+            let _ = wake_tx.send(Event::Wake);
+        })
+        .map_err(|e| log::warn!("no sleep/wake recovery: {e:#}"))
+        .ok();
         let w = inner.clone();
         let worker = std::thread::Builder::new()
             .name("sr-audio-events".into())
@@ -257,6 +295,7 @@ impl Engine {
             tx,
             worker: Some(worker),
             listeners,
+            power,
         })
     }
 
@@ -294,6 +333,7 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.power = None;
         self.listeners.clear();
         let _ = self.tx.send(Event::Shutdown);
         if let Some(w) = self.worker.take() {
@@ -309,6 +349,17 @@ impl Drop for Engine {
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Upper bound of the debounce growth after repeated background failures.
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// Quiet period after a system wake: displays, USB and Bluetooth audio come back late.
+const WAKE_SETTLE: Duration = Duration::from_secs(1);
+
+/// Debounce window of a batch: after a wake, wait for the hardware to reappear.
+fn settle(wake: bool, fails: u32) -> Duration {
+    if wake {
+        WAKE_SETTLE.max(backoff(fails))
+    } else {
+        backoff(fails)
+    }
+}
 
 /// Debounce window after `fails` consecutive background failures: doubles each time, capped.
 fn backoff(fails: u32) -> Duration {
@@ -363,12 +414,94 @@ fn run_op(g: &mut Inner, op: Op) -> Result<()> {
     }
 }
 
+/// What the worker has heard since its last pass.
+#[derive(Default, Debug, PartialEq)]
+struct Pending {
+    devs: bool,
+    procs: bool,
+    wake: bool,
+    /// Uids of devices whose nominal rate changed.
+    rates: BTreeSet<String>,
+    /// `(vdev id, build, started ok)` per finished `AudioDeviceStart`.
+    io: Vec<(String, u64, bool)>,
+}
+
+impl Pending {
+    /// Records `ev`; false for `Shutdown`.
+    fn absorb(&mut self, ev: Event) -> bool {
+        match ev {
+            Event::Shutdown => return false,
+            Event::Devices => self.devs = true,
+            Event::Processes => self.procs = true,
+            Event::Wake => self.wake = true,
+            Event::Rate(uid) => {
+                self.rates.insert(uid);
+            }
+            Event::IoStart { id, build, ok } => self.io.push((id, build, ok)),
+        }
+        true
+    }
+}
+
+/// Nominal rate of the main and sub devices of `spec`, as the HAL reports them now.
+fn read_rates(spec: &AggSpec) -> Vec<(String, f64)> {
+    std::iter::once(&spec.main)
+        .chain(&spec.subs)
+        .filter_map(|u| Some((u.clone(), hal::nominal_rate(hal::device_by_uid(u)?))))
+        .collect()
+}
+
+/// Updates the consecutive start-failure counts (`ok` resets, each `failed` adds one) and returns
+/// the failed ids that are still worth a rebuild. Without the cap a start that always fails would
+/// rebuild forever, because every successful rebuild resets the background failure count.
+fn io_retry(
+    fails: &mut HashMap<String, u32>,
+    failed: &[String],
+    ok: &[String],
+) -> BTreeSet<String> {
+    for id in ok {
+        fails.remove(id);
+    }
+    failed
+        .iter()
+        .filter(|id| {
+            let n = fails.entry((*id).clone()).or_insert(0);
+            *n += 1;
+            retry_delay(*n).is_some()
+        })
+        .cloned()
+        .collect()
+}
+
+/// Vdev ids to tear down and rebuild. `vdevs` is `(id, rates at build)`. A wake rebuilds all (the
+/// HAL may have replaced devices and streams); a rate event rebuilds a vdev only when a device's rate
+/// really differs from the one it was built against, so our own aggregate's echoes do not loop.
+fn rebuild_targets(
+    wake: bool,
+    changed: &BTreeSet<String>,
+    io_failed: &BTreeSet<String>,
+    vdevs: &[(&str, &[(String, f64)])],
+    rate_now: &dyn Fn(&str) -> f64,
+) -> BTreeSet<String> {
+    vdevs
+        .iter()
+        .filter(|(id, built)| {
+            wake || io_failed.contains(*id)
+                || built.iter().any(|(uid, was)| {
+                    let now = rate_now(uid);
+                    changed.contains(uid) && now > 0.0 && now != *was
+                })
+        })
+        .map(|(id, _)| (*id).to_owned())
+        .collect()
+}
+
 fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
     let mut fails = 0u32;
     // Operation to rerun unconditionally (no dev_set filter) after a failure.
     let mut retry: Option<Op> = None;
     loop {
-        let (mut devs, mut procs) = (false, false);
+        let mut pending = Pending::default();
         let first = match retry.and(retry_delay(fails)) {
             Some(d) => match rx.recv_timeout(d) {
                 Ok(e) => Some(e),
@@ -381,13 +514,12 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
             },
         };
         if let Some(mut ev) = first {
+            let level = fails.max(lock(&inner).io_fails.values().copied().max().unwrap_or(0));
             loop {
-                match ev {
-                    Event::Shutdown => return,
-                    Event::Devices => devs = true,
-                    Event::Processes => procs = true,
+                if !pending.absorb(ev) {
+                    return;
                 }
-                match rx.recv_timeout(backoff(fails)) {
+                match rx.recv_timeout(settle(pending.wake, level)) {
                     Ok(e) => ev = e,
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -395,10 +527,11 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
             }
         }
         let mut g = lock(&inner);
-        let devs = devs && current_device_set() != g.dev_set;
-        let op = if devs || retry == Some(Op::Apply) {
+        let targets = recovery_targets(&mut g, &mut pending);
+        let devs = pending.devs && current_device_set() != g.dev_set;
+        let op = if devs || pending.wake || !targets.is_empty() || retry == Some(Op::Apply) {
             Some(Op::Apply)
-        } else if procs || retry == Some(Op::Retap) {
+        } else if pending.procs || retry == Some(Op::Retap) {
             Some(Op::Retap)
         } else {
             None
@@ -432,6 +565,46 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
             }
         }
     }
+}
+
+/// Applies the IOProc-start and rate news in `p`: tears down the vdevs that need a rebuild (the
+/// following apply rebuilds them, with backoff while it fails) and returns their ids.
+fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
+    let (mut failed, mut ok) = (Vec::new(), Vec::new());
+    for (id, build, good) in p.io.drain(..) {
+        // A stale build (already retired) says nothing about the current one.
+        let Some(v) = g.vdevs.get_mut(&id).filter(|v| v.build == build) else {
+            continue;
+        };
+        if good {
+            // The rate may have settled while starting: that is the baseline, not a change.
+            v.rates = read_rates(&v.spec);
+            ok.push(id);
+        } else {
+            failed.push(id);
+        }
+    }
+    let io_failed = io_retry(&mut g.io_fails, &failed, &ok);
+    let watched: Vec<(&str, &[(String, f64)])> = g
+        .vdevs
+        .iter()
+        .map(|(id, v)| (id.as_str(), v.rates.as_slice()))
+        .collect();
+    let targets = rebuild_targets(p.wake, &p.rates, &io_failed, &watched, &|uid| {
+        hal::device_by_uid(uid).map_or(0.0, hal::nominal_rate)
+    });
+    if !targets.is_empty() {
+        log::info!(
+            "rebuilding {targets:?} (wake: {}, rate change: {:?}, io failed: {io_failed:?})",
+            p.wake,
+            p.rates
+        );
+    }
+    for id in &targets {
+        retire(g.vdevs.remove(id));
+        g.recovering.insert(id.clone());
+    }
+    targets
 }
 
 impl Backend for Engine {
@@ -473,11 +646,23 @@ impl Backend for Engine {
         let mic = mic_status();
         let driver_version =
             driver::find_plugin().map(|p| driver::version(p).unwrap_or_else(|| "?".into()));
-        let mut per_device: Vec<(String, DeviceState)> = lock(&self.inner)
+        let g = lock(&self.inner);
+        let waiting = g
+            .bg_errors
+            .get(&Op::Apply)
+            .map_or(DeviceState::Starting, |e| DeviceState::Failed(e.clone()));
+        let mut per_device: Vec<(String, DeviceState)> = g
             .vdevs
             .iter()
             .map(|(id, v)| (id.clone(), device_state(io_state_of(&v.shared), tcc)))
+            .chain(
+                g.recovering
+                    .iter()
+                    .filter(|id| !g.vdevs.contains_key(*id))
+                    .map(|id| (id.clone(), waiting.clone())),
+            )
             .collect();
+        drop(g);
         per_device.sort_by(|a, b| a.0.cmp(&b.0));
         EngineStatus {
             per_device,
@@ -698,6 +883,8 @@ fn apply_locked(g: &mut Inner, cfg: &Config) -> Result<()> {
         }
     }
     g.cfg = Some(cfg.clone());
+    let up: Vec<String> = g.vdevs.keys().cloned().collect();
+    g.recovering.retain(|id| !up.contains(id));
     if errors.is_empty() {
         Ok(())
     } else {
@@ -738,6 +925,7 @@ fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result
                 channels: dev.channels,
             },
             groups,
+            g.tx.as_ref(),
         ) {
             Ok(v) => {
                 log::info!("device '{}': aggregate main device '{main}'", dev.id);
@@ -1048,7 +1236,12 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
     Ok(())
 }
 
-fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result<Vdev> {
+fn build_vdev(
+    dev: &VirtualDevice,
+    spec: AggSpec,
+    groups: &[AppGroup],
+    events: Option<&Sender<Event>>,
+) -> Result<Vdev> {
     let mut taps = Vec::new();
     for (id, b, mute) in app_sources(dev) {
         let objs = app_objs(groups, b);
@@ -1152,6 +1345,24 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
         in_planar: vec![0.0; SCRATCH_LEN],
         out_planar: vec![0.0; SCRATCH_LEN],
     }));
+    let rates = read_rates(&spec);
+    let listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
+        std::iter::once(&spec.main)
+            .chain(&spec.subs)
+            .filter_map(|uid| {
+                let obj = hal::device_by_uid(uid)?;
+                let u = uid.clone();
+                Listener::new(
+                    obj,
+                    kAudioDevicePropertyNominalSampleRate,
+                    tx.clone(),
+                    move || Event::Rate(u.clone()),
+                )
+                .map_err(|e| log::warn!("no rate listener on '{uid}': {e:#}"))
+                .ok()
+            })
+            .collect()
+    });
     let mut v = Vdev {
         dev: dev.clone(),
         spec,
@@ -1168,6 +1379,9 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
         subs: descs,
         taps,
         starter: None,
+        build: seq,
+        rates,
+        _listeners: listeners,
         zombies: Vec::new(),
         tap_dirty: false,
         warnings: Vec::new(),
@@ -1184,6 +1398,7 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
     };
     hal::check("AudioDeviceCreateIOProcID", st).context("creating IOProc")?;
     let (proc_id, sh) = (v.proc_id, v.shared.clone());
+    let (id, events) = (dev.id.clone(), events.cloned());
     // AudioDeviceStart blocks until the TCC prompt is answered: keep it off the caller's thread.
     // `Drop` joins this thread before stopping or destroying anything it uses (F3).
     v.starter = Some(
@@ -1199,6 +1414,13 @@ fn build_vdev(dev: &VirtualDevice, spec: AggSpec, groups: &[AppGroup]) -> Result
                     },
                     Relaxed,
                 );
+                if let Some(tx) = events {
+                    let _ = tx.send(Event::IoStart {
+                        id,
+                        build: seq,
+                        ok: st == 0,
+                    });
+                }
             })?,
     );
     v.handle.flush();

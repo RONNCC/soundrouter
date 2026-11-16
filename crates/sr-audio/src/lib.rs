@@ -5,6 +5,7 @@ pub mod engine;
 pub mod hal;
 pub mod layout;
 pub mod loopback;
+pub mod power;
 pub mod tcc;
 
 pub use engine::{Engine, IoState};
