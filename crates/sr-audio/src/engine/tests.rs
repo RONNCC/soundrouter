@@ -654,3 +654,23 @@ fn monitor_wire_beyond_hardware_channels_is_reported() {
     // In range: nothing to report.
     assert!(monitor_warnings(&dev, &[sub("spk", false, &[], &[16])]).is_empty());
 }
+
+#[test]
+fn retry_delay_schedule_and_give_up() {
+    assert_eq!(retry_delay(0), None);
+    assert_eq!(retry_delay(1), Some(EVENT_DEBOUNCE));
+    assert_eq!(retry_delay(2), Some(EVENT_DEBOUNCE * 2));
+    assert_eq!(retry_delay(MAX_RETRIES), Some(backoff(MAX_RETRIES - 1)));
+    assert_eq!(retry_delay(MAX_RETRIES + 1), None);
+    assert_eq!(retry_delay(u32::MAX), None);
+}
+
+#[test]
+fn background_errors_are_keyed() {
+    let mut e = BTreeMap::new();
+    assert_eq!(background_message(&e), None);
+    e.insert(Op::Apply, "a".to_string());
+    e.insert(Op::Retap, "r".to_string());
+    e.remove(&Op::Retap);
+    assert_eq!(background_message(&e).as_deref(), Some("a"));
+}

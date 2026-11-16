@@ -1,5 +1,5 @@
 //! The routing engine: one private aggregate + IOProc per enabled virtual device.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
@@ -167,7 +167,7 @@ struct Inner {
     vdevs: HashMap<String, Vdev>,
     /// [`current_device_set`] as of the last apply; device events that leave it unchanged are echoes.
     dev_set: Vec<String>,
-    bg_error: Option<String>,
+    bg_errors: BTreeMap<Op, String>,
 }
 
 enum Event {
@@ -272,7 +272,7 @@ impl Engine {
     /// The last background (event-driven) update failure, until a later update succeeds.
     /// Logged once at error level; this lets a UI show it as well.
     pub fn background_error(&self) -> Option<String> {
-        lock(&self.inner).bg_error.clone()
+        background_message(&lock(&self.inner).bg_errors)
     }
 
     /// Configuration problems that do not stop routing, e.g. monitor wires beyond the hardware's
@@ -329,49 +329,102 @@ fn current_device_set() -> Vec<String> {
     uid_set(hal::all_devices().into_iter().map(hal::device_uid))
 }
 
+/// Background retries after a failure before the error is surfaced.
+const MAX_RETRIES: u32 = 5;
+
+/// Wait before retrying after the `fails`-th consecutive background failure; `None` = give up.
+fn retry_delay(fails: u32) -> Option<Duration> {
+    (1..=MAX_RETRIES)
+        .contains(&fails)
+        .then(|| backoff(fails - 1))
+}
+
+/// Which background operation failed; errors are tracked per operation.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Op {
+    Apply,
+    Retap,
+}
+
+fn background_message(errs: &BTreeMap<Op, String>) -> Option<String> {
+    (!errs.is_empty()).then(|| errs.values().cloned().collect::<Vec<_>>().join("; "))
+}
+
+fn run_op(g: &mut Inner, op: Op) -> Result<()> {
+    match op {
+        Op::Apply => match g.cfg.clone() {
+            Some(cfg) => apply_locked(g, &cfg),
+            None => Ok(()),
+        },
+        Op::Retap => retap(g),
+    }
+}
+
 fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
     let mut fails = 0u32;
-    while let Ok(first) = rx.recv() {
+    // Operation to rerun unconditionally (no dev_set filter) after a failure.
+    let mut retry: Option<Op> = None;
+    loop {
         let (mut devs, mut procs) = (false, false);
-        let mut ev = first;
-        loop {
-            match ev {
-                Event::Shutdown => return,
-                Event::Devices => devs = true,
-                Event::Processes => procs = true,
-            }
-            match rx.recv_timeout(backoff(fails)) {
-                Ok(e) => ev = e,
-                Err(RecvTimeoutError::Timeout) => break,
+        let first = match retry.and(retry_delay(fails)) {
+            Some(d) => match rx.recv_timeout(d) {
+                Ok(e) => Some(e),
+                Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
+            },
+            None => match rx.recv() {
+                Ok(e) => Some(e),
+                Err(_) => return,
+            },
+        };
+        if let Some(mut ev) = first {
+            loop {
+                match ev {
+                    Event::Shutdown => return,
+                    Event::Devices => devs = true,
+                    Event::Processes => procs = true,
+                }
+                match rx.recv_timeout(backoff(fails)) {
+                    Ok(e) => ev = e,
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             }
         }
         let mut g = lock(&inner);
         let devs = devs && current_device_set() != g.dev_set;
-        let r = if devs {
-            match g.cfg.clone() {
-                Some(cfg) => apply_locked(&mut g, &cfg),
-                None => Ok(()),
-            }
-        } else if procs {
-            retap(&mut g)
+        let op = if devs || retry == Some(Op::Apply) {
+            Some(Op::Apply)
+        } else if procs || retry == Some(Op::Retap) {
+            Some(Op::Retap)
         } else {
-            Ok(())
+            None
         };
-        match r {
+        let Some(op) = op else { continue };
+        match run_op(&mut g, op) {
             Ok(()) => {
+                retry = None;
                 fails = 0;
-                g.bg_error = None;
+                // A full apply resolves everything; a retap only its own error.
+                if op == Op::Apply {
+                    g.bg_errors.clear();
+                } else {
+                    g.bg_errors.remove(&Op::Retap);
+                }
             }
             Err(e) => {
                 fails = fails.saturating_add(1);
                 let msg = format!("{e:#}");
-                // One error per distinct failure; repeats stay at debug level.
-                if g.bg_error.as_deref() == Some(&msg) {
-                    log::debug!("background update still failing (x{fails}): {msg}");
+                retry = Some(op);
+                if retry_delay(fails).is_some() {
+                    log::debug!("background update failed (x{fails}), retrying: {msg}");
                 } else {
-                    log::error!("background update failed: {msg}");
-                    g.bg_error = Some(msg);
+                    // Final failure: surface once, stop retrying until a new event.
+                    retry = None;
+                    if g.bg_errors.get(&op) != Some(&msg) {
+                        log::error!("background update failed: {msg}");
+                        g.bg_errors.insert(op, msg);
+                    }
                 }
             }
         }
@@ -512,9 +565,8 @@ fn sync_driver(cfg: &Config) -> Result<()> {
     };
     if driver::get_devices(plugin).ok().as_ref() != Some(&want) {
         driver::set_devices(plugin, &want)?;
-        wait_driver_settled(&want)?;
     }
-    Ok(())
+    wait_driver_settled(&want)
 }
 
 /// How long after `set_devices` the driver's devices may take to appear and take their channel counts.
@@ -697,8 +749,13 @@ fn create_tap(source_id: &str, bundle: &str, objs: Vec<u32>) -> Result<Tap> {
     hal::check("AudioHardwareCreateProcessTap", unsafe {
         AudioHardwareCreateProcessTap(Some(&desc), &mut id)
     })?;
-    let uid = hal::get_string(id, kAudioTapPropertyUID)
-        .map_err(|s| anyhow!("tap uid: {}", hal::fourcc(s)))?;
+    let uid = match hal::get_string(id, kAudioTapPropertyUID) {
+        Ok(u) => u,
+        Err(s) => {
+            unsafe { AudioHardwareDestroyProcessTap(id) };
+            bail!("tap uid: {}", hal::fourcc(s));
+        }
+    };
     Ok(Tap {
         source_id: source_id.into(),
         bundle: bundle.into(),
