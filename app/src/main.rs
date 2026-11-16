@@ -3,6 +3,7 @@ mod app;
 mod fake;
 mod graph;
 mod icons;
+mod instance;
 mod layout;
 mod logging;
 mod login;
@@ -63,6 +64,20 @@ fn main() -> eframe::Result {
         println!("usage: SoundRouter [--demo] [--background] [--theme dark|light]");
         return Ok(());
     }
+    // Held until process exit.
+    let _instance = if instance::bypasses_guard(args.demo) {
+        None
+    } else {
+        match instance::lock_path().map(|p| instance::acquire(&p)) {
+            Some(Ok(None)) => {
+                instance::raise_existing();
+                return Ok(());
+            }
+            Some(Ok(Some(g))) => Some(g),
+            // Guard unavailable: run anyway rather than refuse to start.
+            _ => None,
+        }
+    };
     let log_file = logging::init();
     logging::banner(log_file.as_deref());
     let demo = args.demo;
