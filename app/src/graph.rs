@@ -1,5 +1,6 @@
 //! The three-column graph (Sources | Output Channels | Monitors): painting and interaction.
 //! Reads the config, emits `Edit`s; never mutates it.
+use crate::icons::{self, IconTextures};
 use crate::layout::{
     CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, PORT_R, TOP, body_height, wire_distance,
     wire_points,
@@ -13,7 +14,8 @@ use crate::widgets::{
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Popup, Rect, Response, Sense, Shadow, Slider,
-    Stroke, StrokeKind, Ui, UiBuilder, epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
+    Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo, epaint::CubicBezierShape, pos2,
+    text::LayoutJob, vec2,
 };
 use sr_core::backend::{AppInfo, HwDevice, MeterReading};
 use sr_core::config::{Monitor, Source, SourceKind, VirtualDevice};
@@ -26,6 +28,8 @@ pub struct GraphCtx<'a> {
     pub dev: &'a VirtualDevice,
     pub hw: &'a [HwDevice],
     pub apps: &'a [AppInfo],
+    /// App icon textures by source key; keys without one fall back to the letter tile.
+    pub icons: &'a IconTextures,
     pub reading: Option<&'a MeterReading>,
     pub t: &'a Tokens,
     /// Minimum height of the graph area (so it fills the pane).
@@ -272,13 +276,90 @@ fn hint_color(resp: &Response, t: &Tokens) -> Color32 {
     if resp.hovered() { t.text } else { t.text2 }
 }
 
+/// One menu line: icon, label, accent highlight on hover. Returns true when clicked.
+fn menu_row(
+    ui: &mut Ui,
+    t: &Tokens,
+    enabled: bool,
+    label: &str,
+    icon: impl FnOnce(&egui::Painter, Rect),
+) -> bool {
+    const ICON: f32 = 18.0;
+    let font = TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER);
+    let w = (ICON + 24.0 + galley.size().x).max(ui.available_width());
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 24.0), sense);
+    resp.widget_info(|| WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    let hot = enabled && resp.hovered();
+    let p = ui.painter();
+    if hot {
+        p.rect_filled(rect, CornerRadius::same(4), t.accent);
+    }
+    let color = match (enabled, hot) {
+        (_, true) => Color32::WHITE,
+        (true, _) => t.text,
+        _ => t.text2.gamma_multiply(0.6),
+    };
+    let icon_rect = Rect::from_center_size(
+        pos2(rect.left() + 8.0 + ICON / 2.0, rect.center().y),
+        vec2(ICON, ICON),
+    );
+    icon(p, icon_rect);
+    p.galley(
+        pos2(
+            rect.left() + ICON + 14.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
+    enabled && resp.clicked()
+}
+
+/// The app's real icon, else its coloured letter tile.
+fn app_icon(p: &egui::Painter, r: Rect, icons: &IconTextures, key: &str, name: &str, alpha: f32) {
+    if let Some(tex) = icons.get(key) {
+        let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        p.image(tex.id(), r, full, Color32::WHITE.gamma_multiply(alpha));
+    } else {
+        let glyph = name
+            .chars()
+            .next()
+            .map_or("?".into(), |c| c.to_uppercase().to_string());
+        tile(p, r, tile_tint(name), &glyph, r.height() * 0.53, alpha);
+    }
+}
+
+/// Accent-tinted square with a glyph, the look of Pass-Thru and hardware devices.
+fn glyph_tile(
+    p: &egui::Painter,
+    r: Rect,
+    t: &Tokens,
+    alpha: f32,
+    glyph: impl FnOnce(&egui::Painter, Rect, Color32),
+) {
+    p.rect_filled(
+        r,
+        CornerRadius::same((r.width() * 0.24) as u8),
+        t.accent.gamma_multiply(0.18 * alpha),
+    );
+    glyph(p, r, t.accent.gamma_multiply(alpha));
+}
+
 fn source_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
-    let (dev, d) = (g.dev, g.dev_idx);
+    let (dev, d, t) = (g.dev, g.dev_idx, g.t);
     ui.set_min_width(210.0);
     ui.label(
         egui::RichText::new("Applications")
             .size(11.0)
-            .color(g.t.text2),
+            .color(t.text2),
     );
     for a in g.apps {
         let kind = SourceKind::App {
@@ -290,7 +371,10 @@ fn source_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
         } else {
             a.name.clone()
         };
-        if ui.add_enabled(!exists, egui::Button::new(label)).clicked() {
+        let alpha = if exists { 0.5 } else { 1.0 };
+        let paint =
+            |p: &egui::Painter, r: Rect| app_icon(p, r, g.icons, &a.bundle_id, &a.name, alpha);
+        if menu_row(ui, t, !exists, &label, paint) {
             edits.push(Edit::AddSource(d, kind, 2));
         }
     }
@@ -298,24 +382,22 @@ fn source_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
     ui.label(
         egui::RichText::new("Input Devices")
             .size(11.0)
-            .color(g.t.text2),
+            .color(t.text2),
     );
     for h in g.hw.iter().filter(|h| h.in_ch > 0) {
         let kind = SourceKind::Device { uid: h.uid.clone() };
         let exists = dev.sources.iter().any(|s| s.kind == kind);
-        if ui
-            .add_enabled(!exists, egui::Button::new(&h.name))
-            .clicked()
-        {
+        let alpha = if exists { 0.5 } else { 1.0 };
+        let paint = |p: &egui::Painter, r: Rect| glyph_tile(p, r, t, alpha, icons::mic);
+        if menu_row(ui, t, !exists, &h.name, paint) {
             edits.push(Edit::AddSource(d, kind, h.in_ch.min(MAX_ROWS)));
         }
     }
     ui.separator();
     let exists = dev.sources.iter().any(|s| s.kind == SourceKind::PassThru);
-    if ui
-        .add_enabled(!exists, egui::Button::new("Pass-Thru"))
-        .clicked()
-    {
+    let alpha = if exists { 0.5 } else { 1.0 };
+    let paint = |p: &egui::Painter, r: Rect| glyph_tile(p, r, t, alpha, loops);
+    if menu_row(ui, t, !exists, "Pass-Thru", paint) {
         edits.push(Edit::AddSource(d, SourceKind::PassThru, dev.channels));
     }
 }
@@ -331,10 +413,9 @@ fn monitor_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
     for h in g.hw.iter().filter(|h| h.out_ch > 0) {
         any = true;
         let exists = g.dev.monitors.iter().any(|m| m.device_uid == h.uid);
-        if ui
-            .add_enabled(!exists, egui::Button::new(&h.name))
-            .clicked()
-        {
+        let alpha = if exists { 0.5 } else { 1.0 };
+        let paint = |p: &egui::Painter, r: Rect| glyph_tile(p, r, g.t, alpha, icons::speaker);
+        if menu_row(ui, g.t, !exists, &h.name, paint) {
             edits.push(Edit::AddMonitor(
                 g.dev_idx,
                 h.uid.clone(),
@@ -465,21 +546,20 @@ fn card(
             vec2(36.0, 36.0),
         );
         match c.id {
-            CardId::Src(i) if dev.sources[i].kind == SourceKind::PassThru => {
-                painter.rect_filled(
-                    icon,
-                    CornerRadius::same(9),
-                    t.accent.gamma_multiply(0.18 * dim),
-                );
-                loops(&painter, icon, t.accent.gamma_multiply(dim));
-            }
-            _ => {
-                let glyph = title
-                    .chars()
-                    .next()
-                    .map_or("?".into(), |c| c.to_uppercase().to_string());
-                tile(&painter, icon, tile_tint(&title), &glyph, 19.0, dim);
-            }
+            CardId::Src(i) => match &dev.sources[i].kind {
+                SourceKind::PassThru => glyph_tile(&painter, icon, t, dim, loops),
+                SourceKind::Device { .. } => glyph_tile(&painter, icon, t, dim, icons::mic),
+                SourceKind::App { bundle_id } => {
+                    app_icon(&painter, icon, g.icons, bundle_id, &title, dim);
+                    if g.icons.get(bundle_id).is_some() {
+                        let id = Id::unique(("card_icon", d, c.id));
+                        ui.interact(icon, id, Sense::hover()).widget_info(|| {
+                            WidgetInfo::labeled(egui::Role::Image, true, format!("{title} icon"))
+                        });
+                    }
+                }
+            },
+            _ => unreachable!("only sources carry a big icon"),
         }
         (r.left() + 62.0, r.left() + 98.0)
     } else if matches!(c.id, CardId::Out(_)) {
@@ -804,6 +884,7 @@ mod tests {
                         dev: &s.dev,
                         hw: &[],
                         apps: &[],
+                        icons: &IconTextures::default(),
                         reading: None,
                         t: &tk,
                         min_h: 500.0,

@@ -1,5 +1,6 @@
 //! Application state, sidebar and the window frame.
 use crate::graph::{self, GraphCtx, GraphState};
+use crate::icons::IconTextures;
 use crate::model::{Edit, apply, db_to_pct, pct_to_db};
 use crate::store;
 use crate::theme::{Tokens, semibold, tokens};
@@ -33,6 +34,7 @@ pub struct App {
     worker: Worker,
     selected: usize,
     graph: GraphState,
+    icon_tex: IconTextures,
     renaming: Option<(usize, String)>,
     toast: Option<String>,
     save_pending: bool,
@@ -67,6 +69,7 @@ impl App {
             worker,
             selected: 0,
             graph: GraphState::default(),
+            icon_tex: IconTextures::default(),
             renaming: None,
             toast,
             save_pending: false,
@@ -501,6 +504,7 @@ impl App {
                 let hw = snap.hardware.clone();
                 let apps = snap.apps.clone();
                 let reading = snap.meters.get(&dev.id).cloned();
+                self.icon_tex.sync(ui.ctx(), &snap.icons);
                 drop(snap);
                 let area = Rect::from_min_max(pos2(full.left(), full.top() + 44.0), full.max);
                 ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
@@ -512,6 +516,7 @@ impl App {
                                 dev,
                                 hw: &hw,
                                 apps: &apps,
+                                icons: &self.icon_tex,
                                 reading: reading.as_ref(),
                                 t,
                                 min_h: area.height(),

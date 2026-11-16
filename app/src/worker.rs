@@ -1,8 +1,9 @@
 //! Backend worker thread: applies configs, polls meters at 30 Hz, refreshes hardware/apps every 2 s.
-use eframe::egui::Context;
+use crate::icons::{self, IconResolver};
+use eframe::egui::{ColorImage, Context};
 use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading};
-use sr_core::config::Config;
-use std::collections::HashMap;
+use sr_core::config::{Config, SourceKind};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +16,8 @@ pub struct Snapshot {
     pub meters: HashMap<String, MeterReading>,
     pub hardware: Vec<HwDevice>,
     pub apps: Vec<AppInfo>,
+    /// App icons by source key (bundle id or `path:<exe>`); only ever grows.
+    pub icons: HashMap<String, Arc<ColorImage>>,
     /// Error of the most recent `apply`; cleared by the next success.
     pub apply_error: Option<String>,
     pub status: EngineStatus,
@@ -40,6 +43,9 @@ struct Pump {
     backend: Box<dyn Backend + Send>,
     cfg: Config,
     next_refresh: Instant,
+    resolve_icon: IconResolver,
+    /// Keys already looked up (hit or miss), so a refresh never repeats an AppKit call.
+    icons_tried: HashSet<String>,
 }
 
 impl Pump {
@@ -58,27 +64,58 @@ impl Pump {
             .collect();
         let refresh = (now >= self.next_refresh).then(|| {
             self.next_refresh = now + REFRESH_PERIOD;
-            (
-                self.backend.hardware(),
-                self.backend.apps(),
-                self.backend.status(),
-            )
+            let apps = self.backend.apps();
+            let icons = self.new_icons(&apps);
+            (self.backend.hardware(), apps, self.backend.status(), icons)
         });
         let mut s = snap.lock().unwrap();
         if let Some(r) = apply_result {
             s.apply_error = r;
         }
         s.meters = meters;
-        if let Some((hw, apps, status)) = refresh {
+        if let Some((hw, apps, status, icons)) = refresh {
             s.status = status;
             s.hardware = hw;
             s.apps = apps;
+            s.icons.extend(icons);
         }
+    }
+
+    /// Icons for running apps and configured App sources not looked up before.
+    fn new_icons(&mut self, apps: &[AppInfo]) -> Vec<(String, Arc<ColorImage>)> {
+        let configured = self
+            .cfg
+            .devices
+            .iter()
+            .flat_map(|d| &d.sources)
+            .filter_map(|s| match &s.kind {
+                SourceKind::App { bundle_id } => Some(bundle_id.as_str()),
+                _ => None,
+            });
+        let keys: Vec<String> = apps
+            .iter()
+            .map(|a| a.bundle_id.as_str())
+            .chain(configured)
+            .filter(|k| self.icons_tried.insert((*k).to_string()))
+            .map(str::to_string)
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| Some((k.clone(), Arc::new((self.resolve_icon)(&k)?))))
+            .collect()
     }
 }
 
 impl Worker {
     pub fn spawn(backend: Box<dyn Backend + Send>, ctx: Context) -> Worker {
+        Self::spawn_with(backend, ctx, Box::new(icons::resolve))
+    }
+
+    /// `spawn` with a custom icon source (tests use none, so snapshots keep letter tiles).
+    pub fn spawn_with(
+        backend: Box<dyn Backend + Send>,
+        ctx: Context,
+        resolve_icon: IconResolver,
+    ) -> Worker {
         let (tx, rx) = mpsc::channel::<Config>();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let snap = shared.clone();
@@ -87,6 +124,8 @@ impl Worker {
                 backend,
                 cfg: Config::default(),
                 next_refresh: Instant::now(),
+                resolve_icon,
+                icons_tried: HashSet::new(),
             };
             loop {
                 let first = match rx.recv_timeout(METER_PERIOD) {
@@ -110,6 +149,7 @@ impl Worker {
 mod tests {
     use super::*;
     use crate::model::default_config;
+    use eframe::egui::Color32;
     use sr_core::config::Config;
 
     #[derive(Default)]
@@ -149,7 +189,11 @@ mod tests {
         }
         fn apps(&self) -> Vec<AppInfo> {
             self.probe();
-            Vec::new()
+            vec![AppInfo {
+                bundle_id: "com.fake.player".into(),
+                name: "Player".into(),
+                running_output: true,
+            }]
         }
         fn meters(&self, id: &str) -> Option<MeterReading> {
             self.probe();
@@ -171,6 +215,8 @@ mod tests {
             backend: Box::new(backend),
             cfg: Config::default(),
             next_refresh: Instant::now(),
+            resolve_icon: Box::new(|_| None),
+            icons_tried: HashSet::new(),
         };
         (pump, log, snap)
     }
@@ -241,5 +287,38 @@ mod tests {
         assert_eq!(pump.next_refresh, after_first); // not refreshed yet
         pump.tick(None, t0 + REFRESH_PERIOD, &snap);
         assert_eq!(pump.next_refresh, t0 + REFRESH_PERIOD * 2);
+    }
+
+    #[test]
+    fn icons_for_running_and_configured_apps_resolve_once_on_refresh() {
+        use crate::model::{Edit, apply};
+        let (mut pump, _log, snap) = setup();
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        pump.resolve_icon = Box::new(move |k| {
+            log.lock().unwrap().push(k.to_string());
+            (k != "com.fake.missing").then(|| ColorImage::filled([2, 2], Color32::RED))
+        });
+        let mut c = default_config();
+        for id in ["com.fake.configured", "com.fake.missing"] {
+            let kind = SourceKind::App {
+                bundle_id: id.into(),
+            };
+            apply(&mut c, Edit::AddSource(0, kind, 2));
+        }
+        let t0 = Instant::now();
+        pump.tick(Some(c), t0, &snap);
+        pump.tick(None, t0 + REFRESH_PERIOD, &snap); // second refresh must not look up again
+        let s = snap.lock().unwrap();
+        let mut got: Vec<_> = s.icons.keys().cloned().collect();
+        got.sort();
+        assert_eq!(got, ["com.fake.configured", "com.fake.player"]);
+        assert_eq!(s.icons["com.fake.player"].size, [2, 2]);
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(
+            asked,
+            ["com.fake.configured", "com.fake.missing", "com.fake.player"]
+        );
     }
 }

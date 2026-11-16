@@ -62,7 +62,7 @@ pub(super) fn window(
         .with_theme(theme)
         .with_context_setup(crate::theme::install_fonts)
         .build_eframe(move |cc| {
-            let w = Worker::spawn(backend, cc.egui_ctx.clone());
+            let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
             App::new(cfg, None, w, toast, false, demo)
         });
     wait_published(h.state());
@@ -508,7 +508,7 @@ mod snapshots {
             .wgpu()
             .build_eframe(move |cc| {
                 let backend = Box::new(FakeBackend::frozen(1.5));
-                let w = Worker::spawn(backend, cc.egui_ctx.clone());
+                let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
                 App::new(cfg, None, w, toast.map(str::to_string), false, false)
             });
         wait_published(h.state());
@@ -546,6 +546,41 @@ mod snapshots {
     }
 
     #[test]
+    fn icons_and_source_menu() {
+        let mut results = egui_kittest::SnapshotResults::new();
+        // A flat teal square stands in for the machine-specific real Safari icon.
+        let icon = egui::ColorImage::filled([8, 8], egui::Color32::from_rgb(0x30, 0xB0, 0xC7));
+        let publish = |h: &mut Harness<'static, App>| {
+            let shared = h.state().worker.shared.clone();
+            let img = std::sync::Arc::new(icon.clone());
+            shared
+                .lock()
+                .unwrap()
+                .icons
+                .insert("com.apple.Safari".into(), img);
+            settle(h);
+        };
+        let sources = |h: &mut Harness<'static, App>| {
+            publish(h);
+            click(h, "Add source");
+        };
+        let monitors = |h: &mut Harness<'static, App>| {
+            publish(h);
+            click(h, "Add monitor");
+        };
+        let cfg = demo_config;
+        shot("icons", Theme::Dark, cfg(), None, sources, &mut results);
+        shot(
+            "icons_monitors",
+            Theme::Dark,
+            cfg(),
+            None,
+            monitors,
+            &mut results,
+        );
+    }
+
+    #[test]
     fn error_status() {
         both(
             "error",
@@ -570,7 +605,7 @@ mod snapshots {
                 .wgpu()
                 .build_eframe(|cc| {
                     let backend = Box::new(FakeBackend::frozen(1.5));
-                    let w = Worker::spawn(backend, cc.egui_ctx.clone());
+                    let w = Worker::spawn_with(backend, cc.egui_ctx.clone(), Box::new(|_| None));
                     App::new(demo_config(), None, w, None, false, true)
                 });
             wait_published(h.state());
@@ -633,4 +668,26 @@ fn engine_warnings_and_background_error_show_in_the_status_bar() {
         ..EngineStatus::default()
     });
     h.get_by_label("device vanished");
+}
+
+#[test]
+fn app_source_shows_its_icon_once_the_worker_publishes_one() {
+    let mut h = open(one_source());
+    assert!(
+        h.query_by_label("Safari icon").is_none(),
+        "tile fallback has no icon node"
+    );
+    let red = egui::ColorImage::filled([2, 2], egui::Color32::RED);
+    h.state()
+        .worker
+        .shared
+        .lock()
+        .unwrap()
+        .icons
+        .insert("com.apple.Safari".into(), std::sync::Arc::new(red));
+    settle(&mut h);
+    h.get_by_label("Safari icon");
+    // The source menu lists apps (with icon rows) and stays fully named.
+    click(&mut h, "Add source");
+    h.get_by_label("Pass-Thru");
 }

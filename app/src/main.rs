@@ -2,6 +2,7 @@
 mod app;
 mod fake;
 mod graph;
+mod icons;
 mod layout;
 mod logging;
 mod meter;
