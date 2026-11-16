@@ -20,7 +20,9 @@ use objc2_core_audio::*;
 use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSNumber, NSString};
-use sr_core::backend::{AppInfo, Backend, HwDevice, MeterReading};
+use sr_core::backend::{
+    AppInfo, Backend, DeviceState, EngineStatus, HwDevice, MeterReading, TccStatus,
+};
 use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice};
 use sr_core::driver_proto::{COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, companion_uid};
 use sr_core::meters::Meters;
@@ -43,6 +45,24 @@ pub enum IoState {
     Starting,
     Running,
     Failed(i32),
+}
+
+fn io_state_of(shared: &Shared) -> IoState {
+    match shared.state.load(Relaxed) {
+        0 => IoState::Starting,
+        1 => IoState::Running,
+        s => IoState::Failed(s as u32 as i32),
+    }
+}
+
+/// A start that is still blocked without TCC capture permission is the permission prompt.
+fn device_state(io: IoState, tcc: TccStatus) -> DeviceState {
+    match io {
+        IoState::Starting if tcc != TccStatus::Granted => DeviceState::WaitingForPermission,
+        IoState::Starting => DeviceState::Starting,
+        IoState::Running => DeviceState::Running,
+        IoState::Failed(c) => DeviceState::Failed(format!("IO start failed (OSStatus {c})")),
+    }
 }
 
 struct Shared {
@@ -238,13 +258,7 @@ impl Engine {
     }
 
     pub fn io_state(&self, device_id: &str) -> Option<IoState> {
-        let g = lock(&self.inner);
-        let v = g.vdevs.get(device_id)?;
-        Some(match v.shared.state.load(Relaxed) {
-            0 => IoState::Starting,
-            1 => IoState::Running,
-            s => IoState::Failed(s as u32 as i32),
-        })
+        Some(io_state_of(&lock(&self.inner).vdevs.get(device_id)?.shared))
     }
 
     /// Blocks silenced by a buffer-shape mismatch (diagnostic).
@@ -392,6 +406,26 @@ impl Backend for Engine {
 
     fn apps(&self) -> Vec<AppInfo> {
         apps::app_infos(&apps::list_groups())
+    }
+
+    fn status(&self) -> EngineStatus {
+        let tcc = match crate::tcc::audio_capture_status() {
+            crate::tcc::CaptureStatus::Granted => TccStatus::Granted,
+            crate::tcc::CaptureStatus::Denied => TccStatus::Denied,
+            crate::tcc::CaptureStatus::Unknown(_) => TccStatus::Unknown,
+        };
+        let mut per_device: Vec<(String, DeviceState)> = lock(&self.inner)
+            .vdevs
+            .iter()
+            .map(|(id, v)| (id.clone(), device_state(io_state_of(&v.shared), tcc)))
+            .collect();
+        per_device.sort_by(|a, b| a.0.cmp(&b.0));
+        EngineStatus {
+            per_device,
+            warnings: self.warnings(),
+            background_error: self.background_error(),
+            tcc,
+        }
     }
 
     fn meters(&self, device_id: &str) -> Option<MeterReading> {
@@ -1177,3 +1211,28 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn io_state_maps_to_device_state() {
+        use TccStatus::*;
+        for t in [Denied, Unknown] {
+            assert_eq!(
+                device_state(IoState::Starting, t),
+                DeviceState::WaitingForPermission
+            );
+        }
+        assert_eq!(
+            device_state(IoState::Starting, Granted),
+            DeviceState::Starting
+        );
+        assert_eq!(device_state(IoState::Running, Denied), DeviceState::Running);
+        assert_eq!(
+            device_state(IoState::Failed(-50), Granted),
+            DeviceState::Failed("IO start failed (OSStatus -50)".into())
+        );
+    }
+}

@@ -9,12 +9,17 @@ use eframe::egui::{
     self, Align2, CornerRadius, FontId, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit, Theme,
     UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
+use sr_core::backend::{DeviceState, EngineStatus};
 use sr_core::config::Config;
 use std::path::PathBuf;
 use std::time::Duration;
 
 const SIDEBAR_W: f32 = 250.0;
 const ROW_H: f32 = 78.0;
+const AUDIO_CAPTURE_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture";
+pub const PERMISSION_BANNER: &str =
+    "Waiting for System Audio Recording permission — allow it in the prompt / System Settings";
 const BLANK_NAME: &str = "A device name can't be empty.";
 /// Room for the traffic lights in the unified titlebar.
 const TITLEBAR_H: f32 = 46.0;
@@ -31,6 +36,17 @@ pub struct App {
     save_pending: bool,
     vibrancy: bool,
     demo: bool,
+}
+
+/// Label and dot color for a device state; idle devices show no dot.
+fn state_look(s: &DeviceState, t: &Tokens) -> Option<(String, egui::Color32)> {
+    Some(match s {
+        DeviceState::Idle => return None,
+        DeviceState::Running => ("Running".into(), t.meter[0]),
+        DeviceState::Starting => ("Starting".into(), t.meter[1]),
+        DeviceState::WaitingForPermission => ("Waiting for permission".into(), t.meter[1]),
+        DeviceState::Failed(e) => (format!("Failed: {e}"), t.danger),
+    })
 }
 
 impl App {
@@ -55,6 +71,10 @@ impl App {
             vibrancy,
             demo,
         }
+    }
+
+    fn engine_status(&self) -> EngineStatus {
+        self.worker.shared.lock().unwrap().status.clone()
     }
 
     fn commit(&mut self, edits: Vec<Edit>) {
@@ -256,6 +276,24 @@ impl App {
             FontId::proportional(11.0),
             t.text2.gamma_multiply(dim),
         );
+        let state = self
+            .engine_status()
+            .per_device
+            .into_iter()
+            .find_map(|(id, s)| (id == dev.id).then_some(s))
+            .unwrap_or_default();
+        if let Some((text, color)) = state_look(&state, t) {
+            let c = pos2(inner.right() - 24.0, inner.top() + 34.0);
+            ui.painter().circle_filled(c, 4.0, color);
+            let dot = ui.interact(
+                Rect::from_center_size(c, vec2(14.0, 14.0)),
+                Id::unique(("state", i)),
+                Sense::hover(),
+            );
+            let label = format!("{} status: {text}", dev.name);
+            dot.widget_info(|| WidgetInfo::labeled(Role::Label, true, &label));
+            dot.on_hover_text(text);
+        }
         let sw = Rect::from_center_size(
             pos2(inner.right() - 8.0 - 16.0, inner.top() + 18.0),
             vec2(32.0, 18.0),
@@ -347,10 +385,17 @@ impl App {
                 if has && resp.clicked() {
                     edits.push(Edit::RemoveDevice(self.selected));
                 }
+                let (apply_error, es) = {
+                    let s = self.worker.shared.lock().unwrap();
+                    (s.apply_error.clone(), s.status.clone())
+                };
+                let warn = (!es.warnings.is_empty()).then(|| es.warnings.join("; "));
                 let status = self
                     .toast
                     .clone()
-                    .or_else(|| self.worker.shared.lock().unwrap().apply_error.clone());
+                    .or(apply_error)
+                    .or(es.background_error)
+                    .or(warn);
                 let (msg, color) = match status {
                     Some(m) if m.contains("driver not installed") => (
                         "Driver not installed. Run `packaging/driver-dev.sh install`, then relaunch.".to_string(),
@@ -374,6 +419,30 @@ impl App {
                 status.widget_info(|| WidgetInfo::labeled(Role::Label, true, &msg));
                 status.on_hover_text(msg);
             });
+
+        let waiting = self
+            .engine_status()
+            .per_device
+            .iter()
+            .any(|(_, s)| *s == DeviceState::WaitingForPermission);
+        if waiting {
+            egui::Panel::top("permission")
+                .frame(
+                    egui::Frame::default()
+                        .fill(t.card)
+                        .inner_margin(Margin::same(10)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(PERMISSION_BANNER);
+                        if ui.button("Open Settings").clicked() {
+                            let _ = std::process::Command::new("open")
+                                .arg(AUDIO_CAPTURE_SETTINGS)
+                                .spawn();
+                        }
+                    });
+                });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(t.window))

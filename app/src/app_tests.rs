@@ -5,7 +5,7 @@ use crate::fake::{FakeBackend, demo_config};
 use crate::model::default_config;
 use crate::worker::Snapshot;
 use egui_kittest::{Harness, kittest::Queryable};
-use sr_core::backend::{AppInfo, Backend, HwDevice, MeterReading};
+use sr_core::backend::{AppInfo, Backend, DeviceState, EngineStatus, HwDevice, MeterReading};
 use sr_core::config::SourceKind;
 
 /// Fake backend whose `apply` always fails, like a missing driver.
@@ -583,4 +583,54 @@ mod snapshots {
                 .unwrap();
         }
     }
+}
+
+fn with_status(status: EngineStatus) -> Harness<'static, App> {
+    let mut b = FakeBackend::frozen(1.5);
+    b.status = status;
+    window(demo_config(), Box::new(b), None, Theme::Dark, false)
+}
+
+fn one(state: DeviceState) -> EngineStatus {
+    EngineStatus {
+        per_device: vec![("v1".into(), state)],
+        ..EngineStatus::default()
+    }
+}
+
+#[test]
+fn device_states_show_as_named_dots_and_permission_banner() {
+    for (state, text) in [
+        (DeviceState::Running, "Loopback Audio status: Running"),
+        (DeviceState::Starting, "Loopback Audio status: Starting"),
+        (
+            DeviceState::Failed("boom".into()),
+            "Loopback Audio status: Failed: boom",
+        ),
+    ] {
+        let h = with_status(one(state));
+        h.get_by_label(text);
+        assert!(h.query_by_label(PERMISSION_BANNER).is_none());
+    }
+    let h = with_status(one(DeviceState::WaitingForPermission));
+    h.get_by_label("Loopback Audio status: Waiting for permission");
+    h.get_by_label(PERMISSION_BANNER);
+    h.get_by_label("Open Settings");
+    let h = with_status(one(DeviceState::Idle));
+    assert!(h.query_by_label_contains("status:").is_none());
+}
+
+#[test]
+fn engine_warnings_and_background_error_show_in_the_status_bar() {
+    let h = with_status(EngineStatus {
+        warnings: vec!["wire A".into(), "wire B".into()],
+        ..EngineStatus::default()
+    });
+    h.get_by_label("wire A; wire B");
+    let h = with_status(EngineStatus {
+        background_error: Some("device vanished".into()),
+        warnings: vec!["wire A".into()],
+        ..EngineStatus::default()
+    });
+    h.get_by_label("device vanished");
 }

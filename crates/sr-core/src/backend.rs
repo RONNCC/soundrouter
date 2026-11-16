@@ -17,9 +17,35 @@ pub struct MeterReading {
     pub sources: Vec<(String, Vec<f32>)>,
     pub channels: Vec<f32>,
 } // linear peak since last read
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TccStatus {
+    Granted,
+    Denied,
+    #[default]
+    Unknown,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DeviceState {
+    #[default]
+    Idle,
+    WaitingForPermission,
+    Starting,
+    Running,
+    Failed(String),
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineStatus {
+    pub per_device: Vec<(String, DeviceState)>,
+    pub warnings: Vec<String>,
+    pub background_error: Option<String>,
+    pub tcc: TccStatus,
+}
 pub trait Backend {
     fn apply(&mut self, cfg: &Config) -> anyhow::Result<()>; // idempotent diff: driver devices, aggregates, taps, plans
     fn hardware(&self) -> Vec<HwDevice>; // excludes our own vdevs and aggregates
     fn apps(&self) -> Vec<AppInfo>; // processes known to the HAL, deduped by bundle_id
     fn meters(&self, device_id: &str) -> Option<MeterReading>;
+    fn status(&self) -> EngineStatus {
+        EngineStatus::default()
+    }
 }

@@ -1,6 +1,6 @@
 //! Backend worker thread: applies configs, polls meters at 30 Hz, refreshes hardware/apps every 2 s.
 use eframe::egui::Context;
-use sr_core::backend::{AppInfo, Backend, HwDevice, MeterReading};
+use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading};
 use sr_core::config::Config;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -17,6 +17,7 @@ pub struct Snapshot {
     pub apps: Vec<AppInfo>,
     /// Error of the most recent `apply`; cleared by the next success.
     pub apply_error: Option<String>,
+    pub status: EngineStatus,
 }
 
 pub struct Worker {
@@ -57,14 +58,19 @@ impl Pump {
             .collect();
         let refresh = (now >= self.next_refresh).then(|| {
             self.next_refresh = now + REFRESH_PERIOD;
-            (self.backend.hardware(), self.backend.apps())
+            (
+                self.backend.hardware(),
+                self.backend.apps(),
+                self.backend.status(),
+            )
         });
         let mut s = snap.lock().unwrap();
         if let Some(r) = apply_result {
             s.apply_error = r;
         }
         s.meters = meters;
-        if let Some((hw, apps)) = refresh {
+        if let Some((hw, apps, status)) = refresh {
+            s.status = status;
             s.hardware = hw;
             s.apps = apps;
         }

@@ -1,6 +1,6 @@
 //! In-app backend for `--demo`: synthetic meters, fake apps and hardware.
 use crate::model::{Edit, apply, default_config};
-use sr_core::backend::{AppInfo, Backend, HwDevice, MeterReading};
+use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading};
 use sr_core::config::{Config, SourceKind};
 use std::time::Instant;
 
@@ -9,6 +9,8 @@ pub struct FakeBackend {
     start: Instant,
     /// Meter clock pinned to this many seconds, so snapshots are deterministic.
     frozen: Option<f32>,
+    /// What `status()` reports; tests drive the GUI through each engine state with it.
+    pub status: EngineStatus,
 }
 
 impl FakeBackend {
@@ -17,6 +19,7 @@ impl FakeBackend {
             cfg: Config::default(),
             start: Instant::now(),
             frozen: None,
+            status: EngineStatus::default(),
         }
     }
 
@@ -68,6 +71,10 @@ impl Backend for FakeBackend {
             app("com.spotify.client", "Spotify", true),
             app("us.zoom.xos", "Zoom", false),
         ]
+    }
+
+    fn status(&self) -> EngineStatus {
+        self.status.clone()
     }
 
     fn meters(&self, device_id: &str) -> Option<MeterReading> {
