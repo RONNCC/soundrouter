@@ -25,6 +25,8 @@ pub trait Resolver {
     fn responsible_pid(&self, pid: i32) -> i32;
     /// (bundle id, display name) of the running GUI app with this pid.
     fn app_of_pid(&self, pid: i32) -> Option<(String, String)>;
+    /// Executable path of the process, used as a source key (`path:<exe>`) for processes with no bundle id.
+    fn exe_path(&self, pid: i32) -> Option<String>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,7 +54,14 @@ pub fn group(procs: &[ProcInfo], r: &dyn Resolver) -> Vec<AppGroup> {
                 p.bundle_id.clone(),
                 p.bundle_id.rsplit('.').next().unwrap_or("").to_owned(),
             ),
-            None => continue,
+            // Command-line players (afplay, sox, ffplay, python) have no bundle id: key them by executable.
+            None => match r.exe_path(p.pid) {
+                Some(exe) => {
+                    let name = exe.rsplit('/').next().unwrap_or(&exe).to_owned();
+                    (format!("path:{exe}"), name)
+                }
+                None => continue,
+            },
         };
         let g = map.entry(bundle_id.clone()).or_insert_with(|| AppGroup {
             bundle_id,
@@ -89,6 +98,7 @@ pub fn app_infos(groups: &[AppGroup]) -> Vec<AppInfo> {
 pub struct SystemResolver;
 
 unsafe extern "C" {
+    fn proc_pidpath(pid: i32, buf: *mut c_void, size: u32) -> i32;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
@@ -106,6 +116,11 @@ fn responsibility_fn() -> Option<unsafe extern "C" fn(i32) -> i32> {
 impl Resolver for SystemResolver {
     fn responsible_pid(&self, pid: i32) -> i32 {
         responsibility_fn().map_or(pid, |f| unsafe { f(pid) })
+    }
+    fn exe_path(&self, pid: i32) -> Option<String> {
+        let mut buf = [0u8; 4096];
+        let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
     }
     fn app_of_pid(&self, pid: i32) -> Option<(String, String)> {
         let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
@@ -151,6 +166,9 @@ mod tests {
         fn responsible_pid(&self, pid: i32) -> i32 {
             *self.0.get(&pid).unwrap_or(&pid)
         }
+        fn exe_path(&self, pid: i32) -> Option<String> {
+            (pid == 50 || pid == 51).then(|| "/usr/bin/afplay".to_owned())
+        }
         fn app_of_pid(&self, pid: i32) -> Option<(String, String)> {
             self.1
                 .get(&pid)
@@ -181,6 +199,8 @@ mod tests {
             p(3, 21, "com.google.Chrome.helper", false),
             p(4, 30, "com.example.daemon", false), // no GUI app: own bundle id
             p(5, 31, "", false),                   // unidentifiable: skipped
+            p(7, 50, "", true),                    // afplay: no bundle id, keyed by path
+            p(8, 51, "", false),                   // second afplay joins the same group
             p(6, 40, "com.apple.WebKit.GPU", false), // pid itself is an app
         ];
         let g = group(&procs, &r);
@@ -200,7 +220,13 @@ mod tests {
                 .any(|g| g.bundle_id == "com.example.daemon" && g.name == "daemon")
         );
         assert!(g.iter().any(|g| g.bundle_id == "com.apple.Safari"));
-        assert_eq!(g.len(), 3);
-        assert_eq!(app_infos(&g).len(), 3);
+        let ap = g
+            .iter()
+            .find(|g| g.bundle_id == "path:/usr/bin/afplay")
+            .unwrap();
+        assert_eq!((ap.name.as_str(), ap.objs.clone()), ("afplay", vec![7, 8]));
+        assert!(ap.running_output && ap.members.is_empty());
+        assert_eq!(g.len(), 4);
+        assert_eq!(app_infos(&g).len(), 4);
     }
 }
