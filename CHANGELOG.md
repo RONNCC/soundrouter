@@ -5,9 +5,13 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- Driver: each virtual device now has a volume and a mute control on its input and output scope (-64..0 dB, applied on the read side with no allocation; default 0 dB, unmuted), so apps and the system volume keys can control it. The hidden engine companion has none. Needs the new driver installed.
+- Driver: late or oversized `WriteMix` calls are counted per device and readable through the custom property `'srov'`.
+- Docs: driver clock/zero-timestamp contract, volume/mute gain placement and the default-device decisions in `docs/ARCHITECTURE.md`.
 - `packaging/engine-live-test.sh`: live check of the engine against the installed driver (app tap, volume, mute, channel routing, input reverts when the engine stops). The engine logs which main device each aggregate uses (`sr-cli -v run`).
 
 ### Changed
+- Packaging: with `SIGN_ID` the driver, `sr-cli`, app and dmg get the hardened runtime and a secure timestamp; the version comes from `[workspace.package]` in `Cargo.toml` and is stamped into both `Info.plist` files; the driver pkg removes an older driver before installing; `notarize.sh` checks signatures first and reports Apple's log on rejection; release workflow checks the tag, attaches checksums and labels unsigned builds. See `docs/RELEASING.md`.
 - New virtual devices, and the first-run "Loopback Audio" device, start with a Pass-Thru source wired 1→1, 2→2 (Loopback-style). Existing configs are not touched.
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
 

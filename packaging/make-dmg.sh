@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Build target/SoundRouter.dmg containing SoundRouter.app, an /Applications link and uninstall.sh.
+# SIGN_ID set: the dmg itself is signed too (notarization wants a signed container).
 set -euo pipefail
 [ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH" || true
 cd "$(dirname "$0")/.."
@@ -18,4 +19,8 @@ chmod 755 "$WORK/uninstall.sh"
 
 rm -f "$OUT"
 hdiutil create -volname SoundRouter -srcfolder "$WORK" -ov -format UDZO "$OUT"
+if [ -n "${SIGN_ID:-}" ]; then
+  codesign --force --timestamp --sign "$SIGN_ID" "$OUT"
+  codesign --verify --strict "$OUT"
+fi
 echo "built $OUT"

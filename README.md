@@ -35,7 +35,7 @@ packaging/make-dmg.sh              # target/SoundRouter.dmg
 
 `bundle-app.sh` builds `ThirdPartyLicenses.html` with cargo-about: `cargo install --locked cargo-about --features cli`.
 
-Distribution builds: set `SIGN_ID` ("Developer ID Application: ..."), `INSTALLER_ID` for `make-pkg.sh`, then `NOTARY_PROFILE=<profile> packaging/notarize.sh target/SoundRouter.pkg`.
+Distribution builds (Developer ID signing, notarization, the tag-triggered GitHub release workflow, and what to do without a Developer ID): [docs/RELEASING.md](docs/RELEASING.md).
 
 **Signing and privacy grants.** Every ad-hoc build is a new app identity, so macOS resets Microphone and System Audio Recording grants on each rebuild. Create a self-signed code-signing certificate once (Keychain Access > Certificate Assistant > Create a Certificate, name `SoundRouter Dev`, Self Signed Root, Code Signing), then `SIGN_ID="SoundRouter Dev" packaging/bundle-app.sh`.
 
