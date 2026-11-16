@@ -8,6 +8,8 @@ DRV=$APP/Contents/Resources/SoundRouter.driver
 
 # rustup shims first so rust-toolchain.toml selects the pinned toolchain
 export PATH="$HOME/.cargo/bin:$PATH"
+# macos-15 runners default to 15.0; keep the app runnable on the 14.2 minimum (matches build-driver.sh)
+export MACOSX_DEPLOYMENT_TARGET=14.0
 
 cargo build --release -p soundrouter-app -p sr-cli
 

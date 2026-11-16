@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       CERT_P12: ${{ secrets.CERT_P12 }}
       CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
