@@ -28,6 +28,8 @@ pub struct FakeBackend {
     pub status: EngineStatus,
     /// What `self_test` returns; `None` makes it fail.
     pub self_test: Option<SelfTest>,
+    /// Meters stay at silence: stands in for the engine when the real one could not start.
+    silent: bool,
 }
 
 impl FakeBackend {
@@ -43,6 +45,16 @@ impl FakeBackend {
                 rate: 48_000.0,
                 passed: true,
             }),
+            silent: false,
+        }
+    }
+
+    /// Placeholder for an engine that failed to start: accepts configs, plays and shows nothing.
+    pub fn silent() -> Self {
+        Self {
+            silent: true,
+            self_test: None, // never claim audio flows
+            ..Self::new()
         }
     }
 
@@ -120,7 +132,7 @@ impl Backend for FakeBackend {
         for (i, s) in dev.sources.iter().enumerate() {
             let levels: Vec<f32> = (0..s.channels)
                 .map(|c| {
-                    if s.muted {
+                    if s.muted || self.silent {
                         0.0
                     } else {
                         wave(t, i as f32 * 2.3 + f32::from(c) * 0.6)

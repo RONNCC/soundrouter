@@ -126,6 +126,13 @@ pub fn plus_circle(
     resp
 }
 
+/// Small × (remove) glyph, ~8 px across.
+pub fn xmark(p: &Painter, center: Pos2, c: Color32) {
+    let s = Stroke::new(1.4, c);
+    p.line_segment([center + vec2(-4.0, -4.0), center + vec2(4.0, 4.0)], s);
+    p.line_segment([center + vec2(-4.0, 4.0), center + vec2(4.0, -4.0)], s);
+}
+
 pub fn chevron(p: &Painter, center: Pos2, open: bool, color: Color32) {
     let s = Stroke::new(1.4, color);
     let (a, b, c) = if open {

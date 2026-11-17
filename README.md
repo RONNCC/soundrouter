@@ -10,6 +10,7 @@ A free, open-source alternative to Loopback and Soundflower for macOS, written i
 - Virtual audio devices (up to 16) that any app can pick as an input or output, published by a Rust AudioServerPlugIn driver.
 - Every new device is a Soundflower-style loopback out of the box: it starts with a Pass-Thru source wired 1→1, 2→2, so apps that play into it are heard on its input with no setup. Remove the wires or source to route differently.
 - Node-graph routing GUI (egui), dark and light themes.
+- Every source and monitor card has a × to remove it; a "Removed … · Undo" toast (6 s) brings back the card with its wires. Deleting a whole device offers the same Undo.
 - Per-app capture through CoreAudio process taps, with "Mute in original output" per app source and "Choose App…" for apps that are not running.
 - Device sources (microphones, interfaces), pass-thru sources, monitors (physical outputs), per-node volume and mute, level meters.
 - Menu-bar background mode: closing the window keeps routing alive; Dock reopen; Start at Login (per-user LaunchAgent).

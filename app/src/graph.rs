@@ -10,7 +10,7 @@ use crate::model::{Edit, Link, Port, can_link, ch_label, links};
 use crate::theme::{Tokens, semibold, tile_tint};
 use crate::widgets::{
     chevron, loops, menu_hint, meter, name_button, name_widget, plus_circle, slider_knob, switch,
-    tile,
+    tile, xmark,
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Popup, PopupCloseBehavior, Rect, Response,
@@ -18,7 +18,7 @@ use eframe::egui::{
     epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
 };
 use sr_core::backend::{AppInfo, HwDevice, MeterReading, TccStatus};
-use sr_core::config::{Monitor, Source, SourceKind, VirtualDevice};
+use sr_core::config::{Config, Monitor, Source, SourceKind, VirtualDevice};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -68,12 +68,16 @@ fn last_seen(name: &str, fallback: &str) -> String {
     if name.is_empty() { fallback } else { name }.to_string()
 }
 
-fn source_title(g: &GraphCtx, s: &Source) -> (String, &'static str) {
-    let (hw, apps) = (g.hw, g.apps);
+fn source_title(
+    hw: &[HwDevice],
+    apps: &[AppInfo],
+    installed: &[AppInfo],
+    s: &Source,
+) -> (String, &'static str) {
     match &s.kind {
         SourceKind::App { bundle_id } => (
             apps.iter()
-                .chain(g.installed)
+                .chain(installed)
                 .find(|a| &a.bundle_id == bundle_id)
                 .map_or_else(
                     || last_seen(&s.name, bundle_id.rsplit('.').next().unwrap_or(bundle_id)),
@@ -95,6 +99,24 @@ fn monitor_title(m: &Monitor, hw: &[HwDevice]) -> String {
     hw.iter()
         .find(|h| h.uid == m.device_uid)
         .map_or_else(|| last_seen(&m.name, &m.device_uid), |h| h.name.clone())
+}
+
+/// What a card removal removes, as the card names it, for the Undo toast.
+pub fn removed_title(
+    cfg: &Config,
+    edit: &Edit,
+    hw: &[HwDevice],
+    apps: &[AppInfo],
+    installed: &[AppInfo],
+) -> Option<String> {
+    Some(match *edit {
+        Edit::RemoveDevice(d) => cfg.devices.get(d)?.name.clone(),
+        Edit::RemoveSource(d, s) => {
+            source_title(hw, apps, installed, cfg.devices.get(d)?.sources.get(s)?).0
+        }
+        Edit::RemoveMonitor(d, m) => monitor_title(cfg.devices.get(d)?.monitors.get(m)?, hw),
+        _ => return None,
+    })
 }
 
 fn sources_summary(dev: &VirtualDevice) -> String {
@@ -616,7 +638,7 @@ fn card(
     let (title, _sub, on, vol_db, opt_key) = match c.id {
         CardId::Src(i) => {
             let s = &dev.sources[i];
-            let (title, sub) = source_title(g, s);
+            let (title, sub) = source_title(g.hw, g.apps, g.installed, s);
             (
                 title,
                 sub.to_string(),
@@ -689,7 +711,7 @@ fn card(
     let title_w = r.width()
         - 28.0
         - if on.is_some() {
-            62.0 + note_w.max(0.0)
+            84.0 + note_w.max(0.0)
         } else {
             0.0
         };
@@ -707,9 +729,28 @@ fn card(
         ui.interact(hit, Id::unique(("card_note", d, c.id)), Sense::hover())
             .widget_info(|| WidgetInfo::labeled(egui::Role::Label, true, format!("{title}: {n}")));
     }
+    if on.is_some() {
+        let (label, edit) = match c.id {
+            CardId::Src(i) => ("Remove", Edit::RemoveSource(d, i)),
+            CardId::Mon(i) => ("Remove", Edit::RemoveMonitor(d, i)),
+            CardId::Out(_) => unreachable!(),
+        };
+        let at = pos2(r.right() - 14.0 - 8.0, r.top() + HEAD_H / 2.0);
+        let x = ui.interact(
+            Rect::from_center_size(at, vec2(18.0, 18.0)),
+            Id::unique(("card_x", d, c.id)),
+            Sense::click(),
+        );
+        name_button(&x, &format!("{label} {title}"));
+        xmark(&painter, at, if x.hovered() { t.danger } else { t.text2 });
+        if x.clicked() {
+            edits.push(edit);
+        }
+        x.on_hover_text(format!("{label} {title}"));
+    }
     if let Some(on_now) = on {
         let sw = Rect::from_center_size(
-            pos2(r.right() - 14.0 - 16.0, r.top() + HEAD_H / 2.0),
+            pos2(r.right() - 14.0 - 22.0 - 16.0, r.top() + HEAD_H / 2.0),
             vec2(32.0, 18.0),
         );
         let new = switch(
@@ -964,7 +1005,7 @@ fn port_label(g: &GraphCtx, p: Port) -> String {
     match p {
         Port::Src { src, ch } => format!(
             "{} channel {} output",
-            source_title(g, &g.dev.sources[src]).0,
+            source_title(g.hw, g.apps, g.installed, &g.dev.sources[src]).0,
             ch + 1
         ),
         Port::OutIn { ch } => format!("Output channel {} input", ch + 1),

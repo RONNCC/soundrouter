@@ -938,6 +938,11 @@ mod snapshots {
     }
 
     #[test]
+    fn removed_card_offers_undo() {
+        both("removed", demo_config, None, |h| click(h, "Remove Safari"));
+    }
+
+    #[test]
     fn source_menu_open() {
         both("source_menu", demo_config, None, |h| click(h, "Add source"));
     }
@@ -1500,4 +1505,151 @@ fn after_deleting_the_settings_edits_are_not_written_back() {
         click(&mut h, "Mute Loopback Audio");
         assert_eq!(path.exists(), kept, "ticked {tick}");
     }
+}
+
+#[test]
+fn the_x_removes_a_source_with_its_wires_and_the_toast_undoes_it() {
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    let id = before.devices[0].sources[0].id.clone();
+    assert!(before.devices[0].wires.iter().any(|w| w.source == id));
+    click(&mut h, "Remove Safari");
+    let dev = &h.state().cfg.devices[0];
+    assert_eq!(dev.sources.len(), before.devices[0].sources.len() - 1);
+    assert!(dev.wires.iter().all(|w| w.source != id));
+    assert!(h.query_by_label("Safari enabled").is_none());
+    h.get_by_label("Removed Safari");
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before, "same source, same wires, same order");
+    h.get_by_label("Safari enabled");
+    assert!(!has(&h, "Undo") && !has(&h, "Removed Safari"));
+}
+
+/// Stream Mix with an unplugged microphone source named "Podcast Mic".
+fn gone_mic() -> Config {
+    let mut cfg = demo_config();
+    cfg.devices.swap(0, 1);
+    for s in &mut cfg.devices[0].sources {
+        if let SourceKind::Device { uid } = &mut s.kind {
+            *uid = "GoneMic".into();
+            s.name = "Podcast Mic".into();
+        }
+    }
+    cfg
+}
+
+#[test]
+fn the_x_removes_the_monitor_pass_thru_and_input_device_cards() {
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    click(&mut h, "Remove MacBook Pro Speakers");
+    assert!(h.state().cfg.devices[0].monitors.is_empty());
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before);
+    click(&mut h, "Remove Pass-Thru");
+    assert_eq!(h.state().cfg.devices[0].sources.len(), 2);
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before);
+    let mut h = open(gone_mic());
+    let before = h.state().cfg.clone();
+    click(&mut h, "Remove Podcast Mic");
+    assert_eq!(
+        h.state().cfg.devices[0].sources.len(),
+        before.devices[0].sources.len() - 1
+    );
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before);
+}
+
+#[test]
+fn every_removable_card_has_the_x_but_output_cards_do_not() {
+    let h = open(demo_config());
+    for name in ["Safari", "Spotify", "Pass-Thru", "MacBook Pro Speakers"] {
+        h.get_by_label(&format!("Remove {name}"));
+    }
+    assert!(h.query_by_label_contains("Remove Channels").is_none());
+}
+
+#[test]
+fn the_undo_toast_expires_and_the_next_edit_replaces_it() {
+    let mut h = open(demo_config());
+    click(&mut h, "Remove Safari");
+    until(&mut h, "undo to expire", |h| !has(h, "Undo"));
+    assert!(h.state().now > UNDO_SECS);
+    click(&mut h, "Remove Spotify");
+    h.get_by_label("Removed Spotify");
+    click(&mut h, "Mute Loopback Audio");
+    assert!(!has(&h, "Undo"), "a later edit makes the old undo unsafe");
+}
+
+#[test]
+fn deleting_a_device_can_be_undone_from_both_delete_buttons() {
+    for button in ["Delete", "Delete selected device"] {
+        let mut h = open(demo_config());
+        click(&mut h, "Select Stream Mix");
+        let before = h.state().cfg.clone();
+        click(&mut h, button);
+        assert_eq!(h.state().cfg.devices.len(), before.devices.len() - 1);
+        h.get_by_label("Removed Stream Mix");
+        click(&mut h, "Undo");
+        assert_eq!(h.state().cfg, before, "{button}");
+        assert_eq!(h.state().selected, 1);
+        h.get_by_label("Select Stream Mix");
+    }
+}
+
+#[test]
+fn a_failed_engine_start_shows_silence_and_a_standing_banner() {
+    let mut h = window(
+        demo_config(),
+        Box::new(FakeBackend::silent()),
+        None,
+        Theme::Dark,
+        false,
+    );
+    h.state_mut().engine_error = Some("no CoreAudio".into());
+    settle(&mut h);
+    let banner = "Audio engine unavailable: no CoreAudio. Routing is not running.";
+    h.get_by_label(banner);
+    {
+        let s = h.state().worker.shared.lock().unwrap();
+        assert!(!s.meters.is_empty());
+        for m in s.meters.values() {
+            assert!(m.channels.iter().all(|c| *c == 0.0));
+            assert!(m.sources.iter().all(|(_, l)| l.iter().all(|v| *v == 0.0)));
+        }
+    }
+    click(&mut h, "Mute Loopback Audio");
+    h.run_steps(300); // far longer than any toast
+    h.get_by_label(banner);
+    assert!(!has(&h, "Demo mode: synthetic audio, nothing is saved"));
+}
+
+#[test]
+fn a_hung_self_test_can_be_cancelled_or_times_out() {
+    let hang = |h: &mut Harness<App>| {
+        click(h, "Continue");
+        until(h, "self-test", |h| {
+            has(h, "Audio flows (-6 dBFS, 0 dropouts)")
+        });
+        h.state().worker.shared.lock().unwrap().self_test = SelfTestState::Running;
+        settle(h);
+    };
+    let mut h = setup_run(installed(), flowing());
+    hang(&mut h);
+    click(&mut h, "Cancel");
+    assert!(!has(&h, "Cancel") && !has(&h, "Loopback test"));
+
+    let mut h = setup_run(installed(), flowing());
+    hang(&mut h);
+    until(&mut h, "30 s timeout", |h| {
+        has(h, "The test did not finish")
+    });
+    assert!(h.state().now >= 30.0);
+    h.get_by_label("Copy diagnostics");
+    click(&mut h, "Retry");
+    until(&mut h, "retry result", |h| {
+        has(h, "Audio flows (-6 dBFS, 0 dropouts)")
+    });
+    assert!(!has(&h, "The test did not finish"));
 }

@@ -113,28 +113,33 @@ fn main() -> eframe::Result {
             #[cfg(not(target_os = "macos"))]
             let vibrancy = false;
 
-            let (cfg, path, toast, backend): (_, _, _, Box<dyn Backend + Send>) = if demo {
-                (
-                    fake::demo_config(),
-                    None,
-                    None,
-                    Box::new(fake::FakeBackend::new()),
-                )
-            } else {
-                let path = store::default_path();
-                let (cfg, msg) = path
-                    .as_deref()
-                    .map_or_else(|| (model::default_config(), None), store::load);
-                match real_backend() {
-                    Ok(b) => (cfg, path, msg, b),
-                    Err(e) => (
-                        cfg,
-                        path,
-                        Some(format!("Audio engine unavailable: {e:#}")),
+            let (cfg, path, toast, backend, unavailable): (_, _, _, Box<dyn Backend + Send>, _) =
+                if demo {
+                    (
+                        fake::demo_config(),
+                        None,
+                        None,
                         Box::new(fake::FakeBackend::new()),
-                    ),
-                }
-            };
+                        None,
+                    )
+                } else {
+                    let path = store::default_path();
+                    let (cfg, msg) = path
+                        .as_deref()
+                        .map_or_else(|| (model::default_config(), None), store::load);
+                    match real_backend() {
+                        Ok(b) => (cfg, path, msg, b, None),
+                        // The config is still loaded and saved, but nothing routes: silent
+                        // meters and a standing banner, never the demo's fake levels.
+                        Err(e) => (
+                            cfg,
+                            path,
+                            msg,
+                            Box::new(fake::FakeBackend::silent()),
+                            Some(format!("{e:#}")),
+                        ),
+                    }
+                };
             let worker = worker::Worker::spawn(backend, cc.egui_ctx.clone());
             if login::is_enabled() {
                 // The agent plist points at the executable that enabled it; follow the app if it moved.
@@ -151,11 +156,9 @@ fn main() -> eframe::Result {
                 quitting: false,
             };
             Ok(Box::new(
-                app::App::new(cfg, path, worker, toast, vibrancy, demo).background(
-                    tray,
-                    win,
-                    args.background,
-                ),
+                app::App::new(cfg, path, worker, toast, vibrancy, demo)
+                    .engine_unavailable(unavailable)
+                    .background(tray, win, args.background),
             ))
         }),
     )

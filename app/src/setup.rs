@@ -19,6 +19,8 @@ const MIC_SETTINGS: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
 /// The driver must show up in the HAL this long after the install script succeeded.
 const DRIVER_WAIT_SECS: f64 = 10.0;
+/// The loopback test must finish this long after the Verify step first saw it running.
+const SELF_TEST_SECS: f64 = 30.0;
 
 /// Where coreaudiod loads third-party HAL plug-ins from.
 pub const HAL_DIR: &str = "/Library/Audio/Plug-Ins/HAL";
@@ -181,6 +183,8 @@ pub struct Setup {
     copied: bool,
     demo: bool,
     shown: bool,
+    /// When the Verify step first saw the loopback test running; `None` while it is not.
+    test_since: Option<f64>,
 }
 
 impl Setup {
@@ -198,6 +202,7 @@ impl Setup {
             copied: false,
             demo: false,
             shown: false,
+            test_since: None,
         }
     }
 
@@ -322,6 +327,7 @@ impl Setup {
     fn close(&mut self) {
         self.open = false;
         self.step = Step::Welcome;
+        self.test_since = None;
     }
 
     fn sheet(&mut self, ctx: &Context, t: &Tokens, v: &View) -> Option<Action> {
@@ -500,7 +506,15 @@ impl Setup {
                 )
             }
             Step::Verify => {
+                let running = matches!(v.test, SelfTestState::Idle | SelfTestState::Running);
+                if !running {
+                    self.test_since = None;
+                }
+                let since = *self.test_since.get_or_insert(v.now);
+                let hung = running && v.now - since > SELF_TEST_SECS;
+                let running = running && !hung;
                 let (glyph, intro) = match v.test {
+                    _ if hung => (Glyph::Fail, "The tone did not come back."),
                     SelfTestState::Idle | SelfTestState::Running => (
                         Glyph::App,
                         "SoundRouter plays a quiet tone into the virtual device and listens for it to come back.",
@@ -515,7 +529,7 @@ impl Setup {
                     t,
                     &Sheet {
                         id: "setup_verify",
-                        buttons: !matches!(v.test, SelfTestState::Idle | SelfTestState::Running),
+                        buttons: true,
                         glyph,
                         title: "Check the audio path",
                         intro,
@@ -536,6 +550,13 @@ impl Setup {
                             },
                         );
                         rows.push(match v.test {
+                            _ if hung => Row {
+                                state: Status::Fail,
+                                title: "Loopback test",
+                                status: "Failed",
+                                detail: "The test did not finish",
+                                action: None,
+                            },
                             SelfTestState::Idle | SelfTestState::Running => Row {
                                 state: Status::Running,
                                 title: "Loopback test",
@@ -575,6 +596,7 @@ impl Setup {
                         });
                         checklist(ui, t, &rows);
                         match v.test {
+                            _ if hung => body(ui, t, "Try again, or copy diagnostics for support."),
                             SelfTestState::Idle | SelfTestState::Running => {
                                 progress(ui, t, "Playing a quiet tone through the virtual device…");
                             }
@@ -594,6 +616,30 @@ impl Setup {
                         }
                     },
                     |ui, s| match v.test {
+                        _ if running => buttons(
+                            ui,
+                            s,
+                            |_, _| {},
+                            |ui, s| {
+                                if button(ui, t, "Cancel", Kind::Secondary) {
+                                    s.close();
+                                }
+                            },
+                        ),
+                        _ if hung => buttons(
+                            ui,
+                            s,
+                            |ui, s| s.copy_button(ui, t, v),
+                            |ui, s| {
+                                if button(ui, t, "Retry", Kind::Primary) {
+                                    s.test_since = None;
+                                    action = Some(Action::Test);
+                                }
+                                if button(ui, t, "Close", Kind::Secondary) {
+                                    s.close();
+                                }
+                            },
+                        ),
                         SelfTestState::Idle | SelfTestState::Running => {}
                         SelfTestState::Done(Ok(r)) if r.passed => buttons(
                             ui,
@@ -611,6 +657,7 @@ impl Setup {
                             |ui, s| s.copy_button(ui, t, v),
                             |ui, s| {
                                 if button(ui, t, "Retry", Kind::Primary) {
+                                    s.test_since = None;
                                     action = Some(Action::Test);
                                 }
                                 if button(ui, t, "Close", Kind::Secondary) {

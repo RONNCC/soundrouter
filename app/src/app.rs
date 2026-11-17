@@ -27,6 +27,16 @@ pub const PERMISSION_BANNER: &str =
 const BLANK_NAME: &str = "A device name can't be empty.";
 /// Room for the traffic lights in the unified titlebar.
 const TITLEBAR_H: f32 = 46.0;
+/// How long "Removed … · Undo" stays up, in egui seconds (frame time, so tests step it).
+const UNDO_SECS: f64 = 6.0;
+
+/// The config as it was before a removal, kept briefly so the removal can be taken back.
+struct Undo {
+    name: String,
+    prev: Config,
+    selected: usize,
+    until: f64,
+}
 
 pub struct App {
     cfg: Config,
@@ -49,6 +59,11 @@ pub struct App {
     setup: Setup,
     /// The config has been sent to the engine at least once (and the driver is still there).
     applied: bool,
+    undo: Option<Undo>,
+    /// egui time of the current frame.
+    now: f64,
+    /// Why the real audio engine did not start; the app then only edits and saves the config.
+    engine_error: Option<String>,
 }
 
 /// Label and dot color for a device state; idle devices show no dot.
@@ -88,7 +103,16 @@ impl App {
             hide_in: 0,
             setup: Setup::system(),
             applied: false,
+            undo: None,
+            now: 0.0,
+            engine_error: None,
         }
+    }
+
+    /// The real engine failed to start: show why until a real one runs.
+    pub fn engine_unavailable(mut self, why: Option<String>) -> Self {
+        self.engine_error = why;
+        self
     }
 
     /// Keep routing when the window closes: menu-bar item plus close-to-hide state.
@@ -244,6 +268,7 @@ impl App {
             }
             Some(SetupAction::Demo) => {
                 self.demo = true;
+                self.engine_error = None;
                 self.path = None; // never overwrite the saved config with demo edits
                 self.cfg = crate::fake::demo_config();
                 self.applied = true;
@@ -279,7 +304,15 @@ impl App {
         let adds_input = edits
             .iter()
             .any(|e| matches!(e, Edit::AddSource(_, SourceKind::Device { .. }, _)));
+        let removed = {
+            let s = self.worker.shared.lock().unwrap();
+            let installed = self.graph.installed.get().map_or(&[][..], Vec::as_slice);
+            edits
+                .iter()
+                .find_map(|e| graph::removed_title(&self.cfg, e, &s.hardware, &s.apps, installed))
+        };
         let prev = self.cfg.clone();
+        let prev_selected = self.selected;
         let mut select_new = false;
         for e in edits {
             select_new |= e == Edit::NewDevice;
@@ -291,6 +324,12 @@ impl App {
             return;
         }
         self.toast = blank_rename.then(|| BLANK_NAME.to_string());
+        self.undo = removed.map(|name| Undo {
+            name,
+            prev,
+            selected: prev_selected,
+            until: self.now + UNDO_SECS,
+        });
         // A microphone is read through the Microphone permission: if macOS has not been asked yet,
         // hold the apply and let the setup sheet explain and ask first.
         if adds_input && self.engine_status().mic == TccStatus::Unknown {
@@ -303,6 +342,17 @@ impl App {
         if self.selected > last {
             self.selected = last;
         }
+        if self.applied {
+            self.worker.apply(&self.cfg);
+        }
+        self.save_pending = true;
+    }
+
+    /// Take back the last removal: the saved config goes through the normal apply and save.
+    fn undo_removal(&mut self) {
+        let Some(u) = self.undo.take() else { return };
+        self.cfg = u.prev;
+        self.selected = u.selected.min(self.cfg.devices.len().saturating_sub(1));
         if self.applied {
             self.worker.apply(&self.cfg);
         }
@@ -611,6 +661,49 @@ impl App {
                     .or(apply_error)
                     .or(es.background_error)
                     .or(warn);
+                if status.is_none()
+                    && let Some(u) = &self.undo
+                {
+                    let x = btn.right() + 18.0;
+                    let width = r.right() - 18.0 - x - reserved;
+                    let text = format!("Removed {} ·", u.name);
+                    let font = FontId::proportional(12.0);
+                    let tw = ui
+                        .painter()
+                        .layout_no_wrap(text.clone(), font.clone(), t.text2)
+                        .size()
+                        .x
+                        .min((width - 52.0).max(0.0));
+                    graph::text_left(ui, x, r.center().y, &text, font.clone(), t.text2, tw);
+                    ui.interact(
+                        Rect::from_min_size(pos2(x, r.top()), vec2(tw, r.height())),
+                        Id::unique("removed"),
+                        Sense::hover(),
+                    )
+                    .widget_info(|| {
+                        WidgetInfo::labeled(Role::Label, true, format!("Removed {}", u.name))
+                    });
+                    let hit = ui.interact(
+                        Rect::from_center_size(
+                            pos2(x + tw + 6.0 + 18.0, r.center().y),
+                            vec2(36.0, 22.0),
+                        ),
+                        Id::unique("undo"),
+                        Sense::click(),
+                    );
+                    name_button(&hit, "Undo");
+                    ui.painter().text(
+                        hit.rect.left_center(),
+                        Align2::LEFT_CENTER,
+                        "Undo",
+                        font,
+                        if hit.hovered() { t.text } else { t.accent },
+                    );
+                    if hit.clicked() {
+                        self.undo_removal();
+                    }
+                    return;
+                }
                 let (msg, color) = match status {
                     Some(m) => (m, t.danger),
                     None if self.demo => (
@@ -663,6 +756,21 @@ impl App {
                                 .spawn();
                         }
                     });
+                });
+        }
+
+        if let Some(why) = self.engine_error.clone().filter(|_| !self.demo) {
+            egui::Panel::top("engine_unavailable")
+                .frame(
+                    egui::Frame::default()
+                        .fill(t.card)
+                        .inner_margin(Margin::same(10)),
+                )
+                .show(ui, |ui| {
+                    ui.colored_label(
+                        t.danger,
+                        format!("Audio engine unavailable: {why}. Routing is not running."),
+                    );
                 });
         }
 
@@ -782,6 +890,10 @@ impl eframe::App for App {
             s.spacing.slider_rail_height = 4.0;
         });
         ctx.request_repaint_after(Duration::from_millis(33));
+        self.now = ctx.input(|i| i.time);
+        if self.undo.as_ref().is_some_and(|u| self.now > u.until) {
+            self.undo = None;
+        }
 
         let prev_selected = self.selected;
         let learned = {

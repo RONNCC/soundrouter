@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- App: source and monitor cards have a × ("Remove <name>") next to the On switch, and removing a card or deleting a device shows "Removed <name> · Undo" for 6 s.
+- App: the Verify step's self-test has a Cancel button and reports "The test did not finish" after 30 s.
 - Driver: each virtual device now has a volume and a mute control on its input and output scope (-64..0 dB, applied on the read side with no allocation; default 0 dB, unmuted), so apps and the system volume keys can control it. The hidden engine companion has none. Needs the new driver installed.
 - Driver: late or oversized `WriteMix` calls are counted per device and readable through the custom property `'srov'`.
 - Docs: driver clock/zero-timestamp contract, volume/mute gain placement and the default-device decisions in `docs/ARCHITECTURE.md`.
@@ -23,6 +25,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
 
 ### Fixed
+- App: when the audio engine cannot start, meters stay at silence and a standing banner says routing is not running (it no longer falls back to demo meters with a toast that vanishes).
 - Engine: an apply whose driver devices were slow to settle (many devices added or re-channeled at once) failed after 2 s and kept the previous config, so the next device event re-applied that old config and removed the devices the user had just added. The newest config is now kept even when the driver is late, the settle window is 6 s, and devices that are removed or change channel count are torn down before the driver changes them (a channel change under 16 running aggregates had crashed `coreaudiod` once).
 - App: a failed apply is written to the log file, not only shown in the status bar.
 - Driver: an app that plays into a SoundRouter device now hears itself on that device's input while the engine is not running (V.out -> V.in, Soundflower-style); before, the input stayed silent until the engine attached. With the engine running the input carries the routed mix as before.
