@@ -177,8 +177,10 @@ pub struct Slot {
     /// that device's I/O is stopped, so a device must only ever trust its own side.
     pub channels: [AtomicU32; 2],
     pub rate_idx: [AtomicU32; 2],
-    /// `FREED` counter value when this slot was last removed; 0 = never used.
-    pub freed_epoch: AtomicU64,
+    /// Rate index last asked for (by a client, or the default on activation): both sides converge on it.
+    pub rate_want: AtomicU32,
+    /// Host time (`now_ticks`) when this slot was last removed; 0 = never used. See `config::diff`.
+    pub freed_at: AtomicU64,
     pub meta: Mutex<(String, String)>, // (uid, name)
     /// Clients with I/O running per side (index = `Side as usize`).
     pub clients: [AtomicU32; 2],
@@ -203,7 +205,8 @@ impl Slot {
             alive: AtomicBool::new(false),
             channels: [AtomicU32::new(2), AtomicU32::new(2)],
             rate_idx: [AtomicU32::new(0), AtomicU32::new(0)],
-            freed_epoch: AtomicU64::new(0),
+            rate_want: AtomicU32::new(0),
+            freed_at: AtomicU64::new(0),
             meta: Mutex::new((String::new(), String::new())),
             clients: [AtomicU32::new(0), AtomicU32::new(0)],
             anchor: AtomicU64::new(0),
@@ -229,7 +232,8 @@ impl Slot {
             && self.rate_idx[0].load(Acquire) == self.rate_idx[1].load(Acquire)
     }
     /// Format changes that bring a pair with mismatched sides back in sync: channels follow the wanted
-    /// count, the rate follows V. Only sides that differ are listed.
+    /// count, the rate follows the last requested one (`rate_want`), so a pass that runs while a rate
+    /// change has landed on one side only never sends the other side back. Only sides that differ are listed.
     pub fn lagging(&self, want_channels: Option<u16>) -> Vec<(Side, Change)> {
         let mut out = vec![];
         let target = want_channels.map_or(self.channels(Side::Visible), u32::from);
@@ -238,16 +242,17 @@ impl Slot {
                 out.push((side, Change::Channels(target as u16)));
             }
         }
-        let rate = self.rate_idx[0].load(Acquire) as usize;
-        if self.rate_idx[1].load(Acquire) as usize != rate {
-            out.push((Side::Engine, Change::Rate(rate)));
+        let rate = self.rate_want.load(Acquire);
+        for side in [Side::Visible, Side::Engine] {
+            if self.rate_idx[side as usize].load(Acquire) != rate {
+                out.push((side, Change::Rate(rate as usize)));
+            }
         }
         out
     }
-    /// Mark this slot as just freed; `diff` hands out the longest-free slots first.
+    /// Mark this slot as just freed: `diff` keeps it out of use until the removal settled.
     pub fn mark_freed(&self) {
-        self.freed_epoch
-            .store(FREED.fetch_add(1, Relaxed) + 1, Release);
+        self.freed_at.store(now_ticks(), Release);
     }
     pub fn ring(&self, a: bool) -> Option<&Ring> {
         if a {
@@ -283,6 +288,7 @@ impl Slot {
             self.channels[side].store(d.channels as u32, Release);
             self.rate_idx[side].store(default, Release);
         }
+        self.rate_want.store(default, Release);
         for c in &self.clients {
             c.store(0, Release);
         }
@@ -297,9 +303,6 @@ impl Slot {
         self.alive.store(true, Release);
     }
 }
-
-/// Counts slot removals; see `Slot::freed_epoch`.
-static FREED: AtomicU64 = AtomicU64::new(0);
 
 /// Readable window is half the ring and must cover WriteMix running ~2 client buffers ahead of now plus
 /// ReadInput starting ~1 behind, for client buffers up to 4096 frames. Sized for `MAX_CHANNELS`:
@@ -467,7 +470,8 @@ mod tests {
             vec![(Side::Engine, Change::Channels(8))]
         );
         s.channels[1].store(8, Release);
-        s.rate_idx[0].store(2, Release); // rate landed on V only
+        s.rate_want.store(2, Release); // a client asked for rate 2 ...
+        s.rate_idx[0].store(2, Release); // ... and it landed on V only
         assert_eq!(s.lagging(Some(8)), vec![(Side::Engine, Change::Rate(2))]);
         s.channels[0].store(2, Release); // V lags the wanted count instead
         assert_eq!(
@@ -477,6 +481,18 @@ mod tests {
                 (Side::Engine, Change::Rate(2))
             ]
         );
+    }
+
+    #[test]
+    fn a_rate_change_that_landed_on_the_engine_side_first_is_completed_not_undone() {
+        // The HAL applies the pair's rate change to C first; a reconcile pass runs before V's lands.
+        let s = Slot::new();
+        s.rate_want.store(2, Release);
+        s.rate_idx[1].store(2, Release);
+        assert_eq!(s.lagging(Some(2)), vec![(Side::Visible, Change::Rate(2))]);
+        // The re-request lands: the pair is in sync and nothing more is asked.
+        s.rate_idx[0].store(2, Release);
+        assert!(s.in_sync() && s.lagging(Some(2)).is_empty());
     }
 
     #[test]

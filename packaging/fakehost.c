@@ -3,6 +3,7 @@
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -20,7 +21,9 @@ static AudioServerPlugInDriverRef gDrv;
 static struct { AudioObjectID o; UInt32 s; } gNL[256]; // every PropertiesChanged the driver sent since the last reset
 static volatile int gNLn;
 static volatile int gProbe, gGap; // 6c: while gProbe, a PLUGIN DeviceList notification runs gapProbe on the notifying (worker) thread
+static volatile int gStorm; // 6d: likewise for stormProbe
 static void gapProbe(void);
+static void stormProbe(void);
 
 static OSStatus PropsChanged(AudioServerPlugInHostRef h, AudioObjectID o, UInt32 n, const AudioObjectPropertyAddress* a) {
     for (UInt32 i = 0; i < n; i++) {
@@ -29,6 +32,7 @@ static OSStatus PropsChanged(AudioServerPlugInHostRef h, AudioObjectID o, UInt32
         int k = __atomic_fetch_add(&gNLn, 1, __ATOMIC_SEQ_CST);
         if (k < 256) { gNL[k].o = o; gNL[k].s = a[i].mSelector; }
         if (gProbe && o == kAudioObjectPlugInObject && a[i].mSelector == kAudioPlugInPropertyDeviceList) gapProbe();
+        if (gStorm && o == kAudioObjectPlugInObject && a[i].mSelector == kAudioPlugInPropertyDeviceList) stormProbe();
     }
     __atomic_add_fetch(&gNotifies, 1, __ATOMIC_SEQ_CST);
     return 0;
@@ -202,6 +206,22 @@ static void gapProbe(void) {
     if (byUID("sw:15") || byUID("sw:wide")) return;
     CHECK(staleReadClean(0) && staleReadClean(1));
     gGap = 1;
+}
+// 6d: every DeviceList notification during the storm. The storm started at gStormT0, so any slot freed by it was freed
+// after that: until 1 s (the driver's TEARDOWN) later, the stale 2-channel ids of slot 15 must not read as a wider device.
+// One-sided in time: scheduling delays only make the re-creation later, never earlier. All on one reconcile thread.
+static uint64_t gStormT0; static double gTps;
+static pthread_t gStormThread; static volatile int gStormNotes, gStormThreads;
+static void stormProbe(void) {
+    pthread_t me = pthread_self();
+    if (!gStormNotes++) gStormThread = me;
+    if (!pthread_equal(me, gStormThread)) gStormThreads = 2;
+    for (int k = 0; k < 2; k++) {
+        if (staleReadClean(k)) continue;
+        double since = (double)(mach_absolute_time() - gStormT0) / gTps;
+        printf("  storm: slot 15 re-created %.3f s after the storm started\n", since);
+        CHECK(since >= 1.0);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -406,7 +426,23 @@ int main(int argc, char** argv) {
         g.mSampleRate = 48000;
         CHECK(setFmt(ci2, kAudioStreamPropertyPhysicalFormat, g) == 0);
         CHECK(rateOf(V2) == 48000 && rateOf(C2) == 48000 && fmtOf(vi2).mSampleRate == 48000);
-        printf("ok sample rate 48k->44.1k->96k->48k on V and C, unsupported formats refused\n");
+        // A reconcile pass that runs while a rate change landed on C only must complete it (ask V again), not send C
+        // back to V's old rate: that left the pair mismatched, so silent, until the next srcf set.
+        gDefer = 1; gQn = 0;
+        CHECK(setRate(V2, 44100, 8) == 0 && gQn == 2);
+        int qc = gQ[0].d == C2 ? 0 : 1;
+        CHECK(gQ[qc].d == C2 && D->PerformDeviceConfigurationChange(gDrv, C2, gQ[qc].a, NULL) == 0);
+        CHECK(rateOf(C2) == 44100 && rateOf(V2) == 48000);
+        const char* rn2[] = { "Loopback 1", "Rate Two" };
+        CHECK(setConfig(cfg(2, uid2, rn2, ch2)) == 0); // a rename: one reconcile pass, which re-asks the laggard
+        for (int i = 0; i < 400 && gQn < 3; i++) usleep(5000);
+        CHECK(gQn == 3);
+        for (int i = 0; i < gQn; i++) if (i != qc) CHECK(D->PerformDeviceConfigurationChange(gDrv, gQ[i].d, gQ[i].a, NULL) == 0);
+        gDefer = 0;
+        CHECK(rateOf(V2) == 44100 && rateOf(C2) == 44100);
+        CHECK(setRate(V2, 48000, 8) == 0 && rateOf(V2) == 48000 && rateOf(C2) == 48000);
+        CHECK(setConfig(cfg(2, uid2, nm2, ch2)) == 0 && nameIs(V2, "Loopback 2"));
+        printf("ok sample rate 48k->44.1k->96k->48k on V and C, unsupported formats refused, a pass mid-change completes it\n");
     }
 
     // 4e. two srcf sets back to back (no wait): the last list wins, nothing is left over from the others.
@@ -690,6 +726,39 @@ int main(int argc, char** argv) {
         CHECK(w && nDevices() == 2 * MAXDEV && chans(stream(w, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(byUID("sw:wide.engine"), kAudioObjectPropertyScopeInput)) == 8);
         gProbe = 0;
         printf("ok full-pool swap: freed slot not reused in the same pass, no overrun\n");
+    }
+
+    // 6d. regression (heap overflow in coreaudiod): a storm of srcf sets on a full pool, each swapping the last device
+    // for a wider one (4, 6, 8 ch). A reconcile must not hand out a slot that another one freed milliseconds earlier:
+    // within the teardown time the HAL may still run I/O on the old ids with the old (2-channel) buffer.
+    {
+        char u[MAXDEV][16], n[MAXDEV][16]; const char* up[MAXDEV]; const char* np[MAXDEV]; int cc[MAXDEV];
+        for (int i = 0; i < MAXDEV; i++) { snprintf(u[i], 16, "sw:%d", i); snprintf(n[i], 16, "Sw %d", i); up[i] = u[i]; np[i] = n[i]; cc[i] = 2; }
+        CHECK(setConfig(cfg(MAXDEV, up, np, cc)) == 0); // sw:wide (8 ch) back to a 2-channel sw:15
+        for (int i = 0; i < 400 && !byUID("sw:15"); i++) usleep(10000);
+        AudioObjectID oldV = byUID("sw:15"), oldC = byUID("sw:15.engine");
+        CHECK(nDevices() == 2 * MAXDEV && oldV && oldC && chans(stream(oldV, kAudioObjectPropertyScopeInput)) == 2);
+        gStaleDev[0] = oldV; gStaleDev[1] = oldC;
+        gStaleSt[0] = stream(oldV, kAudioObjectPropertyScopeInput); gStaleSt[1] = stream(oldC, kAudioObjectPropertyScopeInput);
+        CHECK(gStaleSt[0] && gStaleSt[1] && staleReadClean(0) && staleReadClean(1));
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb); gTps = 1e9 * tb.denom / tb.numer;
+        AudioObjectPropertyAddress sa = addr('srcf', kAudioObjectPropertyScopeGlobal);
+        const char* su[] = { "st:4", "st:6", "st:8" }; const char* sn[] = { "St 4", "St 6", "St 8" };
+        gStormT0 = mach_absolute_time(); gStorm = 1;
+        for (int k = 0; k < 3; k++) {
+            up[15] = su[k]; np[15] = sn[k]; cc[15] = 4 + 2 * k;
+            CFArrayRef want = cfg(MAXDEV, up, np, cc);
+            CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &sa, 0, NULL, sizeof want, &want) == 0);
+            usleep(2000);
+        }
+        for (int i = 0; i < 400 && !byUID("st:8"); i++) usleep(10000);
+        usleep(300000); // a straggling pass would announce here
+        gStorm = 0;
+        AudioObjectID w = byUID("st:8");
+        CHECK(w && nDevices() == 2 * MAXDEV && !byUID("st:4") && !byUID("st:6") && !byUID("sw:15"));
+        CHECK(chans(stream(w, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(byUID("st:8.engine"), kAudioObjectPropertyScopeInput)) == 8);
+        CHECK(gStormNotes > 0 && gStormThreads < 2); // reconciles ran on a single worker thread
+        printf("ok srcf storm on a full pool: no slot reused before teardown, one reconcile thread\n");
     }
 
     // 7. remove all devices.

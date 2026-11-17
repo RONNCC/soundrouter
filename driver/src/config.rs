@@ -48,17 +48,27 @@ pub enum Op {
 }
 
 /// Steps that turn the live slots into `want` (already validated, so `want.len() <= slots.len()`).
-/// `freed[s]` is the removal epoch of slot `s` (0 = never used). Adds take never-used slots first,
-/// then the longest-free ones, so the HAL can finish tearing a removed device down before its ids return.
-pub fn diff(slots: &[Option<DriverDevice>], freed: &[u64], want: &[DriverDevice]) -> Vec<Op> {
+/// `freed[s]` is when slot `s` was last removed (0 = never used), on the same clock as `now`. A slot is
+/// quarantined until `settle` after its removal: the HAL may still run I/O on its ids with the old
+/// buffers, so handing them to a wider device would overflow them. That holds however many passes run.
+/// Adds take never-used slots first, then the longest-free ones.
+pub fn diff(
+    slots: &[Option<DriverDevice>],
+    freed: &[u64],
+    now: u64,
+    settle: u64,
+    want: &[DriverDevice],
+) -> Vec<Op> {
     let mut ops = vec![];
-    // A slot freed in this pass is never handed out in it: the HAL may still use its ids until the
-    // removal was announced and processed, so the adds that did not fit wait for a later pass.
+    // Slots freed in this pass are live in `slots`, so never handed out in it either; adds that do not
+    // fit wait for a later pass.
     let mut empty = vec![];
     let mut kept = vec![false; want.len()];
     for (s, cur) in slots.iter().enumerate() {
         let Some(cur) = cur else {
-            empty.push(s);
+            if freed[s] == 0 || now.saturating_sub(freed[s]) >= settle {
+                empty.push(s);
+            }
             continue;
         };
         match want.iter().position(|w| w.uid == cur.uid) {
@@ -135,19 +145,94 @@ mod tests {
     }
 
     #[test]
-    fn diff_does_not_reuse_just_freed_slot() {
-        // Slot 0 was freed in the previous pass (epoch 5), slot 1 never used, slot 2 freed long ago (epoch 2).
+    fn diff_quarantines_recently_freed_slots() {
+        // Slot 0 freed at t=5, slot 1 never used, slot 2 freed at t=2; quarantine 3.
         let slots = vec![None, None, None];
+        let want = [d("a", "A", 2), d("b", "B", 2), d("c", "C", 2)];
         assert_eq!(
-            diff(
-                &slots,
-                &[5, 0, 2],
-                &[d("a", "A", 2), d("b", "B", 2), d("c", "C", 2)]
-            ),
+            diff(&slots, &[5, 0, 2], 6, 3, &want),
+            vec![Op::Add(1, d("a", "A", 2)), Op::Add(2, d("b", "B", 2))]
+        );
+        // Once slot 0 settled it is handed out, after the never-used and the longer-free slots.
+        assert_eq!(
+            diff(&slots, &[5, 0, 2], 8, 3, &want),
             vec![
                 Op::Add(1, d("a", "A", 2)),
                 Op::Add(2, d("b", "B", 2)),
                 Op::Add(0, d("c", "C", 2)),
+            ]
+        );
+    }
+
+    /// Quarantine in the simulations below (think ms).
+    const Q: u64 = 1000;
+
+    /// Applies `diff` at time `t` like `pass` does and checks that no add takes a slot inside its quarantine.
+    fn apply(slots: &mut [Option<DriverDevice>], freed: &mut [u64], t: u64, want: &[DriverDevice]) {
+        for op in diff(slots, freed, t, Q, want) {
+            match op {
+                Op::Remove(s) => {
+                    assert!(slots[s].take().is_some());
+                    freed[s] = t;
+                }
+                Op::Rename(s, n) => slots[s].as_mut().unwrap().name = n,
+                Op::Channels(s, c) => slots[s].as_mut().unwrap().channels = c,
+                Op::Add(s, dev) => {
+                    assert!(
+                        freed[s] == 0 || t - freed[s] >= Q,
+                        "slot {s} freed at {} reused at {t}",
+                        freed[s]
+                    );
+                    assert!(slots[s].replace(dev).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rapid_lists_on_a_full_pool_never_reuse_a_slot_inside_the_quarantine() {
+        // Full pool; A, B, C swap the last device for wider ones in quick succession, then D replaces C
+        // after it was placed. A pass runs every tick, as concurrent reconciles could: the quarantine must
+        // hold however many passes run, not only within one.
+        let base: Vec<_> = (0..MAX_DEVICES - 1)
+            .map(|i| d(&format!("u{i}"), "n", 2))
+            .collect();
+        let with = |last: DriverDevice| [base.clone(), vec![last]].concat();
+        let lists = [
+            (0, with(d("a", "A", 4))),
+            (5, with(d("b", "B", 6))),
+            (10, with(d("c", "C", 8))),
+            (1500, with(d("d", "D", 16))),
+        ];
+        let mut slots: Vec<_> = with(d("old", "O", 2)).into_iter().map(Some).collect();
+        let mut freed = vec![0; MAX_DEVICES];
+        // (time, uid) each time the last slot's occupant changes.
+        let mut history = vec![(0, Some("old".to_string()))];
+        for t in 1..4000 {
+            let want = &lists.iter().rfind(|(at, _)| *at <= t).unwrap().1;
+            apply(&mut slots, &mut freed, t, want);
+            let now = slots[MAX_DEVICES - 1].as_ref().map(|x| x.uid.clone());
+            if history.last().unwrap().1 != now {
+                history.push((t, now));
+            }
+        }
+        assert_eq!(
+            slots,
+            with(d("d", "D", 16))
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>()
+        );
+        // The slot sits empty for exactly Q after each removal; A and B never get it, C waits for it.
+        let s = |u: &str| Some(u.to_string());
+        assert_eq!(
+            history,
+            [
+                (0, s("old")),
+                (1, None),
+                (1 + Q, s("c")),
+                (1500, None),
+                (1500 + Q, s("d"))
             ]
         );
     }
@@ -167,7 +252,7 @@ mod tests {
             d("m", "M", 1),
         ];
         assert_eq!(
-            diff(&slots, &[0; 4], &want),
+            diff(&slots, &[0; 4], 1, Q, &want),
             vec![
                 Op::Remove(1),
                 Op::Rename(3, "C2".into()),
@@ -175,15 +260,16 @@ mod tests {
                 Op::Add(2, d("n", "N", 4)),
             ]
         );
-        // "m" did not fit: slot 1 was freed in that pass, so it is only handed out in the next one.
+        // "m" did not fit: slot 1 was freed in that pass, so it is only handed out once it settled.
         let next = vec![
             Some(d("a", "A", 2)),
             None,
             Some(d("n", "N", 4)),
             Some(d("c", "C2", 16)),
         ];
+        assert!(diff(&next, &[0, 1, 0, 0], Q, Q, &want).is_empty());
         assert_eq!(
-            diff(&next, &[0, 1, 0, 0], &want),
+            diff(&next, &[0, 1, 0, 0], 1 + Q, Q, &want),
             vec![Op::Add(1, d("m", "M", 1))]
         );
     }
@@ -196,13 +282,13 @@ mod tests {
             .collect();
         let mut want: Vec<_> = slots.iter().flatten().cloned().collect();
         want[15] = d("wide", "w", 8);
-        let ops = diff(&slots, &[0; MAX_DEVICES], &want);
+        let ops = diff(&slots, &[0; MAX_DEVICES], 1, Q, &want);
         assert_eq!(ops, vec![Op::Remove(15)]);
         slots[15] = None;
         let mut freed = [0; MAX_DEVICES];
         freed[15] = 1;
         assert_eq!(
-            diff(&slots, &freed, &want),
+            diff(&slots, &freed, 1 + Q, Q, &want),
             vec![Op::Add(15, d("wide", "w", 8))]
         );
     }
@@ -210,12 +296,12 @@ mod tests {
     #[test]
     fn diff_noop_and_full_replace() {
         let cur = vec![Some(d("a", "A", 2)), None];
-        assert!(diff(&cur, &[0; 2], &[d("a", "A", 2)]).is_empty());
+        assert!(diff(&cur, &[0; 2], 1, Q, &[d("a", "A", 2)]).is_empty());
         assert_eq!(
-            diff(&cur, &[0; 2], &[d("z", "Z", 2)]),
+            diff(&cur, &[0; 2], 1, Q, &[d("z", "Z", 2)]),
             vec![Op::Remove(0), Op::Add(1, d("z", "Z", 2))]
         );
-        assert_eq!(diff(&cur, &[0; 2], &[]), vec![Op::Remove(0)]);
+        assert_eq!(diff(&cur, &[0; 2], 1, Q, &[]), vec![Op::Remove(0)]);
     }
 
     use proptest::prelude::*;
@@ -237,20 +323,24 @@ mod tests {
     }
 
     proptest! {
-        /// Replays `diff` the way `reconcile` does (ops in order, removals stamp a rising epoch) over any
-        /// sequence of lists and checks the pool after every step.
+        /// Replays `diff` the way `reconcile` does (ops in order, removals stamp the pass time, a second pass
+        /// one quarantine later) over any sequence of lists arriving at any gaps, and checks the pool after every step.
         #[test]
-        fn diff_keeps_the_slot_pool_consistent(steps in prop::collection::vec(want_list(), 1..30)) {
+        fn diff_keeps_the_slot_pool_consistent(steps in prop::collection::vec((want_list(), 0..2 * Q), 1..30)) {
             let mut slots: Vec<Option<DriverDevice>> = vec![None; MAX_DEVICES];
             let mut freed = vec![0u64; MAX_DEVICES];
-            let mut epoch = 0;
-            for want in steps {
+            let mut t = 1;
+            for (want, gap) in steps {
+                t += gap;
                 let before = slots.clone();
                 let freed_before = freed.clone();
                 let (mut removed, mut added) = (HashSet::new(), vec![]);
-                // Pass 1, then (like `reconcile`) a second pass when some wanted devices did not fit.
+                // Pass 1, then (like `reconcile`) a second pass after the settle time when some wanted devices did not fit.
                 for pass in 0..2 {
-                    let ops = diff(&slots, &freed, &want);
+                    if pass == 1 {
+                        t += Q;
+                    }
+                    let ops = diff(&slots, &freed, t, Q, &want);
                     if pass == 1 {
                         prop_assert!(ops.iter().all(|o| matches!(o, Op::Add(..))), "second pass must only add");
                     }
@@ -258,14 +348,14 @@ mod tests {
                         match op {
                             Op::Remove(s) => {
                                 prop_assert!(slots[s].take().is_some(), "remove of empty slot {s}");
-                                epoch += 1;
-                                freed[s] = epoch;
+                                freed[s] = t;
                                 removed.insert(s);
                             }
                             Op::Rename(s, n) => slots[s].as_mut().unwrap().name = n,
                             Op::Channels(s, c) => slots[s].as_mut().unwrap().channels = c,
                             Op::Add(s, dev) => {
                                 prop_assert!(slots[s].is_none(), "add into occupied slot {s}");
+                                prop_assert!(freed[s] == 0 || t - freed[s] >= Q, "slot {s} reused inside its quarantine");
                                 slots[s] = Some(dev);
                                 if pass == 0 {
                                     added.push(s);

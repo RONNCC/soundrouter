@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering::*;
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 const UNKNOWN_PROP: OSStatus = kAudioHardwareUnknownPropertyError as OSStatus;
 const BAD_SIZE: OSStatus = kAudioHardwareBadPropertySizeError as OSStatus;
@@ -27,13 +28,46 @@ pub fn default_devices() -> Vec<DriverDevice> {
 /// How long the HAL gets to tear removed devices down before their slots are handed out again.
 const TEARDOWN: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Make the slots match `WANTED`, in up to two passes: a slot freed in a pass is not reused in it, so
-/// when wanted devices are left over, the removals are announced, `settle` runs (the HAL tears the
-/// old devices down) and a second pass places the rest.
-fn reconcile(announce: bool, settle: impl FnOnce()) {
-    if pass(announce) && announce {
+/// Make the slots match `WANTED`. A freed slot is quarantined for `TEARDOWN`, so when wanted devices are
+/// left over, the removals are announced, `settle` runs (the HAL tears the old devices down) and another
+/// pass places the rest. Bounded: a pass after the quarantine always fits everything wanted.
+fn reconcile(announce: bool, settle: impl Fn()) {
+    let mut left = pass(announce);
+    for _ in 0..4 {
+        if !(left && announce) {
+            return;
+        }
         settle();
-        pass(true);
+        left = pass(true);
+    }
+}
+
+/// Reconcile requests for the single worker: `pending` coalesces requests (each run applies the newest
+/// `WANTED`), `running` says the worker thread exists. One worker means passes never race each other.
+struct Work {
+    pending: bool,
+    running: bool,
+}
+static WORK: Mutex<Work> = Mutex::new(Work {
+    pending: false,
+    running: false,
+});
+static WAKE: Condvar = Condvar::new();
+
+fn work() -> MutexGuard<'static, Work> {
+    WORK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn worker() {
+    loop {
+        {
+            let mut w = work();
+            while !w.pending {
+                w = WAKE.wait(w).unwrap_or_else(PoisonError::into_inner);
+            }
+            w.pending = false;
+        }
+        reconcile(true, || std::thread::sleep(TEARDOWN));
     }
 }
 
@@ -42,10 +76,11 @@ fn pass(announce: bool) -> bool {
     let _g = apply_lock();
     let want = wanted().clone();
     let cur: Vec<_> = SLOTS.iter().map(Slot::snapshot).collect();
-    let freed: Vec<_> = SLOTS.iter().map(|s| s.freed_epoch.load(Acquire)).collect();
+    let freed: Vec<_> = SLOTS.iter().map(|s| s.freed_at.load(Acquire)).collect();
+    let settle = (TEARDOWN.as_secs_f64() * ticks_per_second()) as u64;
     let mut list_changed = false;
     let mut changing = [false; MAX_DEVICES];
-    for op in diff(&cur, &freed, &want) {
+    for op in diff(&cur, &freed, now_ticks(), settle, &want) {
         match op {
             Op::Remove(s) => {
                 SLOTS[s].alive.store(false, Release);
@@ -366,7 +401,9 @@ pub unsafe extern "C" fn set_data(
     let Some(i) = rate_index(rate) else {
         return kAudioDeviceUnsupportedFormatError as OSStatus;
     };
-    // Both devices of the pair must follow, or one side would run at a different rate.
+    // Both devices of the pair must follow, or one side would run at a different rate. A reconcile pass
+    // that runs before both changes landed re-asks the laggard for this rate (`Slot::lagging`).
+    slot.rate_want.store(i as u32, Release);
     for side in [Side::Visible, Side::Engine] {
         if i as u32 != slot.rate_idx[side as usize].load(Acquire) {
             request_change(encode(s, side, Part::Device), &Change::Rate(i));
@@ -403,7 +440,7 @@ fn set_control(level: &Level, obj: u32, sel: u32, sz: u32, data: *const c_void) 
     0
 }
 
-/// Replace the device list: validate, persist, then apply on a worker thread
+/// Replace the device list: validate, persist, then wake the reconcile worker
 /// (host notifications must not come from inside a property call).
 fn set_devices(sz: u32, data: *const c_void) -> OSStatus {
     if sz as usize != size_of::<CFPropertyListRef>() {
@@ -420,8 +457,14 @@ fn set_devices(sz: u32, data: *const c_void) -> OSStatus {
         unsafe { store(&list) };
         *w = list;
     }
-    let _ = std::thread::Builder::new()
-        .name("sr-reconcile".into())
-        .spawn(|| reconcile(true, || std::thread::sleep(TEARDOWN)));
+    let mut w = work();
+    w.pending = true;
+    if !w.running {
+        w.running = std::thread::Builder::new()
+            .name("sr-reconcile".into())
+            .spawn(worker)
+            .is_ok();
+    }
+    WAKE.notify_one();
     0
 }
