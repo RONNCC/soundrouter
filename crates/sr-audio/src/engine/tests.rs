@@ -889,3 +889,24 @@ fn io_retry_is_bounded_and_reset_by_success() {
     assert!(io_retry(&mut f, &[], &id).is_empty());
     assert_eq!(io_retry(&mut f, &id, &[]), set(&["v1"]));
 }
+
+#[test]
+fn apply_keeps_the_newest_config_when_the_driver_does_not_settle() {
+    let mut g = Inner::default();
+    let old = Config {
+        devices: vec![vdev(vec![], vec![], vec![])],
+        ..Config::default()
+    };
+    g.cfg = Some(old.clone());
+    let mut new = old.clone();
+    new.devices[0].channels = 8;
+    let slow: fn(&Config) -> Result<()> = |_| bail!("driver devices not ready");
+    assert!(apply_locked(&mut g, &new, slow).is_err());
+    // A background apply after the next device event must rebuild `new`, not re-apply (undo to) `old`.
+    assert_eq!(g.cfg, Some(new));
+    // An invalid config is refused before anything is kept.
+    let mut bad = old.clone();
+    bad.devices[0].channels = 3;
+    assert!(apply_locked(&mut g, &bad, slow).is_err());
+    assert_eq!(g.cfg.unwrap().devices[0].channels, 8);
+}

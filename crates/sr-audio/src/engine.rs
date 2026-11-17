@@ -468,7 +468,7 @@ impl Retry {
 fn run_op(g: &mut Inner, op: Op) -> Result<()> {
     match op {
         Op::Apply => match g.cfg.clone() {
-            Some(cfg) => apply_locked(g, &cfg),
+            Some(cfg) => apply_locked(g, &cfg, sync_driver),
             None => Ok(()),
         },
         Op::Retap => retap(g),
@@ -640,7 +640,7 @@ fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
 
 impl Backend for Engine {
     fn apply(&mut self, cfg: &Config) -> Result<()> {
-        apply_locked(&mut lock(&self.inner), cfg)
+        apply_locked(&mut lock(&self.inner), cfg, sync_driver)
     }
 
     fn hardware(&self) -> Vec<HwDevice> {
@@ -830,7 +830,8 @@ fn sync_driver(cfg: &Config) -> Result<()> {
 }
 
 /// How long after `set_devices` the driver's devices may take to appear and take their channel counts.
-const DRIVER_SETTLE: Duration = Duration::from_secs(2);
+/// Adding 15 devices at once takes about 3 s on an M-series Mac (coreaudiod publishes them one by one).
+const DRIVER_SETTLE: Duration = Duration::from_secs(6);
 /// Poll step while settling.
 const SETTLE_STEP: Duration = Duration::from_millis(50);
 /// Hidden companions are best-effort: after this long without one, `main_candidates` falls back to the visible device.
@@ -889,36 +890,41 @@ fn wait_driver_settled(want: &[DriverDevice]) -> Result<()> {
     }
 }
 
-fn apply_locked(g: &mut Inner, cfg: &Config) -> Result<()> {
+/// `sync` brings the driver's device list in line with `cfg` (a parameter so tests can fail it without a driver).
+fn apply_locked(g: &mut Inner, cfg: &Config, sync: fn(&Config) -> Result<()>) -> Result<()> {
     cfg.validate().map_err(|e| anyhow!("invalid config: {e}"))?;
-    sync_driver(cfg)?;
-    // Taken before any aggregate is built: our own create/destroy events must compare equal (F4).
-    g.dev_set = current_device_set();
-    let groups = apps::list_groups();
-    let enabled: HashSet<&str> = cfg
+    // Kept even if the driver does not settle in time: the device events that follow rebuild this
+    // config. Keeping the previous one instead let the next background apply undo the user's change.
+    g.cfg = Some(cfg.clone());
+    let enabled: HashMap<&str, u16> = cfg
         .devices
         .iter()
         .filter(|d| d.enabled)
-        .map(|d| d.id.as_str())
+        .map(|d| (d.id.as_str(), d.channels))
         .collect();
-    let gone: Vec<String> = g
+    // Removed devices and those changing channel count go before the driver changes them: a companion
+    // that a running aggregate still uses takes its channel change late (several seconds with many devices).
+    let stale: Vec<String> = g
         .vdevs
-        .keys()
-        .filter(|id| !enabled.contains(id.as_str()))
-        .cloned()
+        .iter()
+        .filter(|(id, v)| enabled.get(id.as_str()) != Some(&v.spec.channels))
+        .map(|(id, _)| id.clone())
         .collect();
-    for id in gone {
+    for id in stale {
         retire(g.vdevs.remove(&id));
     }
     // A removed vdev's start failures must not keep stretching the worker's debounce.
-    g.io_fails.retain(|id, _| enabled.contains(id.as_str()));
+    g.io_fails.retain(|id, _| enabled.contains_key(id.as_str()));
+    sync(cfg)?;
+    // Taken before any aggregate is built: our own create/destroy events must compare equal (F4).
+    g.dev_set = current_device_set();
+    let groups = apps::list_groups();
     let mut errors = Vec::new();
     for dev in cfg.devices.iter().filter(|d| d.enabled) {
         if let Err(e) = apply_vdev(g, dev, &groups) {
             errors.push(format!("device '{}': {e:#}", dev.id));
         }
     }
-    g.cfg = Some(cfg.clone());
     let up: Vec<String> = g.vdevs.keys().cloned().collect();
     g.recovering.retain(|id| !up.contains(id));
     if errors.is_empty() {

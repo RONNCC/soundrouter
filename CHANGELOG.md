@@ -23,6 +23,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
 
 ### Fixed
+- Engine: an apply whose driver devices were slow to settle (many devices added or re-channeled at once) failed after 2 s and kept the previous config, so the next device event re-applied that old config and removed the devices the user had just added. The newest config is now kept even when the driver is late, the settle window is 6 s, and devices that are removed or change channel count are torn down before the driver changes them (a channel change under 16 running aggregates had crashed `coreaudiod` once).
+- App: a failed apply is written to the log file, not only shown in the status bar.
 - Driver: an app that plays into a SoundRouter device now hears itself on that device's input while the engine is not running (V.out -> V.in, Soundflower-style); before, the input stayed silent until the engine attached. With the engine running the input carries the routed mix as before.
 - App: on macOS the window showed only an empty grey surface, because the sidebar blur view ended up composited on top of the GPU layer that egui draws into. The blur now always stays underneath. If it cannot be placed there, the window falls back to an opaque one.
 - App: launching a second copy of the app now brings back the window of the one already running, even when it was hidden in the menu bar. Before, `open -b` could send that request to a different registered copy, which then just exited.

@@ -127,7 +127,13 @@ impl Pump {
     fn tick(&mut self, newest: Option<Config>, now: Instant, snap: &Mutex<Snapshot>) {
         let mut apply_result = None;
         if let Some(c) = newest {
-            apply_result = Some(self.backend.apply(&c).err().map(|e| format!("{e:#}")));
+            let r = self.backend.apply(&c);
+            // The status bar shows it too, but only the log file survives for a bug report.
+            apply_result = Some(r.err().map(|e| {
+                let msg = format!("{e:#}");
+                log::warn!("apply failed: {msg}");
+                msg
+            }));
             self.cfg = c;
         }
         let meters: HashMap<String, MeterReading> = self
