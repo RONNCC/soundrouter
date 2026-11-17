@@ -269,7 +269,7 @@ fn row(ui: &mut Ui, t: &Tokens, r: &Row) -> bool {
             }
             if let Some(a) = r.action {
                 ui.add_space(4.0);
-                clicked = button(ui, t, a, Kind::Secondary);
+                clicked = button(ui, t, a, Kind::Primary);
             }
         });
     });

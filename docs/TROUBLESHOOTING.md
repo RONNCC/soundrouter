@@ -11,8 +11,8 @@ Start with `sr-cli -v doctor` (exits 1 when unhealthy) and the log `~/Library/Lo
 ## Permissions reset after a rebuild
 Rebuilds keep asking for permissions: run `packaging/make-dev-identity.sh` once, then rebuild with `packaging/bundle-app.sh`. Ad-hoc signing gives each build a new identity (the grant is tied to the code hash), so grants reset; the script creates a stable self-signed identity, `SoundRouter Local Dev`, that the build scripts use automatically. Grant Microphone and System Audio Recording once more after the first build signed with it (System Settings > Privacy & Security). If a build shows "codesign wants to use key", enter your login password and choose Always Allow. Check with `codesign -dr - target/SoundRouter.app`: it must say `certificate leaf`, not `cdhash`.
 
-## System Audio Recording ("Not asked yet", app sources silent)
-- Open **Test Setup…** and click **Allow System Audio Recording** (or **Continue**): macOS shows its own prompt; answer Allow. The row turns "Allowed" without a relaunch.
+## System Audio Recording ("Needs permission", app sources silent)
+- Open **Test Setup…** and click **Allow System Audio Recording** (or **Allow All** / **Continue**): macOS shows its own prompt; answer Allow. The row turns "Allowed" without a relaunch.
 - "Denied": click **Open Settings** (System Settings › Privacy & Security › Screen & System Audio Recording) and turn SoundRouter on under **System Audio Recording Only**. If macOS offers Quit & Reopen, accept it.
 - macOS asks once per app identity: after a denial no prompt appears again, only the Settings switch works. `tccutil reset AudioCapture com.ronncc.soundrouter` forgets the answer so the prompt can appear again.
 - The log's startup line records what macOS answers this build: `TCC audio capture Unknown(2)` = not asked yet, `Granted`, `Denied`. `sr-cli doctor` run from Terminal reports the terminal's permission, not the app's.

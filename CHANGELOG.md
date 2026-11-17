@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
-- App: the System Audio Recording row of the setup sheet has an **Allow System Audio Recording** button that shows macOS's own prompt (`TCCAccessRequest`, off the UI thread) and updates the row from the answer; **Open Settings** appears only after a denial, with where the switch lives. **Continue** asks for every permission still unanswered, Microphone first, then System Audio Recording.
+- App: every permission row of the setup sheet that is not Allowed has its own button: **Allow Microphone** / **Allow System Audio Recording** (macOS's own prompt, off the UI thread; the row shows "Asking…" meanwhile), or **Open Settings** after a denial, with where the switch lives. The status reads **Needs permission** (was "Not asked yet"). The footer button is **Allow All**, the name of the one permission left, or **Continue**, and asks for every permission still unanswered, Microphone first, then System Audio Recording.
 - App: the log's startup line records the raw TCC answers for the app (`TCC audio capture Unknown(2)` = not asked yet).
 - Packaging: `packaging/make-dev-identity.sh` creates a stable self-signed `SoundRouter Local Dev` code-signing identity; the build scripts use it when `SIGN_ID` is unset, so macOS keeps Microphone and System Audio Recording grants across rebuilds.
 - App: source and monitor cards have a × ("Remove <name>") next to the On switch, and removing a card or deleting a device shows "Removed <name> · Undo" for 6 s.

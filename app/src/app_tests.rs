@@ -132,6 +132,17 @@ fn click(h: &mut Harness<App>, label: &str) {
     settle(h);
 }
 
+/// The footer button wears the same label as a row's button when one permission is open.
+fn click_footer(h: &mut Harness<App>, label: &str) {
+    h.get_all_by_label(label).last().unwrap().click();
+    settle(h);
+}
+
+fn click_row(h: &mut Harness<App>, label: &str) {
+    h.get_all_by_label(label).next().unwrap().click();
+    settle(h);
+}
+
 fn drag(h: &mut Harness<App>, from: egui::Pos2, to: egui::Pos2) {
     h.hover_at(from);
     h.step();
@@ -1080,6 +1091,40 @@ mod snapshots {
         sheet("allow_denied", WIDE, denied, flowing(), never_run(), |_| {});
     }
 
+    #[test]
+    fn sheet_allow_access_mic_only() {
+        let status = EngineStatus {
+            mic: TccStatus::Unknown,
+            ..installed()
+        };
+        sheet(
+            "allow_mic_only",
+            WIDE,
+            status,
+            flowing(),
+            never_run(),
+            |_| {},
+        );
+    }
+
+    #[test]
+    fn sheet_allow_access_capture_only() {
+        let status = EngineStatus {
+            tcc: TccStatus::Unknown,
+            ..installed()
+        };
+        sheet(
+            "allow_capture_only",
+            WIDE,
+            status,
+            flowing(),
+            never_run(),
+            |h| {
+                click(h, "Test Setup…");
+            },
+        );
+    }
+
     /// The Verify step with System Audio Recording still open: its own Allow button.
     #[test]
     fn sheet_verify_capture_not_asked() {
@@ -1095,7 +1140,7 @@ mod snapshots {
             never_run(),
             |h| {
                 click(h, "Test Setup…");
-                click(h, "Continue");
+                click_footer(h, "Allow System Audio Recording");
                 until(h, "self-test", |h| {
                     h.query_by_label_contains("Audio flows").is_some()
                 });
@@ -1485,7 +1530,7 @@ fn the_capture_row_asks_macos_and_shows_the_answer() {
         (TccStatus::Granted, "Allowed", false),
         (TccStatus::Denied, "Denied", true),
         // no prompt came (or no answer in time): still open, the button stays
-        (TccStatus::Unknown, "Not asked yet", false),
+        (TccStatus::Unknown, "Needs permission", false),
     ] {
         let unasked = EngineStatus {
             tcc: TccStatus::Unknown,
@@ -1494,17 +1539,52 @@ fn the_capture_row_asks_macos_and_shows_the_answer() {
         let (a, calls) = asker(answer);
         let mut h = with_asker(unasked, a);
         click(&mut h, "Test Setup…");
-        h.get_by_label("System Audio Recording: Not asked yet");
+        h.get_by_label("System Audio Recording: Needs permission");
         assert!(!has(&h, "Open Settings"), "only after Denied");
-        click(&mut h, "Allow System Audio Recording");
+        click_row(&mut h, "Allow System Audio Recording");
         assert_eq!(*calls.lock().unwrap(), 1);
         h.get_by_label(&format!("System Audio Recording: {word}"));
         assert_eq!(has(&h, "Open Settings"), settings, "{answer:?}");
         assert_eq!(
-            has(&h, "Allow System Audio Recording"),
+            h.query_all_by_label("Allow System Audio Recording").count() > 0,
             answer == TccStatus::Unknown
         );
     }
+}
+
+#[test]
+fn the_microphone_row_has_its_own_button_and_footer_follows_what_is_missing() {
+    let mut h = with_asker(
+        EngineStatus {
+            mic: TccStatus::Unknown,
+            ..installed()
+        },
+        asker(TccStatus::Granted).0,
+    );
+    click(&mut h, "Test Setup…");
+    h.get_by_label("Microphone: Needs permission");
+    assert_eq!(
+        h.get_all_by_label("Allow Microphone").count(),
+        2,
+        "row + footer"
+    );
+    click_row(&mut h, "Allow Microphone");
+    h.get_by_label("Microphone: Asking…");
+    assert!(!has(&h, "Allow Microphone"));
+    // answered: the row loses its button
+    h.state().worker.shared.lock().unwrap().status.mic = TccStatus::Granted;
+    settle(&mut h);
+    h.get_by_label("Microphone: Allowed");
+
+    let denied = EngineStatus {
+        mic: TccStatus::Denied,
+        ..installed()
+    };
+    let h = setup_run(denied, flowing());
+    h.get_by_label("Microphone: Denied");
+    h.get_by_label("Open Settings");
+    h.get_by_label("Continue");
+    assert!(!has(&h, "Open Microphone Settings"));
 }
 
 #[test]
@@ -1519,7 +1599,7 @@ fn continue_asks_for_the_microphone_then_system_audio() {
         a,
     );
     click(&mut h, "Test Setup…");
-    click(&mut h, "Continue");
+    click_footer(&mut h, "Allow System Audio Recording");
     assert_eq!(*calls.lock().unwrap(), 1);
     h.get_by_label("System Audio Recording: Allowed");
 
@@ -1533,7 +1613,8 @@ fn continue_asks_for_the_microphone_then_system_audio() {
         },
         a,
     );
-    click(&mut h, "Continue");
+    h.get_by_label("Allow All");
+    click(&mut h, "Allow All");
     h.run_steps(3);
     assert_eq!(
         *calls.lock().unwrap(),
@@ -1573,10 +1654,10 @@ fn the_microphone_question_is_explained_before_the_first_apply() {
         ..installed()
     };
     let mut h = with_runner(status, never_run());
-    h.get_by_label("Continue");
+    assert_eq!(h.get_all_by_label("Allow Microphone").count(), 2);
     assert!(!has(&h, "Close"), "cannot skip the explanation");
     assert!(h.state().worker.shared.lock().unwrap().meters.is_empty());
-    click(&mut h, "Continue");
+    click_footer(&mut h, "Allow Microphone");
     until(&mut h, "apply and self-test", |h| {
         let s = h.state().worker.shared.lock().unwrap();
         !s.meters.is_empty() && matches!(s.self_test, SelfTestState::Done(_))

@@ -259,6 +259,10 @@ pub struct Setup {
     answer: Option<TccStatus>,
     /// Continue was pressed: ask for System Audio Recording once the Microphone question is settled.
     ask_after_mic: bool,
+    /// The Microphone request is in flight (the self-test's prompt is up).
+    mic_asking: bool,
+    /// A request from a row button, handed to the app at the end of `sheet`.
+    queued: Option<Action>,
     error: Option<String>,
     /// Time by which the driver must have appeared after a successful install.
     deadline: Option<f64>,
@@ -288,6 +292,8 @@ impl Setup {
             asking: None,
             answer: None,
             ask_after_mic: false,
+            mic_asking: false,
+            queued: None,
             error: None,
             deadline: None,
             confirm: None,
@@ -376,11 +382,23 @@ impl Setup {
         }
     }
 
+    /// The Microphone row's button: Settings once it said no; else the request Continue makes
+    /// for it (the self-test asks), alone.
+    fn mic_action(&mut self, v: &View) {
+        if v.status.mic == TccStatus::Denied {
+            open_url(MIC_SETTINGS);
+        } else {
+            self.queued = self.continue_to_verify(Action::AllowMic);
+            self.ask_after_mic = false;
+        }
+    }
+
     /// Continue: the self-test asks for the Microphone; System Audio Recording follows once that
     /// question is settled, so the two prompts never overlap.
     fn continue_to_verify(&mut self, action: Action) -> Option<Action> {
         self.step = Step::Verify;
         self.ask_after_mic = true;
+        self.mic_asking = action == Action::AllowMic;
         Some(action)
     }
 
@@ -450,6 +468,9 @@ impl Setup {
             return deleted;
         }
         self.sync(v);
+        if v.status.mic != TccStatus::Unknown {
+            self.mic_asking = false;
+        }
         if self.ask_after_mic && v.status.mic != TccStatus::Unknown && self.asking.is_none() {
             self.ask_after_mic = false;
             if self.capture(v) == TccStatus::Unknown {
@@ -473,6 +494,7 @@ impl Setup {
         self.step = Step::Welcome;
         self.test_since = None;
         self.ask_after_mic = false;
+        self.mic_asking = false;
         self.seen = true;
         if let Some(p) = &self.marker {
             mark_seen_at(p);
@@ -598,6 +620,13 @@ impl Setup {
             }
             Step::Permissions => {
                 let mic = v.status.mic;
+                let cap = self.capture(v);
+                let go = match (mic == TccStatus::Unknown, cap == TccStatus::Unknown) {
+                    (true, true) => "Allow All",
+                    (true, false) => "Allow Microphone",
+                    (false, true) => "Allow System Audio Recording",
+                    (false, false) => "Continue",
+                };
                 modal(
                     ctx,
                     t,
@@ -606,13 +635,15 @@ impl Setup {
                         buttons: true,
                         glyph: Glyph::App,
                         title: "Allow access",
-                        intro: "SoundRouter needs two permissions. Continue asks macOS for each one it has not answered yet.",
+                        intro: "SoundRouter needs these permissions to hear your mic and capture app audio.",
                     },
                     self,
                     |ui, s| {
                         let rows = s.permission_rows(v, true);
-                        if checklist(ui, t, &rows) == Some(1) {
-                            s.capture_action(ctx, v);
+                        match checklist(ui, t, &rows) {
+                            Some(0) => s.mic_action(v),
+                            Some(1) => s.capture_action(ctx, v),
+                            _ => {}
                         }
                     },
                     |ui, s| {
@@ -621,14 +652,7 @@ impl Setup {
                             s,
                             |_, _| {},
                             |ui, s| {
-                                if mic == TccStatus::Denied {
-                                    if button(ui, t, "Open Microphone Settings", Kind::Primary) {
-                                        open_url(MIC_SETTINGS);
-                                    }
-                                    if button(ui, t, "Continue", Kind::Secondary) {
-                                        action = s.continue_to_verify(Action::Test);
-                                    }
-                                } else if button(ui, t, "Continue", Kind::Primary) {
+                                if button(ui, t, go, Kind::Primary) {
                                     action = s.continue_to_verify(if mic == TccStatus::Unknown {
                                         Action::AllowMic
                                     } else {
@@ -733,8 +757,10 @@ impl Setup {
                                 }
                             }
                         });
-                        if checklist(ui, t, &rows) == Some(2) {
-                            s.capture_action(ctx, v);
+                        match checklist(ui, t, &rows) {
+                            Some(1) => s.mic_action(v),
+                            Some(2) => s.capture_action(ctx, v),
+                            _ => {}
                         }
                         match v.test {
                             _ if hung => body(ui, t, "Try again, or copy diagnostics for support."),
@@ -838,7 +864,7 @@ impl Setup {
                 },
             ),
         }
-        action
+        action.or(self.queued.take())
     }
 
     fn copy_button(&mut self, ui: &mut egui::Ui, t: &Tokens, v: &View) {
@@ -902,8 +928,8 @@ impl Setup {
 }
 
 impl Setup {
-    /// Microphone and System Audio Recording as checklist rows (index 1 is System Audio
-    /// Recording, whose button asks macOS, or opens Settings once it said no). `explain` adds the why.
+    /// Microphone and System Audio Recording as checklist rows (a row's button asks macOS, or opens
+    /// its Settings pane once it said no). `explain` adds the why.
     fn permission_rows<'a>(&self, v: &View, explain: bool) -> [Row<'a>; 2] {
         let look = |s: TccStatus| match s {
             TccStatus::Granted => Status::Ok,
@@ -938,15 +964,27 @@ impl Setup {
         };
         [
             Row {
-                state: look(mic),
+                state: if self.mic_asking && mic == TccStatus::Unknown {
+                    Status::Running
+                } else {
+                    look(mic)
+                },
                 title: "Microphone",
-                status: tcc_word(mic),
+                status: if self.mic_asking && mic == TccStatus::Unknown {
+                    "Asking…"
+                } else {
+                    tcc_word(mic)
+                },
                 detail: if explain {
                     "Reads the virtual device's input to check that audio flows, and any microphone or input device you add as a source."
                 } else {
                     ""
                 },
-                action: None,
+                action: match mic {
+                    TccStatus::Unknown if !self.mic_asking => Some("Allow Microphone"),
+                    TccStatus::Denied => Some("Open Settings"),
+                    _ => None,
+                },
             },
             capture,
         ]
@@ -956,7 +994,7 @@ impl Setup {
 /// For support text: the status as the user sees it when it is not decided, else its name.
 fn tcc_diag(s: TccStatus) -> String {
     match s {
-        TccStatus::Unknown => "Not asked yet".into(),
+        TccStatus::Unknown => "Needs permission".into(),
         _ => format!("{s:?}"),
     }
 }
@@ -965,7 +1003,7 @@ fn tcc_word(s: TccStatus) -> &'static str {
     match s {
         TccStatus::Granted => "Allowed",
         TccStatus::Denied => "Denied",
-        TccStatus::Unknown => "Not asked yet",
+        TccStatus::Unknown => "Needs permission",
     }
 }
 
@@ -1159,7 +1197,7 @@ mod tests {
             "protocol version 1",
             "driver bundle in app: missing",
             "TCC microphone: Denied",
-            "TCC audio capture: Not asked yet",
+            "TCC audio capture: Needs permission",
             "virtual devices: 2",
             "self-test: error: boom",
             "apply error: tap denied",
