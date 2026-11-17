@@ -30,6 +30,8 @@ pub struct Tokens {
     pub scrim: Color32,
     pub switch_off: Color32,
     pub danger: Color32,
+    /// Warning text on a card, e.g. "Not connected" (meter yellow is unreadable on white).
+    pub warn: Color32,
 }
 
 pub fn tokens(dark: bool) -> Tokens {
@@ -50,6 +52,7 @@ pub fn tokens(dark: bool) -> Tokens {
             scrim: Color32::from_black_alpha(80),
             switch_off: hex(0x48484A),
             danger: hex(0xFF453A),
+            warn: hex(0xFFD60A),
         }
     } else {
         Tokens {
@@ -68,6 +71,7 @@ pub fn tokens(dark: bool) -> Tokens {
             scrim: Color32::from_black_alpha(36),
             switch_off: hex(0xC7C7CC),
             danger: hex(0xFF3B30),
+            warn: hex(0xB25000),
         }
     }
 }

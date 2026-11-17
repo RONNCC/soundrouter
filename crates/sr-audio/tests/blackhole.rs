@@ -65,6 +65,7 @@ fn cfg(player_key: &str, volume_db: f32, muted: bool, wires: &[(u16, u16)]) -> C
                 volume_db,
                 muted,
                 mute_original: false,
+                name: String::new(),
             }],
             wires: wires
                 .iter()

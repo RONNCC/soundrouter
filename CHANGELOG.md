@@ -30,6 +30,13 @@ All notable changes to this project are documented here. The format follows [Kee
 - Engine: the self-test routes its tone through the engine whenever the device is enabled, not only while its aggregate is up. Before, a recovery or retry that rebuilt the device mid-test could send the tone to the user's monitor outputs.
 - Engine: a removed device's failed IOProc starts no longer keep the event debounce at its maximum (up to 5 s) for the rest of the session.
 - Engine: reading a device's stream layout never trusts a buffer count beyond the bytes the HAL returned.
+- App: with Start at Login (`--background`) the config was only sent to the engine from a drawn frame, and eframe stops drawing once the window is hidden, so routing usually did not start until the window was opened. The first apply now runs while hidden.
+- App: opening a source's or monitor's Options no longer rewrites a volume outside the slider's -60..+12 dB range (from `sr-cli` or a hand-edited config) to the nearest end; it changes only when the slider is moved.
+- App: an unplugged input device or monitor is shown by its last known name instead of its raw uid, and an unplugged monitor now says "Not connected" too. Sources and monitors record the device's (or app's) name in the config (`name`, optional).
+- App: device names stop at the driver's 64-character limit while typing instead of failing with an error that named the device by its internal id.
+- App: clicking a highlighted wire removes it; before, hovering highlighted it but clicking did nothing.
+- App: the Monitors popup scrolls inside the window when there are many output devices; before, the devices below the window edge could not be reached.
+- App: after "Uninstall… > Also delete my SoundRouter settings" the app no longer writes the settings folder back on the next edit or window close.
 
 ## [0.1.0]
 

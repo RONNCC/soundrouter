@@ -1,5 +1,6 @@
 //! Pure edit operations on the `Config` the GUI owns. The UI never mutates the config while
 //! drawing: it emits `Edit`s, and `apply` runs them after the frame.
+use sr_core::backend::{AppInfo, HwDevice};
 use sr_core::config::{
     Config, MAX_CH, Monitor, MonitorWire, Source, SourceKind, VirtualDevice, Wire,
 };
@@ -255,6 +256,7 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
                 volume_db: 0.0,
                 muted: false,
                 mute_original: false,
+                name: String::new(),
             });
             auto_wire_source(dev, &id, channels);
         }
@@ -300,6 +302,7 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
                 enabled: true,
                 volume_db: 0.0,
                 wires,
+                name: String::new(),
             });
         }
         Edit::RemoveMonitor(_, m) => {
@@ -399,6 +402,42 @@ pub fn ch_label(ch: u16, total: u16) -> String {
     }
 }
 
+/// Copy the names of the apps and devices that are present onto the sources and monitors using
+/// them, so one that is gone later is still shown by name. Returns whether anything changed.
+pub fn learn_names(
+    cfg: &mut Config,
+    hw: &[HwDevice],
+    apps: &[AppInfo],
+    installed: &[AppInfo],
+) -> bool {
+    let hw_name = |uid: &str| hw.iter().find(|h| h.uid == uid).map(|h| h.name.as_str());
+    let mut changed = false;
+    let mut learn = |name: &mut String, seen: Option<&str>| {
+        if let Some(seen) = seen.filter(|s| !s.is_empty() && *s != name.as_str()) {
+            *name = seen.to_string();
+            changed = true;
+        }
+    };
+    for d in &mut cfg.devices {
+        for s in &mut d.sources {
+            let seen = match &s.kind {
+                SourceKind::App { bundle_id } => apps
+                    .iter()
+                    .chain(installed)
+                    .find(|a| &a.bundle_id == bundle_id)
+                    .map(|a| a.name.as_str()),
+                SourceKind::Device { uid } => hw_name(uid),
+                SourceKind::PassThru => None,
+            };
+            learn(&mut s.name, seen);
+        }
+        for m in &mut d.monitors {
+            learn(&mut m.name, hw_name(&m.device_uid));
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +463,40 @@ mod tests {
         assert_eq!(c.devices.len(), 1);
         assert_eq!(c.devices[0].id, "v1");
         assert_eq!(c.devices[0].channels, 2);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn names_are_learned_while_present_and_kept_when_gone() {
+        let mut c = cfg_with_dev();
+        let mic = SourceKind::Device { uid: "mic".into() };
+        apply(&mut c, Edit::AddSource(0, mic, 1));
+        apply(&mut c, Edit::AddMonitor(0, "spk".into(), 2));
+        let hw = |uid: &str, name: &str| HwDevice {
+            uid: uid.into(),
+            name: name.into(),
+            in_ch: 1,
+            out_ch: 2,
+        };
+        let safari = AppInfo {
+            bundle_id: "com.apple.Safari".into(),
+            name: "Safari".into(),
+            running_output: false,
+            regular: true,
+        };
+        let present = [hw("mic", "USB Mic"), hw("spk", "Speakers")];
+        assert!(learn_names(&mut c, &present, &[], &[safari]));
+        let d = &c.devices[0];
+        let names: Vec<&str> = d.sources.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Safari", "USB Mic"]);
+        assert_eq!(d.monitors[0].name, "Speakers");
+        assert!(!learn_names(&mut c, &present, &[], &[]), "nothing new");
+        // unplugged: the last name stays; a renamed device updates it
+        let before = c.clone();
+        assert!(!learn_names(&mut c, &[], &[], &[]));
+        assert_eq!(c, before);
+        assert!(learn_names(&mut c, &[hw("spk", "Desk Speakers")], &[], &[]));
+        assert_eq!(c.devices[0].monitors[0].name, "Desk Speakers");
         c.validate().unwrap();
     }
 

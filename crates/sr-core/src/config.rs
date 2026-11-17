@@ -64,6 +64,10 @@ pub struct Source {
     /// App sources only: silence the app's own output while it is tapped (`CATapMuteBehavior`).
     #[serde(default)]
     pub mute_original: bool,
+    /// Name of the app or input device when it was last seen, so a UI can still name it while
+    /// it is absent. Display only; may be empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -95,6 +99,9 @@ pub struct Monitor {
     pub volume_db: f32,
     #[serde(default)]
     pub wires: Vec<MonitorWire>,
+    /// Name of the output device when it was last seen (see `Source::name`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -248,6 +255,22 @@ mod tests {
     }
 
     #[test]
+    fn names_are_optional_omitted_when_empty_and_round_trip() {
+        let mut cfg = example();
+        assert!(cfg.devices[0].sources[1].name.is_empty());
+        assert!(cfg.devices[0].monitors[0].name.is_empty());
+        assert!(
+            !serde_json::to_string(&cfg)
+                .unwrap()
+                .contains(r#""name":"""#)
+        );
+        cfg.devices[0].sources[1].name = "USB Mic".into();
+        cfg.devices[0].monitors[0].name = "Speakers".into();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(cfg, serde_json::from_str::<Config>(&json).unwrap());
+    }
+
+    #[test]
     fn pass_thru_round_trips() {
         let mut cfg = example();
         cfg.devices[0].sources.push(Source {
@@ -257,6 +280,7 @@ mod tests {
             volume_db: 0.0,
             muted: false,
             mute_original: false,
+            name: String::new(),
         });
         cfg.devices[0].wires.push(Wire {
             source: "p".into(),

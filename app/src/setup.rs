@@ -146,6 +146,8 @@ pub enum Action {
     Test,
     /// Leave the real engine for the synthetic one.
     Demo,
+    /// The uninstall deleted the settings folder.
+    SettingsDeleted,
 }
 
 /// What the app tells the sheet each frame.
@@ -256,18 +258,21 @@ impl Setup {
         }
     }
 
-    fn poll(&mut self, now: f64) {
-        let Some(r) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) else {
-            return;
-        };
+    fn poll(&mut self, now: f64) -> Option<Action> {
+        let r = self.rx.as_ref().and_then(|rx| rx.try_recv().ok())?;
         self.rx = None;
         match (self.busy.take(), r) {
             (Some(Busy::Installing), Ok(())) => self.deadline = Some(now + DRIVER_WAIT_SECS),
-            (Some(Busy::Uninstalling), Ok(())) => self.confirm = None,
+            (Some(Busy::Uninstalling), Ok(())) => {
+                if self.confirm.take() == Some(true) {
+                    return Some(Action::SettingsDeleted);
+                }
+            }
             (_, Err(SetupError::Cancelled)) => self.error = Some("Cancelled.".into()),
             (_, Err(SetupError::Failed(m))) => self.error = Some(m),
             (None, Ok(())) => {}
         }
+        None
     }
 
     /// Move between steps when the world changed under the sheet.
@@ -296,10 +301,10 @@ impl Setup {
 
     /// Draw whatever is due; returns at most one request for the app.
     pub fn show(&mut self, ctx: &Context, v: &View) -> Option<Action> {
-        self.poll(v.now);
+        let deleted = self.poll(v.now);
         self.shown = false;
         if self.demo || !v.ready {
-            return None;
+            return deleted;
         }
         self.sync(v);
         let t = tokens(ctx.theme() == Theme::Dark);
@@ -311,7 +316,7 @@ impl Setup {
         if self.confirm.is_some() {
             self.uninstall_dialog(ctx, &t);
         }
-        action
+        deleted.or(action)
     }
 
     fn close(&mut self) {

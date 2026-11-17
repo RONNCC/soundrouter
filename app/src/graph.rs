@@ -63,6 +63,11 @@ fn mon_rows(m: &Monitor, hw: &[HwDevice]) -> u16 {
     }
 }
 
+/// `name` when known, else `fallback`: what an absent app or device is called.
+fn last_seen(name: &str, fallback: &str) -> String {
+    if name.is_empty() { fallback } else { name }.to_string()
+}
+
 fn source_title(g: &GraphCtx, s: &Source) -> (String, &'static str) {
     let (hw, apps) = (g.hw, g.apps);
     match &s.kind {
@@ -71,13 +76,7 @@ fn source_title(g: &GraphCtx, s: &Source) -> (String, &'static str) {
                 .chain(g.installed)
                 .find(|a| &a.bundle_id == bundle_id)
                 .map_or_else(
-                    || {
-                        bundle_id
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or(bundle_id)
-                            .to_string()
-                    },
+                    || last_seen(&s.name, bundle_id.rsplit('.').next().unwrap_or(bundle_id)),
                     |a| a.name.clone(),
                 ),
             "Application",
@@ -85,7 +84,7 @@ fn source_title(g: &GraphCtx, s: &Source) -> (String, &'static str) {
         SourceKind::Device { uid } => (
             hw.iter()
                 .find(|h| &h.uid == uid)
-                .map_or_else(|| uid.clone(), |h| h.name.clone()),
+                .map_or_else(|| last_seen(&s.name, uid), |h| h.name.clone()),
             "Input device",
         ),
         SourceKind::PassThru => ("Pass-Thru".to_string(), "Apps playing to this device"),
@@ -95,7 +94,7 @@ fn source_title(g: &GraphCtx, s: &Source) -> (String, &'static str) {
 fn monitor_title(m: &Monitor, hw: &[HwDevice]) -> String {
     hw.iter()
         .find(|h| h.uid == m.device_uid)
-        .map_or_else(|| m.device_uid.clone(), |h| h.name.clone())
+        .map_or_else(|| last_seen(&m.name, &m.device_uid), |h| h.name.clone())
 }
 
 fn sources_summary(dev: &VirtualDevice) -> String {
@@ -576,23 +575,29 @@ fn monitor_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
             .size(11.0)
             .color(g.t.text2),
     );
-    let mut any = false;
-    for h in g.hw.iter().filter(|h| h.out_ch > 0) {
-        any = true;
-        let exists = g.dev.monitors.iter().any(|m| m.device_uid == h.uid);
-        let alpha = if exists { 0.5 } else { 1.0 };
-        let paint = |p: &egui::Painter, r: Rect| glyph_tile(p, r, g.t, alpha, icons::speaker);
-        if menu_row(ui, g.t, !exists, &h.name, "", paint) {
-            edits.push(Edit::AddMonitor(
-                g.dev_idx,
-                h.uid.clone(),
-                h.out_ch.min(MAX_ROWS),
-            ));
-        }
-    }
-    if !any {
-        ui.label("No output devices");
-    }
+    let room = ui.ctx().content_rect().bottom() - ui.cursor().top() - 16.0;
+    egui::ScrollArea::vertical()
+        .max_height(room.clamp(96.0, 420.0))
+        .show(ui, |ui| {
+            let mut any = false;
+            for h in g.hw.iter().filter(|h| h.out_ch > 0) {
+                any = true;
+                let exists = g.dev.monitors.iter().any(|m| m.device_uid == h.uid);
+                let alpha = if exists { 0.5 } else { 1.0 };
+                let paint =
+                    |p: &egui::Painter, r: Rect| glyph_tile(p, r, g.t, alpha, icons::speaker);
+                if menu_row(ui, g.t, !exists, &h.name, "", paint) {
+                    edits.push(Edit::AddMonitor(
+                        g.dev_idx,
+                        h.uid.clone(),
+                        h.out_ch.min(MAX_ROWS),
+                    ));
+                }
+            }
+            if !any {
+                ui.label("No output devices");
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -638,12 +643,18 @@ fn card(
             )
         }
     };
-    // A device source whose hardware is gone (or whose microphone access is off) says so, dimmed.
+    // A device source or monitor whose hardware is gone (or whose microphone access is off) says
+    // so, dimmed.
     let note = match c.id {
         CardId::Src(i) => source_note(g, &dev.sources[i]),
-        _ => None,
+        CardId::Mon(i) => {
+            let uid = &dev.monitors[i].device_uid;
+            (!g.hw.iter().any(|h| &h.uid == uid)).then_some(NOT_CONNECTED)
+        }
+        CardId::Out(_) => None,
     };
-    let active = on.unwrap_or(true) && dev.enabled;
+    // An unplugged monitor plays nothing, whatever reaches the output channels.
+    let active = on.unwrap_or(true) && dev.enabled && note != Some(NOT_CONNECTED);
     let dim = if on.unwrap_or(true) && note != Some(NOT_CONNECTED) {
         1.0
     } else {
@@ -709,13 +720,12 @@ fn card(
             t,
             &format!("{title} enabled"),
         );
-        let note_color = t.meter[1];
         painter.text(
             pos2(sw.left() - 6.0, sw.center().y),
             Align2::RIGHT_CENTER,
             note.unwrap_or(if new { "On" } else { "Off" }),
             FontId::proportional(11.0),
-            if note.is_some() { note_color } else { t.text2 },
+            if note.is_some() { t.warn } else { t.text2 },
         );
         if new != on_now {
             edits.push(match c.id {
@@ -833,7 +843,10 @@ fn card(
         FontId::proportional(11.0),
         t.text2,
     );
-    let mut v = vol_db.clamp(-60.0, 12.0);
+    // A volume outside the slider range (CLI or hand-edited config) is shown as is and only
+    // changes when the slider is moved.
+    let before = vol_db.clamp(-60.0, 12.0);
+    let mut v = before;
     let slider =
         Rect::from_x_y_ranges((vrow.left() + 46.0)..=(vrow.right() - 52.0), vrow.y_range());
     let vol = ui.scope_builder(UiBuilder::new().max_rect(slider), |ui| {
@@ -842,14 +855,15 @@ fn card(
     });
     name_widget(ui, &vol.inner, &format!("{title} volume"));
     slider_knob(&painter, vol.inner.rect, (v - -60.0) / 72.0, t);
+    let moved = (v - before).abs() > 1e-4;
     painter.text(
         pos2(vrow.right(), vrow.center().y),
         Align2::RIGHT_CENTER,
-        format!("{v:+.1} dB"),
+        format!("{:+.1} dB", if moved { v } else { vol_db }),
         FontId::proportional(11.0),
         t.text2,
     );
-    if (v - vol_db).abs() > 1e-4 {
+    if moved {
         edits.push(match c.id {
             CardId::Src(i) => Edit::SourceVolume(d, i, v),
             CardId::Mon(i) => Edit::MonitorVolume(d, i, v),
@@ -1025,8 +1039,10 @@ fn wires_and_ports(
         Port::Src { src, .. } => !dev.sources[src].muted,
         _ => true,
     };
+    // Only the graph's own layer: never a wire under an open menu or the setup sheet.
+    let on_graph = |pos| ui.ctx().layer_id_at(pos).is_none_or(|l| l == ui.layer_id());
     let hovered_wire = match (hover, pointer, st.drag) {
-        (None, Some(pos), None) => {
+        (None, Some(pos), None) if on_graph(pos) => {
             all.iter()
                 .position(|l| match (layout.port_pos(l.from), layout.port_pos(l.to)) {
                     (Some(a), Some(b)) => wire_distance(&wire_points(a, b), pos) < 5.0,
@@ -1035,6 +1051,12 @@ fn wires_and_ports(
         }
         _ => None,
     };
+    // Clicking a highlighted wire removes it (as does dragging its input end away).
+    if let Some(n) = hovered_wire
+        && ui.input(|i| i.pointer.primary_clicked())
+    {
+        edits.push(Edit::Unlink(d, all[n]));
+    }
     for (n, l) in all.iter().enumerate() {
         let (Some(a), Some(b)) = (layout.port_pos(l.from), layout.port_pos(l.to)) else {
             continue;
@@ -1231,6 +1253,69 @@ mod tests {
             h.state().edits,
             vec![Edit::Disconnect(0, Port::Mon { mon: 0, ch: 0 })]
         );
+    }
+
+    /// Press and release at `at` without moving; returns the edits.
+    fn click(h: &mut Harness<S>, at: egui::Pos2) -> Vec<Edit> {
+        h.state_mut().edits.clear();
+        h.hover_at(at);
+        h.step();
+        h.drag_at(at);
+        h.step();
+        h.drop_at(at);
+        h.step();
+        h.step();
+        std::mem::take(&mut h.state_mut().edits)
+    }
+
+    #[test]
+    fn clicking_a_wire_removes_just_that_wire() {
+        let mut h = rig(device());
+        let (a, b) = (
+            port(&h, Port::OutOut { ch: 1 }),
+            port(&h, Port::Mon { mon: 0, ch: 1 }),
+        );
+        let [p0, p1, p2, p3] = wire_points(a, b);
+        let mid = pos2(
+            (p0.x + 3.0 * p1.x + 3.0 * p2.x + p3.x) / 8.0,
+            (p0.y + 3.0 * p1.y + 3.0 * p2.y + p3.y) / 8.0,
+        );
+        let want = Link {
+            from: Port::OutOut { ch: 1 },
+            to: Port::Mon { mon: 0, ch: 1 },
+        };
+        assert_eq!(click(&mut h, mid), vec![Edit::Unlink(0, want)]);
+        // empty space is not a wire
+        assert!(click(&mut h, pos2(600.0, 500.0)).is_empty());
+    }
+
+    #[test]
+    fn opening_options_never_rewrites_a_volume_outside_the_slider_range() {
+        for db in [-80.0, -200.0, 18.0] {
+            let mut dev = device();
+            dev.sources[0].volume_db = db;
+            dev.monitors[0].volume_db = db;
+            let mut h = rig(dev);
+            h.state_mut().st.expanded = ["v1/s1", "v1/m:spk"].map(String::from).into();
+            h.run_steps(3);
+            assert!(h.state().edits.is_empty(), "{db}: {:?}", h.state().edits);
+            h.get_by_label("y volume");
+            h.get_by_label("spk volume");
+        }
+    }
+
+    #[test]
+    fn an_absent_device_keeps_its_last_seen_name_and_says_not_connected() {
+        let mut c = bare_config();
+        apply(&mut c, Edit::AddMonitor(0, "spk".into(), 2));
+        let mic = SourceKind::Device { uid: "mic".into() };
+        apply(&mut c, Edit::AddSource(0, mic, 1));
+        c.devices[0].monitors[0].name = "Desk Speakers".into();
+        c.devices[0].sources[0].name = "USB Mic".into();
+        let h = rig(c.devices.remove(0));
+        h.get_by_label("Desk Speakers: Not connected");
+        h.get_by_label("USB Mic: Not connected");
+        h.get_by_label("Desk Speakers channel 1 input");
     }
 
     /// A screen reader (and the tests above) reach a port by name; it must sit on the painted port.

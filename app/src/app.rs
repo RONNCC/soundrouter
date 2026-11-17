@@ -16,7 +16,7 @@ use eframe::egui::{
     UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
-use sr_core::config::{Config, SourceKind};
+use sr_core::config::{Config, MAX_NAME_CHARS, SourceKind};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -146,7 +146,8 @@ impl App {
                         if let Some(t) = &mut self.tray {
                             t.hint();
                         }
-                        if !self.demo {
+                        // Not in demo mode, nor once the settings folder was deleted.
+                        if self.path.is_some() {
                             tray::mark_hint_seen();
                         }
                     }
@@ -164,8 +165,33 @@ impl App {
         self.worker.shared.lock().unwrap().status.clone()
     }
 
-    /// First apply, the setup sheet and what it asks for.
+    /// Send the config to the engine once it can take it, and again after the driver came back.
+    /// Runs from `logic`, which eframe also calls while the window is hidden, so a `--background`
+    /// launch (Start at Login) routes audio without the window ever being shown. Returns whether
+    /// the first apply waits for the setup sheet to explain the Microphone prompt.
+    fn first_apply(&mut self) -> bool {
+        let (ready, driver, mic) = {
+            let s = self.worker.shared.lock().unwrap();
+            (
+                s.status_ready,
+                s.status.driver_version.is_some(),
+                s.status.mic,
+            )
+        };
+        if ready && !driver {
+            self.applied = false; // re-apply once a driver (re)appears
+        }
+        let pending = ready && driver && !self.applied && mic == TccStatus::Unknown;
+        if ready && driver && !self.applied && !pending {
+            self.applied = true;
+            self.worker.apply(&self.cfg);
+        }
+        pending
+    }
+
+    /// The setup sheet and what it asks for.
     fn drive_setup(&mut self, ctx: &egui::Context) {
+        let pending = self.first_apply();
         let (ready, status, test, apply_error) = {
             let s = self.worker.shared.lock().unwrap();
             (
@@ -175,16 +201,6 @@ impl App {
                 s.apply_error.clone(),
             )
         };
-        let driver = status.driver_version.is_some();
-        if ready && !driver {
-            self.applied = false; // re-apply once a driver (re)appears
-        }
-        // With the driver present but the Microphone question open, the sheet explains it first.
-        let pending = ready && driver && !self.applied && status.mic == TccStatus::Unknown;
-        if ready && driver && !self.applied && !pending {
-            self.applied = true;
-            self.worker.apply(&self.cfg);
-        }
         let dev = self
             .cfg
             .devices
@@ -233,6 +249,11 @@ impl App {
                 self.applied = true;
                 self.worker.use_demo();
                 self.worker.apply(&self.cfg);
+            }
+            Some(SetupAction::SettingsDeleted) => {
+                // The settings folder is gone: stop writing it back with every edit.
+                self.path = None;
+                self.save_pending = false;
             }
             None => {}
         }
@@ -403,7 +424,8 @@ impl App {
                     .font(FontId::new(13.5, semibold()))
                     .margin(Margin::ZERO)
                     .frame(egui::Frame::NONE)
-                    .text_color(t.text),
+                    .text_color(t.text)
+                    .char_limit(MAX_NAME_CHARS),
             );
             name_widget(ui, &te, "Rename device");
             let esc = ui.input(|k| k.key_pressed(egui::Key::Escape));
@@ -670,7 +692,8 @@ impl App {
                         .font(FontId::new(19.0, semibold()))
                         .margin(Margin::ZERO)
                         .frame(egui::Frame::NONE)
-                        .text_color(t.text),
+                        .text_color(t.text)
+                        .char_limit(MAX_NAME_CHARS),
                 );
                 name_widget(ui, &te, "Device name");
                 let w = ui
@@ -728,6 +751,7 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.first_apply();
         self.handle_window(ctx);
     }
 
@@ -760,6 +784,12 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(33));
 
         let prev_selected = self.selected;
+        let learned = {
+            let s = self.worker.shared.lock().unwrap();
+            let installed = self.graph.installed.get().map_or(&[][..], Vec::as_slice);
+            crate::model::learn_names(&mut self.cfg, &s.hardware, &s.apps, installed)
+        };
+        self.save_pending |= learned;
         let mut edits = Vec::new();
         self.sidebar(ui, &t, &mut edits);
         self.main_pane(ui, &t, &mut edits);

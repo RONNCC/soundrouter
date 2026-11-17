@@ -22,6 +22,7 @@ fn cfg(enabled: bool) -> Config {
                 volume_db: 0.0,
                 muted: false,
                 mute_original: false,
+                name: String::new(),
             }],
             wires: vec![],
             monitors: vec![],

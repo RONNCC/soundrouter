@@ -10,6 +10,7 @@ fn src(id: &str, kind: SourceKind) -> Source {
         volume_db: 0.0,
         muted: false,
         mute_original: false,
+        name: String::new(),
     }
 }
 fn mon(uid: &str, enabled: bool) -> Monitor {
@@ -18,6 +19,7 @@ fn mon(uid: &str, enabled: bool) -> Monitor {
         enabled,
         volume_db: 0.0,
         wires: vec![],
+        name: String::new(),
     }
 }
 fn vdev(sources: Vec<Source>, wires: Vec<Wire>, monitors: Vec<Monitor>) -> VirtualDevice {

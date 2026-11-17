@@ -554,7 +554,7 @@ fn demo_mode_says_so_and_nothing_else_by_default() {
     assert!(h.query_by_label_contains("Demo mode").is_none());
 }
 
-/// Fake backend with many apps, to overflow the Sources popup.
+/// Fake backend with many apps and output devices, to overflow the Sources and Monitors popups.
 struct Crowded(FakeBackend);
 
 impl Backend for Crowded {
@@ -562,7 +562,13 @@ impl Backend for Crowded {
         self.0.apply(cfg)
     }
     fn hardware(&self) -> Vec<HwDevice> {
-        self.0.hardware()
+        let outputs = (0..40).map(|i| HwDevice {
+            uid: format!("out{i}"),
+            name: format!("Output {i:02}"),
+            in_ch: 0,
+            out_ch: 2,
+        });
+        self.0.hardware().into_iter().chain(outputs).collect()
     }
     fn apps(&self) -> Vec<AppInfo> {
         (0..60)
@@ -755,6 +761,83 @@ fn the_source_menu_stays_inside_the_window_and_scrolls() {
     assert!(h.get_by_label("Search sources").rect().width() <= 300.0);
 }
 
+#[test]
+fn the_monitor_menu_stays_inside_the_window_and_scrolls() {
+    let mut h = window(
+        demo_config(),
+        Box::new(Crowded(FakeBackend::frozen(1.5))),
+        None,
+        Theme::Dark,
+        false,
+    );
+    click(&mut h, "Add monitor");
+    let win = h.ctx.content_rect();
+    let first = h.get_by_label("Output 00").rect();
+    assert!(win.contains_rect(first), "{first:?} leaves {win:?}");
+    // The last device is out of view, and reachable by scrolling the menu, not the window.
+    assert!(!win.contains_rect(h.get_by_label("Output 39").rect()));
+    h.get_by_label("Output 39").scroll_to_me();
+    settle(&mut h);
+    let last = h.get_by_label("Output 39").rect();
+    assert!(win.contains_rect(last), "{last:?} leaves {win:?}");
+}
+
+#[test]
+fn a_hidden_background_launch_applies_the_config_without_drawing() {
+    let ctx = egui::Context::default();
+    let backend = Box::new(FakeBackend::frozen(1.5));
+    let w = Worker::spawn_inline(backend, ctx.clone(), Box::new(|_| None));
+    let mut app = App::new(demo_config(), None, w, None, false, false).background(
+        None,
+        tray::WinState::default(),
+        true,
+    );
+    // While the window is hidden eframe calls only `logic`, never `ui`.
+    let mut frame = eframe::Frame::_new_kittest();
+    for _ in 0..3 {
+        eframe::App::logic(&mut app, &ctx, &mut frame);
+    }
+    assert!(app.applied);
+    let s = app.worker.shared.lock().unwrap();
+    let enabled = app.cfg.devices.iter().filter(|d| d.enabled);
+    assert!(enabled.clone().count() > 0);
+    for d in enabled {
+        assert!(s.meters.contains_key(&d.id), "{} not running", d.id);
+    }
+}
+
+#[test]
+fn names_stop_at_the_driver_limit_instead_of_failing() {
+    let mut h = open(demo_config());
+    h.get_by_label("Device name").click();
+    settle(&mut h);
+    select_all(&mut h);
+    h.get_by_label("Device name").type_text(&"x".repeat(80));
+    settle(&mut h);
+    assert_eq!(h.state().cfg.devices[0].name, "x".repeat(MAX_NAME_CHARS));
+    assert!(h.state().toast.is_none(), "{:?}", h.state().toast);
+
+    double_click(&mut h, "Rename Stream Mix");
+    select_all(&mut h);
+    h.get_by_label("Rename device").type_text(&"y".repeat(80));
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert_eq!(h.state().cfg.devices[1].name, "y".repeat(MAX_NAME_CHARS));
+    assert!(h.state().toast.is_none(), "{:?}", h.state().toast);
+}
+
+#[test]
+fn an_unplugged_monitor_is_named_from_the_config_and_flagged() {
+    let mut cfg = demo_config();
+    cfg.devices[0].monitors[0].device_uid = "GoneSpeakers".into();
+    cfg.devices[0].monitors[0].name = "Desk Speakers".into();
+    let h = open(cfg);
+    h.get_by_label("Desk Speakers: Not connected");
+    // a present device's name is recorded in the config, for when it is unplugged later
+    assert_eq!(h.state().cfg.devices[0].sources[0].name, "Safari");
+}
+
 /// GPU snapshots: `cargo test -p soundrouter-app --features snapshots`
 /// (`UPDATE_SNAPSHOTS=1` to rewrite the baselines in `app/tests/snapshots`).
 #[cfg(feature = "snapshots")]
@@ -884,6 +967,27 @@ mod snapshots {
             Some("Could not save config: Permission denied (os error 13)"),
             |_| {},
         );
+    }
+
+    /// An unplugged microphone source and monitor, named from the config.
+    fn unplugged() -> Config {
+        let mut cfg = demo_config();
+        cfg.devices.swap(0, 1); // Stream Mix: a microphone source
+        let d = &mut cfg.devices[0];
+        for s in &mut d.sources {
+            if let SourceKind::Device { uid } = &mut s.kind {
+                *uid = "GoneMic".into();
+                s.name = "Podcast Mic".into();
+            }
+        }
+        apply(&mut cfg, Edit::AddMonitor(0, "GoneSpeakers".into(), 2));
+        cfg.devices[0].monitors.last_mut().unwrap().name = "Desk Speakers".into();
+        cfg
+    }
+
+    #[test]
+    fn unplugged_devices() {
+        both("unplugged", unplugged, None, |_| {});
     }
 
     /// A window showing the setup flow, driven by `before`; both themes.
@@ -1374,4 +1478,26 @@ fn uninstall_asks_first_and_deletes_settings_only_when_ticked() {
     click(&mut h, "Uninstall");
     until(&mut h, "second run", |_| calls.lock().unwrap().len() == 2);
     assert!(calls.lock().unwrap()[1].contains("Application Support/SoundRouter"));
+}
+
+#[test]
+fn after_deleting_the_settings_edits_are_not_written_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("SoundRouter/config.json");
+    for (tick, kept) in [(false, true), (true, false)] {
+        let (runner, _) = recording(Ok(()));
+        let mut h = with_runner(installed(), runner);
+        h.state_mut().path = Some(path.clone());
+        click(&mut h, "Uninstall…");
+        if tick {
+            click(&mut h, "Also delete my SoundRouter settings");
+        }
+        click(&mut h, "Uninstall");
+        until(&mut h, "uninstalled", |h| !has(h, "Uninstall"));
+        if tick {
+            std::fs::remove_dir_all(dir.path().join("SoundRouter")).ok(); // what the script did
+        }
+        click(&mut h, "Mute Loopback Audio");
+        assert_eq!(path.exists(), kept, "ticked {tick}");
+    }
 }

@@ -12,6 +12,7 @@ pub fn src(id: &str, channels: u16, volume_db: f32, muted: bool) -> Source {
         volume_db,
         muted,
         mute_original: false,
+        name: String::new(),
     }
 }
 
@@ -56,6 +57,7 @@ pub fn mon(uid: &str, enabled: bool, volume_db: f32) -> Monitor {
                 dst_ch: 1,
             },
         ],
+        name: String::new(),
     }
 }
 

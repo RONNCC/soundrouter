@@ -29,6 +29,7 @@ fn arb_source() -> impl Strategy<Value = Source> {
             volume_db,
             muted,
             mute_original: false,
+            name: String::new(),
         })
 }
 
@@ -54,6 +55,7 @@ fn arb_device() -> impl Strategy<Value = VirtualDevice> {
             enabled,
             volume_db,
             wires,
+            name: String::new(),
         });
     (
         "[a-z0-9]{0,4}",

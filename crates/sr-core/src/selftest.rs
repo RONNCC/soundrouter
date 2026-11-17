@@ -37,6 +37,7 @@ pub fn probe_config(cfg: &Config, id: &str) -> Option<Config> {
                 volume_db: 0.0,
                 muted: false,
                 mute_original: false,
+                name: String::new(),
             });
             dev.sources.last_mut()?
         }
@@ -199,6 +200,7 @@ mod tests {
                 volume_db: -3.0,
                 muted: false,
                 mute_original: true,
+                name: String::new(),
             }],
             wires: vec![Wire {
                 source: "zoom".into(),
@@ -213,6 +215,7 @@ mod tests {
                     out_ch: 0,
                     dst_ch: 0,
                 }],
+                name: String::new(),
             }],
         }
     }
@@ -265,6 +268,7 @@ mod tests {
             volume_db: -20.0,
             muted: true,
             mute_original: false,
+            name: String::new(),
         });
         let d2 = &probe_config(&c2, "v1").unwrap().devices[0];
         assert_eq!(d2.sources.len(), 2);
