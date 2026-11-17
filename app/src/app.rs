@@ -527,7 +527,9 @@ impl App {
             .unwrap_or_default();
         if let Some((text, color)) = state_look(&state, t) {
             let c = pos2(inner.right() - 24.0, inner.top() + 34.0);
-            ui.painter().circle_filled(c, 4.0, color);
+            if state != DeviceState::Running {
+                ui.painter().circle_filled(c, 4.0, color);
+            }
             let dot = ui.interact(
                 Rect::from_center_size(c, vec2(14.0, 14.0)),
                 Id::unique(("state", i)),
