@@ -10,7 +10,7 @@ The single source is `[workspace.package] version` in `Cargo.toml`; every crate 
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `SIGN_ID` | `build-driver.sh`, `bundle-app.sh`, `make-dmg.sh` | Code-signing identity, e.g. `Developer ID Application: Name (TEAMID)`. Set: hardened runtime + secure timestamp (required for notarization). Unset: ad-hoc signature, no runtime flag. |
+| `SIGN_ID` | `build-driver.sh`, `bundle-app.sh`, `make-dmg.sh` | Code-signing identity, e.g. `Developer ID Application: Name (TEAMID)`. Set: hardened runtime + secure timestamp (required for notarization). Unset: no runtime flag; signed with the `SoundRouter Local Dev` identity if `packaging/make-dev-identity.sh` created it, else ad-hoc. |
 | `INSTALLER_ID` | `make-pkg.sh` | `Developer ID Installer: Name (TEAMID)`. Unset: the `.pkg` is unsigned (a warning is printed) and cannot be notarized. |
 | `NOTARY_PROFILE` | `notarize.sh` | `notarytool` keychain profile, created once with `xcrun notarytool store-credentials <profile>`. |
 | `BUILD_NUMBER` | scripts | Overrides `CFBundleVersion`. |
@@ -64,7 +64,7 @@ The result is ad-hoc signed and not notarized. Consequences, honestly:
 
 - **Gatekeeper blocks the first launch** of the app and the `.pkg`. Right-click the app (or pkg) and choose Open; on macOS 15 use System Settings > Privacy & Security > Open Anyway. For a downloaded build you trust, `xattr -dr com.apple.quarantine /Applications/SoundRouter.app` (and on the pkg/dmg before opening) removes the block from the shell.
 - **The driver may need approval.** coreaudiod loads HAL plug-ins signed by other teams (it carries `com.apple.private.security.clear-library-validation`), and the packaging path removes the quarantine flag, so an ad-hoc driver is expected to load. This has been checked in-process (`packaging/driver-dev.sh fakehost`) but **not** inside a real coreaudiod on a clean machine. If the device does not appear, check `codesign -dv /Library/Audio/Plug-Ins/HAL/SoundRouter.driver`, remove quarantine with `sudo xattr -dr com.apple.quarantine <driver>`, allow it under Privacy & Security if macOS lists it, and see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
-- **Privacy grants reset on every rebuild**, because each ad-hoc build is a new code identity. A self-signed certificate (README, "Signing and privacy grants") keeps one identity; it still cannot be notarized.
+- **Privacy grants reset on every rebuild**, because each ad-hoc build is a new code identity. `packaging/make-dev-identity.sh` (README, "Signing and privacy grants") keeps one identity for local builds; it still cannot be notarized.
 
 ## Upgrades and installer behaviour
 

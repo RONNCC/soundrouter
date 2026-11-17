@@ -9,7 +9,7 @@ Start with `sr-cli -v doctor` (exits 1 when unhealthy) and the log `~/Library/Lo
 - Watch `log stream --predicate 'process == "coreaudiod"'` while it restarts.
 
 ## Permissions reset after a rebuild
-Ad-hoc signing gives each build a new identity, so grants reset. Re-grant Microphone and System Audio Recording in System Settings > Privacy & Security, or sign with a stable self-signed certificate: `SIGN_ID="SoundRouter Dev" packaging/bundle-app.sh` (see README).
+Rebuilds keep asking for permissions: run `packaging/make-dev-identity.sh` once, then rebuild with `packaging/bundle-app.sh`. Ad-hoc signing gives each build a new identity (the grant is tied to the code hash), so grants reset; the script creates a stable self-signed identity, `SoundRouter Local Dev`, that the build scripts use automatically. Grant Microphone and System Audio Recording once more after the first build signed with it (System Settings > Privacy & Security). If a build shows "codesign wants to use key", enter your login password and choose Always Allow. Check with `codesign -dr - target/SoundRouter.app`: it must say `certificate leaf`, not `cdhash`.
 
 ## System Audio Recording ("Not asked yet", app sources silent)
 - Open **Test Setup…** and click **Allow System Audio Recording** (or **Continue**): macOS shows its own prompt; answer Allow. The row turns "Allowed" without a relaunch.
