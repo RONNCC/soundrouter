@@ -17,6 +17,10 @@ pub const AUDIO_CAPTURE_SETTINGS: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture";
 const MIC_SETTINGS: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+/// Where AUDIO_CAPTURE_SETTINGS lands (checked on macOS 14.7.1) and the switch to turn on there.
+const CAPTURE_DENIED: &str = "Turn on SoundRouter in System Settings › Privacy & Security › Screen & System Audio Recording › System Audio Recording Only. macOS may ask you to Quit & Reopen SoundRouter.";
+/// How long a System Audio Recording request waits for the user to answer the prompt.
+const CAPTURE_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 /// The driver must show up in the HAL this long after the install script succeeded.
 const DRIVER_WAIT_SECS: f64 = 10.0;
 /// The loopback test must finish this long after the Verify step first saw it running.
@@ -44,6 +48,77 @@ impl std::fmt::Display for SetupError {
 
 /// Runs a shell script as root. Injected into the app so tests never prompt.
 pub type Runner = Arc<dyn Fn(&str) -> Result<(), SetupError> + Send + Sync>;
+
+/// Asks macOS for System Audio Recording and returns the answer. Injected so tests never prompt.
+pub type Asker = Arc<dyn Fn() -> TccStatus + Send + Sync>;
+
+/// What decides whether the setup sheet opens by itself (it always opens on "Test Setup…").
+#[derive(Clone, Copy, Debug)]
+pub struct Needs {
+    pub driver: bool,
+    pub mic: TccStatus,
+    pub capture: TccStatus,
+    /// An enabled device: the engine reads its input, which takes the Microphone permission.
+    pub mic_source: bool,
+    /// An enabled device has an app source, which takes System Audio Recording.
+    pub app_source: bool,
+    /// The sheet was finished or dismissed in this version.
+    pub seen: bool,
+}
+
+impl Needs {
+    /// Hold the first apply so the sheet explains the Microphone prompt before macOS shows it.
+    /// Once the sheet was seen, macOS asks on its own (its prompt carries our usage text).
+    pub fn hold_first_apply(&self) -> bool {
+        self.driver && self.mic_source && self.mic == TccStatus::Unknown && !self.seen
+    }
+}
+
+/// Open the sheet only when something is missing that the app needs, and never again in this
+/// version once the user finished or dismissed it, except for a missing driver (nothing works).
+/// A System Audio Recording question still open is not missing: macOS asks when an app source starts.
+pub fn should_show_setup(n: &Needs) -> bool {
+    !n.driver
+        || (!n.seen
+            && ((n.mic_source && n.mic != TccStatus::Granted)
+                || (n.app_source && n.capture == TccStatus::Denied)))
+}
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Marker next to the config: the version whose setup sheet was finished or dismissed.
+fn seen_marker() -> Option<PathBuf> {
+    Some(crate::store::default_path()?.with_file_name(".setup-seen"))
+}
+
+fn seen_at(p: &Path) -> bool {
+    std::fs::read_to_string(p).is_ok_and(|v| v == VERSION)
+}
+
+fn mark_seen_at(p: &Path) {
+    let _ = std::fs::create_dir_all(p.parent().unwrap_or(p));
+    let _ = std::fs::write(p, VERSION);
+}
+
+/// Run `job` off the UI thread (inline in tests, so the answer is there by the next frame) and
+/// repaint when it is done.
+fn off_ui<T: Send + 'static>(
+    ctx: &Context,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+    let ctx = ctx.clone();
+    let job = move || {
+        let _ = tx.send(job());
+        ctx.request_repaint();
+    };
+    if cfg!(test) {
+        job();
+    } else {
+        std::thread::spawn(job);
+    }
+    rx
+}
 
 /// POSIX single-quote `s`: safe for any bytes except NUL (which paths cannot contain).
 pub fn sh_quote(s: &str) -> String {
@@ -160,21 +235,30 @@ pub struct View<'a> {
     pub test: &'a SelfTestState,
     pub device_name: &'a str,
     /// The driver is there but nothing has been applied yet, because the Microphone prompt would
-    /// otherwise appear unexplained.
+    /// otherwise appear unexplained (`Needs::hold_first_apply`).
     pub first_apply_pending: bool,
+    /// `should_show_setup` said yes.
+    pub missing: bool,
     pub now: f64,
     pub diagnostics: &'a dyn Fn() -> String,
 }
 
 pub struct Setup {
     runner: Runner,
+    asker: Asker,
     /// The driver bundle to install; `None` when this build ships without one.
     source: Option<PathBuf>,
     step: Step,
-    /// Opened by "Test Setup…" or after an install; otherwise the sheet shows only without a driver.
+    /// Opened by "Test Setup…", after an install, or when `should_show_setup` says so.
     open: bool,
     busy: Option<Busy>,
     rx: Option<Receiver<Result<(), SetupError>>>,
+    /// A System Audio Recording request in flight.
+    asking: Option<Receiver<TccStatus>>,
+    /// Its answer, shown until the next status poll knows it too.
+    answer: Option<TccStatus>,
+    /// Continue was pressed: ask for System Audio Recording once the Microphone question is settled.
+    ask_after_mic: bool,
     error: Option<String>,
     /// Time by which the driver must have appeared after a successful install.
     deadline: Option<f64>,
@@ -185,17 +269,25 @@ pub struct Setup {
     shown: bool,
     /// When the Verify step first saw the loopback test running; `None` while it is not.
     test_since: Option<f64>,
+    /// Finished or dismissed in this version (`Needs::seen`).
+    seen: bool,
+    /// Where `seen` is remembered; `None` in tests.
+    marker: Option<PathBuf>,
 }
 
 impl Setup {
     pub fn new(runner: Runner, source: Option<PathBuf>) -> Self {
         Self {
             runner,
+            asker: Arc::new(|| TccStatus::Unknown),
             source,
             step: Step::Welcome,
             open: false,
             busy: None,
             rx: None,
+            asking: None,
+            answer: None,
+            ask_after_mic: false,
             error: None,
             deadline: None,
             confirm: None,
@@ -203,12 +295,33 @@ impl Setup {
             demo: false,
             shown: false,
             test_since: None,
+            seen: false,
+            marker: None,
         }
     }
 
-    /// The real thing: the administrator prompt and the bundled driver.
+    /// The real thing: the administrator prompt, the System Audio Recording prompt, the bundled
+    /// driver, and the "setup seen" marker.
     pub fn system() -> Self {
-        Self::new(Arc::new(run_admin), locate_driver())
+        let marker = seen_marker();
+        Self {
+            seen: marker.as_deref().is_some_and(seen_at),
+            marker,
+            ..Self::new(Arc::new(run_admin), locate_driver())
+        }
+        .with_asker(Arc::new(|| {
+            sr_audio::tcc::request_audio_capture(CAPTURE_PROMPT_WAIT).into()
+        }))
+    }
+
+    pub fn with_asker(mut self, asker: Asker) -> Self {
+        self.asker = asker;
+        self
+    }
+
+    /// Finished or dismissed in this version.
+    pub fn seen(&self) -> bool {
+        self.seen
     }
 
     pub fn source(&self) -> Option<&Path> {
@@ -233,21 +346,42 @@ impl Setup {
     }
 
     fn spawn(&mut self, ctx: &Context, busy: Busy, script: String) {
-        let (tx, rx) = mpsc::channel();
-        let (runner, ctx) = (self.runner.clone(), ctx.clone());
-        let job = move || {
-            let _ = tx.send(runner(&script));
-            ctx.request_repaint();
-        };
-        // Tests run the job here, so its result is there for the next frame whatever the scheduler does.
-        if cfg!(test) {
-            job();
-        } else {
-            std::thread::spawn(job);
-        }
+        let runner = self.runner.clone();
+        self.rx = Some(off_ui(ctx, move || runner(&script)));
         self.busy = Some(busy);
-        self.rx = Some(rx);
         self.error = None;
+    }
+
+    /// Show macOS's System Audio Recording prompt (an immediate answer once it was decided).
+    fn ask_capture(&mut self, ctx: &Context) {
+        let asker = self.asker.clone();
+        self.asking = Some(off_ui(ctx, move || asker()));
+    }
+
+    /// System Audio Recording as the sheet shows it: the status poll, or the request's answer
+    /// while the poll has not caught up.
+    fn capture(&self, v: &View) -> TccStatus {
+        match (v.status.tcc, self.answer) {
+            (TccStatus::Unknown, Some(a)) => a,
+            (s, _) => s,
+        }
+    }
+
+    /// The row's button: ask macOS, or once it said no, its Settings pane.
+    fn capture_action(&mut self, ctx: &Context, v: &View) {
+        if self.capture(v) == TccStatus::Denied {
+            open_url(AUDIO_CAPTURE_SETTINGS);
+        } else {
+            self.ask_capture(ctx);
+        }
+    }
+
+    /// Continue: the self-test asks for the Microphone; System Audio Recording follows once that
+    /// question is settled, so the two prompts never overlap.
+    fn continue_to_verify(&mut self, action: Action) -> Option<Action> {
+        self.step = Step::Verify;
+        self.ask_after_mic = true;
+        Some(action)
     }
 
     fn start_install(&mut self, ctx: &Context) {
@@ -264,6 +398,10 @@ impl Setup {
     }
 
     fn poll(&mut self, now: f64) -> Option<Action> {
+        if let Some(a) = self.asking.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.asking = None;
+            self.answer = Some(a);
+        }
         let r = self.rx.as_ref().and_then(|rx| rx.try_recv().ok())?;
         self.rx = None;
         match (self.busy.take(), r) {
@@ -295,7 +433,7 @@ impl Setup {
                 );
             }
         } else if matches!(self.step, Step::Welcome | Step::Driver) {
-            if self.deadline.take().is_some() || v.first_apply_pending {
+            if self.deadline.take().is_some() || v.missing {
                 self.step = Step::Permissions;
                 self.open = true;
             } else {
@@ -312,6 +450,12 @@ impl Setup {
             return deleted;
         }
         self.sync(v);
+        if self.ask_after_mic && v.status.mic != TccStatus::Unknown && self.asking.is_none() {
+            self.ask_after_mic = false;
+            if self.capture(v) == TccStatus::Unknown {
+                self.ask_capture(ctx);
+            }
+        }
         let t = tokens(ctx.theme() == Theme::Dark);
         let mut action = None;
         if self.open || v.status.driver_version.is_none() {
@@ -328,6 +472,11 @@ impl Setup {
         self.open = false;
         self.step = Step::Welcome;
         self.test_since = None;
+        self.ask_after_mic = false;
+        self.seen = true;
+        if let Some(p) = &self.marker {
+            mark_seen_at(p);
+        }
     }
 
     fn sheet(&mut self, ctx: &Context, t: &Tokens, v: &View) -> Option<Action> {
@@ -457,13 +606,13 @@ impl Setup {
                         buttons: true,
                         glyph: Glyph::App,
                         title: "Allow access",
-                        intro: "SoundRouter needs two permissions. macOS asks for each the first time it is needed.",
+                        intro: "SoundRouter needs two permissions. Continue asks macOS for each one it has not answered yet.",
                     },
                     self,
-                    |ui, _| {
-                        let rows = permission_rows(v, true);
+                    |ui, s| {
+                        let rows = s.permission_rows(v, true);
                         if checklist(ui, t, &rows) == Some(1) {
-                            open_url(AUDIO_CAPTURE_SETTINGS);
+                            s.capture_action(ctx, v);
                         }
                     },
                     |ui, s| {
@@ -472,29 +621,19 @@ impl Setup {
                             s,
                             |_, _| {},
                             |ui, s| {
-                                match mic {
-                                    TccStatus::Granted => {
-                                        if button(ui, t, "Continue", Kind::Primary) {
-                                            s.step = Step::Verify;
-                                            action = Some(Action::Test);
-                                        }
+                                if mic == TccStatus::Denied {
+                                    if button(ui, t, "Open Microphone Settings", Kind::Primary) {
+                                        open_url(MIC_SETTINGS);
                                     }
-                                    TccStatus::Unknown => {
-                                        if button(ui, t, "Allow Microphone", Kind::Primary) {
-                                            s.step = Step::Verify;
-                                            action = Some(Action::AllowMic);
-                                        }
+                                    if button(ui, t, "Continue", Kind::Secondary) {
+                                        action = s.continue_to_verify(Action::Test);
                                     }
-                                    TccStatus::Denied => {
-                                        if button(ui, t, "Open Microphone Settings", Kind::Primary)
-                                        {
-                                            open_url(MIC_SETTINGS);
-                                        }
-                                        if button(ui, t, "Continue", Kind::Secondary) {
-                                            s.step = Step::Verify;
-                                            action = Some(Action::Test);
-                                        }
-                                    }
+                                } else if button(ui, t, "Continue", Kind::Primary) {
+                                    action = s.continue_to_verify(if mic == TccStatus::Unknown {
+                                        Action::AllowMic
+                                    } else {
+                                        Action::Test
+                                    });
                                 }
                                 if !v.first_apply_pending && button(ui, t, "Close", Kind::Secondary)
                                 {
@@ -538,7 +677,7 @@ impl Setup {
                     |ui, s| {
                         let flows;
                         let why;
-                        let mut rows = permission_rows(v, false).to_vec();
+                        let mut rows = s.permission_rows(v, false).to_vec();
                         rows.insert(
                             0,
                             Row {
@@ -594,7 +733,9 @@ impl Setup {
                                 }
                             }
                         });
-                        checklist(ui, t, &rows);
+                        if checklist(ui, t, &rows) == Some(2) {
+                            s.capture_action(ctx, v);
+                        }
                         match v.test {
                             _ if hung => body(ui, t, "Try again, or copy diagnostics for support."),
                             SelfTestState::Idle | SelfTestState::Running => {
@@ -760,39 +901,56 @@ impl Setup {
     }
 }
 
-/// Microphone and System Audio Recording as checklist rows. `explain` adds the why and the
-/// Settings shortcut (index 1 is the audio capture row).
-fn permission_rows<'a>(v: &View, explain: bool) -> [Row<'a>; 2] {
-    let look = |s: TccStatus| match s {
-        TccStatus::Granted => Status::Ok,
-        TccStatus::Denied => Status::Fail,
-        TccStatus::Unknown => Status::Pending,
-    };
-    let (mic, cap) = (v.status.mic, v.status.tcc);
-    [
-        Row {
-            state: look(mic),
-            title: "Microphone",
-            status: tcc_word(mic),
-            detail: if explain {
-                "Reads the virtual device's input to check that audio flows, and any microphone or input device you add as a source. macOS asks the first time."
-            } else {
-                ""
+impl Setup {
+    /// Microphone and System Audio Recording as checklist rows (index 1 is System Audio
+    /// Recording, whose button asks macOS, or opens Settings once it said no). `explain` adds the why.
+    fn permission_rows<'a>(&self, v: &View, explain: bool) -> [Row<'a>; 2] {
+        let look = |s: TccStatus| match s {
+            TccStatus::Granted => Status::Ok,
+            TccStatus::Denied => Status::Fail,
+            TccStatus::Unknown => Status::Pending,
+        };
+        let (mic, cap) = (v.status.mic, self.capture(v));
+        let capture = if self.asking.is_some() {
+            Row {
+                state: Status::Running,
+                title: "System Audio Recording",
+                status: "Asking…",
+                detail: "Answer the macOS prompt.",
+                action: None,
+            }
+        } else {
+            Row {
+                state: look(cap),
+                title: "System Audio Recording",
+                status: tcc_word(cap),
+                detail: match cap {
+                    TccStatus::Denied => CAPTURE_DENIED,
+                    _ if explain => "Captures audio from apps you add as sources.",
+                    _ => "",
+                },
+                action: match cap {
+                    TccStatus::Granted => None,
+                    TccStatus::Denied => Some("Open Settings"),
+                    TccStatus::Unknown => Some("Allow System Audio Recording"),
+                },
+            }
+        };
+        [
+            Row {
+                state: look(mic),
+                title: "Microphone",
+                status: tcc_word(mic),
+                detail: if explain {
+                    "Reads the virtual device's input to check that audio flows, and any microphone or input device you add as a source."
+                } else {
+                    ""
+                },
+                action: None,
             },
-            action: None,
-        },
-        Row {
-            state: look(cap),
-            title: "System Audio Recording",
-            status: tcc_word(cap),
-            detail: if explain {
-                "Captures audio from apps you add as sources. macOS asks when the first app source starts."
-            } else {
-                ""
-            },
-            action: (explain && cap != TccStatus::Granted).then_some("Open Settings"),
-        },
-    ]
+            capture,
+        ]
+    }
 }
 
 /// For support text: the status as the user sees it when it is not decided, else its name.
@@ -1030,5 +1188,51 @@ mod tests {
             classify(false, "boom (1)\n"),
             Err(SetupError::Failed("boom (1)".into()))
         );
+    }
+
+    #[test]
+    fn the_sheet_opens_only_for_something_missing_and_not_again_once_seen() {
+        use TccStatus::{Denied as D, Granted as G, Unknown as U};
+        // (driver, mic, capture, mic source, app source, seen) -> show, hold first apply
+        #[rustfmt::skip]
+        let table = [
+            (false, G, G, true,  true,  true,  true,  false), // no driver: always
+            (false, U, U, false, false, false, true,  false),
+            (true,  G, G, true,  true,  false, false, false), // all granted
+            (true,  G, U, true,  true,  false, false, false), // capture not asked: macOS asks at the tap
+            (true,  G, U, true,  false, false, false, false),
+            (true,  U, U, true,  false, false, true,  true ), // explain the Microphone prompt first
+            (true,  U, U, true,  false, true,  false, false), // seen: macOS asks on its own
+            (true,  U, U, false, false, false, false, false), // nothing reads an input
+            (true,  D, G, true,  false, false, true,  false),
+            (true,  D, G, true,  false, true,  false, false), // dismissed: no nagging
+            (true,  D, G, false, false, false, false, false),
+            (true,  G, D, true,  true,  false, true,  false), // capture denied with an app source
+            (true,  G, D, true,  false, false, false, false), // ... without one: not needed
+            (true,  G, D, true,  true,  true,  false, false),
+        ];
+        for (driver, mic, capture, mic_source, app_source, seen, show, hold) in table {
+            let n = Needs {
+                driver,
+                mic,
+                capture,
+                mic_source,
+                app_source,
+                seen,
+            };
+            assert_eq!(should_show_setup(&n), show, "{n:?}");
+            assert_eq!(n.hold_first_apply(), hold, "{n:?}");
+        }
+    }
+
+    #[test]
+    fn seen_is_per_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("SoundRouter/.setup-seen");
+        assert!(!seen_at(&p));
+        mark_seen_at(&p);
+        assert!(seen_at(&p));
+        std::fs::write(&p, "0.0.0-older").unwrap();
+        assert!(!seen_at(&p));
     }
 }

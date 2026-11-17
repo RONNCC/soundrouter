@@ -85,7 +85,8 @@ pub fn init() -> Option<PathBuf> {
     path
 }
 
-/// One-line startup banner: version, macOS version, driver presence.
+/// One-line startup banner: version, macOS version, driver presence, and the raw TCC answers for
+/// this process (which, launched from Finder or `open`, is the app's own TCC subject).
 pub fn banner(log_file: Option<&Path>) {
     let os = std::process::Command::new("sw_vers")
         .arg("-productVersion")
@@ -96,9 +97,11 @@ pub fn banner(log_file: Option<&Path>) {
         .unwrap_or_else(|| "unknown".into());
     let driver = sr_audio::driver::find_plugin().is_some();
     log::info!(
-        "SoundRouter {} starting; macOS {os}; driver plug-in {}; log file {}",
+        "SoundRouter {} starting; macOS {os}; driver plug-in {}; TCC audio capture {:?}, microphone {:?}; log file {}",
         env!("CARGO_PKG_VERSION"),
         if driver { "found" } else { "NOT found" },
+        sr_audio::tcc::audio_capture_status(),
+        sr_audio::tcc::microphone_status(),
         log_file.map_or_else(|| "(none)".into(), |p| p.display().to_string()),
     );
 }

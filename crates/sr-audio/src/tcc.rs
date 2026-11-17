@@ -1,19 +1,30 @@
-//! TCC audio-capture permission preflight (private framework, dlopen'd; no prompt is triggered).
-use std::ffi::{c_char, c_int, c_void};
+//! TCC permission checks (private framework, dlopen'd) and the System Audio Recording request.
+use std::ffi::{CStr, c_char, c_int, c_void};
 
 use std::time::Duration;
 
-use block2::RcBlock;
+use block2::{Block, RcBlock};
 use objc2::msg_send;
 use objc2::runtime::{AnyClass, Bool};
 use objc2_foundation::NSString;
+use sr_core::backend::TccStatus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureStatus {
     Granted,
     Denied,
-    /// Not decided yet, or the private API is unavailable (carries the raw value, -1 = unavailable).
+    /// Not decided yet (raw 2) or unreadable; carries the raw value, -1 = private API unavailable.
     Unknown(i32),
+}
+
+impl From<CaptureStatus> for TccStatus {
+    fn from(s: CaptureStatus) -> Self {
+        match s {
+            CaptureStatus::Granted => TccStatus::Granted,
+            CaptureStatus::Denied => TccStatus::Denied,
+            CaptureStatus::Unknown(_) => TccStatus::Unknown,
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -21,8 +32,40 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
+const AUDIO_CAPTURE: &str = "kTCCServiceAudioCapture";
+
+/// System Audio Recording (process taps), without prompting.
 pub fn audio_capture_status() -> CaptureStatus {
-    preflight("kTCCServiceAudioCapture")
+    preflight(AUDIO_CAPTURE)
+}
+
+/// Ask macOS for System Audio Recording the way AudioCap does (`TCCAccessRequest`): the system
+/// prompt when the question is still open, an immediate answer once it was decided. Blocks until
+/// the user answers, at most `wait`. Returns the status afterwards.
+pub fn request_audio_capture(wait: Duration) -> CaptureStatus {
+    let granted = tcc_symbol(c"TCCAccessRequest").and_then(|f| {
+        // SAFETY: `void TCCAccessRequest(CFStringRef service, CFDictionaryRef options, void (^)(Boolean))`;
+        // NSString is toll-free bridged to CFString, and TCC copies the block it calls later.
+        let f: unsafe extern "C" fn(*const NSString, *const c_void, *const Block<dyn Fn(Bool)>) =
+            unsafe { std::mem::transmute(f) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = RcBlock::new(move |granted: Bool| {
+            let _ = tx.send(granted.as_bool());
+        });
+        let svc = NSString::from_str(AUDIO_CAPTURE);
+        unsafe { f(&*svc, std::ptr::null(), &*done) };
+        rx.recv_timeout(wait).ok()
+    });
+    after_request(granted, audio_capture_status())
+}
+
+/// The status after a request: a "yes" from the completion is final; anything else (no, or no
+/// answer in time) is whatever TCC now says, so a prompt that never showed stays "not asked".
+fn after_request(granted: Option<bool>, now: CaptureStatus) -> CaptureStatus {
+    match granted {
+        Some(true) => CaptureStatus::Granted,
+        _ => now,
+    }
 }
 
 /// Microphone permission, without prompting. AVFoundation's public answer wins; the private TCC
@@ -83,27 +126,65 @@ pub fn request_microphone(wait: Duration) -> CaptureStatus {
     microphone_status()
 }
 
-fn preflight(service: &str) -> CaptureStatus {
+/// A function of the private TCC framework.
+fn tcc_symbol(name: &CStr) -> Option<*mut c_void> {
     const RTLD_NOW: c_int = 2;
+    // SAFETY: loading a system framework by path and looking a symbol up in it.
     unsafe {
         let h = dlopen(
             c"/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC".as_ptr(),
             RTLD_NOW,
         );
-        if h.is_null() {
-            return CaptureStatus::Unknown(-1);
-        }
-        let f = dlsym(h, c"TCCAccessPreflight".as_ptr());
-        if f.is_null() {
-            return CaptureStatus::Unknown(-1);
-        }
-        let f: unsafe extern "C" fn(*const NSString, *const c_void) -> c_int =
-            std::mem::transmute(f);
-        let svc = NSString::from_str(service);
-        match f(&*svc, std::ptr::null()) {
-            0 => CaptureStatus::Granted,
-            1 => CaptureStatus::Denied,
-            v => CaptureStatus::Unknown(v),
-        }
+        let f = if h.is_null() {
+            h
+        } else {
+            dlsym(h, name.as_ptr())
+        };
+        (!f.is_null()).then_some(f)
+    }
+}
+
+/// `TCCAccessPreflight`: 0 allowed, 1 denied, 2 not decided yet (checked on macOS 14.7.1 with a
+/// fresh binary launched by launchd, i.e. its own TCC subject).
+fn preflight(service: &str) -> CaptureStatus {
+    let Some(f) = tcc_symbol(c"TCCAccessPreflight") else {
+        return CaptureStatus::Unknown(-1);
+    };
+    // SAFETY: `int TCCAccessPreflight(CFStringRef service, CFDictionaryRef options)`.
+    let f: unsafe extern "C" fn(*const NSString, *const c_void) -> c_int =
+        unsafe { std::mem::transmute(f) };
+    let svc = NSString::from_str(service);
+    match unsafe { f(&*svc, std::ptr::null()) } {
+        0 => CaptureStatus::Granted,
+        1 => CaptureStatus::Denied,
+        v => CaptureStatus::Unknown(v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_private_tcc_functions_exist() {
+        assert!(tcc_symbol(c"TCCAccessPreflight").is_some());
+        assert!(tcc_symbol(c"TCCAccessRequest").is_some());
+    }
+
+    #[test]
+    fn only_a_yes_from_the_request_is_final() {
+        let not_asked = CaptureStatus::Unknown(2);
+        assert_eq!(after_request(Some(true), not_asked), CaptureStatus::Granted);
+        assert_eq!(
+            after_request(Some(false), CaptureStatus::Denied),
+            CaptureStatus::Denied
+        );
+        // no prompt could be shown, or the user has not answered yet
+        assert_eq!(after_request(Some(false), not_asked), not_asked);
+        assert_eq!(after_request(None, not_asked), not_asked);
+        assert_eq!(
+            TccStatus::from(CaptureStatus::Unknown(-1)),
+            TccStatus::Unknown
+        );
     }
 }

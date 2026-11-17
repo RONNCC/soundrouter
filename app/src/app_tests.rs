@@ -1076,9 +1076,31 @@ mod snapshots {
             tcc: TccStatus::Denied,
             ..installed()
         };
-        sheet("allow_denied", WIDE, denied, flowing(), never_run(), |h| {
-            click(h, "Test Setup…");
-        });
+        // denied with sources that need it: the sheet opens by itself
+        sheet("allow_denied", WIDE, denied, flowing(), never_run(), |_| {});
+    }
+
+    /// The Verify step with System Audio Recording still open: its own Allow button.
+    #[test]
+    fn sheet_verify_capture_not_asked() {
+        let status = EngineStatus {
+            tcc: TccStatus::Unknown,
+            ..installed()
+        };
+        sheet(
+            "verify_capture_unasked",
+            WIDE,
+            status,
+            flowing(),
+            never_run(),
+            |h| {
+                click(h, "Test Setup…");
+                click(h, "Continue");
+                until(h, "self-test", |h| {
+                    h.query_by_label_contains("Audio flows").is_some()
+                });
+            },
+        );
     }
 
     #[test]
@@ -1378,7 +1400,10 @@ fn setup_run(status: EngineStatus, test: Option<SelfTest>) -> Harness<'static, A
     b.status = status;
     b.self_test = test;
     let mut h = window(demo_config(), Box::new(b), None, Theme::Dark, false);
-    click(&mut h, "Test Setup…");
+    // Something missing opens the sheet by itself; otherwise the footer button does.
+    if !h.state().setup.shown() {
+        click(&mut h, "Test Setup…");
+    }
     h
 }
 
@@ -1428,8 +1453,117 @@ fn denied_audio_capture_offers_open_settings() {
     );
     h.get_by_label("Open Settings");
     h.get_by_label("System Audio Recording: Denied");
+    h.get_by_label_contains("System Audio Recording Only");
+    assert!(!has(&h, "Allow System Audio Recording"));
     let h = setup_run(installed(), flowing());
-    assert!(!has(&h, "Open Settings"));
+    assert!(!has(&h, "Open Settings") && !has(&h, "Allow System Audio Recording"));
+}
+
+/// An asker that counts its calls and answers `with`.
+fn asker(with: TccStatus) -> (crate::setup::Asker, Arc<Mutex<usize>>) {
+    let calls = Arc::new(Mutex::new(0));
+    let c = calls.clone();
+    (
+        Arc::new(move || {
+            *c.lock().unwrap() += 1;
+            with
+        }),
+        calls,
+    )
+}
+
+fn with_asker(status: EngineStatus, a: crate::setup::Asker) -> Harness<'static, App> {
+    let mut h = with_runner(status, never_run());
+    h.state_mut().setup = Setup::new(never_run(), None).with_asker(a);
+    settle(&mut h);
+    h
+}
+
+#[test]
+fn the_capture_row_asks_macos_and_shows_the_answer() {
+    for (answer, word, settings) in [
+        (TccStatus::Granted, "Allowed", false),
+        (TccStatus::Denied, "Denied", true),
+        // no prompt came (or no answer in time): still open, the button stays
+        (TccStatus::Unknown, "Not asked yet", false),
+    ] {
+        let unasked = EngineStatus {
+            tcc: TccStatus::Unknown,
+            ..installed()
+        };
+        let (a, calls) = asker(answer);
+        let mut h = with_asker(unasked, a);
+        click(&mut h, "Test Setup…");
+        h.get_by_label("System Audio Recording: Not asked yet");
+        assert!(!has(&h, "Open Settings"), "only after Denied");
+        click(&mut h, "Allow System Audio Recording");
+        assert_eq!(*calls.lock().unwrap(), 1);
+        h.get_by_label(&format!("System Audio Recording: {word}"));
+        assert_eq!(has(&h, "Open Settings"), settings, "{answer:?}");
+        assert_eq!(
+            has(&h, "Allow System Audio Recording"),
+            answer == TccStatus::Unknown
+        );
+    }
+}
+
+#[test]
+fn continue_asks_for_the_microphone_then_system_audio() {
+    // Microphone already answered: Continue asks for System Audio Recording right away.
+    let (a, calls) = asker(TccStatus::Granted);
+    let mut h = with_asker(
+        EngineStatus {
+            tcc: TccStatus::Unknown,
+            ..installed()
+        },
+        a,
+    );
+    click(&mut h, "Test Setup…");
+    click(&mut h, "Continue");
+    assert_eq!(*calls.lock().unwrap(), 1);
+    h.get_by_label("System Audio Recording: Allowed");
+
+    // Both open: the Microphone prompt (self-test) first, System Audio Recording once it is answered.
+    let (a, calls) = asker(TccStatus::Granted);
+    let mut h = with_asker(
+        EngineStatus {
+            mic: TccStatus::Unknown,
+            tcc: TccStatus::Unknown,
+            ..installed()
+        },
+        a,
+    );
+    click(&mut h, "Continue");
+    h.run_steps(3);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        0,
+        "not while the Microphone is open"
+    );
+    until(&mut h, "System Audio Recording asked", |h| {
+        h.state().worker.shared.lock().unwrap().status.mic = TccStatus::Granted;
+        *calls.lock().unwrap() == 1
+    });
+    settle(&mut h);
+    h.get_by_label("System Audio Recording: Allowed");
+}
+
+#[test]
+fn a_dismissed_sheet_stays_dismissed() {
+    let status = EngineStatus {
+        mic: TccStatus::Denied,
+        ..installed()
+    };
+    let mut h = with_runner(status, never_run());
+    assert!(
+        h.state().setup.shown(),
+        "missing: the sheet opens by itself"
+    );
+    click(&mut h, "Close");
+    h.run_steps(10);
+    assert!(!h.state().setup.shown() && h.state().setup.seen());
+    click(&mut h, "Test Setup…");
+    assert!(h.state().setup.shown(), "Test Setup… always opens it");
 }
 
 #[test]
@@ -1439,10 +1573,10 @@ fn the_microphone_question_is_explained_before_the_first_apply() {
         ..installed()
     };
     let mut h = with_runner(status, never_run());
-    h.get_by_label("Allow Microphone");
+    h.get_by_label("Continue");
     assert!(!has(&h, "Close"), "cannot skip the explanation");
     assert!(h.state().worker.shared.lock().unwrap().meters.is_empty());
-    click(&mut h, "Allow Microphone");
+    click(&mut h, "Continue");
     until(&mut h, "apply and self-test", |h| {
         let s = h.state().worker.shared.lock().unwrap();
         !s.meters.is_empty() && matches!(s.self_test, SelfTestState::Done(_))

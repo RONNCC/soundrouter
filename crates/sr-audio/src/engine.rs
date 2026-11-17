@@ -666,11 +666,7 @@ impl Backend for Engine {
     }
 
     fn status(&self) -> EngineStatus {
-        let tcc = match crate::tcc::audio_capture_status() {
-            crate::tcc::CaptureStatus::Granted => TccStatus::Granted,
-            crate::tcc::CaptureStatus::Denied => TccStatus::Denied,
-            crate::tcc::CaptureStatus::Unknown(_) => TccStatus::Unknown,
-        };
+        let tcc = crate::tcc::audio_capture_status().into();
         let mic = mic_status();
         let driver_version =
             driver::find_plugin().map(|p| driver::version(p).unwrap_or_else(|| "?".into()));

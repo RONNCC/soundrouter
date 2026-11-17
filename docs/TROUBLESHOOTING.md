@@ -11,6 +11,12 @@ Start with `sr-cli -v doctor` (exits 1 when unhealthy) and the log `~/Library/Lo
 ## Permissions reset after a rebuild
 Ad-hoc signing gives each build a new identity, so grants reset. Re-grant Microphone and System Audio Recording in System Settings > Privacy & Security, or sign with a stable self-signed certificate: `SIGN_ID="SoundRouter Dev" packaging/bundle-app.sh` (see README).
 
+## System Audio Recording ("Not asked yet", app sources silent)
+- Open **Test Setup…** and click **Allow System Audio Recording** (or **Continue**): macOS shows its own prompt; answer Allow. The row turns "Allowed" without a relaunch.
+- "Denied": click **Open Settings** (System Settings › Privacy & Security › Screen & System Audio Recording) and turn SoundRouter on under **System Audio Recording Only**. If macOS offers Quit & Reopen, accept it.
+- macOS asks once per app identity: after a denial no prompt appears again, only the Settings switch works. `tccutil reset AudioCapture com.ronncc.soundrouter` forgets the answer so the prompt can appear again.
+- The log's startup line records what macOS answers this build: `TCC audio capture Unknown(2)` = not asked yet, `Granted`, `Denied`. `sr-cli doctor` run from Terminal reports the terminal's permission, not the app's.
+
 ## No sound
 - Is the app running (or in the menu bar)? Routing stops when it quits; devices remain as plain loopbacks.
 - Check both permissions are granted and the setup self-test passes.

@@ -40,7 +40,7 @@ Distribution builds (Developer ID signing, notarization, the tag-triggered GitHu
 
 **Signing and privacy grants.** Every ad-hoc build is a new app identity, so macOS resets Microphone and System Audio Recording grants on each rebuild. Create a self-signed code-signing certificate once (Keychain Access > Certificate Assistant > Create a Certificate, name `SoundRouter Dev`, Self Signed Root, Code Signing), then `SIGN_ID="SoundRouter Dev" packaging/bundle-app.sh`.
 
-**Permissions.** Microphone (needed for any input, including the virtual device inside the engine's aggregate) and System Audio Recording (app taps).
+**Permissions.** Microphone (needed for any input, including the virtual device inside the engine's aggregate) and System Audio Recording (app taps). In the setup sheet (**Test Setup…**), **Continue** asks macOS for each one not answered yet (Microphone first, then System Audio Recording); the System Audio Recording row also has an **Allow System Audio Recording** button. If you denied it, the row shows **Open Settings**: turn SoundRouter on under System Settings › Privacy & Security › Screen & System Audio Recording › **System Audio Recording Only**. The sheet opens by itself only when something an existing source needs is missing, and not again in the same version once you finished or closed it.
 
 **Uninstall:** the setup sheet's Uninstall…, or `packaging/uninstall.sh [--purge]`.
 

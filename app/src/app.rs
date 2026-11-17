@@ -189,24 +189,37 @@ impl App {
         self.worker.shared.lock().unwrap().status.clone()
     }
 
+    /// What `setup::should_show_setup` decides on: this config, this engine status.
+    fn needs(&self, status: &EngineStatus) -> setup::Needs {
+        let enabled: Vec<_> = self.cfg.devices.iter().filter(|d| d.enabled).collect();
+        setup::Needs {
+            driver: status.driver_version.is_some(),
+            mic: status.mic,
+            capture: status.tcc,
+            mic_source: !enabled.is_empty(),
+            app_source: enabled
+                .iter()
+                .flat_map(|d| &d.sources)
+                .any(|s| matches!(s.kind, SourceKind::App { .. })),
+            seen: self.setup.seen(),
+        }
+    }
+
     /// Send the config to the engine once it can take it, and again after the driver came back.
     /// Runs from `logic`, which eframe also calls while the window is hidden, so a `--background`
     /// launch (Start at Login) routes audio without the window ever being shown. Returns whether
     /// the first apply waits for the setup sheet to explain the Microphone prompt.
     fn first_apply(&mut self) -> bool {
-        let (ready, driver, mic) = {
+        let (ready, status) = {
             let s = self.worker.shared.lock().unwrap();
-            (
-                s.status_ready,
-                s.status.driver_version.is_some(),
-                s.status.mic,
-            )
+            (s.status_ready, s.status.clone())
         };
-        if ready && !driver {
+        let needs = self.needs(&status);
+        if ready && !needs.driver {
             self.applied = false; // re-apply once a driver (re)appears
         }
-        let pending = ready && driver && !self.applied && mic == TccStatus::Unknown;
-        if ready && driver && !self.applied && !pending {
+        let pending = ready && !self.applied && needs.hold_first_apply();
+        if ready && needs.driver && !self.applied && !pending {
             self.applied = true;
             self.worker.apply(&self.cfg);
         }
@@ -225,6 +238,7 @@ impl App {
                 s.apply_error.clone(),
             )
         };
+        let missing = setup::should_show_setup(&self.needs(&status));
         let dev = self
             .cfg
             .devices
@@ -248,6 +262,7 @@ impl App {
             test: &test,
             device_name: name,
             first_apply_pending: pending,
+            missing,
             now: ctx.input(|i| i.time),
             diagnostics: &diagnostics,
         };
