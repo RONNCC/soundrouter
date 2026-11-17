@@ -8,7 +8,7 @@ use crate::store;
 use crate::theme::{Tokens, semibold, tokens};
 use crate::tray::{self, Action, Event, Tray, WinState};
 use crate::widgets::{
-    name_button, name_widget, pencil, plus_circle, plus_glyph, slider_knob, speaker, switch,
+    name_button, name_widget, pencil, plus_glyph, slider_knob, speaker, switch, xmark,
 };
 use crate::worker::Worker;
 use eframe::egui::{
@@ -328,6 +328,10 @@ impl App {
         };
         let prev = self.cfg.clone();
         let prev_selected = self.selected;
+        let removed_dev = edits.iter().find_map(|e| match e {
+            Edit::RemoveDevice(d) => Some(*d),
+            _ => None,
+        });
         let mut select_new = false;
         for e in edits {
             select_new |= e == Edit::NewDevice;
@@ -352,6 +356,11 @@ impl App {
         }
         if select_new {
             self.selected = self.cfg.devices.len() - 1;
+        }
+        // Removing a device above the selected one shifts the selection's index down with it.
+        let removed_above = removed_dev.is_some_and(|d| d < self.selected);
+        if removed_above {
+            self.selected -= 1;
         }
         let last = self.cfg.devices.len().saturating_sub(1);
         if self.selected > last {
@@ -413,7 +422,7 @@ impl App {
                             }
                         });
                 });
-                // Footer: New Virtual Device and remove.
+                // Footer: New Virtual Device.
                 let foot =
                     Rect::from_min_max(pos2(full.left(), full.bottom() - footer_h), full.max);
                 ui.painter().hline(
@@ -440,18 +449,6 @@ impl App {
                 if new.clicked() {
                     edits.push(Edit::NewDevice);
                 }
-                let minus = plus_circle(
-                    ui,
-                    pos2(foot.right() - 24.0, cy),
-                    Id::unique("del_dev_icon"),
-                    t,
-                    true,
-                    "Delete selected device",
-                );
-                if minus.clicked() && self.selected < self.cfg.devices.len() {
-                    edits.push(Edit::RemoveDevice(self.selected));
-                }
-                minus.on_hover_text("Delete the selected device");
             });
     }
 
@@ -476,7 +473,7 @@ impl App {
         let name_pos = pos2(icon.right() + 10.0, inner.top() + 16.0);
         let name_rect = Rect::from_min_size(
             pos2(name_pos.x, name_pos.y - 10.0),
-            vec2(inner.right() - 58.0 - name_pos.x, 20.0),
+            vec2(inner.right() - 72.0 - name_pos.x, 20.0),
         );
         let renaming_here = matches!(&self.renaming, Some((r, _)) if *r == i);
         if renaming_here {
@@ -554,8 +551,24 @@ impl App {
             dot.widget_info(|| WidgetInfo::labeled(Role::Label, true, &label));
             dot.on_hover_text(text);
         }
+        let x_at = pos2(inner.right() - 16.0, inner.top() + 18.0);
+        let x = ui.interact(
+            Rect::from_center_size(x_at, vec2(18.0, 18.0)),
+            Id::unique(("dev_x", i)),
+            Sense::click(),
+        );
+        name_button(&x, &format!("Remove {}", dev.name));
+        xmark(
+            ui.painter(),
+            x_at,
+            if x.hovered() { t.danger } else { t.text2 },
+        );
+        if x.clicked() {
+            edits.push(Edit::RemoveDevice(i));
+        }
+        x.on_hover_text(format!("Remove {}", dev.name));
         let sw = Rect::from_center_size(
-            pos2(inner.right() - 8.0 - 16.0, inner.top() + 18.0),
+            pos2(inner.right() - 16.0 - 9.0 - 8.0 - 16.0, inner.top() + 18.0),
             vec2(32.0, 18.0),
         );
         let on = switch(

@@ -194,7 +194,7 @@ fn every_control_of_the_demo_window_has_an_accessible_name() {
     // `window` already ran the check; spot-check the names the other tests rely on.
     for label in [
         "New Virtual Device",
-        "Delete selected device",
+        "Remove Loopback Audio",
         "Delete",
         "Select Loopback Audio",
         "Rename Loopback Audio",
@@ -238,14 +238,13 @@ fn deleting_the_last_device_selects_the_new_last_one_and_empties_cleanly() {
         h.get_by_label("Device name").value().as_deref(),
         Some("Stream Mix")
     );
-    click(&mut h, "Delete selected device");
-    click(&mut h, "Delete selected device");
+    click(&mut h, "Remove Stream Mix");
+    click(&mut h, "Remove Loopback Audio");
     assert!(h.state().cfg.devices.is_empty());
     assert_eq!(h.state().selected, 0);
     assert!(h.query_by_label("Device name").is_none());
-    // nothing left to delete: both buttons are inert instead of panicking
+    // nothing left to delete: the button is inert instead of panicking
     click(&mut h, "Delete");
-    click(&mut h, "Delete selected device");
     assert!(h.state().cfg.devices.is_empty());
     // and the user can start over
     click(&mut h, "New Virtual Device");
@@ -946,6 +945,29 @@ mod snapshots {
             monitors,
             &mut results,
         );
+    }
+
+    #[test]
+    fn sidebar_only_window_with_row_x() {
+        let mut results = egui_kittest::SnapshotResults::new();
+        for (theme, suffix) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
+            let mut h = Harness::builder()
+                .with_size(vec2(243.0, 330.0))
+                .with_step_dt(0.05)
+                .with_theme(theme)
+                .with_context_setup(crate::theme::install_fonts)
+                .wgpu()
+                .build_eframe(move |cc| {
+                    let backend = Box::new(FakeBackend::frozen(1.5));
+                    let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
+                    App::new(demo_config(), None, w, None, false, false)
+                });
+            wait_published(&mut h);
+            settle(&mut h);
+            h.run_steps(5);
+            h.snapshot(format!("sidebar_narrow_{suffix}"));
+            results.extend_harness(&mut h);
+        }
     }
 
     #[test]
@@ -1799,7 +1821,7 @@ fn the_undo_toast_expires_and_the_next_edit_replaces_it() {
 
 #[test]
 fn deleting_a_device_can_be_undone_from_both_delete_buttons() {
-    for button in ["Delete", "Delete selected device"] {
+    for button in ["Delete", "Remove Stream Mix"] {
         let mut h = open(demo_config());
         click(&mut h, "Select Stream Mix");
         let before = h.state().cfg.clone();
@@ -1811,6 +1833,32 @@ fn deleting_a_device_can_be_undone_from_both_delete_buttons() {
         assert_eq!(h.state().selected, 1);
         h.get_by_label("Select Stream Mix");
     }
+}
+
+#[test]
+fn row_x_removes_that_device_keeps_the_selection_on_its_device_and_undoes() {
+    let mut h = open(demo_config());
+    click(&mut h, "Select Zoom Out");
+    let before = h.state().cfg.clone();
+    click(&mut h, "Remove Loopback Audio");
+    let names: Vec<_> = h
+        .state()
+        .cfg
+        .devices
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    assert_eq!(names, ["Stream Mix", "Zoom Out"]);
+    assert_eq!(h.state().selected, 1, "still Zoom Out");
+    h.get_by_label("Removed Loopback Audio");
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before);
+    assert_eq!(h.state().selected, 2);
+    // removing a device below the selection leaves the selection alone
+    click(&mut h, "Select Loopback Audio");
+    click(&mut h, "Remove Zoom Out");
+    assert_eq!(h.state().cfg.devices.len(), 2);
+    assert_eq!(h.state().selected, 0);
 }
 
 #[test]
