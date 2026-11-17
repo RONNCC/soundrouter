@@ -36,7 +36,7 @@ use crate::layout::{self, LayoutSpec, SCRATCH_LEN, SubDesc};
 use crate::power::PowerWatch;
 
 /// If the hidden companion cannot be found or joined, run on the visible vdev instead.
-/// shortcut: then pass-thru audio mixes with the engine output in the HAL; the companion path is verified live (docs/TESTING.md), this fallback is not.
+/// shortcut: then the Pass-Thru source is off (see `LayoutInputs::passthru`); the companion path is verified live (docs/TESTING.md), this fallback is not.
 pub const ALLOW_VISIBLE_FALLBACK: bool = true;
 pub const AGG_UID_PREFIX: &str = "soundrouter.agg.";
 static AGG_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -704,18 +704,17 @@ impl Backend for Engine {
 
     fn self_test(&mut self, id: &str) -> Result<SelfTest> {
         let uid = format!("{DEVICE_UID_PREFIX}{id}");
-        let (cfg, running) = {
-            let g = lock(&self.inner);
-            (g.cfg.clone(), g.vdevs.contains_key(id))
-        };
+        let cfg = lock(&self.inner).cfg.clone();
         // A virtual device's input reads silence until the microphone question is answered: ask now.
         if mic_status() == TccStatus::Unknown {
             crate::tcc::request_microphone(MIC_PROMPT_WAIT);
         }
         let probe = || Ok(crate::loopback::loopback_test(&uid, 2)?.to_self_test());
         let t = match cfg {
-            // A running engine owns the device's input: route the tone through it, as a user would.
-            Some(cfg) => selftest::run_routed(self, &cfg, id, running, probe)?,
+            // The engine owns every enabled device's input, or takes it back as soon as a recovery or
+            // retry rebuilds it, which can land mid-probe with the user's monitors still wired: so route
+            // the tone through the engine (probe route, no monitor wires) whenever the device is enabled.
+            Some(cfg) => selftest::run_routed(self, &cfg, id, true, probe)?,
             None => probe()?,
         };
         selftest::verdict(t, mic_status())
@@ -911,6 +910,8 @@ fn apply_locked(g: &mut Inner, cfg: &Config) -> Result<()> {
     for id in gone {
         retire(g.vdevs.remove(&id));
     }
+    // A removed vdev's start failures must not keep stretching the worker's debounce.
+    g.io_fails.retain(|id, _| enabled.contains(id.as_str()));
     let mut errors = Vec::new();
     for dev in cfg.devices.iter().filter(|d| d.enabled) {
         if let Err(e) = apply_vdev(g, dev, &groups) {
@@ -1168,7 +1169,9 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
 /// The config-derived inputs of the layout spec.
 #[derive(Debug, Default, PartialEq)]
 struct LayoutInputs {
-    /// Source id fed by the main device's input.
+    /// Source id fed by the main device's input. `None` when the main is the visible device itself
+    /// (fallback without the companion): its input is the driver's V.out -> V.in loop, which also
+    /// carries the engine's own output, so reading it as Pass-Thru would feed the mix back into itself.
     passthru: Option<String>,
     /// Device uid -> Device source id (first source wins).
     device_sources: HashMap<String, String>,
@@ -1176,12 +1179,14 @@ struct LayoutInputs {
     monitors: HashSet<String>,
 }
 
-fn layout_inputs(dev: &VirtualDevice) -> LayoutInputs {
+/// `main` is the uid of the aggregate's main device.
+fn layout_inputs(dev: &VirtualDevice, main: &str) -> LayoutInputs {
+    let fallback = main == format!("{DEVICE_UID_PREFIX}{}", dev.id);
     LayoutInputs {
         passthru: dev
             .sources
             .iter()
-            .find(|s| s.kind == SourceKind::PassThru)
+            .find(|s| s.kind == SourceKind::PassThru && !fallback)
             .map(|s| s.id.clone()),
         device_sources: dev
             .sources
@@ -1240,7 +1245,7 @@ fn check_width(lay: &IoLayout) -> Result<()> {
 fn refresh_layout(v: &mut Vdev) -> Result<()> {
     let ain = hal::stream_channels(v.agg, kAudioObjectPropertyScopeInput);
     let aout = hal::stream_channels(v.agg, kAudioObjectPropertyScopeOutput);
-    let li = layout_inputs(&v.dev);
+    let li = layout_inputs(&v.dev, &v.spec.main);
     let tap_ids: Vec<String> = v.taps.iter().map(|t| t.source_id.clone()).collect();
     let spec = LayoutSpec {
         subs: &v.subs,

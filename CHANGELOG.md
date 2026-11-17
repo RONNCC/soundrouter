@@ -26,6 +26,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - Driver: an app that plays into a SoundRouter device now hears itself on that device's input while the engine is not running (V.out -> V.in, Soundflower-style); before, the input stayed silent until the engine attached. With the engine running the input carries the routed mix as before.
 - App: on macOS the window showed only an empty grey surface, because the sidebar blur view ended up composited on top of the GPU layer that egui draws into. The blur now always stays underneath. If it cannot be placed there, the window falls back to an opaque one.
 - App: launching a second copy of the app now brings back the window of the one already running, even when it was hidden in the menu bar. Before, `open -b` could send that request to a different registered copy, which then just exited.
+- Engine: when a device ran on the visible-device fallback (hidden companion unavailable), its Pass-Thru source read the driver's new V.out -> V.in loop, which also carries the engine's own output, so the mix fed back into itself. Pass-Thru is now off on that fallback.
+- Engine: the self-test routes its tone through the engine whenever the device is enabled, not only while its aggregate is up. Before, a recovery or retry that rebuilt the device mid-test could send the tone to the user's monitor outputs.
+- Engine: a removed device's failed IOProc starts no longer keep the event debounce at its maximum (up to 5 s) for the rest of the session.
+- Engine: reading a device's stream layout never trusts a buffer count beyond the bytes the HAL returned.
 
 ## [0.1.0]
 

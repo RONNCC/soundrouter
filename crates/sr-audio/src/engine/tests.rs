@@ -121,14 +121,22 @@ fn layout_inputs_collects_roles() {
         vec![],
         vec![mon("spk", true), mon("off", false)],
     );
-    let li = layout_inputs(&dev);
+    let visible = format!("{DEVICE_UID_PREFIX}{}", dev.id);
+    let li = layout_inputs(&dev, &companion_uid(&visible));
     assert_eq!(li.passthru.as_deref(), Some("pt"));
+    // Visible-device fallback: its input loops the engine's own output back, so no Pass-Thru.
+    let fb = layout_inputs(&dev, &visible);
+    assert_eq!(fb.passthru, None);
+    assert_eq!(
+        (fb.device_sources, fb.monitors),
+        (li.device_sources.clone(), li.monitors.clone())
+    );
     // Same uid twice: the first source wins.
     assert_eq!(li.device_sources["mic"], "m1");
     assert_eq!(li.device_sources.len(), 1);
     assert_eq!(li.monitors, HashSet::from(["spk".to_owned()]));
     assert_eq!(
-        layout_inputs(&vdev(vec![], vec![], vec![])),
+        layout_inputs(&vdev(vec![], vec![], vec![]), "comp"),
         LayoutInputs::default()
     );
 }
@@ -396,7 +404,7 @@ fn sub(uid: &str, main: bool, i: &[u16], o: &[u16]) -> SubDesc {
     }
 }
 fn build(dev: &VirtualDevice, subs: &[SubDesc], ain: &[u16], aout: &[u16]) -> Rig {
-    let li = layout_inputs(dev);
+    let li = layout_inputs(dev, "comp");
     let spec = LayoutSpec {
         subs,
         passthru: li.passthru.as_deref(),

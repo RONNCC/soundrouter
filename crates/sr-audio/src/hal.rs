@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_core_audio::*;
-use objc2_core_audio_types::AudioBufferList;
+use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 
 pub const SYSTEM: u32 = kAudioObjectSystemObject as u32;
@@ -188,7 +188,9 @@ pub fn stream_channels(dev: u32, scope: u32) -> Vec<u16> {
     {
         return vec![];
     }
-    let mut buf = vec![0u64; (sz as usize).div_ceil(8)];
+    // At least one whole `AudioBufferList`, so the reference below never covers unallocated bytes.
+    let len = (sz as usize).max(std::mem::size_of::<AudioBufferList>());
+    let mut buf = vec![0u64; len.div_ceil(8)];
     let st = unsafe {
         AudioObjectGetPropertyData(
             dev,
@@ -203,8 +205,11 @@ pub fn stream_channels(dev: u32, scope: u32) -> Vec<u16> {
         return vec![];
     }
     let abl = unsafe { &*(buf.as_ptr() as *const AudioBufferList) };
-    let bufs =
-        unsafe { std::slice::from_raw_parts(abl.mBuffers.as_ptr(), abl.mNumberBuffers as usize) };
+    // Never trust `mNumberBuffers` beyond the bytes actually returned (the list can change between the calls).
+    let fit = (sz as usize).saturating_sub(std::mem::offset_of!(AudioBufferList, mBuffers))
+        / std::mem::size_of::<AudioBuffer>();
+    let n = (abl.mNumberBuffers as usize).min(fit);
+    let bufs = unsafe { std::slice::from_raw_parts(abl.mBuffers.as_ptr(), n) };
     bufs.iter().map(|b| b.mNumberChannels as u16).collect()
 }
 
