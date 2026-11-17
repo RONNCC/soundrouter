@@ -119,6 +119,12 @@ fn expect(e: &mut Engine, p: &Probe, c: &Config, what: &str, want: [f32; 2]) {
 #[test]
 #[ignore = "needs BlackHole 16ch installed + audio capture permission"]
 fn srtone_through_engine_into_blackhole() {
+    // Stage lines go to stderr unbuffered, so a CI log shows where a hang (e.g. a TCC prompt) sits.
+    eprintln!(
+        "stage: start; TCC audio capture {:?}, microphone {:?}",
+        sr_audio::tcc::audio_capture_status(),
+        sr_audio::tcc::microphone_status()
+    );
     let mut e = Engine::new().unwrap();
     let Some(bh) = e
         .hardware()
@@ -132,6 +138,7 @@ fn srtone_through_engine_into_blackhole() {
     unsafe { std::env::set_var("SR_MAIN_UID_OVERRIDE", &bh.uid) };
 
     let srtone = build_srtone();
+    eprintln!("stage: srtone built; starting player on {}", bh.uid);
     let key = format!("path:{}", srtone.display());
     let c = |volume_db: f32, muted: bool, wires: &[(u16, u16)]| cfg(&key, volume_db, muted, wires);
     // Only ever BlackHole (found by name above); srtone itself also refuses any non-virtual device.
@@ -158,12 +165,14 @@ fn srtone_through_engine_into_blackhole() {
         "srtone did not open BlackHole channels 8-9: {banner:?}"
     );
 
+    eprintln!("stage: player up; applying the route (creates the process tap)");
     e.apply(&c(0.0, false, &[(0, 0), (1, 1)])).unwrap();
     wait_for("IoState::Running", 30, || match e.io_state("e2e") {
         Some(IoState::Failed(s)) => panic!("IO failed: {s}"),
         Some(IoState::Running) => Some(()),
         _ => None,
     });
+    eprintln!("stage: engine IO running; opening the probe (BlackHole input)");
     let probe = Probe::start(&bh.uid, false).unwrap();
 
     // The stereo-mixdown tap scales a many-channel player device (BlackHole 16ch measured 1/8), so take the

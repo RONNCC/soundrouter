@@ -36,7 +36,9 @@ test_live() {
   tools  # always rebuild: a stale srctl hides parser fixes
   local srctl=$TOOLS/srctl log=/tmp/sr-coreaudiod.log lp
   log stream --level debug --predicate 'process == "coreaudiod" AND (eventMessage CONTAINS[c] "SoundRouter" OR eventMessage CONTAINS "PlugIn")' >"$log" 2>&1 &
-  lp=$!; trap "kill $lp 2>/dev/null || true" EXIT; sleep 1
+  lp=$!
+  # shellcheck disable=SC2064 # $lp is a local: expand it now, it is gone when the EXIT trap runs
+  trap "kill $lp 2>/dev/null || true" EXIT; sleep 1
 
   step "1/8 driver loaded by coreaudiod"
   "$srctl" get || fail "not loaded; see $log and: codesign -dv $DEST"

@@ -94,4 +94,4 @@ check "SoundRouter devices in system_profiler (companion hidden)" \
   "$(system_profiler SPAudioDataType | grep -c 'Manufacturer: SoundRouter')" "$("$CLI" driver get | grep -c '"uid"')"
 kill -INT $run; wait $run 2>/dev/null
 
-[ "$fails" = 0 ] && echo "PASS" || { echo "$fails check(s) FAILED"; exit 1; }
+if [ "$fails" = 0 ]; then echo "PASS"; else echo "$fails check(s) FAILED"; exit 1; fi

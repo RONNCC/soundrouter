@@ -719,6 +719,71 @@ fn background_errors_are_keyed() {
     assert_eq!(background_message(&e).as_deref(), Some("a"));
 }
 
+#[test]
+fn retry_reruns_with_backoff_then_surfaces_the_error_once() {
+    let mut r = Retry::default();
+    let mut errs = BTreeMap::new();
+    assert_eq!(r.wait(), None, "idle: block until an event");
+    for n in 1..=MAX_RETRIES {
+        r.record(Op::Apply, Err(anyhow!("no device")), &mut errs);
+        assert_eq!(r.op, Some(Op::Apply));
+        assert_eq!(r.wait(), retry_delay(n));
+        assert!(errs.is_empty(), "retries stay quiet");
+    }
+    // Out of retries: surfaced, and nothing reruns until a new event.
+    r.record(Op::Apply, Err(anyhow!("no device")), &mut errs);
+    assert_eq!((r.op, r.wait()), (None, None));
+    assert_eq!(background_message(&errs).as_deref(), Some("no device"));
+    // A new event's attempt that fails the same way changes nothing.
+    r.record(Op::Apply, Err(anyhow!("no device")), &mut errs);
+    assert_eq!((r.op, errs.len()), (None, 1));
+    // A different failure replaces the message.
+    r.record(Op::Apply, Err(anyhow!("still no device")), &mut errs);
+    assert_eq!(errs[&Op::Apply], "still no device");
+    // Success resets the budget and clears everything.
+    errs.insert(Op::Retap, "tap".into());
+    r.record(Op::Apply, Ok(()), &mut errs);
+    assert_eq!(r, Retry::default());
+    assert!(errs.is_empty());
+}
+
+#[test]
+fn a_good_retap_clears_only_its_own_error() {
+    let mut r = Retry {
+        fails: 3,
+        op: Some(Op::Retap),
+    };
+    let mut errs = BTreeMap::from([(Op::Apply, "a".into()), (Op::Retap, "r".into())]);
+    r.record(Op::Retap, Ok(()), &mut errs);
+    assert_eq!(r, Retry::default());
+    assert_eq!(background_message(&errs).as_deref(), Some("a"));
+}
+
+#[test]
+fn retry_choose_prefers_apply_and_reruns_the_failed_op() {
+    let idle = Retry::default();
+    assert_eq!(idle.choose(false, false, false, false), None);
+    assert_eq!(idle.choose(false, false, false, true), Some(Op::Retap));
+    for (devs, wake, rebuild) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        assert_eq!(idle.choose(devs, wake, rebuild, true), Some(Op::Apply));
+    }
+    let retap = Retry {
+        fails: 1,
+        op: Some(Op::Retap),
+    };
+    assert_eq!(retap.choose(false, false, false, false), Some(Op::Retap));
+    assert_eq!(retap.choose(true, false, false, false), Some(Op::Apply));
+    let apply = Retry {
+        fails: 1,
+        op: Some(Op::Apply),
+    };
+    assert_eq!(apply.choose(false, false, false, true), Some(Op::Apply));
+}
+
 // ---- sleep/wake and rate recovery ----
 
 fn set(items: &[&str]) -> BTreeSet<String> {

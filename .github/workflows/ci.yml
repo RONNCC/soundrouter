@@ -23,6 +23,10 @@ jobs:
         run: cargo deny check advisories
         continue-on-error: true
       - run: cargo fmt --all --check
+      - name: Shell lint
+        run: |
+          command -v shellcheck >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install shellcheck
+          shellcheck packaging/*.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Build driver
@@ -92,12 +96,20 @@ jobs:
           path: lcov.info
 
   snapshots:
+    # Baselines come from an Apple-silicon Mac. The hosted runner's paravirtual GPU anti-aliases glyph
+    # edges a little differently: measured at most 427 differing pixels per frame (1180x700) at the
+    # default threshold. The CI-only kittest.toml allows 800, so layout and colour changes (thousands of
+    # pixels) still fail while that drift does not; text content is asserted by the plain app tests.
+    # Local runs have no kittest.toml and stay pixel-exact.
     runs-on: macos-15
-    continue-on-error: true
+    continue-on-error: true # a runner image update can move the drift; diffs are uploaded below
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
+      - name: Tolerate hosted-GPU anti-aliasing drift
+        run: echo 'max_failed_pixels = 800' > kittest.toml
       - run: cargo test -p soundrouter-app --features snapshots
       - name: Upload snapshot diffs
         if: failure()
@@ -106,28 +118,77 @@ jobs:
           name: snapshot-diffs
           if-no-files-found: ignore
           path: |
-            **/*.new.png
-            **/*.diff.png
-            **/*.new
-            **/snapshots/**/*.diff.*
+            app/tests/snapshots/*.new.png
+            app/tests/snapshots/*.diff.png
 
   blackhole-e2e:
-    # Experimental: hosted runners may deny audio-capture TCC, so this can fail for reasons unrelated to the code.
+    # Experimental: verifies routing through a real process tap and the engine into BlackHole only when
+    # the runner allows audio capture. The image grants Microphone (the BlackHole input) to the runner
+    # agent but not Audio Capture (process taps), and nobody can answer that prompt here, so it is
+    # pre-granted below; if macOS ignores the grant the run times out and the logs show the stage.
     # Silent by design: the test builds packaging/srtone.c (clang) and plays only into BlackHole ch 8-9.
     runs-on: macos-15
     continue-on-error: true
-    timeout-minutes: 10 # an unanswerable audio-capture TCC prompt blocks the tap forever
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
-      - name: Install BlackHole
+      - name: Install BlackHole (retried) and wait for coreaudiod to list it
         run: |
-          brew install --cask blackhole-16ch
+          for i in 1 2 3; do
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask blackhole-16ch && break
+            [ "$i" = 3 ] && exit 1
+            sleep 15
+          done
           sudo killall coreaudiod || true
-          sleep 5
-      - name: Run e2e (a SKIP means the device never appeared; fail instead of passing silently)
+          for _ in $(seq 30); do
+            system_profiler SPAudioDataType | grep -q 'BlackHole 16ch' && exit 0
+            sleep 2
+          done
+          echo "::error::BlackHole 16ch never appeared in coreaudiod"; exit 1
+      - name: Pre-grant Audio Capture to the runner agent
+        run: |
+          # Same row shape and owners as the image's configure-tccdb-macos.sh (user db as the user, system
+          # db with sudo); SIP is off on hosted runners.
+          now=$(date +%s)
+          for client in /opt/hca/hosted-compute-agent /usr/local/opt/runner/provisioner/provisioner /bin/bash; do
+            row="INSERT OR REPLACE INTO access VALUES('kTCCServiceAudioCapture','$client',1,2,4,1,NULL,NULL,NULL,'UNUSED',NULL,0,$now,NULL,NULL,'UNUSED',$now);"
+            sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" "$row" || echo "::warning::user TCC.db: $client"
+            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "$row" || echo "::warning::system TCC.db: $client"
+          done
+          sudo killall tccd 2>/dev/null || true
+      - name: Build e2e
+        run: cargo test -p sr-audio --test blackhole --no-run
+      - name: Run e2e (2 attempts of 180 s; a SKIP fails instead of passing silently)
         run: |
           set -o pipefail
-          cargo test -p sr-audio --test blackhole -- --ignored --nocapture 2>&1 | tee blackhole.log
-          ! grep -q '^SKIP' blackhole.log
+          for attempt in 1 2; do
+            # perl alarm: macOS has no coreutils timeout, and an unanswered TCC prompt blocks forever
+            if perl -e 'alarm shift; exec @ARGV' 180 \
+                cargo test -p sr-audio --test blackhole -- --ignored --nocapture 2>&1 | tee "blackhole-$attempt.log"; then
+              if grep -q '^SKIP' "blackhole-$attempt.log"; then
+                echo "::error::the engine did not find BlackHole 16ch"; exit 1
+              fi
+              exit 0
+            fi
+            echo "::warning::attempt $attempt failed; last stage: $(grep '^stage:' "blackhole-$attempt.log" | tail -1)"
+            pkill -f 'target/debug/deps/blackhole-' || true
+            sleep 5
+          done
+          exit 1
+      - name: Collect TCC and coreaudiod logs
+        if: always()
+        run: |
+          log show --last 20m --style compact \
+            --predicate 'subsystem == "com.apple.TCC" OR process == "coreaudiod"' > system.log 2>&1 || true
+          grep -iE 'AudioCapture|Microphone' system.log | tail -40 || true
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackhole-e2e-logs
+          if-no-files-found: ignore
+          path: |
+            blackhole-*.log
+            system.log

@@ -12,8 +12,8 @@ pub fn default_path() -> Option<PathBuf> {
 const SUPPORTED_VERSION: u64 = 1;
 
 /// `version` of a JSON document, if it has a numeric one.
-fn file_version(text: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(text)
+fn file_version(text: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(text)
         .ok()?
         .get("version")?
         .as_u64()
@@ -50,7 +50,8 @@ fn quarantine(path: &Path) -> std::io::Result<PathBuf> {
 /// Missing file -> default config. Newer-version file -> defaults, file kept (and `save` refuses
 /// to overwrite it). Corrupt or invalid file -> moved to `config.json.bad`, defaults, and a message.
 pub fn load(path: &Path) -> (Config, Option<String>) {
-    let text = match std::fs::read_to_string(path) {
+    // Bytes, not a String: a file that is not UTF-8 is corrupt and must be quarantined like any other.
+    let text = match std::fs::read(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (default_config(), None),
         Err(e) => {
@@ -63,7 +64,7 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
     if let Some(v) = file_version(&text).filter(|&v| v > SUPPORTED_VERSION) {
         return (default_config(), Some(future_version_msg(v)));
     }
-    let problem = match serde_json::from_str::<Config>(&text) {
+    let problem = match serde_json::from_slice::<Config>(&text) {
         Ok(cfg) => match cfg.validate() {
             Ok(()) => return (cfg, None),
             Err(e) => format!("invalid config: {e}"),
@@ -87,7 +88,7 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
 pub fn save(path: &Path, cfg: &Config) -> std::io::Result<()> {
     use std::io::Write;
     let ctx = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()));
-    if let Some(v) = std::fs::read_to_string(path)
+    if let Some(v) = std::fs::read(path)
         .ok()
         .and_then(|t| file_version(&t))
         .filter(|&v| v > SUPPORTED_VERSION)
@@ -178,6 +179,33 @@ mod tests {
             "{nope"
         );
         assert_eq!(load(&path).0, cfg);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn non_utf8_file_is_quarantined_not_overwritten() {
+        let dir = tmpdir("binary");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let junk = [0xff, 0xfe, b'{', 0x80];
+        std::fs::write(&path, junk).unwrap();
+        let (cfg, msg) = load(&path);
+        assert_eq!(cfg, default_config());
+        assert!(msg.unwrap().contains("config.json.bad"));
+        save(&path, &cfg).unwrap();
+        assert_eq!(std::fs::read(dir.join("config.json.bad")).unwrap(), junk);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_path_gives_defaults_and_says_why() {
+        let dir = tmpdir("isdir");
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let (cfg, msg) = load(&path);
+        assert_eq!(cfg, default_config());
+        assert!(msg.unwrap().starts_with("Could not read config"));
+        assert!(path.is_dir() && bad_files(&path).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

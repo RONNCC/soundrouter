@@ -394,7 +394,7 @@ fn retry_delay(fails: u32) -> Option<Duration> {
 }
 
 /// Which background operation failed; errors are tracked per operation.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Op {
     Apply,
     Retap,
@@ -402,6 +402,67 @@ enum Op {
 
 fn background_message(errs: &BTreeMap<Op, String>) -> Option<String> {
     (!errs.is_empty()).then(|| errs.values().cloned().collect::<Vec<_>>().join("; "))
+}
+
+/// The worker's failure bookkeeping between passes.
+#[derive(Default, Debug, PartialEq)]
+struct Retry {
+    /// Consecutive failed passes.
+    fails: u32,
+    /// Operation to rerun unconditionally (no dev_set filter) after a failure.
+    op: Option<Op>,
+}
+
+impl Retry {
+    /// How long to wait for an event before rerunning `op`; `None` = block until an event.
+    fn wait(&self) -> Option<Duration> {
+        self.op.and(retry_delay(self.fails))
+    }
+
+    /// What a pass runs for this news: device list changed, wake, vdevs to rebuild, processes
+    /// changed. A full apply covers everything a retap does.
+    fn choose(&self, devs: bool, wake: bool, rebuild: bool, procs: bool) -> Option<Op> {
+        if devs || wake || rebuild || self.op == Some(Op::Apply) {
+            Some(Op::Apply)
+        } else if procs || self.op == Some(Op::Retap) {
+            Some(Op::Retap)
+        } else {
+            None
+        }
+    }
+
+    /// Books the outcome of `op`. Success clears its errors (an apply resolves everything). A failure
+    /// schedules a retry; once the retries are spent the error is surfaced, once per distinct message,
+    /// and nothing reruns until a new event.
+    fn record(&mut self, op: Op, res: Result<()>, errs: &mut BTreeMap<Op, String>) {
+        let e = match res {
+            Ok(()) => {
+                *self = Retry::default();
+                if op == Op::Apply {
+                    errs.clear();
+                } else {
+                    errs.remove(&Op::Retap);
+                }
+                return;
+            }
+            Err(e) => e,
+        };
+        self.fails = self.fails.saturating_add(1);
+        let msg = format!("{e:#}");
+        if retry_delay(self.fails).is_some() {
+            self.op = Some(op);
+            log::debug!(
+                "background update failed (x{}), retrying: {msg}",
+                self.fails
+            );
+            return;
+        }
+        self.op = None;
+        if errs.get(&op) != Some(&msg) {
+            log::error!("background update failed: {msg}");
+            errs.insert(op, msg);
+        }
+    }
 }
 
 fn run_op(g: &mut Inner, op: Op) -> Result<()> {
@@ -497,12 +558,10 @@ fn rebuild_targets(
 }
 
 fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
-    let mut fails = 0u32;
-    // Operation to rerun unconditionally (no dev_set filter) after a failure.
-    let mut retry: Option<Op> = None;
+    let mut retry = Retry::default();
     loop {
         let mut pending = Pending::default();
-        let first = match retry.and(retry_delay(fails)) {
+        let first = match retry.wait() {
             Some(d) => match rx.recv_timeout(d) {
                 Ok(e) => Some(e),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -514,7 +573,9 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
             },
         };
         if let Some(mut ev) = first {
-            let level = fails.max(lock(&inner).io_fails.values().copied().max().unwrap_or(0));
+            let level = retry
+                .fails
+                .max(lock(&inner).io_fails.values().copied().max().unwrap_or(0));
             loop {
                 if !pending.absorb(ev) {
                     return;
@@ -529,41 +590,11 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
         let mut g = lock(&inner);
         let targets = recovery_targets(&mut g, &mut pending);
         let devs = pending.devs && current_device_set() != g.dev_set;
-        let op = if devs || pending.wake || !targets.is_empty() || retry == Some(Op::Apply) {
-            Some(Op::Apply)
-        } else if pending.procs || retry == Some(Op::Retap) {
-            Some(Op::Retap)
-        } else {
-            None
+        let Some(op) = retry.choose(devs, pending.wake, !targets.is_empty(), pending.procs) else {
+            continue;
         };
-        let Some(op) = op else { continue };
-        match run_op(&mut g, op) {
-            Ok(()) => {
-                retry = None;
-                fails = 0;
-                // A full apply resolves everything; a retap only its own error.
-                if op == Op::Apply {
-                    g.bg_errors.clear();
-                } else {
-                    g.bg_errors.remove(&Op::Retap);
-                }
-            }
-            Err(e) => {
-                fails = fails.saturating_add(1);
-                let msg = format!("{e:#}");
-                retry = Some(op);
-                if retry_delay(fails).is_some() {
-                    log::debug!("background update failed (x{fails}), retrying: {msg}");
-                } else {
-                    // Final failure: surface once, stop retrying until a new event.
-                    retry = None;
-                    if g.bg_errors.get(&op) != Some(&msg) {
-                        log::error!("background update failed: {msg}");
-                        g.bg_errors.insert(op, msg);
-                    }
-                }
-            }
-        }
+        let res = run_op(&mut g, op);
+        retry.record(op, res, &mut g.bg_errors);
     }
 }
 
@@ -787,12 +818,11 @@ fn sync_driver(cfg: &Config) -> Result<()> {
             channels: d.channels,
         })
         .collect();
-    let Some(plugin) = driver::find_plugin() else {
-        if want.is_empty() {
-            return Ok(());
-        }
-        driver::require_plugin()?;
-        unreachable!()
+    let plugin = match driver::find_plugin() {
+        Some(p) => p,
+        None if want.is_empty() => return Ok(()),
+        // Looks again: the plug-in may have appeared since, so this must not assume an error.
+        None => driver::require_plugin()?,
     };
     if driver::get_devices(plugin).ok().as_ref() != Some(&want) {
         driver::set_devices(plugin, &want)?;
