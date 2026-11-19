@@ -6,7 +6,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=packaging/lib.sh
 . packaging/lib.sh
-export MACOSX_DEPLOYMENT_TARGET=14.0
 OUT=target/SoundRouter.driver
 cargo build --release -p soundrouter-driver
 rm -rf "$OUT"
@@ -19,6 +18,7 @@ install_name_tool -id "@loader_path/SoundRouter" "$OUT/Contents/MacOS/SoundRoute
 plutil -lint "$OUT/Contents/Info.plist"
 # factory symbol named in Info.plist must be exported
 nm -gU "$OUT/Contents/MacOS/SoundRouter" | grep -q ' _SoundRouter_Create$' || { echo "missing _SoundRouter_Create" >&2; exit 1; }
+check_minos "$OUT/Contents/MacOS/SoundRouter"
 sign_driver "$OUT"
 check_signed "$OUT"
 codesign --verify --strict --verbose=2 "$OUT"

@@ -6,6 +6,19 @@
 #   local dev identity if packaging/make-dev-identity.sh created it (stable identity: macOS keeps Microphone / System
 #   Audio Recording grants across rebuilds), else ad-hoc (new identity every build, grants reset).
 
+# Process taps (AudioHardwareCreateProcessTap) are 14.2+ and linked as hard symbols: build every binary for
+# 14.2 so dyld/Finder refuse cleanly on 14.0/14.1 instead of crashing on a missing symbol.
+export MACOSX_DEPLOYMENT_TARGET=14.2
+
+# check_minos <binary>...: each Mach-O's LC_BUILD_VERSION minos equals MACOSX_DEPLOYMENT_TARGET.
+check_minos() {
+  local f m
+  for f in "$@"; do
+    m=$(otool -l "$f" | awk '/^ *minos /{print $2; exit}')
+    [ "$m" = "$MACOSX_DEPLOYMENT_TARGET" ] || { echo "$f: minos '$m', want $MACOSX_DEPLOYMENT_TARGET" >&2; return 1; }
+  done
+}
+
 # [workspace.package] version from Cargo.toml: the single version source.
 workspace_version() {
   awk -F'"' '/^\[/ { ws = ($0 == "[workspace.package]") } ws && /^version[ ]*=/ { print $2; exit }' Cargo.toml

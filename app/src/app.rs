@@ -2,7 +2,7 @@
 use crate::graph::{self, GraphCtx, GraphState};
 use crate::icons::IconTextures;
 use crate::login;
-use crate::model::{Edit, apply, db_to_pct, pct_to_db};
+use crate::model::{Edit, apply, db_to_pct, latency_label, pct_to_db};
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, Setup};
 use crate::store;
 use crate::theme::{Tokens, semibold, tokens};
@@ -16,7 +16,7 @@ use eframe::egui::{
     UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
-use sr_core::config::{Config, MAX_NAME_CHARS, SourceKind};
+use sr_core::config::{BUFFER_FRAMES, Config, MAX_NAME_CHARS, SourceKind};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -663,23 +663,39 @@ impl App {
                     .engine_status()
                     .driver_version
                     .is_some_and(|v| v != crate::fake::DEMO_DRIVER);
-                let mut reserved = 0.0;
+                let mut right = r.right() - 18.0;
+                let by = r.center().y - 13.0;
                 if real_driver {
-                    let by = r.center().y - 13.0;
                     let uninstall =
                         Rect::from_min_size(pos2(r.right() - 18.0 - 90.0, by), vec2(90.0, 26.0));
                     let test = Rect::from_min_size(
                         uninstall.min - vec2(8.0 + 104.0, 0.0),
                         vec2(104.0, 26.0),
                     );
-                    if setup::footer_button(ui, test, "test_setup", "Test Setup…", t) {
+                    if setup::footer_button(ui, test, "test_setup", "Test Setup…", t).clicked() {
                         self.setup.open_test();
                     }
-                    if setup::footer_button(ui, uninstall, "uninstall", "Uninstall…", t) {
+                    if setup::footer_button(ui, uninstall, "uninstall", "Uninstall…", t).clicked()
+                    {
                         self.setup.ask_uninstall();
                     }
-                    reserved = r.right() - test.left() + 12.0;
+                    right = test.left() - 8.0;
                 }
+                let latency = Rect::from_min_size(pos2(right - 176.0, by), vec2(176.0, 26.0));
+                let label = latency_label(self.cfg.buffer_frames);
+                let resp = setup::footer_button(ui, latency, "latency", &label, t);
+                resp.clone().on_hover_text(
+                    "Engine buffer size. Smaller is faster but uses more CPU and battery.",
+                );
+                egui::Popup::menu(&resp).show(|ui| {
+                    for n in BUFFER_FRAMES {
+                        let on = n == self.cfg.buffer_frames;
+                        if ui.selectable_label(on, latency_label(n)).clicked() && !on {
+                            edits.push(Edit::BufferFrames(n));
+                        }
+                    }
+                });
+                let reserved = r.right() - latency.left() + 12.0;
                 let (apply_error, es) = {
                     let s = self.worker.shared.lock().unwrap();
                     (s.apply_error.clone(), s.status.clone())

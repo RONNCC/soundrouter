@@ -17,7 +17,7 @@ use block2::RcBlock;
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_core_audio::*;
-use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
+use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp, AudioValueRange};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSNumber, NSString};
 use sr_core::backend::{
@@ -160,6 +160,8 @@ struct AggSpec {
     main: String,
     subs: Vec<String>,
     channels: u16,
+    /// Requested IO buffer size (`Config::buffer_frames`); part of the reuse key.
+    buffer_frames: u32,
 }
 
 struct Vdev {
@@ -1016,7 +1018,7 @@ fn apply_locked(g: &mut Inner, cfg: &Config, sync: fn(&Config) -> Result<()>) ->
     let groups = apps::list_groups();
     let mut errors = Vec::new();
     for dev in cfg.devices.iter().filter(|d| d.enabled) {
-        if let Err(e) = apply_vdev(g, dev, &groups) {
+        if let Err(e) = apply_vdev(g, dev, cfg.buffer_frames, &groups) {
             errors.push(format!("device '{}': {e:#}", dev.id));
         }
     }
@@ -1029,7 +1031,12 @@ fn apply_locked(g: &mut Inner, cfg: &Config, sync: fn(&Config) -> Result<()>) ->
     }
 }
 
-fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result<()> {
+fn apply_vdev(
+    g: &mut Inner,
+    dev: &VirtualDevice,
+    buffer_frames: u32,
+    groups: &[AppGroup],
+) -> Result<()> {
     let cands = main_candidates(dev);
     if cands.is_empty() {
         retire(g.vdevs.remove(&dev.id));
@@ -1039,7 +1046,11 @@ fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result
     }
     let subs = plan_subs(dev, &|u| hal::device_by_uid(u).is_some());
     if let Some(v) = g.vdevs.get_mut(&dev.id) {
-        if v.spec.subs == subs && v.spec.channels == dev.channels && cands.contains(&v.spec.main) {
+        if v.spec.subs == subs
+            && v.spec.channels == dev.channels
+            && v.spec.buffer_frames == buffer_frames
+            && cands.contains(&v.spec.main)
+        {
             v.dev = dev.clone();
             match sync_taps(v, groups).and_then(|()| refresh_layout(v)) {
                 Ok(()) => return Ok(()),
@@ -1060,6 +1071,7 @@ fn apply_vdev(g: &mut Inner, dev: &VirtualDevice, groups: &[AppGroup]) -> Result
                 main: main.clone(),
                 subs: subs.clone(),
                 channels: dev.channels,
+                buffer_frames,
             },
             groups,
             g.tx.as_ref(),
@@ -1377,6 +1389,25 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
     Ok(())
 }
 
+/// Asks the aggregate for `frames`-frame IO buffers; outside the device's range or on any HAL
+/// error the aggregate keeps its default size (logged, not fatal).
+fn set_buffer_frames(agg: u32, frames: u32) {
+    let range = hal::get_global::<AudioValueRange>(agg, kAudioDevicePropertyBufferFrameSizeRange);
+    let result = match range {
+        Ok(r) if (r.mMinimum..=r.mMaximum).contains(&f64::from(frames)) => {
+            hal::set_global(agg, kAudioDevicePropertyBufferFrameSize, &frames)
+                .map_err(|st| format!("set failed: OSStatus {}", hal::fourcc(st)))
+        }
+        Ok(r) => Err(format!("outside range {}..={}", r.mMinimum, r.mMaximum)),
+        Err(st) => Err(format!("range unreadable: OSStatus {}", hal::fourcc(st))),
+    };
+    let now = hal::get_global::<u32>(agg, kAudioDevicePropertyBufferFrameSize).unwrap_or(0);
+    match result {
+        Ok(()) => log::info!("aggregate {agg}: buffer {frames} frames (now {now})"),
+        Err(e) => log::info!("aggregate {agg}: buffer {frames} frames {e}; keeping {now}"),
+    }
+}
+
 fn build_vdev(
     dev: &VirtualDevice,
     spec: AggSpec,
@@ -1532,6 +1563,7 @@ fn build_vdev(
     };
     // From here `Drop` cleans up the aggregate, taps and callback state.
     refresh_layout(&mut v)?;
+    set_buffer_frames(agg, v.spec.buffer_frames);
     let st = unsafe {
         AudioDeviceCreateIOProcID(
             agg,

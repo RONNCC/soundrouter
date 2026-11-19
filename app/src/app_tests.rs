@@ -102,7 +102,8 @@ fn window_with(
         .build_eframe(move |cc| {
             let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
             let mut app = App::new(cfg, None, w, toast, false, demo);
-            app.setup = Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()));
+            app.setup = Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()))
+                .with_driver_check(|_| Ok(()));
             app
         });
     wait_published(&mut h);
@@ -1054,7 +1055,8 @@ mod snapshots {
                         Worker::spawn_inline(Box::new(b), cc.egui_ctx.clone(), Box::new(|_| None));
                     let mut app = App::new(demo_config(), None, w, None, false, false);
                     app.setup =
-                        Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()));
+                        Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()))
+                            .with_driver_check(|_| Ok(()));
                     app
                 });
             wait_published(&mut h);
@@ -1438,6 +1440,19 @@ fn without_a_driver_the_sheet_installs_it_and_a_cancel_says_not_installed() {
     assert!(calls[0].contains("'/App/Resources/SoundRouter.driver'"));
     h.get_by_label("Retry");
     h.get_by_label("Copy diagnostics");
+}
+
+#[test]
+fn a_driver_signed_by_someone_else_is_refused_before_the_admin_prompt() {
+    let (runner, calls) = recording(Ok(()));
+    let mut h = with_runner(no_driver(), runner.clone());
+    h.state_mut().setup = Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()))
+        .with_driver_check(|_| Err(crate::setup::DRIVER_MISMATCH.into()));
+    settle(&mut h);
+    click(&mut h, "Install Driver…");
+    until(&mut h, "check result", |h| has(h, "Driver not installed"));
+    h.get_by_label_contains("does not match this app");
+    assert!(calls.lock().unwrap().is_empty());
 }
 
 #[test]

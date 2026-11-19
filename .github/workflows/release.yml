@@ -11,6 +11,9 @@ on:
 permissions:
   contents: write
 
+env:
+  MACOSX_DEPLOYMENT_TARGET: "14.2" # same as packaging/lib.sh
+
 jobs:
   release:
     runs-on: macos-15

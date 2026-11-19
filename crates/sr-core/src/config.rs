@@ -11,6 +11,10 @@ pub const MAX_DB: f32 = 24.0;
 pub const CONFIG_VERSION: u32 = 1;
 /// Longest device id; the driver uid `soundrouter:<id>` (and its `.engine` companion) must stay a valid driver uid.
 pub const MAX_ID_BYTES: usize = 64;
+/// IO buffer sizes (frames) the engine's aggregate may run at: each one adds one buffer of
+/// latency; smaller ones wake the IOProc more often (more CPU and battery).
+pub const BUFFER_FRAMES: [u32; 4] = [64, 128, 256, 512];
+pub const DEFAULT_BUFFER_FRAMES: u32 = 256;
 
 fn yes() -> bool {
     true
@@ -24,12 +28,15 @@ fn stereo() -> u16 {
 pub struct Config {
     pub version: u32,
     pub devices: Vec<VirtualDevice>,
+    /// Engine IO buffer size in frames, one of [`BUFFER_FRAMES`]; global so every device shares it.
+    pub buffer_frames: u32,
 }
 impl Default for Config {
     fn default() -> Self {
         Config {
             version: CONFIG_VERSION,
             devices: Vec::new(),
+            buffer_frames: DEFAULT_BUFFER_FRAMES,
         }
     }
 }
@@ -133,6 +140,12 @@ impl Config {
             return Err(format!(
                 "unsupported config version {} (expected {CONFIG_VERSION})",
                 self.version
+            ));
+        }
+        if !BUFFER_FRAMES.contains(&self.buffer_frames) {
+            return Err(format!(
+                "buffer_frames {} must be one of {BUFFER_FRAMES:?}",
+                self.buffer_frames
             ));
         }
         let mut dev_ids = HashSet::new();
@@ -265,6 +278,22 @@ mod tests {
         cfg.devices[0].sources[0].mute_original = true;
         let json = serde_json::to_string(&cfg).unwrap();
         assert_eq!(cfg, serde_json::from_str::<Config>(&json).unwrap());
+    }
+
+    #[test]
+    fn buffer_frames_defaults_for_old_configs_and_is_checked() {
+        let mut cfg = example(); // EXAMPLE predates the field
+        assert_eq!(cfg.buffer_frames, DEFAULT_BUFFER_FRAMES);
+        for n in BUFFER_FRAMES {
+            cfg.buffer_frames = n;
+            cfg.validate().unwrap();
+            let json = serde_json::to_string(&cfg).unwrap();
+            assert_eq!(cfg, serde_json::from_str::<Config>(&json).unwrap());
+        }
+        for n in [0, 63, 100, 1024] {
+            cfg.buffer_frames = n;
+            assert!(cfg.validate().unwrap_err().contains("buffer_frames"));
+        }
     }
 
     #[test]

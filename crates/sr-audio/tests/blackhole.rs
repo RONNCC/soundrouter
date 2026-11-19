@@ -48,7 +48,6 @@ impl Drop for Player {
 
 fn cfg(player_key: &str, volume_db: f32, muted: bool, wires: &[(u16, u16)]) -> Config {
     Config {
-        version: 1,
         devices: vec![VirtualDevice {
             id: "e2e".into(),
             name: "e2e".into(),
@@ -77,6 +76,7 @@ fn cfg(player_key: &str, volume_db: f32, muted: bool, wires: &[(u16, u16)]) -> C
                 .collect(),
             monitors: vec![],
         }],
+        ..Config::default()
     }
 }
 

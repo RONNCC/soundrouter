@@ -111,21 +111,25 @@ pub fn get_string(obj: u32, sel: u32) -> Result<String, i32> {
         .unwrap_or_default())
 }
 
-/// Set a property whose value is one object pointer (CFString, CFArray, ...).
-pub fn set_object<T: objc2::Message>(obj: u32, sel: u32, value: &Retained<T>) -> Result<(), i32> {
+/// Set a fixed-size global property.
+pub fn set_global<T: Copy>(obj: u32, sel: u32, value: &T) -> Result<(), i32> {
     let a = addr(sel, kAudioObjectPropertyScopeGlobal);
-    let ptr = Retained::as_ptr(value);
     let st = unsafe {
         AudioObjectSetPropertyData(
             obj,
             NonNull::from(&a),
             0,
             null(),
-            std::mem::size_of::<usize>() as u32,
-            NonNull::from(&ptr).cast(),
+            std::mem::size_of::<T>() as u32,
+            NonNull::from(value).cast(),
         )
     };
     if st != 0 { Err(st) } else { Ok(()) }
+}
+
+/// Set a property whose value is one object pointer (CFString, CFArray, ...).
+pub fn set_object<T: objc2::Message>(obj: u32, sel: u32, value: &Retained<T>) -> Result<(), i32> {
+    set_global(obj, sel, &Retained::as_ptr(value))
 }
 
 /// Qualifier bytes for a CFString-keyed translation (the pointer value).

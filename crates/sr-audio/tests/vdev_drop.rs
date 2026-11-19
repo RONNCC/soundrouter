@@ -7,7 +7,6 @@ use sr_core::config::*;
 
 fn cfg(enabled: bool) -> Config {
     Config {
-        version: 1,
         devices: vec![VirtualDevice {
             id: "drop".into(),
             name: "drop".into(),
@@ -27,6 +26,7 @@ fn cfg(enabled: bool) -> Config {
             wires: vec![],
             monitors: vec![],
         }],
+        ..Config::default()
     }
 }
 

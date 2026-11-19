@@ -9,6 +9,7 @@
 | GUI | egui kittest interaction tests; GPU (Metal) snapshot baselines | `cargo test -p soundrouter-app --features snapshots` (`UPDATE_SNAPSHOTS=1` rewrites baselines) |
 | Hardware (ignored) | Needs driver installed, permissions, audio hardware | `cargo test -- --ignored` |
 | BlackHole e2e | `srtone` (into BlackHole ch 8-9) -> process tap -> engine mixer -> BlackHole 16ch ch 0-1 | `cargo test -p sr-audio --test blackhole -- --ignored` |
+| Bundled driver signature | Install Driver's check accepts the app's own driver and refuses a tampered one, against a real ad-hoc or dev-signed build | `cargo test -p soundrouter-app -- --ignored real_bundle` (`SR_APP=<SoundRouter.app>`, default `target/SoundRouter.app`) |
 | Live driver | Driver inside coreaudiod (sudo) | `packaging/driver-dev.sh test` |
 | Live engine | `srtone` into `soundrouter:v2` -> process tap -> engine aggregate with the hidden companion -> `soundrouter:v1` input, installed driver, no sudo | `packaging/engine-live-test.sh` |
 | Churn soak | Engine apply loops against the installed driver: 200 volume changes, 100 app-source add/removes, 50 disable/enables (aggregate and driver devices torn down and re-created). Asserts every apply succeeds and RSS grows < 8 MiB per loop. Changes the driver list: quit the app first | `cargo test -p sr-audio --test churn -- --ignored --nocapture` |

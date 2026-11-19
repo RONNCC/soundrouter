@@ -202,6 +202,106 @@ pub fn locate_driver() -> Option<PathBuf> {
     .and_then(|p| p.canonicalize().ok())
 }
 
+/// Checks the driver bundle before it is copied as root. Injected so tests need no signed bundle.
+pub type DriverCheck = fn(&Path) -> Result<(), String>;
+
+pub const DRIVER_MISMATCH: &str = "The bundled driver does not match this app.";
+
+/// Who signed some code, from `codesign -dvvv` plus `codesign -dr -` output.
+#[derive(Debug, PartialEq, Eq)]
+enum Signer {
+    AdHoc,
+    /// Developer ID and other Apple-issued certificates.
+    Team(String),
+    /// A self-signed identity (e.g. "SoundRouter Local Dev"), by its leaf certificate hash.
+    Leaf(String),
+    Unknown,
+}
+
+fn signer(codesign: &str) -> Signer {
+    let field = |key: &str| {
+        codesign
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(key).map(str::trim))
+    };
+    if field("Signature=") == Some("adhoc") {
+        return Signer::AdHoc;
+    }
+    if let Some(team) = field("TeamIdentifier=").filter(|t| !t.is_empty() && *t != "not set") {
+        return Signer::Team(team.to_owned());
+    }
+    codesign
+        .split_once("certificate leaf = H\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map_or(Signer::Unknown, |(hash, _)| {
+            Signer::Leaf(hash.to_ascii_lowercase())
+        })
+}
+
+/// Whether the driver is signed by whoever signed the app. Ad-hoc signatures carry no identity, so an
+/// ad-hoc app only trusts an ad-hoc driver inside its own `Contents/Resources`.
+fn driver_matches_app(app: &str, driver: &str, driver_in_app: bool) -> bool {
+    match (signer(app), signer(driver)) {
+        (Signer::AdHoc, Signer::AdHoc) => driver_in_app,
+        (Signer::Team(a), Signer::Team(d)) | (Signer::Leaf(a), Signer::Leaf(d)) => a == d,
+        _ => false,
+    }
+}
+
+/// `codesign -dvvv` and `codesign -dr -` output for `path` (both streams).
+fn codesign_info(path: &Path) -> Result<String, String> {
+    let mut all = String::new();
+    for args in [&["-dvvv"][..], &["-dr", "-"]] {
+        let out = Command::new("/usr/bin/codesign")
+            .args(args)
+            .arg(path)
+            .output()
+            .map_err(|e| format!("could not run codesign: {e}"))?;
+        all += &String::from_utf8_lossy(&out.stdout);
+        all += &String::from_utf8_lossy(&out.stderr);
+    }
+    Ok(all)
+}
+
+/// The real [`DriverCheck`]: `driver` has a valid strict signature by the same identity as this app.
+pub fn check_bundled_driver(driver: &Path) -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(|e| format!("cannot locate this app: {e}"))?;
+    check_driver_for(&exe, driver)
+}
+
+/// [`check_bundled_driver`] for the app whose executable is `exe` (canonical path).
+fn check_driver_for(exe: &Path, driver: &Path) -> Result<(), String> {
+    let verify = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "--deep"])
+        .arg(driver)
+        .output()
+        .map_err(|e| format!("could not run codesign: {e}"))?;
+    if !verify.status.success() {
+        return Err(format!(
+            "{DRIVER_MISMATCH} Its signature is invalid: {}",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        ));
+    }
+    // <name>.app/Contents/MacOS/<exe>; a cargo build is not in a bundle and is checked as itself.
+    let bundle = exe
+        .ancestors()
+        .nth(3)
+        .filter(|b| b.extension().is_some_and(|e| e == "app"));
+    let driver_in_app = bundle.is_some_and(|b| {
+        driver
+            .canonicalize()
+            .is_ok_and(|d| d.starts_with(b.join("Contents/Resources")))
+    });
+    let app = codesign_info(bundle.unwrap_or(exe))?;
+    if driver_matches_app(&app, &codesign_info(driver)?, driver_in_app) {
+        Ok(())
+    } else {
+        Err(DRIVER_MISMATCH.into())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Welcome,
@@ -250,6 +350,7 @@ pub struct Setup {
     asker: Asker,
     /// The driver bundle to install; `None` when this build ships without one.
     source: Option<PathBuf>,
+    driver_check: DriverCheck,
     step: Step,
     /// Opened by "Test Setup…", after an install, or when `should_show_setup` says so.
     open: bool,
@@ -287,6 +388,7 @@ impl Setup {
             runner,
             asker: Arc::new(|| TccStatus::Unknown),
             source,
+            driver_check: check_bundled_driver,
             step: Step::Welcome,
             open: false,
             busy: None,
@@ -327,6 +429,12 @@ impl Setup {
         self
     }
 
+    #[cfg(test)]
+    pub fn with_driver_check(mut self, check: DriverCheck) -> Self {
+        self.driver_check = check;
+        self
+    }
+
     /// Finished or dismissed in this version.
     pub fn seen(&self) -> bool {
         self.seen
@@ -353,9 +461,15 @@ impl Setup {
         self.error = None;
     }
 
-    fn spawn(&mut self, ctx: &Context, busy: Busy, script: String) {
-        let runner = self.runner.clone();
-        self.rx = Some(off_ui(ctx, move || runner(&script)));
+    /// Run `script` as root; when `driver` is given, only if that driver bundle passes the check.
+    fn spawn(&mut self, ctx: &Context, busy: Busy, script: String, driver: Option<PathBuf>) {
+        let (runner, check) = (self.runner.clone(), self.driver_check);
+        self.rx = Some(off_ui(ctx, move || {
+            if let Some(d) = driver {
+                check(&d).map_err(SetupError::Failed)?;
+            }
+            runner(&script)
+        }));
         self.busy = Some(busy);
         self.error = None;
     }
@@ -407,7 +521,7 @@ impl Setup {
     fn start_install(&mut self, ctx: &Context) {
         self.step = Step::Driver;
         match self.source.clone() {
-            Some(src) => self.spawn(ctx, Busy::Installing, install_script(&src)),
+            Some(src) => self.spawn(ctx, Busy::Installing, install_script(&src), Some(src)),
             None => {
                 self.error = Some(
                     "This copy of SoundRouter does not contain the driver (SoundRouter.driver)."
@@ -916,7 +1030,7 @@ impl Setup {
                     |ui, s| {
                         if button(ui, t, "Uninstall", Kind::Danger) {
                             let script = uninstall_script(s.confirm == Some(true));
-                            s.spawn(ctx, Busy::Uninstalling, script);
+                            s.spawn(ctx, Busy::Uninstalling, script, None);
                         }
                         if button(ui, t, "Cancel", Kind::Secondary) {
                             s.confirm = None;
@@ -1014,7 +1128,13 @@ fn open_url(url: &str) {
 }
 
 /// Footer button in the style of the Delete button.
-pub fn footer_button(ui: &mut egui::Ui, rect: Rect, id: &str, label: &str, t: &Tokens) -> bool {
+pub fn footer_button(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: &str,
+    label: &str,
+    t: &Tokens,
+) -> egui::Response {
     let resp = ui.interact(rect, Id::unique(id), Sense::click());
     name_button(&resp, label);
     let fill = if resp.hovered() {
@@ -1036,7 +1156,7 @@ pub fn footer_button(ui: &mut egui::Ui, rect: Rect, id: &str, label: &str, t: &T
         FontId::proportional(12.5),
         t.text,
     );
-    resp.clicked()
+    resp
 }
 
 /// Everything support needs, in the spirit of `sr-cli doctor`.
@@ -1164,6 +1284,102 @@ mod tests {
             assert!(s.contains(step), "{step}\n{s}");
         }
         assert!(s.ends_with("killall coreaudiod"));
+    }
+
+    // `codesign -dvvv` + `codesign -dr -` output, trimmed, from real builds (Developer ID: documented form).
+    const LOCAL_DEV_APP: &str = r#"Identifier=com.ronncc.soundrouter
+CodeDirectory v=20400 size=130063 flags=0x0(none) hashes=4058+3 location=embedded
+Authority=SoundRouter Local Dev
+TeamIdentifier=not set
+designated => identifier "com.ronncc.soundrouter" and certificate leaf = H"336c4aeb944d901a8d5c9e7cdbf3c14bbf058d33""#;
+    const LOCAL_DEV_DRIVER: &str = r#"Identifier=io.github.ronncc.soundrouter.driver
+Authority=SoundRouter Local Dev
+TeamIdentifier=not set
+designated => identifier "io.github.ronncc.soundrouter.driver" and certificate leaf = H"336C4AEB944D901A8D5C9E7CDBF3C14BBF058D33""#;
+    const OTHER_DEV_DRIVER: &str = r#"Identifier=io.github.ronncc.soundrouter.driver
+Authority=Someone Else
+TeamIdentifier=not set
+designated => identifier "io.github.ronncc.soundrouter.driver" and certificate leaf = H"0123456789abcdef0123456789abcdef01234567""#;
+    const ADHOC: &str = r#"Identifier=io.github.ronncc.soundrouter.driver
+CodeDirectory v=20400 size=4092 flags=0x2(adhoc) hashes=121+3 location=embedded
+Signature=adhoc
+TeamIdentifier=not set
+# designated => cdhash H"89cceaacfe3ec4d7d708764b2e1879c3be4e6f8e""#;
+    fn developer_id(t: &str) -> String {
+        format!(
+            "Authority=Developer ID Application: R G ({t})\nAuthority=Developer ID Certification Authority\n\
+             Authority=Apple Root CA\nTeamIdentifier={t}\ndesignated => anchor apple generic and identifier \"x\" and \
+             (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate \
+             1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate \
+             leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = {t})"
+        )
+    }
+
+    #[test]
+    fn signers_are_read_from_codesign_output() {
+        assert_eq!(
+            signer(LOCAL_DEV_APP),
+            Signer::Leaf("336c4aeb944d901a8d5c9e7cdbf3c14bbf058d33".into())
+        );
+        assert_eq!(signer(ADHOC), Signer::AdHoc);
+        assert_eq!(
+            signer(&developer_id("ABCDE12345")),
+            Signer::Team("ABCDE12345".into())
+        );
+        assert_eq!(signer("code object is not signed at all"), Signer::Unknown);
+    }
+
+    #[test]
+    fn the_driver_must_carry_the_apps_signing_identity() {
+        let (team, other) = (developer_id("ABCDE12345"), developer_id("ZZZZZ99999"));
+        // Same identity: accepted wherever the driver sits.
+        assert!(driver_matches_app(LOCAL_DEV_APP, LOCAL_DEV_DRIVER, false));
+        assert!(driver_matches_app(&team, &team, false));
+        // Different identity, or an ad-hoc driver next to a signed app (or the reverse): refused.
+        assert!(!driver_matches_app(LOCAL_DEV_APP, OTHER_DEV_DRIVER, true));
+        assert!(!driver_matches_app(&team, &other, true));
+        assert!(!driver_matches_app(&team, LOCAL_DEV_DRIVER, true));
+        assert!(!driver_matches_app(LOCAL_DEV_APP, ADHOC, true));
+        assert!(!driver_matches_app(ADHOC, LOCAL_DEV_DRIVER, true));
+        // Ad-hoc carries no identity: only the app's own Contents/Resources counts.
+        assert!(driver_matches_app(ADHOC, ADHOC, true));
+        assert!(!driver_matches_app(ADHOC, ADHOC, false));
+        // Unparseable output never matches, not even itself.
+        assert!(!driver_matches_app("garbage", "garbage", true));
+    }
+
+    /// Against a real `packaging/bundle-app.sh` build (ad-hoc or dev-signed), by default
+    /// `target/SoundRouter.app`: `SR_APP=<SoundRouter.app> cargo test -p soundrouter-app -- --ignored real_bundle`
+    #[test]
+    #[ignore = "needs a built SoundRouter.app"]
+    fn real_bundle_accepts_its_own_driver_only() {
+        let app = std::env::var_os("SR_APP")
+            .map_or_else(
+                || Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/SoundRouter.app"),
+                PathBuf::from,
+            )
+            .canonicalize()
+            .expect("build it with packaging/bundle-app.sh or set SR_APP");
+        let exe = app.join("Contents/MacOS/SoundRouter");
+        let own = app.join("Contents/Resources/SoundRouter.driver");
+        assert_eq!(check_driver_for(&exe, &own), Ok(()));
+        // A copy outside the bundle keeps the identity of a signed build, but not of an ad-hoc one.
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("SoundRouter.driver");
+        assert!(
+            Command::new("ditto")
+                .arg(&own)
+                .arg(&copy)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let adhoc = signer(&codesign_info(&app).unwrap()) == Signer::AdHoc;
+        assert_eq!(check_driver_for(&exe, &copy).is_ok(), !adhoc);
+        // A broken seal is refused.
+        std::fs::write(copy.join("Contents/Info.plist"), "tampered").unwrap();
+        let err = check_driver_for(&exe, &copy).unwrap_err();
+        assert!(err.starts_with(DRIVER_MISMATCH), "{err}");
     }
 
     #[test]

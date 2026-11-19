@@ -44,6 +44,10 @@ enum Cmd {
         /// (temporary Pass-Thru route, routing restored afterwards), print the result and exit
         #[arg(long, value_name = "ID")]
         self_test: Option<String>,
+        /// Engine IO buffer in frames (64, 128, 256 or 512); overrides the config's `buffer_frames`.
+        /// Smaller buffers cut latency but cost CPU and battery.
+        #[arg(long, value_name = "FRAMES")]
+        buffer: Option<u32>,
     },
     /// Print per-channel input peaks of a virtual device (what apps record from it) at 4 Hz
     Meter { device_id: String },
@@ -115,7 +119,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::LoopbackTest { uid, secs } => loopback_test(&full_uid(&uid), secs),
-        Cmd::Run { config, self_test } => run(&config, self_test.as_deref()),
+        Cmd::Run {
+            config,
+            self_test,
+            buffer,
+        } => run(&config, self_test.as_deref(), buffer),
         Cmd::Meter { device_id } => {
             install_ctrlc()?;
             let uid = full_uid(&device_id);
@@ -205,11 +213,14 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn run(path: &PathBuf, self_test: Option<&str>) -> Result<()> {
-    let cfg: Config = serde_json::from_str(
+fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>) -> Result<()> {
+    let mut cfg: Config = serde_json::from_str(
         &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
     )
     .context("parsing config")?;
+    if let Some(n) = buffer {
+        cfg.buffer_frames = n;
+    }
     cfg.validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
     install_ctrlc()?;

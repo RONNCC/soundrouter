@@ -71,9 +71,19 @@ pub fn db_to_pct(db: f32) -> f32 {
     }
 }
 
+/// Footer label for an engine buffer size. shortcut: assumes 48 kHz, read the live rate if users mind.
+pub fn latency_label(frames: u32) -> String {
+    format!(
+        "Latency: {:.1} ms ({frames} frames)",
+        f64::from(frames) / 48.0
+    )
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Edit {
     NewDevice,
+    /// Engine IO buffer size in frames (global, `Config::buffer_frames`).
+    BufferFrames(u32),
     RemoveDevice(usize),
     Rename(usize, String),
     Enable(usize, bool),
@@ -126,10 +136,7 @@ pub fn new_device(cfg: &mut Config) {
 }
 
 pub fn default_config() -> Config {
-    let mut cfg = Config {
-        version: 1,
-        devices: Vec::new(),
-    };
+    let mut cfg = Config::default();
     new_device(&mut cfg);
     cfg
 }
@@ -188,12 +195,19 @@ fn next_source_id(dev: &VirtualDevice) -> String {
 }
 
 pub fn apply(cfg: &mut Config, edit: Edit) {
-    if matches!(edit, Edit::NewDevice) {
-        new_device(cfg);
-        return;
+    match edit {
+        Edit::NewDevice => {
+            new_device(cfg);
+            return;
+        }
+        Edit::BufferFrames(n) => {
+            cfg.buffer_frames = n;
+            return;
+        }
+        _ => {}
     }
     let d = match &edit {
-        Edit::NewDevice => unreachable!(),
+        Edit::NewDevice | Edit::BufferFrames(_) => unreachable!(),
         Edit::RemoveDevice(d)
         | Edit::Rename(d, _)
         | Edit::Enable(d, _)
@@ -224,7 +238,7 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
         return;
     };
     match edit {
-        Edit::NewDevice | Edit::RemoveDevice(_) => {}
+        Edit::NewDevice | Edit::BufferFrames(_) | Edit::RemoveDevice(_) => {}
         Edit::Rename(_, name) => dev.name = name,
         Edit::Enable(_, on) => dev.enabled = on,
         Edit::Volume(_, db) => dev.volume_db = db,
@@ -464,6 +478,19 @@ mod tests {
         assert_eq!(c.devices[0].id, "v1");
         assert_eq!(c.devices[0].channels, 2);
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn buffer_frames_edit_and_label() {
+        let mut c = default_config();
+        assert_eq!(
+            latency_label(c.buffer_frames),
+            "Latency: 5.3 ms (256 frames)"
+        );
+        apply(&mut c, Edit::BufferFrames(128));
+        assert_eq!(c.buffer_frames, 128);
+        c.validate().unwrap();
+        assert_eq!(latency_label(512), "Latency: 10.7 ms (512 frames)");
     }
 
     #[test]

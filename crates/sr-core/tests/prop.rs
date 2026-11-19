@@ -172,8 +172,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
     #[test]
-    fn config_json_round_trips(devices in prop::collection::vec(arb_device(), 0..3), version in any::<u32>()) {
-        let cfg = Config { version, devices };
+    fn config_json_round_trips(devices in prop::collection::vec(arb_device(), 0..3), version in any::<u32>(), buffer_frames in any::<u32>()) {
+        let cfg = Config { version, devices, buffer_frames };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&cfg, &back);
@@ -201,7 +201,7 @@ proptest! {
             }
             d
         }).collect();
-        let cfg = Config { version: 1, devices };
+        let cfg = Config { devices, ..Config::default() };
         if cfg.validate().is_ok() {
             for d in &cfg.devices {
                 prop_assert!(!d.name.trim().is_empty() && d.name.chars().count() <= MAX_NAME_CHARS);
@@ -449,7 +449,7 @@ proptest! {
         cut in any::<prop::sample::Index>(),
         flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..4),
     ) {
-        let mut json = serde_json::to_vec(&Config { version: 1, devices }).unwrap();
+        let mut json = serde_json::to_vec(&Config { devices, ..Config::default() }).unwrap();
         for (at, b) in flips {
             let i = at.index(json.len());
             json[i] = b;
@@ -471,7 +471,7 @@ proptest! {
         // A valid base (arb_world is routable), so many edits still validate and reach the mixer.
         let mut d = w.dev;
         d.monitors.push(mon("spk", true, 0.0));
-        let mut doc = serde_json::to_value(Config { version: 1, devices: vec![d] }).unwrap();
+        let mut doc = serde_json::to_value(Config { devices: vec![d], ..Config::default() }).unwrap();
         for (at, leaf) in &edits {
             let mut n = 0;
             fn count(v: &serde_json::Value, n: &mut usize) {

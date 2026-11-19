@@ -11,7 +11,7 @@
 	<key>CFBundleShortVersionString</key><string>0.1.0</string>
 	<key>CFBundleVersion</key><string>1</string>
 	<key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
-	<key>LSMinimumSystemVersion</key><string>14.0</string>
+	<key>LSMinimumSystemVersion</key><string>14.2</string>
 	<key>CFPlugInFactories</key>
 	<dict>
 		<key>6C1B6E3A-3F0E-4E7B-9C1D-5A0F2B7D9E41</key><string>SoundRouter_Create</string>

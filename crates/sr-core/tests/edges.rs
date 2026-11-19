@@ -189,8 +189,8 @@ fn named(name: &str) -> Config {
     let mut d = dev();
     d.name = name.into();
     Config {
-        version: 1,
         devices: vec![d],
+        ..Config::default()
     }
 }
 
