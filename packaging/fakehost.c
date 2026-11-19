@@ -477,7 +477,8 @@ int main(int argc, char** argv) {
             CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &sa, 0, NULL, sizeof b, &b) == 0);
             CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &sa, 0, NULL, sizeof c, &c) == 0);
         }
-        for (int i = 0; i < 400 && !(nDevices() == 4 && byUID("soundrouter:v4") && !byUID("soundrouter:v1")); i++) usleep(10000);
+        // the final name too: a pass on the middle list can leave 4 devices while v5 waits out a quarantined slot (1 s)
+        for (int i = 0; i < 400 && !(nDevices() == 4 && byUID("soundrouter:v4") && !byUID("soundrouter:v1") && nameIs(byUID("soundrouter:v2"), "Last Two")); i++) usleep(10000);
         usleep(300000); // let a straggling reconcile pass finish
         AudioObjectID a2 = byUID("soundrouter:v2"), a4 = byUID("soundrouter:v4");
         CHECK(nDevices() == 4 && a2 && a4 && a2 != a4 && byUID("soundrouter:v2.engine") && byUID("soundrouter:v4.engine"));
