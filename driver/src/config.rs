@@ -1,5 +1,5 @@
 //! Device-list validation and diffing. Pure Rust, no CoreFoundation.
-use sr_core::driver_proto::{COMPANION_SUFFIX, DriverDevice, MAX_DEVICES};
+use sr_core::driver_proto::{COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, MAX_DEVICES};
 
 pub const MAX_CHANNELS: u16 = 64;
 const MAX_UID_BYTES: usize = 128;
@@ -13,6 +13,12 @@ pub fn validate(mut list: Vec<DriverDevice>) -> Result<Vec<DriverDevice>, String
     for (i, d) in list.iter_mut().enumerate() {
         if d.uid.is_empty() || d.uid.len() > MAX_UID_BYTES || d.uid.contains('\0') {
             return Err(format!("device {i}: bad uid"));
+        }
+        // Any local process may set the list: keep it out of other devices' uid namespace (BuiltInSpeakerDevice, ...).
+        if d.uid.len() <= DEVICE_UID_PREFIX.len() || !d.uid.starts_with(DEVICE_UID_PREFIX) {
+            return Err(format!(
+                "device {i}: uid must start with {DEVICE_UID_PREFIX}"
+            ));
         }
         if d.uid.ends_with(COMPANION_SUFFIX) {
             return Err(format!(
@@ -104,9 +110,10 @@ pub fn diff(
 mod tests {
     use super::*;
 
+    /// `uid` is the part after `DEVICE_UID_PREFIX`.
     fn d(uid: &str, name: &str, channels: u16) -> DriverDevice {
         DriverDevice {
-            uid: uid.into(),
+            uid: format!("{DEVICE_UID_PREFIX}{uid}"),
             name: name.into(),
             channels,
         }
@@ -128,9 +135,25 @@ mod tests {
                 .contains("duplicate")
         );
         assert!(validate(vec![d("", "n", 2)]).is_err());
+        for uid in [
+            "BuiltInSpeakerDevice",
+            "soundrouter",
+            "v1",
+            "SoundRouter:v1",
+        ] {
+            let raw = DriverDevice {
+                uid: uid.into(),
+                ..d("a", "n", 2)
+            };
+            assert!(
+                validate(vec![raw]).unwrap_err().contains("must start"),
+                "{uid}"
+            );
+        }
         assert!(validate(vec![d("a\0b", "n", 2)]).is_err());
         assert!(validate(vec![d("a.engine", "n", 2)]).is_err());
-        assert!(validate(vec![d(&"u".repeat(129), "n", 2)]).is_err());
+        assert!(validate(vec![d(&"u".repeat(129 - DEVICE_UID_PREFIX.len()), "n", 2)]).is_err());
+        assert!(validate(vec![d(&"u".repeat(128 - DEVICE_UID_PREFIX.len()), "n", 2)]).is_ok());
         assert!(validate(vec![d("a", "n", 0)]).is_err());
         assert!(validate(vec![d("a", "n", 65)]).is_err());
         assert!(validate(vec![d("a", "   ", 2)]).is_err());
@@ -207,7 +230,7 @@ mod tests {
         let mut slots: Vec<_> = with(d("old", "O", 2)).into_iter().map(Some).collect();
         let mut freed = vec![0; MAX_DEVICES];
         // (time, uid) each time the last slot's occupant changes.
-        let mut history = vec![(0, Some("old".to_string()))];
+        let mut history = vec![(0, Some(format!("{DEVICE_UID_PREFIX}old")))];
         for t in 1..4000 {
             let want = &lists.iter().rfind(|(at, _)| *at <= t).unwrap().1;
             apply(&mut slots, &mut freed, t, want);
@@ -224,7 +247,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // The slot sits empty for exactly Q after each removal; A and B never get it, C waits for it.
-        let s = |u: &str| Some(u.to_string());
+        let s = |u: &str| Some(format!("{DEVICE_UID_PREFIX}{u}"));
         assert_eq!(
             history,
             [

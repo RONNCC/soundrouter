@@ -25,6 +25,9 @@ cp -R "$DRIVER" "$WORK/hal/"
 cp -R "$APP" "$WORK/apps/"
 cp packaging/uninstall.sh "$WORK/support/uninstall.sh"
 chmod 755 "$WORK/support/uninstall.sh"
+# payload modes come from the build machine's umask: installed files must not be group/world-writable (the HAL
+# folder holds code coreaudiod loads) nor unreadable
+chmod -R go-w,a+rX "$WORK/hal" "$WORK/apps" "$WORK/support"
 
 # an upgrade must not leave files of an older driver build inside the bundle (they break the code seal)
 cat > "$WORK/scripts/preinstall" <<'EOF'

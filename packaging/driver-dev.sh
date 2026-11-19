@@ -34,7 +34,8 @@ profiler() { system_profiler SPAudioDataType; }
 inprof() { local o; o=$(profiler); grep -q -- "$1" <<<"$o"; }
 test_live() {
   tools  # always rebuild: a stale srctl hides parser fixes
-  local srctl=$TOOLS/srctl log=/tmp/sr-coreaudiod.log lp
+  local srctl=$TOOLS/srctl log lp
+  log=$(mktemp "${TMPDIR:-/tmp}/sr-coreaudiod.XXXXXX") # not a fixed /tmp name: a planted symlink would be written through
   log stream --level debug --predicate 'process == "coreaudiod" AND (eventMessage CONTAINS[c] "SoundRouter" OR eventMessage CONTAINS "PlugIn")' >"$log" 2>&1 &
   lp=$!
   # shellcheck disable=SC2064 # $lp is a local: expand it now, it is gone when the EXIT trap runs

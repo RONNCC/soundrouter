@@ -88,7 +88,7 @@ pub fn init() -> Option<PathBuf> {
 /// One-line startup banner: version, macOS version, driver presence, and the raw TCC answers for
 /// this process (which, launched from Finder or `open`, is the app's own TCC subject).
 pub fn banner(log_file: Option<&Path>) {
-    let os = std::process::Command::new("sw_vers")
+    let os = std::process::Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
         .output()
         .ok()

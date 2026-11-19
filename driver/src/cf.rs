@@ -97,7 +97,7 @@ mod tests {
 
     fn d(uid: &str, name: &str, channels: u16) -> DriverDevice {
         DriverDevice {
-            uid: uid.into(),
+            uid: format!("soundrouter:{uid}"),
             name: name.into(),
             channels,
         }
@@ -105,10 +105,7 @@ mod tests {
 
     #[test]
     fn plist_round_trip() {
-        let list = vec![
-            d("soundrouter:v1", "Loopback Audio", 2),
-            d("x", "Ünïcode ✓", 64),
-        ];
+        let list = vec![d("v1", "Loopback Audio", 2), d("x", "Ünïcode ✓", 64)];
         let p = devices_to_plist(&list);
         assert_eq!(parse_devices(Some(&p)).unwrap(), list);
         let empty = devices_to_plist(&[]);

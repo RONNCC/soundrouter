@@ -184,7 +184,7 @@ pub fn installed_apps_in(dirs: &[&std::path::Path]) -> Vec<AppInfo> {
             let Some(name) = path.file_stem().map(|n| n.to_string_lossy().into_owned()) else {
                 continue;
             };
-            let id = std::process::Command::new("plutil")
+            let id = std::process::Command::new("/usr/bin/plutil")
                 .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
                 .arg(path.join("Contents/Info.plist"))
                 .output()

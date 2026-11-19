@@ -130,13 +130,15 @@ fn applescript_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', r"\\").replace('"', r#"\""#))
 }
 
-/// Copy the driver bundle at `src` into the HAL folder, fix owner and quarantine, restart coreaudiod.
+/// Copy the driver bundle at `src` into the HAL folder, fix owner, modes and quarantine, restart coreaudiod.
+/// The modes are forced because `ditto` keeps the source's: a bundle built under a loose umask must not
+/// end up writable by others in a folder coreaudiod loads code from (or unreadable by coreaudiod).
 /// `src` is quoted, so any path is safe (non-UTF-8 bytes are replaced, which makes `ditto` fail loudly).
 pub fn install_script(src: &Path) -> String {
     let dest = sh_quote(INSTALLED_DRIVER);
     format!(
         "mkdir -p {hal} && rm -rf {dest} && ditto {src} {dest} && chown -R root:wheel {dest} \
-         && xattr -dr com.apple.quarantine {dest} && killall coreaudiod",
+         && chmod -R go-w,a+rX {dest} && xattr -dr com.apple.quarantine {dest} && killall coreaudiod",
         hal = sh_quote(HAL_DIR),
         src = sh_quote(&src.to_string_lossy()),
     )
@@ -1008,7 +1010,7 @@ fn tcc_word(s: TccStatus) -> &'static str {
 }
 
 fn open_url(url: &str) {
-    let _ = Command::new("open").arg(url).spawn();
+    let _ = Command::new("/usr/bin/open").arg(url).spawn();
 }
 
 /// Footer button in the style of the Delete button.
@@ -1156,6 +1158,7 @@ mod tests {
         for step in [
             "ditto '/x/SoundRouter.driver' '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'",
             "chown -R root:wheel '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'",
+            "chmod -R go-w,a+rX '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'",
             "xattr -dr com.apple.quarantine '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'",
         ] {
             assert!(s.contains(step), "{step}\n{s}");

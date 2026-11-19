@@ -8,7 +8,7 @@ pub const PROP_VERSION: u32 = u32::from_be_bytes(*b"srvr");
 /// WriteMix calls on that device arrived after their output time or exceeded the ring. Resets when the slot is reused.
 pub const PROP_OVERLOADS: u32 = u32::from_be_bytes(*b"srov");
 /// Device list, on the plug-in object (global scope, element main). Type 'plst' (CFPropertyList), settable.
-/// Value = CFArray of CFDictionary {uid: CFString, name: CFString, channels: CFNumber 1..=64}, at most `MAX_DEVICES`.
+/// Value = CFArray of CFDictionary {uid: CFString starting with `DEVICE_UID_PREFIX`, name: CFString, channels: CFNumber 1..=64}, at most `MAX_DEVICES`.
 /// Set replaces the whole list. The driver persists it via host storage under `STORAGE_KEY`.
 pub const PROP_DEVICES: u32 = u32::from_be_bytes(*b"srcf");
 pub const STORAGE_KEY: &str = "devices"; // host WriteToStorage key, same CFArray

@@ -781,7 +781,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(PERMISSION_BANNER);
                         if ui.button("Open Settings").clicked() {
-                            let _ = std::process::Command::new("open")
+                            let _ = std::process::Command::new("/usr/bin/open")
                                 .arg(AUDIO_CAPTURE_SETTINGS)
                                 .spawn();
                         }

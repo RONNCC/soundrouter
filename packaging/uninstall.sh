@@ -47,7 +47,8 @@ if [ "$(id -u)" -eq 0 ]; then
 else
   TARGET_USER=$(id -un)
 fi
-TARGET_HOME=$(dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+# `|| true`: an unknown user (no console user) must not abort under set -e/pipefail before the driver is removed
+TARGET_HOME=$(dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null | tr '\n' ' ' | sed 's/^NFSHomeDirectory:[[:space:]]*//; s/[[:space:]]*$//' || true)  # not awk $2: homes may contain spaces
 TARGET_HOME=${TARGET_HOME:-$HOME}
 
 if [ -e "$DRIVER" ] || [ -L "$DRIVER" ]; then

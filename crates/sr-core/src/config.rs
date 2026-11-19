@@ -1,3 +1,4 @@
+use crate::driver_proto::COMPANION_SUFFIX;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -8,6 +9,8 @@ pub const MAX_NAME_CHARS: usize = 64;
 /// Highest accepted volume in dB; anything lower (even -200) is valid and just means near-silence.
 pub const MAX_DB: f32 = 24.0;
 pub const CONFIG_VERSION: u32 = 1;
+/// Longest device id; the driver uid `soundrouter:<id>` (and its `.engine` companion) must stay a valid driver uid.
+pub const MAX_ID_BYTES: usize = 64;
 
 fn yes() -> bool {
     true
@@ -136,6 +139,16 @@ impl Config {
         for dev in &self.devices {
             if !dev_ids.insert(dev.id.as_str()) {
                 return Err(format!("duplicate device id '{}'", dev.id));
+            }
+            if dev.id.is_empty()
+                || dev.id.len() > MAX_ID_BYTES
+                || dev.id.contains('\0')
+                || dev.id.ends_with(COMPANION_SUFFIX)
+            {
+                return Err(format!(
+                    "device id '{}' must be 1..={MAX_ID_BYTES} bytes without NUL and not end with {COMPANION_SUFFIX}",
+                    dev.id
+                ));
             }
             if dev.name.trim().is_empty() {
                 return Err(format!("device '{}': name is empty", dev.id));
@@ -305,7 +318,7 @@ mod tests {
     #[test]
     fn rejects_bad_values() {
         type Mutate = fn(&mut Config);
-        let bad: [(&str, Mutate); 18] = [
+        let bad: [(&str, Mutate); 22] = [
             ("dup device", |c| {
                 let d = c.devices[0].clone();
                 c.devices.push(d);
@@ -314,6 +327,12 @@ mod tests {
                 let s = c.devices[0].sources[0].clone();
                 c.devices[0].sources.push(s);
             }),
+            ("empty id", |c| c.devices[0].id.clear()),
+            ("long id", |c| {
+                c.devices[0].id = "v".repeat(MAX_ID_BYTES + 1)
+            }),
+            ("nul id", |c| c.devices[0].id = "v\0".into()),
+            ("companion id", |c| c.devices[0].id = "v1.engine".into()),
             ("odd channels", |c| c.devices[0].channels = 3),
             ("zero channels", |c| c.devices[0].channels = 0),
             ("too many channels", |c| c.devices[0].channels = 66),

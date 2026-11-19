@@ -62,7 +62,7 @@ pub fn bypasses_guard(demo: bool) -> bool {
 /// process the Dock-click reopen event, which shows a hidden window; `open -b` goes to whichever
 /// registered copy LaunchServices prefers, which may be another one that then just exits.
 pub fn raise_existing() {
-    let mut open = std::process::Command::new("open");
+    let mut open = std::process::Command::new("/usr/bin/open");
     match lock_path().as_deref().and_then(holder_app) {
         Some(app) => open.arg(app),
         None => open.args(["-b", BUNDLE_ID]),

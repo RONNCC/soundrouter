@@ -47,9 +47,27 @@ fn quarantine(path: &Path) -> std::io::Result<PathBuf> {
     Ok(dest)
 }
 
+/// A real config is a few KB; anything this big is corrupt or hostile and is not read into memory.
+const MAX_CONFIG_BYTES: u64 = 4 << 20;
+
+/// Quarantine the unusable file at `path` and fall back to defaults with a message.
+fn set_aside(path: &Path, problem: &str) -> (Config, Option<String>) {
+    let kept = match quarantine(path) {
+        Ok(p) => format!("saved as {}", p.display()),
+        Err(e) => format!("could not move it aside: {e}"),
+    };
+    (
+        default_config(),
+        Some(format!("Ignoring {problem} ({kept})")),
+    )
+}
+
 /// Missing file -> default config. Newer-version file -> defaults, file kept (and `save` refuses
 /// to overwrite it). Corrupt or invalid file -> moved to `config.json.bad`, defaults, and a message.
 pub fn load(path: &Path) -> (Config, Option<String>) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_CONFIG_BYTES) {
+        return set_aside(path, "oversized config");
+    }
     // Bytes, not a String: a file that is not UTF-8 is corrupt and must be quarantined like any other.
     let text = match std::fs::read(path) {
         Ok(t) => t,
@@ -71,14 +89,7 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
         },
         Err(e) => format!("unreadable config: {e}"),
     };
-    let kept = match quarantine(path) {
-        Ok(p) => format!("saved as {}", p.display()),
-        Err(e) => format!("could not move it aside: {e}"),
-    };
-    (
-        default_config(),
-        Some(format!("Ignoring {problem} ({kept})")),
-    )
+    set_aside(path, &problem)
 }
 
 /// Write to a temp file next to the target, fsync it, then rename over the target.
@@ -138,6 +149,20 @@ mod tests {
         let (back, msg) = load(&path);
         assert_eq!(back, cfg);
         assert!(msg.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_file_is_quarantined_unread() {
+        let dir = tmpdir("big");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        let (cfg, msg) = load(&path);
+        assert_eq!(cfg, default_config());
+        assert!(msg.unwrap().contains("oversized config"));
+        assert!(!path.exists() && !bad_files(&path).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
