@@ -309,6 +309,28 @@ mod tests {
     }
 
     #[test]
+    fn channel_counts_must_match_exactly_and_be_at_least_two() {
+        let mut cfg = example();
+        cfg.devices[0].channels = 0;
+        assert!(cfg.validate().unwrap_err().contains("channels"));
+        // pass_thru must have the device's channel count: neither narrower nor wider.
+        let mut cfg = example();
+        cfg.devices[0].channels = 4;
+        cfg.devices[0].sources.push(Source {
+            id: "p".into(),
+            kind: SourceKind::PassThru,
+            channels: 2,
+            volume_db: 0.0,
+            muted: false,
+            mute_original: false,
+            name: String::new(),
+        });
+        assert!(cfg.validate().unwrap_err().contains("pass_thru"));
+        cfg.devices[0].sources[2].channels = 4;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
     fn rejects_dangling_wire() {
         let mut cfg = example();
         cfg.devices[0].wires[0].source = "nope".into();

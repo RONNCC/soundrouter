@@ -277,3 +277,15 @@ fn minimal_json_is_usable_end_to_end() {
     bad.devices[0].volume_db = 1000.0;
     assert!(bad.validate().is_err());
 }
+
+#[test]
+fn huge_finite_samples_cannot_overflow_to_inf() {
+    let mut d = dev();
+    d.volume_db = 24.0;
+    d.sources[0].volume_db = 24.0;
+    d.monitors.push(mon("spk", true, 24.0));
+    let (mut m, _h, _) = setup(&d, &layout());
+    let ins = vec![vec![f32::MAX; 16], vec![f32::MIN; 16]];
+    let o = run(&mut m, &ins, 4, 16);
+    assert!(all_finite(&o));
+}

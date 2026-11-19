@@ -371,3 +371,75 @@ fn process_is_far_below_realtime_budget() {
         "{per_block:?}"
     );
 }
+
+#[test]
+fn device_mute_ramps_without_a_step_and_holds_across_blocks() {
+    let (mut m, mut h, _) = setup(&dev(), &layout());
+    let n = 64;
+    let ins = vec![vec![1.0; n], vec![1.0; n]];
+    run(&mut m, &ins, 4, n);
+    let mut d = dev();
+    d.muted = true;
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    let step = 1.0 / n as f32;
+    let mut prev = 1.0;
+    for x in &run(&mut m, &ins, 4, n)[0] {
+        assert!(prev - x <= step + 1e-5 && prev >= *x, "jump {prev} -> {x}");
+        prev = *x;
+    }
+    assert!(prev.abs() < 1e-5, "ramp must land on the target");
+    // The ramp is finished: later blocks are exactly silent, not ramping again from 1.
+    assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 0.0));
+    // A plan that keeps the device muted continues from the applied gain: no jump back to 1 and down again.
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 0.0));
+}
+
+#[test]
+fn a_plan_swap_continues_the_device_ramp_from_what_was_applied() {
+    let mut d = dev();
+    d.muted = true;
+    let (mut m, mut h, _) = setup(&d, &layout());
+    let n = 64;
+    let ins = vec![vec![1.0; n], vec![1.0; n]];
+    run(&mut m, &ins, 4, n);
+    d.muted = false;
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    let o = run(&mut m, &ins, 4, n);
+    assert!(
+        o[0][0] <= 1.0 / n as f32 + 1e-5,
+        "ramp must start from silence, got {}",
+        o[0][0]
+    );
+    assert!(close(o[0][n - 1], 1.0));
+}
+
+#[test]
+fn a_long_ramp_spans_exactly_the_first_chunk() {
+    let (mut m, mut h, _) = setup(&dev(), &layout());
+    let n = MAX_FRAMES + 904;
+    let ins = vec![vec![1.0; n], vec![1.0; n]];
+    run(&mut m, &ins, 4, n);
+    let mut d = dev();
+    d.sources[0].volume_db = -200.0; // ~0
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    let o = run(&mut m, &ins, 4, n);
+    assert!(
+        o[0][MAX_FRAMES - 2] > 1e-6,
+        "the ramp must still be running one frame before the chunk end"
+    );
+    assert!(o[0][MAX_FRAMES - 1] < 1e-6 && o[0][MAX_FRAMES] < 1e-6);
+}
+
+#[test]
+fn a_wire_to_a_channel_past_the_device_is_dropped_not_indexed() {
+    let mut d = dev();
+    d.wires.push(Wire {
+        source: "s1".into(),
+        src_ch: 0,
+        out_ch: 2,
+    }); // the device has channels 0 and 1
+    let (mut m, _h, _) = setup(&d, &layout());
+    let o = run(&mut m, &ones(8), 4, 8);
+    assert!(o[0].iter().all(|x| close(*x, 1.0)) && o[1].iter().all(|x| close(*x, 0.5)));
+}

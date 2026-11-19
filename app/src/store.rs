@@ -309,4 +309,27 @@ mod tests {
         assert_eq!(load(&path), (cfg, None));
         let _ = std::fs::remove_dir_all(dir);
     }
+    use proptest::prelude::Strategy;
+
+    proptest::proptest! {
+        /// Whatever is on disk, `load` returns a config that validates, never panics, and never loses the file:
+        /// it is still there, or it was moved to a `.bad` sibling byte for byte.
+        #[test]
+        fn any_file_loads_to_a_valid_config_and_is_never_lost(bytes in proptest::prop_oneof![
+            proptest::collection::vec(proptest::prelude::any::<u8>(), 0..300),
+            proptest::prelude::any::<u64>().prop_map(|v| format!(r#"{{"version":{v},"devices":[]}}"#).into_bytes()),
+        ]) {
+            static CASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let dir = tmpdir(&format!("fuzz{}", CASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.json");
+            std::fs::write(&path, &bytes).unwrap();
+            let (cfg, _msg) = load(&path);
+            proptest::prop_assert!(cfg.validate().is_ok());
+            let kept = path.exists() && std::fs::read(&path).unwrap() == bytes
+                || bad_files(&path).iter().any(|p| std::fs::read(p).unwrap() == bytes);
+            proptest::prop_assert!(kept, "file contents lost");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }

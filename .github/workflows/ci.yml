@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: macos-15
+    timeout-minutes: 30 # a hung test or fakehost must fail, not hold the runner for the 6 h default
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95
@@ -58,6 +59,7 @@ jobs:
     runs-on: macos-15
     needs: build
     continue-on-error: true
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95
@@ -74,6 +76,7 @@ jobs:
   coverage:
     runs-on: macos-15
     continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95

@@ -281,13 +281,18 @@ proptest! {
         n in 1usize..600,
         amp in 0.1f32..=1.0,
         start in (-60.0f32..=0.0, any::<bool>()),
+        device_stage in any::<bool>(),
         blocks in prop::collection::vec(prop::collection::vec((-60.0f32..=0.0, any::<bool>()), 0..4), 1..12),
     ) {
         let gain = |(db, muted): (f32, bool)| if muted { 0.0 } else { lin(db) };
         let plan = |g: (f32, bool)| {
             let mut d = dev();
-            d.sources[0].volume_db = g.0;
-            d.sources[0].muted = g.1;
+            // the same unity-elsewhere ramp through the source stage or the device stage
+            if device_stage {
+                (d.volume_db, d.muted) = g;
+            } else {
+                (d.sources[0].volume_db, d.sources[0].muted) = g;
+            }
             MixPlan::compile(&d, &layout())
         };
         let meters = Arc::new(Meters::new());
@@ -343,5 +348,182 @@ proptest! {
         }
         let r = meters.take(&l, &w.dev);
         prop_assert!(r.sources.iter().flat_map(|(_, c)| c).chain(&r.channels).all(|x| *x == 0.0));
+    }
+}
+
+// ---- hostile input -------------------------------------------------------------------------------------
+
+/// Any f32 bit pattern: NaN payloads, infinities, subnormals, f32::MAX.
+fn any_f32() -> impl Strategy<Value = f32> {
+    any::<u32>().prop_map(f32::from_bits)
+}
+
+/// Audio samples as a hostile source could deliver them: mostly sane, sometimes anything at all.
+fn nasty_sample() -> impl Strategy<Value = f32> {
+    prop_oneof![8 => -1.0f32..=1.0, 1 => any_f32(), 1 => Just(f32::NAN), 1 => Just(f32::INFINITY), 1 => Just(f32::MIN)]
+}
+
+/// Replace node number `*k` (preorder) of `v` with `new`; counts down `*k` as it walks.
+fn replace_node(v: &mut serde_json::Value, k: &mut usize, new: &serde_json::Value) {
+    if *k == 0 {
+        *v = new.clone();
+        *k = usize::MAX;
+        return;
+    }
+    *k -= 1;
+    let kids: Vec<&mut serde_json::Value> = match v {
+        serde_json::Value::Array(a) => a.iter_mut().collect(),
+        serde_json::Value::Object(o) => o.values_mut().collect(),
+        _ => return,
+    };
+    for kid in kids {
+        replace_node(kid, k, new);
+        if *k == usize::MAX {
+            return;
+        }
+    }
+}
+
+fn hostile_leaf() -> impl Strategy<Value = serde_json::Value> {
+    use serde_json::Value;
+    prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::from),
+        any::<i64>().prop_map(Value::from),
+        any::<u64>().prop_map(Value::from),
+        any::<f64>().prop_map(Value::from),
+        prop::sample::select(vec![-1i64, 0, 1, 2, 3, 63, 64, 65, 255, 65535, 65536])
+            .prop_map(Value::from),
+        prop::sample::select(vec![1e39f64, -1e39, 1e308, 24.000001, f64::MIN_POSITIVE])
+            .prop_map(Value::from),
+        ".{0,12}".prop_map(Value::from),
+        prop::sample::select(vec!["app", "device", "pass_thru", "", "v1", "s1"])
+            .prop_map(Value::from),
+        Just(Value::Array(vec![])),
+        Just(Value::Object(Default::default())),
+    ]
+}
+
+/// Mixes one block of a validate-accepted device through its own natural layout.
+fn mix_once(d: &VirtualDevice, ins: &[f32]) -> Vec<Vec<f32>> {
+    let mut inputs = vec![];
+    for s in &d.sources {
+        for c in 0..s.channels {
+            inputs.push(Some((s.id.clone(), c)));
+        }
+    }
+    let mut outputs: Vec<_> = (0..d.channels).map(|c| Some(OutPort::Device(c))).collect();
+    for m in &d.monitors {
+        for ch in 0..4 {
+            outputs.push(Some(OutPort::Monitor {
+                uid: m.device_uid.clone(),
+                ch,
+            }));
+        }
+    }
+    let layout = IoLayout { inputs, outputs };
+    let meters = Arc::new(Meters::new());
+    let (mut m, mut h) = mixer(meters);
+    h.set_plan(MixPlan::compile(d, &layout));
+    let data: Vec<Vec<f32>> = (0..layout.inputs.len())
+        .map(|i| ins.iter().cycle().skip(i).take(32).copied().collect())
+        .collect();
+    run(&mut m, &data, layout.outputs.len(), 32)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Whatever bytes land in config.json, parsing and validating returns Ok or Err, never panics.
+    #[test]
+    fn arbitrary_bytes_never_panic_the_config_parser(bytes in prop::collection::vec(any::<u8>(), 0..400)) {
+        if let Ok(cfg) = serde_json::from_slice::<Config>(&bytes) {
+            let _ = cfg.validate();
+        }
+    }
+
+    /// A valid config with bytes dropped, flipped or repeated (a torn or bit-rotted file) is Ok or Err, never a panic.
+    #[test]
+    fn torn_config_files_never_panic(
+        devices in prop::collection::vec(arb_device(), 0..3),
+        cut in any::<prop::sample::Index>(),
+        flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..4),
+    ) {
+        let mut json = serde_json::to_vec(&Config { version: 1, devices }).unwrap();
+        for (at, b) in flips {
+            let i = at.index(json.len());
+            json[i] = b;
+        }
+        json.truncate(cut.index(json.len() + 1));
+        if let Ok(cfg) = serde_json::from_slice::<Config>(&json) {
+            let _ = cfg.validate();
+        }
+    }
+
+    /// Type- and range-hostile edits of a valid document: whatever validate accepts, the mixer runs on
+    /// without a panic and with finite output, even for NaN/inf/huge samples.
+    #[test]
+    fn mutated_documents_either_fail_cleanly_or_mix_finitely(
+        w in arb_world(),
+        edits in prop::collection::vec((any::<prop::sample::Index>(), hostile_leaf()), 0..4),
+        ins in prop::collection::vec(nasty_sample(), 1..40),
+    ) {
+        // A valid base (arb_world is routable), so many edits still validate and reach the mixer.
+        let mut d = w.dev;
+        d.monitors.push(mon("spk", true, 0.0));
+        let mut doc = serde_json::to_value(Config { version: 1, devices: vec![d] }).unwrap();
+        for (at, leaf) in &edits {
+            let mut n = 0;
+            fn count(v: &serde_json::Value, n: &mut usize) {
+                *n += 1;
+                match v {
+                    serde_json::Value::Array(a) => a.iter().for_each(|x| count(x, n)),
+                    serde_json::Value::Object(o) => o.values().for_each(|x| count(x, n)),
+                    _ => {}
+                }
+            }
+            count(&doc, &mut n);
+            replace_node(&mut doc, &mut at.index(n), leaf);
+        }
+        if let Ok(cfg) = serde_json::from_value::<Config>(doc)
+            && cfg.validate().is_ok()
+        {
+            for d in &cfg.devices {
+                for out in mix_once(d, &ins) {
+                    prop_assert!(out.iter().all(|x| x.is_finite()), "non-finite output from a validated device");
+                }
+            }
+        }
+    }
+
+    /// Any gain bit pattern on any stage, any samples (NaN, inf, f32::MAX), a plan swap mid-stream:
+    /// the output and the meters stay finite.
+    #[test]
+    fn any_gain_and_any_samples_give_finite_output(
+        g in prop::collection::vec(any_f32(), 6),
+        flags in prop::collection::vec(any::<bool>(), 3),
+        a in prop::collection::vec(nasty_sample(), 48),
+        b in prop::collection::vec(nasty_sample(), 48),
+    ) {
+        let build = |g: &[f32], muted: bool, off: bool| {
+            let mut d = dev();
+            d.volume_db = g[0];
+            d.sources[0].volume_db = g[1];
+            d.muted = muted;
+            d.monitors.push(mon("spk", !off, g[2]));
+            d
+        };
+        let meters = Arc::new(Meters::new());
+        let (mut m, mut h) = mixer(meters.clone());
+        let l = layout();
+        h.set_plan(MixPlan::compile(&build(&g[..3], flags[0], flags[1]), &l));
+        let blk = |v: &[f32]| vec![v[..24].to_vec(), v[24..].to_vec()];
+        let o = run(&mut m, &blk(&a), 4, 24);
+        prop_assert!(o.iter().flatten().all(|x| x.is_finite()), "block 1");
+        h.set_plan(MixPlan::compile(&build(&g[3..], flags[2], false), &l));
+        let o = run(&mut m, &blk(&b), 4, 24);
+        prop_assert!(o.iter().flatten().all(|x| x.is_finite()), "block 2 after a plan swap");
+        let r = meters.take(&l, &build(&g[3..], false, false));
+        prop_assert!(r.channels.iter().chain(r.sources.iter().flat_map(|(_, c)| c)).all(|x| x.is_finite()));
     }
 }

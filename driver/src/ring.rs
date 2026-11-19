@@ -176,6 +176,33 @@ mod tests {
         let mut o = vec![1.0; 6];
         r.read(3, 0, &mut o);
         assert!(o.iter().all(|&x| x == 0.0));
+        // The rejected write left nothing behind for a valid reader to find.
+        r.read(2, 0, &mut o);
+        assert!(o.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn a_gap_hides_stale_frames_that_alias_the_gap_in_the_ring() {
+        let r = Ring::new(64, 1);
+        r.write(1, 0, &[1.0; 32]); // fills ring slots 0..32
+        r.write(1, 100, &[2.0; 10]); // gap 32..100; slots 36.. alias the gap, slots 14..32 still hold 1.0
+        let mut o = vec![9.0; 32];
+        r.read(1, 78, &mut o); // inside the half-ring window, but before the new run began
+        assert!(
+            o[..22].iter().all(|&x| x == 0.0),
+            "stale data leaked: {o:?}"
+        );
+        assert!(o[22..32].iter().all(|&x| x == 2.0));
+    }
+
+    #[test]
+    fn sample_times_may_be_negative_and_cross_zero() {
+        let r = Ring::new(64, 1);
+        let w = ramp(20, 1, 1.0);
+        r.write(1, -10, &w); // slots must not mirror: t = -1 and t = 1 are different frames
+        let mut o = vec![0.0; 20];
+        r.read(1, -10, &mut o);
+        assert_eq!(o, w);
     }
 
     /// After several wraps, every frame a read returns is either silence or exactly what was written

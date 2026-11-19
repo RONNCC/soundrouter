@@ -71,14 +71,18 @@ fn after_request(granted: Option<bool>, now: CaptureStatus) -> CaptureStatus {
 /// Microphone permission, without prompting. AVFoundation's public answer wins; the private TCC
 /// preflight is the fallback when AVFoundation is unavailable or says "not asked yet".
 pub fn microphone_status() -> CaptureStatus {
-    match av_authorization() {
+    mic_from_av(av_authorization(), || preflight("kTCCServiceMicrophone"))
+}
+
+fn mic_from_av(av: Option<isize>, preflight: impl FnOnce() -> CaptureStatus) -> CaptureStatus {
+    match av {
         Some(3) => CaptureStatus::Granted,
         Some(1 | 2) => CaptureStatus::Denied, // restricted, denied
-        Some(0) => match preflight("kTCCServiceMicrophone") {
+        Some(0) => match preflight() {
             CaptureStatus::Unknown(-1) => CaptureStatus::Unknown(0),
             other => other,
         },
-        _ => preflight("kTCCServiceMicrophone"),
+        _ => preflight(),
     }
 }
 
@@ -154,7 +158,11 @@ fn preflight(service: &str) -> CaptureStatus {
     let f: unsafe extern "C" fn(*const NSString, *const c_void) -> c_int =
         unsafe { std::mem::transmute(f) };
     let svc = NSString::from_str(service);
-    match unsafe { f(&*svc, std::ptr::null()) } {
+    from_preflight(unsafe { f(&*svc, std::ptr::null()) })
+}
+
+fn from_preflight(v: c_int) -> CaptureStatus {
+    match v {
         0 => CaptureStatus::Granted,
         1 => CaptureStatus::Denied,
         v => CaptureStatus::Unknown(v),
@@ -185,6 +193,54 @@ mod tests {
         assert_eq!(
             TccStatus::from(CaptureStatus::Unknown(-1)),
             TccStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn capture_status_maps_to_tcc_status() {
+        assert_eq!(TccStatus::from(CaptureStatus::Granted), TccStatus::Granted);
+        assert_eq!(TccStatus::from(CaptureStatus::Denied), TccStatus::Denied);
+        assert_eq!(
+            TccStatus::from(CaptureStatus::Unknown(2)),
+            TccStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn preflight_codes() {
+        assert_eq!(from_preflight(0), CaptureStatus::Granted);
+        assert_eq!(from_preflight(1), CaptureStatus::Denied);
+        assert_eq!(from_preflight(2), CaptureStatus::Unknown(2));
+    }
+
+    #[test]
+    fn avfoundation_wins_and_tcc_is_only_the_fallback() {
+        let tcc = |s| move || s;
+        let unreachable = || panic!("AVFoundation already answered");
+        assert_eq!(mic_from_av(Some(3), unreachable), CaptureStatus::Granted);
+        assert_eq!(mic_from_av(Some(2), unreachable), CaptureStatus::Denied);
+        assert_eq!(mic_from_av(Some(1), unreachable), CaptureStatus::Denied); // restricted
+        // not determined: TCC may know better; with no TCC symbol it is "not asked", not an error code
+        assert_eq!(
+            mic_from_av(Some(0), tcc(CaptureStatus::Granted)),
+            CaptureStatus::Granted
+        );
+        assert_eq!(
+            mic_from_av(Some(0), tcc(CaptureStatus::Denied)),
+            CaptureStatus::Denied
+        );
+        assert_eq!(
+            mic_from_av(Some(0), tcc(CaptureStatus::Unknown(-1))),
+            CaptureStatus::Unknown(0)
+        );
+        // no AVFoundation at all: TCC verbatim
+        assert_eq!(
+            mic_from_av(None, tcc(CaptureStatus::Denied)),
+            CaptureStatus::Denied
+        );
+        assert_eq!(
+            mic_from_av(None, tcc(CaptureStatus::Unknown(-1))),
+            CaptureStatus::Unknown(-1)
         );
     }
 }

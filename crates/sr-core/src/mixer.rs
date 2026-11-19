@@ -73,9 +73,16 @@ pub struct MixPlan {
     acc: Vec<f32>, // nch * MAX_FRAMES vdev channel scratch
 }
 
+/// Finite samples are clamped here so that even 64 taps through three +24 dB stages (x15.85 each) cannot overflow to inf.
+const SAMPLE_LIMIT: f32 = 1e30;
+
 /// NaN/Inf samples count as silence so one bad source cannot poison the whole device.
 fn clean(x: f32) -> f32 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x.clamp(-SAMPLE_LIMIT, SAMPLE_LIMIT)
+    } else {
+        0.0
+    }
 }
 
 fn ramp_add(dst: &mut [f32], src: &[f32], from: f32, to: f32) {
