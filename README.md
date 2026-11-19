@@ -66,6 +66,8 @@ Checked against the code (`crates/sr-core/src/config.rs`, `driver_proto.rs`, `sr
 - At most 16 virtual devices; device channels even, 2 to 64.
 - An aggregate carries at most 64 input and 64 output channels (wider layouts fail the shape check).
 - Process taps need macOS 14.2+ (the app's `LSMinimumSystemVersion`).
+- Apple silicon only: the app and driver are arm64 builds (no Intel or universal build); the `.pkg` refuses Intel Macs and macOS older than 14.2, and Finder refuses the app there.
+- Virtual devices run at 44.1, 48 (default) or 96 kHz; a request for any other rate (88.2, 192 kHz) is refused. Input devices and monitors at other rates are resampled by the aggregate's drift compensation.
 - Config `version` is 1; other versions are refused.
 
 ## Status

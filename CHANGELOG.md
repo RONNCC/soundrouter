@@ -11,6 +11,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - App: each virtual device row in the sidebar has a × ("Remove <name>", top-right, next to the On switch) instead of the − button at the bottom; it uses the same "Removed <name> · Undo" toast, and removing a device above the selected one keeps the selection on its device.
 - App: source and monitor cards have a × ("Remove <name>") next to the On switch, and removing a card or deleting a device shows "Removed <name> · Undo" for 6 s.
 - App: the Verify step's self-test has a Cancel button and reports "The test did not finish" after 30 s.
+- Packaging: the `.pkg` declares its requirements (Apple silicon, macOS 14.2+), so Installer refuses Intel Macs and older systems instead of installing an arm64 driver coreaudiod cannot load; README lists both limits and the supported device sample rates.
 - Driver: each virtual device now has a volume and a mute control on its input and output scope (-64..0 dB, applied on the read side with no allocation; default 0 dB, unmuted), so apps and the system volume keys can control it. The hidden engine companion has none. Needs the new driver installed.
 - Driver: late or oversized `WriteMix` calls are counted per device and readable through the custom property `'srov'`.
 - Docs: driver clock/zero-timestamp contract, volume/mute gain placement and the default-device decisions in `docs/ARCHITECTURE.md`.

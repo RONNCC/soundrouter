@@ -66,13 +66,22 @@ pkgbuild --root "$WORK/support" \
   --version "$VERSION" \
   "$WORK/support.pkg"
 
+# Installer refuses Intel Macs (the binaries are arm64 only) and macOS < 14.2 (process taps).
+cat > "$WORK/requirements.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>os</key><array><string>14.2</string></array>
+<key>arch</key><array><string>arm64</string></array>
+</dict></plist>
+EOF
+PKGS=(--package "$WORK/driver.pkg" --package "$WORK/app.pkg" --package "$WORK/support.pkg" --product "$WORK/requirements.plist")
 rm -f "$OUT"
 if [ -n "${INSTALLER_ID:-}" ]; then
-  productbuild --package "$WORK/driver.pkg" --package "$WORK/app.pkg" --package "$WORK/support.pkg" \
-    --sign "$INSTALLER_ID" --timestamp "$OUT"
+  productbuild "${PKGS[@]}" --sign "$INSTALLER_ID" --timestamp "$OUT"
   pkgutil --check-signature "$OUT"
 else
   echo "warning: INSTALLER_ID not set; building an UNSIGNED pkg (Gatekeeper blocks it, cannot be notarized)" >&2
-  productbuild --package "$WORK/driver.pkg" --package "$WORK/app.pkg" --package "$WORK/support.pkg" "$OUT"
+  productbuild "${PKGS[@]}" "$OUT"
 fi
 echo "built $OUT"
