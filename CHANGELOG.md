@@ -32,6 +32,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
 
 ### Fixed
+- App: Start at Login refuses to point its LaunchAgent at the release dmg (`/Volumes/SoundRouter…`) or a Gatekeeper-translocated copy, and a launch from one no longer overwrites a working agent; it shows "move it to Applications first".
+- Packaging: `uninstall.sh` no longer aborts before removing the driver when the target user cannot be looked up; README names where the installed `uninstall.sh` and `sr-cli` live.
 - App: when the audio engine cannot start, meters stay at silence and a standing banner says routing is not running (it no longer falls back to demo meters with a toast that vanishes).
 - Engine: an apply whose driver devices were slow to settle (many devices added or re-channeled at once) failed after 2 s and kept the previous config, so the next device event re-applied that old config and removed the devices the user had just added. The newest config is now kept even when the driver is late, the settle window is 6 s, and devices that are removed or change channel count are torn down before the driver changes them (a channel change under 16 running aggregates had crashed `coreaudiod` once).
 - App: a failed apply is written to the log file, not only shown in the status bar.
