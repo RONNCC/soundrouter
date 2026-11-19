@@ -231,6 +231,19 @@ impl Slot {
         self.channels[0].load(Acquire) == self.channels[1].load(Acquire)
             && self.rate_idx[0].load(Acquire) == self.rate_idx[1].load(Acquire)
     }
+    /// A client asked for rate index `i`: record it and return which sides (index = `Side as usize`)
+    /// the host must be asked to change. When the wanted rate moved, both sides are asked even if one
+    /// already runs at `i`: an older request may still be pending, or a Perform may be running with the
+    /// old wanted rate, and that side must get one more Perform after this set.
+    pub fn want_rate(&self, i: u32) -> [bool; 2] {
+        let prev = self.rate_want.swap(i, AcqRel);
+        [0, 1].map(|s| prev != i || self.rate_idx[s].load(Acquire) != i)
+    }
+    /// The host performs a rate change on `side`: it converges on the rate wanted now, not on the one in
+    /// the request, which is stale when the host runs requests late or out of order.
+    pub fn perform_rate(&self, side: Side) {
+        self.rate_idx[side as usize].store(self.rate_want.load(Acquire), Release);
+    }
     /// Format changes that bring a pair with mismatched sides back in sync: channels follow the wanted
     /// count, the rate follows the last requested one (`rate_want`), so a pass that runs while a rate
     /// change has landed on one side only never sends the other side back. Only sides that differ are listed.
@@ -493,6 +506,123 @@ mod tests {
         // The re-request lands: the pair is in sync and nothing more is asked.
         s.rate_idx[0].store(2, Release);
         assert!(s.in_sync() && s.lagging(Some(2)).is_empty());
+    }
+
+    /// The host side of a rate change: queued per-device requests, performed later in an order the host
+    /// chooses.
+    struct Host<'a> {
+        s: &'a Slot,
+        q: Vec<Side>,
+    }
+    impl Host<'_> {
+        fn set(&mut self, i: u32) {
+            let ask = self.s.want_rate(i);
+            for side in [Side::Visible, Side::Engine] {
+                if ask[side as usize] {
+                    self.q.push(side);
+                }
+            }
+        }
+        fn perform(&mut self, k: usize) {
+            let side = self.q.remove(k % self.q.len());
+            self.s.perform_rate(side);
+        }
+        fn rates(&self) -> [u32; 2] {
+            [0, 1].map(|s| self.s.rate_idx[s].load(Acquire))
+        }
+    }
+    fn host(s: &Slot) -> Host<'_> {
+        s.want_rate(1);
+        s.rate_idx.iter().for_each(|r| r.store(1, Release)); // 48k on both sides
+        Host { s, q: vec![] }
+    }
+
+    #[test]
+    fn the_last_requested_rate_wins_on_both_sides_whatever_order_the_host_performs_in() {
+        // 48k -> 96k -> 44.1k -> 96k -> 48k, with the host performing V's first request between sets.
+        let s = Slot::new();
+        let mut h = host(&s);
+        h.set(2);
+        let v = h.q.iter().position(|&side| side == Side::Visible).unwrap();
+        h.perform(v); // V is 96k, C's 96k request is still pending
+        h.set(0);
+        h.set(2); // back to V's current rate while V's 44.1k request is pending
+        h.set(1);
+        while !h.q.is_empty() {
+            h.perform(0); // FIFO: the stale requests land after the last set
+        }
+        assert_eq!(h.rates(), [1, 1]);
+        // Everything deferred, then performed newest first: the oldest (stale) request lands last.
+        let s = Slot::new();
+        let mut h = host(&s);
+        for i in [2, 0, 2, 1] {
+            h.set(i);
+        }
+        while !h.q.is_empty() {
+            h.perform(h.q.len() - 1);
+        }
+        assert_eq!(h.rates(), [1, 1]);
+    }
+
+    #[test]
+    fn a_set_racing_a_perform_asks_both_sides_again() {
+        let s = Slot::new();
+        let mut h = host(&s);
+        h.set(2);
+        // V's Perform starts on the host's thread and reads the wanted rate (96k) ...
+        let seen = s.rate_want.load(Acquire);
+        // ... a client sets 48k, V's current rate, before that Perform stored 96k: V must be asked again.
+        assert_eq!(s.want_rate(1), [true, true]);
+        s.rate_idx[0].store(seen, Release);
+        s.perform_rate(Side::Visible);
+        s.perform_rate(Side::Engine);
+        assert_eq!(h.rates(), [1, 1]);
+        // Setting the wanted rate again while both sides run it asks for nothing.
+        assert_eq!(s.want_rate(1), [false, false]);
+    }
+
+    #[test]
+    fn setting_the_same_rate_again_re_asks_a_side_whose_request_the_host_aborted() {
+        let s = Slot::new();
+        let mut h = host(&s);
+        h.set(2);
+        h.q.retain(|&side| side == Side::Engine); // the host aborted V's request
+        h.perform(0);
+        h.set(2);
+        assert_eq!(h.q, [Side::Visible]);
+        h.perform(0);
+        assert_eq!(h.rates(), [2, 2]);
+    }
+
+    proptest::proptest! {
+        /// Any interleaving of sets and host Performs, then the rest performed in any order: both sides
+        /// end at the last requested rate.
+        #[test]
+        fn rate_converges_to_the_last_set(
+            ops in proptest::collection::vec((proptest::bool::ANY, 0u32..3, 0usize..16), 1..24),
+            drain in proptest::collection::vec(0usize..16, 32),
+        ) {
+            let s = Slot::new();
+            let mut h = host(&s);
+            let mut last = 1;
+            for (set, i, k) in ops {
+                if set {
+                    h.set(i);
+                    last = i;
+                } else if !h.q.is_empty() {
+                    h.perform(k);
+                }
+            }
+            for k in drain {
+                if !h.q.is_empty() {
+                    h.perform(k);
+                }
+            }
+            while !h.q.is_empty() {
+                h.perform(0);
+            }
+            proptest::prop_assert_eq!(h.rates(), [last, last]);
+        }
     }
 
     #[test]

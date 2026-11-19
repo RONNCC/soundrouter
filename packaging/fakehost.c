@@ -49,12 +49,17 @@ static OSStatus WriteStore(AudioServerPlugInHostRef h, CFStringRef k, CFProperty
 }
 static OSStatus DelStore(AudioServerPlugInHostRef h, CFStringRef k) { return 0; }
 static int gChanges, gDefer, gQn;
-static struct { AudioObjectID d; UInt64 a; } gQ[8]; // requests held back while gDefer, to run them one device at a time
+static struct { AudioObjectID d; UInt64 a; } gQ[32]; // requests held back while gDefer, to run them one device at a time
 static OSStatus ReqChange(AudioServerPlugInHostRef h, AudioObjectID d, UInt64 act, void* info) {
-    if (gDefer) { if (gQn < 8) { gQ[gQn].d = d; gQ[gQn++].a = act; } return 0; }
+    if (gDefer) { if (gQn < 32) { gQ[gQn].d = d; gQ[gQn++].a = act; } return 0; }
     printf("  host.RequestDeviceConfigurationChange dev=%u action=%llu -> Perform\n", d, act);
     gChanges++;
     return D->PerformDeviceConfigurationChange(gDrv, d, act, info); // real host stops IO first
+}
+// Perform held-back request i and drop it from the queue.
+static void performQ(int i) {
+    CHECK(i < gQn && D->PerformDeviceConfigurationChange(gDrv, gQ[i].d, gQ[i].a, NULL) == 0);
+    memmove(&gQ[i], &gQ[i + 1], (size_t)(gQn - i - 1) * sizeof gQ[0]); gQn--;
 }
 static AudioServerPlugInHostInterface gHost = { PropsChanged, CopyStore, WriteStore, DelStore, ReqChange };
 
@@ -203,7 +208,7 @@ static int staleReadClean(int k) {
 static void gapProbe(void) {
     // The worker's first pass just announced the removal and has not run its second pass: the slot is dead,
     // so the stale ids must be refused and silent. Deterministic: no polling, no dependence on scheduling.
-    if (byUID("sw:15") || byUID("sw:wide")) return;
+    if (byUID("soundrouter:sw15") || byUID("soundrouter:swide")) return;
     CHECK(staleReadClean(0) && staleReadClean(1));
     gGap = 1;
 }
@@ -442,7 +447,22 @@ int main(int argc, char** argv) {
         CHECK(rateOf(V2) == 44100 && rateOf(C2) == 44100);
         CHECK(setRate(V2, 48000, 8) == 0 && rateOf(V2) == 48000 && rateOf(C2) == 48000);
         CHECK(setConfig(cfg(2, uid2, nm2, ch2)) == 0 && nameIs(V2, "Loopback 2"));
-        printf("ok sample rate 48k->44.1k->96k->48k on V and C, unsupported formats refused, a pass mid-change completes it\n");
+        // Rapid changes 48k->96k->44.1k->96k->48k while the host holds the Performs back, then runs them FIFO, LIFO, or
+        // FIFO after V's first one landed between sets (a stale request after newer sets): the last rate set wins on V and C.
+        const Float64 seq[] = { 96000, 44100, 96000, 48000 };
+        for (int order = 0; order < 3; order++) {
+            gDefer = 1; gQn = 0;
+            for (int k = 0; k < 4; k++) {
+                CHECK(setRate(V2, seq[k], 8) == 0);
+                if (order == 2 && k == 0) performQ(gQ[0].d == V2 ? 0 : 1);
+            }
+            while (gQn) performQ(order == 1 ? gQn - 1 : 0);
+            gDefer = 0;
+            printf("  rapid rates, order %d: V2 %.0f C2 %.0f\n", order, rateOf(V2), rateOf(C2));
+            CHECK(rateOf(V2) == 48000 && rateOf(C2) == 48000);
+        }
+        printf("ok sample rate 48k->44.1k->96k->48k on V and C, unsupported formats refused, a pass mid-change completes it,"
+               " rapid changes end at the last rate\n");
     }
 
     // 4e. two srcf sets back to back (no wait): the last list wins, nothing is left over from the others.
@@ -692,19 +712,19 @@ int main(int argc, char** argv) {
     // not hand the freed slot to the new device in the same pass. Until the removal had time to settle, the old ids
     // must not exist as the new device, and a 2-channel ReadInput on them must stay inside its buffer.
     {
-        char u[MAXDEV][16], n[MAXDEV][16]; const char* up[MAXDEV]; const char* np[MAXDEV]; int cc[MAXDEV];
-        for (int i = 0; i < MAXDEV; i++) { snprintf(u[i], 16, "sw:%d", i); snprintf(n[i], 16, "Sw %d", i); up[i] = u[i]; np[i] = n[i]; cc[i] = 2; }
+        char u[MAXDEV][24], n[MAXDEV][16]; const char* up[MAXDEV]; const char* np[MAXDEV]; int cc[MAXDEV];
+        for (int i = 0; i < MAXDEV; i++) { snprintf(u[i], 24, "soundrouter:sw%d", i); snprintf(n[i], 16, "Sw %d", i); up[i] = u[i]; np[i] = n[i]; cc[i] = 2; }
         CHECK(setConfig(CFArrayCreate(0, NULL, 0, &kCFTypeArrayCallBacks)) == 0);
         for (int i = 0; i < 400 && nDevices() != 0; i++) usleep(10000);
         usleep(1500000); // removal pass + any straggler
         CHECK(setConfig(cfg(MAXDEV, up, np, cc)) == 0);
-        for (int i = 0; i < 400 && !byUID("sw:15"); i++) usleep(10000);
-        AudioObjectID oldV = byUID("sw:15"), oldC = byUID("sw:15.engine");
+        for (int i = 0; i < 400 && !byUID("soundrouter:sw15"); i++) usleep(10000);
+        AudioObjectID oldV = byUID("soundrouter:sw15"), oldC = byUID("soundrouter:sw15.engine");
         CHECK(nDevices() == 2 * MAXDEV && oldV && oldC);
         gStaleDev[0] = oldV; gStaleDev[1] = oldC;
         gStaleSt[0] = stream(oldV, kAudioObjectPropertyScopeInput); gStaleSt[1] = stream(oldC, kAudioObjectPropertyScopeInput);
         CHECK(gStaleSt[0] && gStaleSt[1]);
-        up[15] = "sw:wide"; np[15] = "Wide"; cc[15] = 8;
+        up[15] = "soundrouter:swide"; np[15] = "Wide"; cc[15] = 8;
         AudioObjectPropertyAddress sa = addr('srcf', kAudioObjectPropertyScopeGlobal);
         CFArrayRef want = cfg(MAXDEV, up, np, cc);
         gProbe = 1; // gapProbe runs on the worker when it announces the removal: that is where the gap is observed
@@ -713,17 +733,17 @@ int main(int argc, char** argv) {
         // slot is legitimately re-created as the 8-channel sw:wide, a 2-channel read on its old ids writes 8 channels:
         // that is this test's own misuse, and it can start between the loop condition and the read. sw:wide never goes
         // away again, so "absent after the read" proves it was absent during it; only then must the guard words be intact.
-        for (int i = 0; i < 400 && !byUID("sw:wide"); i++) {
+        for (int i = 0; i < 400 && !byUID("soundrouter:swide"); i++) {
             for (int k = 0; k < 2; k++) {
                 int clean = staleReadClean(k);
-                if (!byUID("sw:wide")) CHECK(clean);
+                if (!byUID("soundrouter:swide")) CHECK(clean);
             }
             usleep(5000);
         }
         CHECK(gGap); // the add came in a later pass than the removal
-        for (int i = 0; i < 400 && !byUID("sw:wide"); i++) usleep(10000);
-        AudioObjectID w = byUID("sw:wide");
-        CHECK(w && nDevices() == 2 * MAXDEV && chans(stream(w, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(byUID("sw:wide.engine"), kAudioObjectPropertyScopeInput)) == 8);
+        for (int i = 0; i < 400 && !byUID("soundrouter:swide"); i++) usleep(10000);
+        AudioObjectID w = byUID("soundrouter:swide");
+        CHECK(w && nDevices() == 2 * MAXDEV && chans(stream(w, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(byUID("soundrouter:swide.engine"), kAudioObjectPropertyScopeInput)) == 8);
         gProbe = 0;
         printf("ok full-pool swap: freed slot not reused in the same pass, no overrun\n");
     }
@@ -732,18 +752,18 @@ int main(int argc, char** argv) {
     // for a wider one (4, 6, 8 ch). A reconcile must not hand out a slot that another one freed milliseconds earlier:
     // within the teardown time the HAL may still run I/O on the old ids with the old (2-channel) buffer.
     {
-        char u[MAXDEV][16], n[MAXDEV][16]; const char* up[MAXDEV]; const char* np[MAXDEV]; int cc[MAXDEV];
-        for (int i = 0; i < MAXDEV; i++) { snprintf(u[i], 16, "sw:%d", i); snprintf(n[i], 16, "Sw %d", i); up[i] = u[i]; np[i] = n[i]; cc[i] = 2; }
+        char u[MAXDEV][24], n[MAXDEV][16]; const char* up[MAXDEV]; const char* np[MAXDEV]; int cc[MAXDEV];
+        for (int i = 0; i < MAXDEV; i++) { snprintf(u[i], 24, "soundrouter:sw%d", i); snprintf(n[i], 16, "Sw %d", i); up[i] = u[i]; np[i] = n[i]; cc[i] = 2; }
         CHECK(setConfig(cfg(MAXDEV, up, np, cc)) == 0); // sw:wide (8 ch) back to a 2-channel sw:15
-        for (int i = 0; i < 400 && !byUID("sw:15"); i++) usleep(10000);
-        AudioObjectID oldV = byUID("sw:15"), oldC = byUID("sw:15.engine");
+        for (int i = 0; i < 400 && !byUID("soundrouter:sw15"); i++) usleep(10000);
+        AudioObjectID oldV = byUID("soundrouter:sw15"), oldC = byUID("soundrouter:sw15.engine");
         CHECK(nDevices() == 2 * MAXDEV && oldV && oldC && chans(stream(oldV, kAudioObjectPropertyScopeInput)) == 2);
         gStaleDev[0] = oldV; gStaleDev[1] = oldC;
         gStaleSt[0] = stream(oldV, kAudioObjectPropertyScopeInput); gStaleSt[1] = stream(oldC, kAudioObjectPropertyScopeInput);
         CHECK(gStaleSt[0] && gStaleSt[1] && staleReadClean(0) && staleReadClean(1));
         mach_timebase_info_data_t tb; mach_timebase_info(&tb); gTps = 1e9 * tb.denom / tb.numer;
         AudioObjectPropertyAddress sa = addr('srcf', kAudioObjectPropertyScopeGlobal);
-        const char* su[] = { "st:4", "st:6", "st:8" }; const char* sn[] = { "St 4", "St 6", "St 8" };
+        const char* su[] = { "soundrouter:st4", "soundrouter:st6", "soundrouter:st8" }; const char* sn[] = { "St 4", "St 6", "St 8" };
         gStormT0 = mach_absolute_time(); gStorm = 1;
         for (int k = 0; k < 3; k++) {
             up[15] = su[k]; np[15] = sn[k]; cc[15] = 4 + 2 * k;
@@ -751,12 +771,12 @@ int main(int argc, char** argv) {
             CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &sa, 0, NULL, sizeof want, &want) == 0);
             usleep(2000);
         }
-        for (int i = 0; i < 400 && !byUID("st:8"); i++) usleep(10000);
+        for (int i = 0; i < 400 && !byUID("soundrouter:st8"); i++) usleep(10000);
         usleep(300000); // a straggling pass would announce here
         gStorm = 0;
-        AudioObjectID w = byUID("st:8");
-        CHECK(w && nDevices() == 2 * MAXDEV && !byUID("st:4") && !byUID("st:6") && !byUID("sw:15"));
-        CHECK(chans(stream(w, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(byUID("st:8.engine"), kAudioObjectPropertyScopeInput)) == 8);
+        AudioObjectID w = byUID("soundrouter:st8");
+        CHECK(w && nDevices() == 2 * MAXDEV && !byUID("soundrouter:st4") && !byUID("soundrouter:st6") && !byUID("soundrouter:sw15"));
+        CHECK(chans(stream(w, kAudioObjectPropertyScopeOutput)) == 8 && chans(stream(byUID("soundrouter:st8.engine"), kAudioObjectPropertyScopeInput)) == 8);
         CHECK(gStormNotes > 0 && gStormThreads < 2); // reconciles ran on a single worker thread
         printf("ok srcf storm on a full pool: no slot reused before teardown, one reconcile thread\n");
     }

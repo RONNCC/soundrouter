@@ -301,6 +301,7 @@ mod tests {
         let mut buf = vec![];
         run(c, READ, 100.0, &mut buf, FRAMES * 2);
         assert_eq!(&buf[..FRAMES * 2], &out[..FRAMES * 2]);
+        SLOTS[14].want_rate(2); // a client asked for 96 kHz; only V's Perform has run
         change(v, Change::Rate(2));
         assert!(!SLOTS[14].in_sync());
         run(c, READ, 100.0, &mut buf, FRAMES * 2);
@@ -312,6 +313,7 @@ mod tests {
     #[test]
     fn zero_timestamp_uses_the_devices_own_rate() {
         let (v, c) = activate(13, 2);
+        SLOTS[13].want_rate(2);
         change(v, Change::Rate(2)); // V 96 kHz, C stays 48 kHz
         let per48 = ticks_per_second() / 48_000.0 * RING_FRAMES as f64;
         SLOTS[13]

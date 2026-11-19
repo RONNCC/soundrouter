@@ -214,7 +214,7 @@ pub unsafe extern "C" fn perform_change(
     };
     match change {
         Change::Channels(n) => slot.channels[side as usize].store(n as u32, Release),
-        Change::Rate(i) => slot.rate_idx[side as usize].store(i as u32, Release),
+        Change::Rate(_) => slot.perform_rate(side),
     }
     slot.reset_rings();
     0
@@ -403,9 +403,9 @@ pub unsafe extern "C" fn set_data(
     };
     // Both devices of the pair must follow, or one side would run at a different rate. A reconcile pass
     // that runs before both changes landed re-asks the laggard for this rate (`Slot::lagging`).
-    slot.rate_want.store(i as u32, Release);
+    let ask = slot.want_rate(i as u32);
     for side in [Side::Visible, Side::Engine] {
-        if i as u32 != slot.rate_idx[side as usize].load(Acquire) {
+        if ask[side as usize] {
             request_change(encode(s, side, Part::Device), &Change::Rate(i));
         }
     }
