@@ -1,9 +1,25 @@
 # SoundRouter
 
+[![ci](https://github.com/RONNCC/soundrouter/actions/workflows/ci.yml/badge.svg)](https://github.com/RONNCC/soundrouter/actions/workflows/ci.yml) ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue) ![macOS 14.2+](https://img.shields.io/badge/macOS-14.2%2B-lightgrey)
+
 A free, open-source alternative to Loopback and Soundflower for macOS, written in Rust. Create virtual audio devices, then route apps, microphones and monitors between them on a node graph.
 
 ![SoundRouter, dark](docs/screenshots/soundrouter-dark.png)
 ![SoundRouter, light](docs/screenshots/soundrouter-light.png)
+
+## How routing works
+
+```
+ SOURCES                         ENGINE (in the app)                    OUTPUTS
+ App taps (Safari, Spotify…) ─┐
+ Input devices (microphones) ─┼─► private aggregate ─► IOProc ─► mixer ─┬─► virtual device INPUT ─► Zoom, OBS…
+ Pass-Thru (apps playing INTO ┘   (one per device)        wires,        └─► monitors (speakers, headphones)
+   the virtual device)                                    volume, mute
+
+ While no engine runs, the driver loops what apps play into a virtual device straight to its input.
+```
+
+The driver (`SoundRouter.driver`, loaded by `coreaudiod`) only publishes the virtual devices. The routing runs in the SoundRouter app (its engine): it stops when you quit, and the devices then act as plain loopbacks. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Features
 
@@ -17,11 +33,11 @@ A free, open-source alternative to Loopback and Soundflower for macOS, written i
 - First-run setup sheet: install or uninstall the driver in the app, permission steps, and a self-test.
 - Single instance (lock file), config safety (corrupt config quarantined, newer-version config protected, fsync on save).
 - Log file at `~/Library/Logs/SoundRouter/soundrouter.log`.
-- `sr-cli`: `list`, `driver`, `loopback-test`, `run`, `meter`, `doctor`; `-v`/`-vv` for logging.
+- `sr-cli`: `list`, `driver`, `loopback-test`, `run`, `meter`, `doctor`; `-v`/`-vv` for logging. Installed copies have it at `/Applications/SoundRouter.app/Contents/MacOS/sr-cli` (from source: `target/release/sr-cli`).
 
 ## Install
 
-**From a release** (`.pkg` or `.dmg` on the Releases page): builds are ad-hoc signed unless the release says otherwise, so Gatekeeper blocks the first launch. On macOS 14: right-click the app, Open. On macOS 15: System Settings > Privacy & Security > Open Anyway. Then follow the setup sheet.
+**From a release** (`.pkg` or `.dmg` on the [Releases page](https://github.com/RONNCC/soundrouter/releases); no release is published yet, see [docs/RELEASING.md](docs/RELEASING.md)): builds are ad-hoc signed unless the release says otherwise, so Gatekeeper blocks the first launch. On macOS 14: right-click the app, Open. On macOS 15: System Settings > Privacy & Security > Open Anyway. Then follow the setup sheet.
 
 **From source** (macOS 14.2+, Command Line Tools, rustup with Rust 1.95; full Xcode not needed):
 
@@ -42,7 +58,7 @@ Distribution builds (Developer ID signing, notarization, the tag-triggered GitHu
 
 **Permissions.** Microphone (needed for any input, including the virtual device inside the engine's aggregate) and System Audio Recording (app taps). In the setup sheet (**Test Setup…**), each permission shows **Needs permission** until answered, with its own **Allow Microphone** / **Allow System Audio Recording** button; the footer button (**Allow All**, or the one name left, then **Continue**) asks for each one not answered yet (Microphone first, then System Audio Recording). If you denied one, its row shows **Open Settings**: turn SoundRouter on under System Settings › Privacy & Security › Screen & System Audio Recording › **System Audio Recording Only**. The sheet opens by itself only when something an existing source needs is missing, and not again in the same version once you finished or closed it.
 
-**Uninstall:** the setup sheet's Uninstall…, or `packaging/uninstall.sh [--purge]`.
+**Uninstall:** the setup sheet's Uninstall…, or `packaging/uninstall.sh [--purge]` from a checkout. Without one: `/Library/Application Support/SoundRouter/uninstall.sh` (installed by the `.pkg`), `uninstall.sh` on the `.dmg`, or `SoundRouter.app/Contents/Resources/uninstall.sh`. It never deletes the app itself; drag that to the Trash.
 
 ## Use the Mac's microphone as a source
 
@@ -101,7 +117,7 @@ Regenerate the screenshots: `cargo test -p soundrouter-app --features snapshots 
 
 ## Docs
 
-[Architecture](docs/ARCHITECTURE.md), [Testing](docs/TESTING.md), [Troubleshooting](docs/TROUBLESHOOTING.md), [Changelog](CHANGELOG.md), [original plan](docs/PLAN.md).
+[Architecture](docs/ARCHITECTURE.md), [Testing](docs/TESTING.md), [Troubleshooting](docs/TROUBLESHOOTING.md), [Releasing](docs/RELEASING.md), [Changelog](CHANGELOG.md), [original plan](docs/PLAN.md) (historical; superseded by the architecture doc).
 
 ## Provenance and license
 

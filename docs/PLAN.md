@@ -1,5 +1,7 @@
 # SoundRouter — FINAL execution plan (OpusPlan)
 
+> **Historical.** This is the original design plan, kept for its reasoning and evidence. It is **not** the current design; where they differ, the code and [ARCHITECTURE.md](ARCHITECTURE.md) win. Known differences: the driver property is `'srcf'` (a CFArray of dictionaries, at most 16 devices), not `'srdv'` (a JSON string); the plug-in bundle id is `io.github.ronncc.soundrouter.driver`; each device has a hidden engine companion that the engine uses as main device, and pass-thru is an ordinary Pass-Thru source, not an always-on identity route that the engine ignores; closing the window keeps routing alive from the menu bar; the toolchain is Rust 1.95 and eframe 0.37 (egui-snarl is not used; the graph is drawn by the app).
+
 Supersedes agent://AdvisorPlan. Driver ABI details, tap/TCC details and GUI crate pick are owned by OpusDriver / OpusCapture / OpusGui; where they report, their findings win on those points. Defaults below are what slices use if they have not reported.
 
 ## 1. Architecture (decided)

@@ -1,2 +1,7 @@
 target/
 .DS_Store
+*.p12
+*.pem
+*.key
+.env
+kittest.toml

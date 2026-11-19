@@ -2,6 +2,21 @@
 
 Two ways to get an installable build: a notarized one (needs a paid Apple Developer ID) and an ad-hoc signed one (free, needs a manual Gatekeeper override). Everything is driven by `packaging/*.sh`; full Xcode is not needed, the Command Line Tools are enough.
 
+## Checklist: first release (v0.1.0)
+
+No release exists yet. Work through this in order.
+
+1. Merge everything for the release; `main` is green on CI (`build`; the other jobs are informational).
+2. `CHANGELOG.md`: rename `[Unreleased]` to `[0.1.0] - YYYY-MM-DD` and fold in the current `[0.1.0]` stub (it still says "First release"); start a new empty `[Unreleased]`.
+3. `[workspace.package] version` in `Cargo.toml` is `0.1.0` (bump and `cargo check` to refresh `Cargo.lock` otherwise).
+4. Local gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo test -p soundrouter-app --features snapshots`, `cargo deny check licenses bans sources`.
+5. `REQUIRE_NOTICES=1 packaging/bundle-app.sh`: the app has `Contents/Resources/ThirdPartyLicenses.html`, `LICENSE-MIT` and `LICENSE-APACHE`.
+6. Hardware checklist in [TESTING.md](TESTING.md) on a Mac with the driver installed (driver test, `engine-live-test.sh`, app steps 5-11). Turn the system volume down before the steps that play real audio.
+7. Decide signing: with Developer ID secrets set, the workflow signs and notarizes; without them the release says "UNSIGNED build" and the README install text applies. Do not call a build notarized unless `notarize.sh` finished without error (it fails on anything but Apple status `Accepted`).
+8. Commit, `git tag v0.1.0`, `git push origin main v0.1.0`. The workflow refuses a tag that differs from the Cargo version.
+9. When the workflow ends: download the release, check `SHA256SUMS.txt`, install the `.pkg` on a clean macOS user account (or machine), confirm the device shows up, the setup sheet passes its self-test, and `packaging/uninstall.sh --dry-run` lists what it removes.
+10. Edit the release notes: link the changelog section; state signed or unsigned, and what was not verified (see README "Status").
+
 ## Version
 
 The single source is `[workspace.package] version` in `Cargo.toml`; every crate inherits it. The packaging scripts stamp it into `CFBundleShortVersionString` of the app and driver `Info.plist` files; `CFBundleVersion` is the git commit count (override with `BUILD_NUMBER`). To release: bump the version, update `CHANGELOG.md`, commit, tag `vX.Y.Z`. The release workflow fails if the tag and the Cargo version differ.

@@ -8,6 +8,15 @@ Start with `sr-cli -v doctor` (exits 1 when unhealthy) and the log `~/Library/Lo
 - Check `codesign -dv /Library/Audio/Plug-Ins/HAL/SoundRouter.driver` and remove quarantine: `sudo xattr -dr com.apple.quarantine <driver>`.
 - Watch `log stream --predicate 'process == "coreaudiod"'` while it restarts.
 
+## Quick fixes
+| Symptom | Try |
+|---|---|
+| No SoundRouter device in Sound settings or an app's picker | Open **Test Setup…** and install the driver; then `sudo killall coreaudiod` (audio drops for 1-2 s). |
+| Device exists, apps hear nothing | The app must be running (or in the menu bar) for routing; check the node is not muted and the setup self-test passes. Without the engine a device only loops what apps play into it back to its own input. |
+| "Needs permission" / mic or app source silent | Microphone and System Audio Recording, see the sections below. |
+| First launch blocked by macOS | Unsigned or ad-hoc build: right-click the app, Open (macOS 14), or System Settings > Privacy & Security > Open Anyway (macOS 15); `xattr -dr com.apple.quarantine /Applications/SoundRouter.app` from a shell. |
+| Still broken | `sr-cli -v doctor` (reports driver, devices and permissions of the terminal) and the log file above. |
+
 ## Permissions reset after a rebuild
 Rebuilds keep asking for permissions: run `packaging/make-dev-identity.sh` once, then rebuild with `packaging/bundle-app.sh`. Ad-hoc signing gives each build a new identity (the grant is tied to the code hash), so grants reset; the script creates a stable self-signed identity, `SoundRouter Local Dev`, that the build scripts use automatically. Grant Microphone and System Audio Recording once more after the first build signed with it (System Settings > Privacy & Security). If a build shows "codesign wants to use key", enter your login password and choose Always Allow. Check with `codesign -dr - target/SoundRouter.app`: it must say `certificate leaf`, not `cdhash`.
 

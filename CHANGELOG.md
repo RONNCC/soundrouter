@@ -5,6 +5,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- Docs: README "How routing works" diagram and CI badge; a quick-fix table in TROUBLESHOOTING; a first-release checklist in RELEASING; PLAN.md marked historical. The app bundle now also carries `LICENSE-MIT` and `LICENSE-APACHE` next to `ThirdPartyLicenses.html`.
 - App: every permission row of the setup sheet that is not Allowed has its own button: **Allow Microphone** / **Allow System Audio Recording** (macOS's own prompt, off the UI thread; the row shows "Asking…" meanwhile), or **Open Settings** after a denial, with where the switch lives. The status reads **Needs permission** (was "Not asked yet"). The footer button is **Allow All**, the name of the one permission left, or **Continue**, and asks for every permission still unanswered, Microphone first, then System Audio Recording.
 - App: the log's startup line records the raw TCC answers for the app (`TCC audio capture Unknown(2)` = not asked yet).
 - Packaging: `packaging/make-dev-identity.sh` creates a stable self-signed `SoundRouter Local Dev` code-signing identity; the build scripts use it when `SIGN_ID` is unset, so macOS keeps Microphone and System Audio Recording grants across rebuilds.
@@ -54,7 +55,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [0.1.0]
 
-First release. Driver-in-`coreaudiod` and end-to-end tap behaviour are not yet verified in automation (see README, Status).
+First release (not yet tagged; see docs/RELEASING.md). Driver-in-`coreaudiod` and end-to-end tap behaviour were checked by hand on one dev machine and are not covered by CI (see README, Status).
 
 ### Added
 - AudioServerPlugIn driver (Rust): up to 16 runtime-configurable loopback devices, each with a hidden engine companion, controlled through the `srcf` plug-in property and persisted across restarts.

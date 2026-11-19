@@ -23,6 +23,7 @@ stamp_version "$APP/Contents/Info.plist"
 cp target/release/SoundRouter "$APP/Contents/MacOS/SoundRouter"
 cp target/release/sr-cli "$APP/Contents/MacOS/sr-cli"
 cp app/assets/icon.icns "$APP/Contents/Resources/icon.icns"
+cp LICENSE-MIT LICENSE-APACHE "$APP/Contents/Resources/"
 cp packaging/uninstall.sh "$APP/Contents/Resources/uninstall.sh"
 chmod +x "$APP/Contents/Resources/uninstall.sh"
 
