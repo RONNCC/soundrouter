@@ -176,6 +176,8 @@ pub struct Slot {
     /// Per side (index = `Side as usize`): the HAL changes each device's format separately, while
     /// that device's I/O is stopped, so a device must only ever trust its own side.
     pub channels: [AtomicU32; 2],
+    /// Channel count last asked for (the device list, or activation): both sides converge on it.
+    pub ch_want: AtomicU32,
     pub rate_idx: [AtomicU32; 2],
     /// Rate index last asked for (by a client, or the default on activation): both sides converge on it.
     pub rate_want: AtomicU32,
@@ -204,6 +206,7 @@ impl Slot {
         Slot {
             alive: AtomicBool::new(false),
             channels: [AtomicU32::new(2), AtomicU32::new(2)],
+            ch_want: AtomicU32::new(2),
             rate_idx: [AtomicU32::new(0), AtomicU32::new(0)],
             rate_want: AtomicU32::new(0),
             freed_at: AtomicU64::new(0),
@@ -231,28 +234,41 @@ impl Slot {
         self.channels[0].load(Acquire) == self.channels[1].load(Acquire)
             && self.rate_idx[0].load(Acquire) == self.rate_idx[1].load(Acquire)
     }
-    /// A client asked for rate index `i`: record it and return which sides (index = `Side as usize`)
-    /// the host must be asked to change. When the wanted rate moved, both sides are asked even if one
-    /// already runs at `i`: an older request may still be pending, or a Perform may be running with the
-    /// old wanted rate, and that side must get one more Perform after this set.
-    pub fn want_rate(&self, i: u32) -> [bool; 2] {
-        let prev = self.rate_want.swap(i, AcqRel);
-        [0, 1].map(|s| prev != i || self.rate_idx[s].load(Acquire) != i)
+    /// The per-side values and the wanted value a change of this kind moves.
+    fn format(&self, c: &Change) -> (&[AtomicU32; 2], &AtomicU32) {
+        match c {
+            Change::Channels(_) => (&self.channels, &self.ch_want),
+            Change::Rate(_) => (&self.rate_idx, &self.rate_want),
+        }
     }
-    /// The host performs a rate change on `side`: it converges on the rate wanted now, not on the one in
-    /// the request, which is stale when the host runs requests late or out of order.
-    pub fn perform_rate(&self, side: Side) {
-        self.rate_idx[side as usize].store(self.rate_want.load(Acquire), Release);
+    /// The channel count or rate in `c` is now wanted: record it and return which sides (index =
+    /// `Side as usize`) the host must be asked to change. When the wanted value moved, both sides are
+    /// asked even if one already runs it: an older request may still be pending, or a Perform may be
+    /// running with the old wanted value, and that side must get one more Perform after this set.
+    pub fn want(&self, c: &Change) -> [bool; 2] {
+        let v = match *c {
+            Change::Channels(n) => n as u32,
+            Change::Rate(i) => i as u32,
+        };
+        let (have, want) = self.format(c);
+        let prev = want.swap(v, AcqRel);
+        [0, 1].map(|s| prev != v || have[s].load(Acquire) != v)
     }
-    /// Format changes that bring a pair with mismatched sides back in sync: channels follow the wanted
-    /// count, the rate follows the last requested one (`rate_want`), so a pass that runs while a rate
-    /// change has landed on one side only never sends the other side back. Only sides that differ are listed.
-    pub fn lagging(&self, want_channels: Option<u16>) -> Vec<(Side, Change)> {
+    /// The host performs a change of `c`'s kind on `side`: it converges on the value wanted now, not on
+    /// the one in the request, which is stale when the host runs requests late or out of order.
+    pub fn perform(&self, side: Side, c: &Change) {
+        let (have, want) = self.format(c);
+        have[side as usize].store(want.load(Acquire), Release);
+    }
+    /// Format changes that bring a pair with sides off the wanted channel count or rate back in sync, so
+    /// a pass that runs while a change has landed on one side only completes it and never sends the
+    /// other side back. Only sides that differ are listed.
+    pub fn lagging(&self) -> Vec<(Side, Change)> {
         let mut out = vec![];
-        let target = want_channels.map_or(self.channels(Side::Visible), u32::from);
+        let ch = self.ch_want.load(Acquire);
         for side in [Side::Visible, Side::Engine] {
-            if self.channels(side) != target {
-                out.push((side, Change::Channels(target as u16)));
+            if self.channels(side) != ch {
+                out.push((side, Change::Channels(ch as u16)));
             }
         }
         let rate = self.rate_want.load(Acquire);
@@ -287,7 +303,8 @@ impl Slot {
             DriverDevice {
                 uid: m.0.clone(),
                 name: m.1.clone(),
-                channels: self.channels(Side::Visible) as u16,
+                // The wanted count, not a side's: `diff` asks again whenever the list moves away from it.
+                channels: self.ch_want.load(Acquire) as u16,
             }
         })
     }
@@ -301,6 +318,7 @@ impl Slot {
             self.channels[side].store(d.channels as u32, Release);
             self.rate_idx[side].store(default, Release);
         }
+        self.ch_want.store(d.channels as u32, Release);
         self.rate_want.store(default, Release);
         for c in &self.clients {
             c.store(0, Release);
@@ -476,19 +494,17 @@ mod tests {
     #[test]
     fn lagging_side_is_asked_again() {
         let s = Slot::new();
-        assert!(s.lagging(Some(2)).is_empty());
-        s.channels[0].store(8, Release); // V landed, C did not
-        assert_eq!(
-            s.lagging(Some(8)),
-            vec![(Side::Engine, Change::Channels(8))]
-        );
+        assert!(s.lagging().is_empty());
+        s.ch_want.store(8, Release); // the list asked for 8 ch ...
+        s.channels[0].store(8, Release); // ... V landed, C did not
+        assert_eq!(s.lagging(), vec![(Side::Engine, Change::Channels(8))]);
         s.channels[1].store(8, Release);
         s.rate_want.store(2, Release); // a client asked for rate 2 ...
         s.rate_idx[0].store(2, Release); // ... and it landed on V only
-        assert_eq!(s.lagging(Some(8)), vec![(Side::Engine, Change::Rate(2))]);
+        assert_eq!(s.lagging(), vec![(Side::Engine, Change::Rate(2))]);
         s.channels[0].store(2, Release); // V lags the wanted count instead
         assert_eq!(
-            s.lagging(Some(8)),
+            s.lagging(),
             vec![
                 (Side::Visible, Change::Channels(8)),
                 (Side::Engine, Change::Rate(2))
@@ -502,113 +518,168 @@ mod tests {
         let s = Slot::new();
         s.rate_want.store(2, Release);
         s.rate_idx[1].store(2, Release);
-        assert_eq!(s.lagging(Some(2)), vec![(Side::Visible, Change::Rate(2))]);
+        assert_eq!(s.lagging(), vec![(Side::Visible, Change::Rate(2))]);
         // The re-request lands: the pair is in sync and nothing more is asked.
         s.rate_idx[0].store(2, Release);
-        assert!(s.in_sync() && s.lagging(Some(2)).is_empty());
+        assert!(s.in_sync() && s.lagging().is_empty());
     }
 
-    /// The host side of a rate change: queued per-device requests, performed later in an order the host
-    /// chooses.
+    /// The host side of a format change: queued per-device requests (with the value each was asked
+    /// with), performed later in an order the host chooses.
     struct Host<'a> {
         s: &'a Slot,
-        q: Vec<Side>,
+        kind: fn(u32) -> Change,
+        q: Vec<(Side, Change)>,
     }
     impl Host<'_> {
-        fn set(&mut self, i: u32) {
-            let ask = self.s.want_rate(i);
+        /// A client's rate set, or a reconcile pass for a new channel count in the device list.
+        fn set(&mut self, v: u32) {
+            let ask = self.s.want(&(self.kind)(v));
             for side in [Side::Visible, Side::Engine] {
                 if ask[side as usize] {
-                    self.q.push(side);
+                    self.q.push((side, (self.kind)(v)));
                 }
             }
         }
         fn perform(&mut self, k: usize) {
-            let side = self.q.remove(k % self.q.len());
-            self.s.perform_rate(side);
+            let (side, c) = self.q.remove(k % self.q.len());
+            self.s.perform(side, &c);
         }
-        fn rates(&self) -> [u32; 2] {
-            [0, 1].map(|s| self.s.rate_idx[s].load(Acquire))
+        fn perform_side(&mut self, side: Side) {
+            let k = self.q.iter().position(|q| q.0 == side).unwrap();
+            self.perform(k);
+        }
+        fn values(&self) -> [u32; 2] {
+            let (have, _) = self.s.format(&(self.kind)(0));
+            [0, 1].map(|s| have[s].load(Acquire))
+        }
+        fn sides(&self) -> Vec<Side> {
+            self.q.iter().map(|q| q.0).collect()
         }
     }
-    fn host(s: &Slot) -> Host<'_> {
-        s.want_rate(1);
-        s.rate_idx.iter().for_each(|r| r.store(1, Release)); // 48k on both sides
-        Host { s, q: vec![] }
+    fn rate(i: u32) -> Change {
+        Change::Rate(i as usize)
+    }
+    fn chans(n: u32) -> Change {
+        Change::Channels(n as u16)
+    }
+    /// A host for `s` with both sides at, and wanting, `v`.
+    fn host(s: &Slot, kind: fn(u32) -> Change, v: u32) -> Host<'_> {
+        s.want(&kind(v));
+        s.format(&kind(v))
+            .0
+            .iter()
+            .for_each(|x| x.store(v, Release));
+        Host { s, kind, q: vec![] }
     }
 
     #[test]
     fn the_last_requested_rate_wins_on_both_sides_whatever_order_the_host_performs_in() {
         // 48k -> 96k -> 44.1k -> 96k -> 48k, with the host performing V's first request between sets.
         let s = Slot::new();
-        let mut h = host(&s);
+        let mut h = host(&s, rate, 1);
         h.set(2);
-        let v = h.q.iter().position(|&side| side == Side::Visible).unwrap();
-        h.perform(v); // V is 96k, C's 96k request is still pending
+        h.perform_side(Side::Visible); // V is 96k, C's 96k request is still pending
         h.set(0);
         h.set(2); // back to V's current rate while V's 44.1k request is pending
         h.set(1);
         while !h.q.is_empty() {
             h.perform(0); // FIFO: the stale requests land after the last set
         }
-        assert_eq!(h.rates(), [1, 1]);
+        assert_eq!(h.values(), [1, 1]);
         // Everything deferred, then performed newest first: the oldest (stale) request lands last.
         let s = Slot::new();
-        let mut h = host(&s);
+        let mut h = host(&s, rate, 1);
         for i in [2, 0, 2, 1] {
             h.set(i);
         }
         while !h.q.is_empty() {
             h.perform(h.q.len() - 1);
         }
-        assert_eq!(h.rates(), [1, 1]);
+        assert_eq!(h.values(), [1, 1]);
+    }
+
+    #[test]
+    fn the_last_listed_channel_count_wins_on_both_sides_whatever_order_the_host_performs_in() {
+        // 2 -> 8 -> 16 -> 8 (-> 16): everything deferred, or V's first request performed between sets
+        // (the set back to 8 then finds V at 8), each drained oldest or newest first.
+        for seq in [&[8, 16, 8][..], &[8, 16, 8, 16]] {
+            for (early, lifo) in [(false, false), (false, true), (true, false), (true, true)] {
+                let s = Slot::new();
+                let mut h = host(&s, chans, 2);
+                for (k, &n) in seq.iter().enumerate() {
+                    h.set(n);
+                    if early && k == 0 {
+                        h.perform_side(Side::Visible);
+                    }
+                }
+                while !h.q.is_empty() {
+                    h.perform(if lifo { h.q.len() - 1 } else { 0 });
+                }
+                let last = seq[seq.len() - 1];
+                assert_eq!(
+                    h.values(),
+                    [last, last],
+                    "{seq:?} early={early} lifo={lifo}"
+                );
+                assert!(s.in_sync() && s.lagging().is_empty());
+            }
+        }
     }
 
     #[test]
     fn a_set_racing_a_perform_asks_both_sides_again() {
-        let s = Slot::new();
-        let mut h = host(&s);
-        h.set(2);
-        // V's Perform starts on the host's thread and reads the wanted rate (96k) ...
-        let seen = s.rate_want.load(Acquire);
-        // ... a client sets 48k, V's current rate, before that Perform stored 96k: V must be asked again.
-        assert_eq!(s.want_rate(1), [true, true]);
-        s.rate_idx[0].store(seen, Release);
-        s.perform_rate(Side::Visible);
-        s.perform_rate(Side::Engine);
-        assert_eq!(h.rates(), [1, 1]);
-        // Setting the wanted rate again while both sides run it asks for nothing.
-        assert_eq!(s.want_rate(1), [false, false]);
+        for (kind, from, to) in [(rate as fn(u32) -> Change, 1, 2), (chans, 2, 8)] {
+            let s = Slot::new();
+            let mut h = host(&s, kind, from);
+            h.set(to);
+            // V's Perform starts on the host's thread and reads the wanted value ...
+            let (have, want) = s.format(&kind(0));
+            let seen = want.load(Acquire);
+            // ... the old value, V's current one, is set again before that Perform stored the new one:
+            // V must be asked again.
+            assert_eq!(s.want(&kind(from)), [true, true]);
+            have[0].store(seen, Release);
+            s.perform(Side::Visible, &kind(to));
+            s.perform(Side::Engine, &kind(to));
+            assert_eq!(h.values(), [from, from]);
+            // Setting the wanted value again while both sides run it asks for nothing.
+            assert_eq!(s.want(&kind(from)), [false, false]);
+        }
     }
 
     #[test]
-    fn setting_the_same_rate_again_re_asks_a_side_whose_request_the_host_aborted() {
-        let s = Slot::new();
-        let mut h = host(&s);
-        h.set(2);
-        h.q.retain(|&side| side == Side::Engine); // the host aborted V's request
-        h.perform(0);
-        h.set(2);
-        assert_eq!(h.q, [Side::Visible]);
-        h.perform(0);
-        assert_eq!(h.rates(), [2, 2]);
+    fn setting_the_same_value_again_re_asks_a_side_whose_request_the_host_aborted() {
+        for (kind, from, to) in [(rate as fn(u32) -> Change, 1, 2), (chans, 2, 8)] {
+            let s = Slot::new();
+            let mut h = host(&s, kind, from);
+            h.set(to);
+            h.q.retain(|q| q.0 == Side::Engine); // the host aborted V's request
+            h.perform(0);
+            h.set(to);
+            assert_eq!(h.sides(), [Side::Visible]);
+            h.perform(0);
+            assert_eq!(h.values(), [to, to]);
+        }
     }
 
     proptest::proptest! {
         /// Any interleaving of sets and host Performs, then the rest performed in any order: both sides
-        /// end at the last requested rate.
+        /// end at the last requested rate or channel count.
         #[test]
-        fn rate_converges_to_the_last_set(
-            ops in proptest::collection::vec((proptest::bool::ANY, 0u32..3, 0usize..16), 1..24),
+        fn format_converges_to_the_last_set(
+            ops in proptest::collection::vec((proptest::bool::ANY, 0usize..3, 0usize..16), 1..24),
             drain in proptest::collection::vec(0usize..16, 32),
+            ch in proptest::bool::ANY,
         ) {
+            let (kind, vals): (fn(u32) -> Change, _) = if ch { (chans, [2, 8, 16]) } else { (rate, [1, 0, 2]) };
             let s = Slot::new();
-            let mut h = host(&s);
-            let mut last = 1;
+            let mut h = host(&s, kind, vals[0]);
+            let mut last = vals[0];
             for (set, i, k) in ops {
                 if set {
-                    h.set(i);
-                    last = i;
+                    h.set(vals[i]);
+                    last = vals[i];
                 } else if !h.q.is_empty() {
                     h.perform(k);
                 }
@@ -621,7 +692,7 @@ mod tests {
             while !h.q.is_empty() {
                 h.perform(0);
             }
-            proptest::prop_assert_eq!(h.rates(), [last, last]);
+            proptest::prop_assert_eq!(h.values(), [last, last]);
         }
     }
 

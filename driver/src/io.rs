@@ -263,7 +263,8 @@ mod tests {
     fn channel_change_on_one_side_never_overruns_the_other_buffer() {
         let (v, c) = activate(15, 2);
         SLOTS[15].clients[Side::Engine as usize].store(1, Release); // engine attached: B feeds V.in
-        // V's format change lands first; C's I/O keeps running on its 2-channel buffer.
+        // The list asks for 8 ch; V's format change lands first; C's I/O keeps running on its 2-channel buffer.
+        SLOTS[15].want(&Change::Channels(8));
         change(v, Change::Channels(8));
         let mut out = ramp(8);
         assert_eq!(run(v, WRITE, 1000.0, &mut out, FRAMES * 8), 0);
@@ -301,7 +302,7 @@ mod tests {
         let mut buf = vec![];
         run(c, READ, 100.0, &mut buf, FRAMES * 2);
         assert_eq!(&buf[..FRAMES * 2], &out[..FRAMES * 2]);
-        SLOTS[14].want_rate(2); // a client asked for 96 kHz; only V's Perform has run
+        SLOTS[14].want(&Change::Rate(2)); // a client asked for 96 kHz; only V's Perform has run
         change(v, Change::Rate(2));
         assert!(!SLOTS[14].in_sync());
         run(c, READ, 100.0, &mut buf, FRAMES * 2);
@@ -313,7 +314,7 @@ mod tests {
     #[test]
     fn zero_timestamp_uses_the_devices_own_rate() {
         let (v, c) = activate(13, 2);
-        SLOTS[13].want_rate(2);
+        SLOTS[13].want(&Change::Rate(2));
         change(v, Change::Rate(2)); // V 96 kHz, C stays 48 kHz
         let per48 = ticks_per_second() / 48_000.0 * RING_FRAMES as f64;
         SLOTS[13]

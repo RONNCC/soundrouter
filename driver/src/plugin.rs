@@ -98,11 +98,16 @@ fn pass(announce: bool) -> bool {
             // The HAL applies a change per device, so both must be asked; until both land, I/O is silent.
             Op::Channels(s, n) if announce => {
                 changing[s] = true;
+                let c = Change::Channels(n);
+                let ask = SLOTS[s].want(&c);
                 for side in [Side::Visible, Side::Engine] {
-                    request_change(encode(s, side, Part::Device), &Change::Channels(n));
+                    if ask[side as usize] {
+                        request_change(encode(s, side, Part::Device), &c);
+                    }
                 }
             }
             Op::Channels(s, n) => {
+                SLOTS[s].ch_want.store(n as u32, Release);
                 for c in &SLOTS[s].channels {
                     c.store(n as u32, Release);
                 }
@@ -125,11 +130,10 @@ fn pass(announce: bool) -> bool {
     if announce {
         // A change the HAL applied to one side only leaves the pair silent for good: ask the laggard again.
         for (s, slot) in SLOTS.iter().enumerate() {
-            let Some(d) = slot.snapshot().filter(|_| !changing[s]) else {
+            if !slot.alive.load(Acquire) || changing[s] {
                 continue;
-            };
-            let want_ch = want.iter().find(|w| w.uid == d.uid).map(|w| w.channels);
-            for (side, c) in slot.lagging(want_ch) {
+            }
+            for (side, c) in slot.lagging() {
                 request_change(encode(s, side, Part::Device), &c);
             }
         }
@@ -212,10 +216,7 @@ pub unsafe extern "C" fn perform_change(
     let (Some((slot, _, side, _)), Some(change)) = (lookup(dev), parse_action(action)) else {
         return BAD_OBJECT;
     };
-    match change {
-        Change::Channels(n) => slot.channels[side as usize].store(n as u32, Release),
-        Change::Rate(_) => slot.perform_rate(side),
-    }
+    slot.perform(side, &change);
     slot.reset_rings();
     0
 }
@@ -403,10 +404,11 @@ pub unsafe extern "C" fn set_data(
     };
     // Both devices of the pair must follow, or one side would run at a different rate. A reconcile pass
     // that runs before both changes landed re-asks the laggard for this rate (`Slot::lagging`).
-    let ask = slot.want_rate(i as u32);
+    let c = Change::Rate(i);
+    let ask = slot.want(&c);
     for side in [Side::Visible, Side::Engine] {
         if ask[side as usize] {
-            request_change(encode(s, side, Part::Device), &Change::Rate(i));
+            request_change(encode(s, side, Part::Device), &c);
         }
     }
     0

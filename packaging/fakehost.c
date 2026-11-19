@@ -678,6 +678,38 @@ int main(int argc, char** argv) {
     CHECK(V2 && C2 && chans(stream(V2, kAudioObjectPropertyScopeOutput)) == 16 && chans(stream(C2, kAudioObjectPropertyScopeInput)) == 16);
     printf("ok channel change 8->16\n");
 
+    // 6a. Rapid channel changes on v1 (2 ch) while the host holds the Performs back, then runs them FIFO or newest
+    // first, with everything deferred or with V's first request performed between sets (a later set back to V's count
+    // must still ask, and stale requests land after newer sets): V and C end at the last count set.
+    {
+        const int seqs[2][4] = { { 8, 16, 8 }, { 8, 16, 8, 16 } }, lens[2] = { 3, 4 };
+        AudioObjectID V1 = byUID("soundrouter:v1"), C1 = byUID("soundrouter:v1.engine");
+        int bad = 0;
+        for (int q = 0; q < 2; q++) for (int order = 0; order < 4; order++) {
+            gDefer = 1; gQn = 0;
+            for (int k = 0; k < lens[q]; k++) {
+                char nm[32]; snprintf(nm, sizeof nm, "Chan %d.%d.%d", q, order, k); const char* rn[] = { nm, "Loopback 2" };
+                int ch[] = { seqs[q][k], 16 }, n0 = gQn;
+                CHECK(setConfig(cfg(2, uid2, rn, ch)) == 0); // renamed too, so the pass notifies and setConfig waits for it
+                for (int i = 0; i < 100 && gQn < n0 + 2; i++) usleep(5000);
+                if (order >= 2 && k == 0) performQ(gQ[0].d == V1 ? 0 : 1);
+            }
+            int n = gQn;
+            while (gQn) performQ(order & 1 ? gQn - 1 : 0);
+            gDefer = 0;
+            UInt32 v = chans(stream(V1, kAudioObjectPropertyScopeOutput)), c = chans(stream(C1, kAudioObjectPropertyScopeInput)), want = seqs[q][lens[q] - 1];
+            printf("  rapid channels %d, order %d: V1 %u C1 %u, want %u (%d requests)\n", q, order, v, c, want, n);
+            bad |= v != want || c != want || chans(stream(V1, kAudioObjectPropertyScopeInput)) != want || chans(stream(C1, kAudioObjectPropertyScopeOutput)) != want;
+            CHECK(setConfig(cfg(2, uid2, nm2, ch3)) == 0); // back to 2 ch, performed inline
+            CHECK(chans(stream(V1, kAudioObjectPropertyScopeOutput)) == 2 && chans(stream(C1, kAudioObjectPropertyScopeInput)) == 2);
+        }
+        CHECK(!bad);
+        // The count both sides already run asks for nothing.
+        int c1 = gChanges; const char* rn[] = { "Same Count", "Loopback 2" };
+        CHECK(setConfig(cfg(2, uid2, rn, ch3)) == 0 && setConfig(cfg(2, uid2, nm2, ch3)) == 0 && gChanges == c1);
+        printf("ok rapid channel changes 2->8->16->8(->16) end at the last count on V and C in any Perform order\n");
+    }
+
     // 6b. regression (heap overflow in coreaudiod): the HAL applies a channel change per device. After V changed
     // 2 -> 8 but before C did, I/O on C (still 2 ch) must stay inside its buffer and read silence.
     {
