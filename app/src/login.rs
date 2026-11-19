@@ -65,6 +65,14 @@ fn write_agent(path: &Path, exe: &Path, on: bool) -> io::Result<()> {
             _ => Ok(()),
         };
     }
+    // The release dmg (volume "SoundRouter") or a Gatekeeper-translocated copy is gone by the next login (and a launch from one would
+    // overwrite a good agent on startup), so the agent must never point there.
+    let exe_str = exe.to_string_lossy();
+    if exe_str.starts_with("/Volumes/SoundRouter") || exe_str.contains("/AppTranslocation/") {
+        return Err(io::Error::other(
+            "SoundRouter is running from a disk image or a temporary location; move it to Applications first",
+        ));
+    }
     let text = plist(exe);
     if std::fs::read_to_string(path).is_ok_and(|old| old == text) {
         return Ok(());
@@ -101,6 +109,22 @@ mod tests {
             plist_path(Path::new("/Users/me")),
             Path::new("/Users/me/Library/LaunchAgents/com.ronncc.soundrouter.login.plist")
         );
+    }
+
+    #[test]
+    fn enable_refuses_a_disk_image_or_translocated_exe_and_keeps_the_old_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let path = plist_path(home.path());
+        let good = Path::new("/Applications/SoundRouter.app/Contents/MacOS/SoundRouter");
+        write_agent(&path, good, true).unwrap();
+        for bad in [
+            "/Volumes/SoundRouter/SoundRouter.app/Contents/MacOS/SoundRouter",
+            "/private/var/folders/x/T/AppTranslocation/ABC/d/SoundRouter.app/Contents/MacOS/SoundRouter",
+        ] {
+            assert!(write_agent(&path, Path::new(bad), true).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), plist(good));
+        }
+        write_agent(&path, Path::new(good), false).unwrap(); // turning it off still works
     }
 
     #[test]
