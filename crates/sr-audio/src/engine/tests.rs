@@ -386,8 +386,8 @@ fn rig(dev: &VirtualDevice, lay: &IoLayout, ain: &[u16], aout: &[u16]) -> Rig {
             mixer,
             shared,
             meters: meters.clone(),
-            in_planar: vec![0.0; SCRATCH_LEN],
-            out_planar: vec![0.0; SCRATCH_LEN],
+            in_planar: Scratch::new(),
+            out_planar: Scratch::new(),
             next_t: f64::NAN,
         },
         meters,
@@ -605,7 +605,7 @@ fn unsettled_waits_for_channel_change_on_visible_and_companion() {
         let (vis, comp) = (vis.clone(), comp.clone());
         move |u: &str| (u == vis || u == comp).then_some((c, c))
     };
-    assert!(unsettled(&want, &all(8), false).is_empty());
+    assert!(unsettled(&want, &all(8), false, &[]).is_empty());
     // Companion still reports the old channel count.
     let stale = |u: &str| {
         if u == companion_uid(&want[0].uid) {
@@ -614,12 +614,12 @@ fn unsettled_waits_for_channel_change_on_visible_and_companion() {
             Some((8, 8))
         }
     };
-    let bad = unsettled(&want, &stale, false);
+    let bad = unsettled(&want, &stale, false, &[]);
     assert_eq!(bad.len(), 1);
     assert!(bad[0].contains("2 in / 2 out, want 8"), "{bad:?}");
     // Input and output are checked separately.
     let half = |_: &str| Some((8, 2));
-    assert_eq!(unsettled(&want, &half, false).len(), 2);
+    assert_eq!(unsettled(&want, &half, false, &[]).len(), 2);
 }
 
 #[test]
@@ -628,12 +628,37 @@ fn unsettled_missing_devices_and_companion_grace() {
     let vis = want[0].uid.clone();
     let only_visible = |u: &str| (u == vis).then_some((2, 2));
     // Inside the grace period a missing companion keeps us waiting, afterwards it is tolerated.
-    assert_eq!(unsettled(&want, &only_visible, false).len(), 1);
-    assert!(unsettled(&want, &only_visible, true).is_empty());
+    assert_eq!(unsettled(&want, &only_visible, false, &[]).len(), 1);
+    assert!(unsettled(&want, &only_visible, true, &[]).is_empty());
     // The visible device itself is always required.
     let none = |_: &str| None;
-    let bad = unsettled(&want, &none, true);
+    let bad = unsettled(&want, &none, true, &[]);
     assert_eq!(bad, [format!("{}: not present", want[0].uid)]);
+}
+
+#[test]
+fn unsettled_waits_until_removed_devices_are_gone() {
+    // Disable then enable: the HAL still lists the device the driver just dropped. Taking that as
+    // settled lost it right after ("neither the hidden companion nor the visible device is present").
+    let gone = want_dev("v1", 2).uid;
+    let comp = companion_uid(&gone);
+    let removed = [gone.clone()];
+    let dying = |u: &str| (u == gone || u == comp).then_some((2, 2));
+    let bad = unsettled(&[], &dying, true, &removed);
+    assert_eq!(
+        bad,
+        [
+            format!("{gone}: removed but still present"),
+            format!("{comp}: removed but still present")
+        ]
+    );
+    let hidden_left = |u: &str| (u == comp).then_some((2, 2));
+    assert_eq!(unsettled(&[], &hidden_left, true, &removed).len(), 1);
+    assert!(unsettled(&[], &|_| None, true, &removed).is_empty());
+    // A kept device is not a removed one.
+    let want = [want_dev("v2", 2)];
+    let kept = |u: &str| u.contains("v2").then_some((2, 2));
+    assert!(unsettled(&want, &kept, false, &removed).is_empty());
 }
 
 // ---- device-event filter and backoff (F4) ----
@@ -875,6 +900,31 @@ fn failed_start_rebuilds_that_vdev() {
     let v: Vec<(&str, &[(String, f64)])> = vec![("v1", &a), ("v2", &b)];
     let t = rebuild_targets(false, &set(&[]), &set(&["v2", "gone"]), &v, &|_| 48e3);
     assert_eq!(t, set(&["v2"]));
+}
+
+#[test]
+fn a_monitor_rate_change_in_the_start_batch_still_rebuilds() {
+    // v1 monitors V2 and was built at 48 kHz. V2 moves to 96 kHz before v1's IOProc start is booked,
+    // and the rate event lands in the same batch as that start.
+    let built = rates(&[("c1", 48e3), ("V2", 48e3)]);
+    let now = rates(&[("c1", 48e3), ("V2", 96e3)]);
+    let changed = set(&["V2"]);
+    let base = start_baseline(&built, now.clone(), &changed);
+    assert_eq!(base, built, "the reported device keeps its build rate");
+    let v: Vec<(&str, &[(String, f64)])> = vec![("v1", &base)];
+    let rate_now = |u: &str| if u == "V2" { 96e3 } else { 48e3 };
+    assert_eq!(
+        rebuild_targets(false, &changed, &set(&[]), &v, &rate_now),
+        set(&["v1"])
+    );
+    // Settled while starting with no event in this batch: the new rate is the baseline (an echo).
+    assert_eq!(start_baseline(&built, now.clone(), &set(&[])), now);
+    // A device gone since the build drops out; one with no build rate takes the current one.
+    assert_eq!(
+        start_baseline(&built, rates(&[("c1", 48e3)]), &changed),
+        rates(&[("c1", 48e3)])
+    );
+    assert_eq!(start_baseline(&[], now.clone(), &changed), now);
 }
 
 #[test]

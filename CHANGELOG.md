@@ -34,6 +34,9 @@ All notable changes to this project are documented here. The format follows [Kee
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
 
 ### Fixed
+- Engine: rebuilding a virtual device's aggregate grew memory by about 0.4 MiB each time (+31 MiB over 38 disable/enable cycles). The IOProc's two 1 MiB scratch buffers came from malloc's medium zone, which kept them dirty after free; they are now mapped from the kernel and unmapped on teardown (+0.7 MiB over the same loop). The churn soak (`cargo test -p sr-audio --test churn -- --ignored`) now asserts it.
+- Engine: enabling a device right after disabling it could fail with "neither the hidden companion nor the visible device is present": the HAL still listed the device the driver had just removed, the settle wait took it as the re-added one and lost it a moment later. An apply now also waits until removed devices are gone.
+- Engine: a rate change on a monitored (or source) device that landed while the vdev was starting could be taken as the new baseline without a rebuild. A device with a rate event in the same batch as the start keeps its build-time rate, and rate listeners are registered before the baseline is read and the aggregate built.
 - App: Start at Login refuses to point its LaunchAgent at the release dmg (`/Volumes/SoundRouter…`) or a Gatekeeper-translocated copy, and a launch from one no longer overwrites a working agent; it shows "move it to Applications first".
 - Packaging: `uninstall.sh` no longer aborts before removing the driver when the target user cannot be looked up; README names where the installed `uninstall.sh` and `sr-cli` live.
 - App: when the audio engine cannot start, meters stay at silence and a standing banner says routing is not running (it no longer falls back to demo meters with a toast that vanishes).

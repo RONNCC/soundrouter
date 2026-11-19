@@ -39,7 +39,6 @@ fn cfg(enabled: bool, volume_db: f32, with_app: bool) -> Config {
         });
     }
     Config {
-        version: 1,
         devices: vec![VirtualDevice {
             id: "v1".into(),
             name: "Churn".into(),
@@ -51,6 +50,7 @@ fn cfg(enabled: bool, volume_db: f32, with_app: bool) -> Config {
             wires,
             monitors: vec![],
         }],
+        ..Config::default()
     }
 }
 
@@ -93,11 +93,12 @@ fn rebuild_loops_do_not_leak() {
     worst = worst.max(grow("add/remove app source", 100, |i| {
         e.apply(&cfg(true, 0.0, i % 2 == 0)).unwrap();
     }));
-    // Whole aggregate torn down and rebuilt. Measured once: +31 MiB over 38 rebuilds (about 0.8 MiB each),
-    // not yet explained, so it is printed but not asserted.
-    grow("disable/enable (full rebuild)", 50, |i| {
+    // Whole aggregate torn down and rebuilt, driver devices removed and re-added. Before the scratch
+    // buffers left malloc this grew about 0.4 MiB per cycle (+31 MiB over 38 cycles). Every enable must
+    // also find its device: apply used to return before the removed one was gone.
+    worst = worst.max(grow("disable/enable (full rebuild)", 50, |i| {
         e.apply(&cfg(i % 2 == 0, 0.0, false)).unwrap();
-    });
+    }));
     e.apply(&cfg(false, 0.0, false)).unwrap();
     // Allocator noise is a few MiB; a per-cycle leak of even 100 KiB would show as 5+ MiB here.
     assert!(worst < 8 * 1024, "rss grew by {worst} KiB in one loop");

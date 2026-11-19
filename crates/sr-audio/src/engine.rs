@@ -81,8 +81,8 @@ struct Cb {
     mixer: Mixer,
     shared: Arc<Shared>,
     meters: Arc<Meters>,
-    in_planar: Vec<f32>,
-    out_planar: Vec<f32>,
+    in_planar: Scratch,
+    out_planar: Scratch,
     /// Sample time the next cycle should start at; NaN before the first cycle.
     next_t: f64,
 }
@@ -95,6 +95,53 @@ impl Cb {
             self.meters.glitch_count.fetch_add(1, Relaxed);
         }
         self.next_t = t + frames as f64;
+    }
+}
+
+/// `SCRATCH_LEN` zeroed floats mapped straight from the kernel and unmapped on drop. As a `Vec` (1 MiB,
+/// malloc's medium zone) freed scratch stayed dirty in ever more malloc regions: RSS grew about
+/// 0.4 MiB per vdev rebuild (tests/churn.rs).
+struct Scratch(NonNull<f32>);
+// SAFETY: owns its mapping exclusively, like a `Box<[f32]>`.
+unsafe impl Send for Scratch {}
+
+impl Scratch {
+    const BYTES: usize = SCRATCH_LEN * size_of::<f32>();
+
+    fn new() -> Scratch {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                Self::BYTES,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            std::alloc::handle_alloc_error(std::alloc::Layout::array::<f32>(SCRATCH_LEN).unwrap());
+        }
+        Scratch(NonNull::new(p.cast()).expect("mmap never maps address 0"))
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr(), SCRATCH_LEN) }
+    }
+}
+
+impl std::ops::DerefMut for Scratch {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.0.as_ptr(), SCRATCH_LEN) }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.0.as_ptr().cast(), Self::BYTES) };
     }
 }
 
@@ -533,6 +580,23 @@ fn read_rates(spec: &AggSpec) -> Vec<(String, f64)> {
         .collect()
 }
 
+/// Baseline after a good IOProc start: the rates `now`, since starting may settle them (an echo, not a
+/// change). A device with a rate event in the same batch (`changed`) keeps its `built` rate so the event is
+/// still compared: else a change landing between build and start became the baseline and the vdev
+/// (e.g. one monitoring that device) kept running on an aggregate built for the old rate.
+fn start_baseline(
+    built: &[(String, f64)],
+    now: Vec<(String, f64)>,
+    changed: &BTreeSet<String>,
+) -> Vec<(String, f64)> {
+    now.into_iter()
+        .map(|(uid, r)| match built.iter().find(|(u, _)| *u == uid) {
+            Some(&(_, was)) if changed.contains(&uid) => (uid, was),
+            _ => (uid, r),
+        })
+        .collect()
+}
+
 /// Updates the consecutive start-failure counts (`ok` resets, each `failed` adds one) and returns
 /// the failed ids that are still worth a rebuild. Without the cap a start that always fails would
 /// rebuild forever, because every successful rebuild resets the background failure count.
@@ -629,8 +693,7 @@ fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
             continue;
         };
         if good {
-            // The rate may have settled while starting: that is the baseline, not a change.
-            v.rates = read_rates(&v.spec);
+            v.rates = start_baseline(&v.rates, read_rates(&v.spec), &p.rates);
             ok.push(id);
         } else {
             failed.push(id);
@@ -840,10 +903,16 @@ fn sync_driver(cfg: &Config) -> Result<()> {
         // Looks again: the plug-in may have appeared since, so this must not assume an error.
         None => driver::require_plugin()?,
     };
-    if driver::get_devices(plugin).ok().as_ref() != Some(&want) {
+    let old = driver::get_devices(plugin).unwrap_or_default();
+    if old != want {
         driver::set_devices(plugin, &want)?;
     }
-    wait_driver_settled(&want)
+    let removed: Vec<String> = old
+        .into_iter()
+        .filter(|o| !want.iter().any(|w| w.uid == o.uid))
+        .map(|o| o.uid)
+        .collect();
+    wait_driver_settled(&want, &removed)
 }
 
 /// How long after `set_devices` the driver's devices may take to appear and take their channel counts.
@@ -856,17 +925,25 @@ const COMPANION_GRACE: Duration = Duration::from_millis(500);
 
 /// Devices from `want` that are not ready: visible device and companion present, and each reporting
 /// exactly the configured channels on both scopes (the HAL applies a channel change asynchronously, F1b).
-/// `totals(uid)` = `(input, output)` channels, `None` when the device does not exist.
+/// `totals(uid)` = `(input, output)` channels, `None` when the device does not exist. A `removed` device
+/// (or its companion) must be gone too: the HAL drops it a moment after the driver does, and a disable
+/// then enable that found the dying device would take it as settled and lose it right after.
 fn unsettled(
     want: &[DriverDevice],
     totals: &dyn Fn(&str) -> Option<(u16, u16)>,
     companion_optional: bool,
+    removed: &[String],
 ) -> Vec<String> {
     let check = |uid: &str, ch: u16| match totals(uid) {
         None => Some(format!("{uid}: not present")),
         Some((i, o)) if i != ch || o != ch => Some(format!("{uid}: {i} in / {o} out, want {ch}")),
         Some(_) => None,
     };
+    let lingering = removed
+        .iter()
+        .flat_map(|u| [u.clone(), companion_uid(u)])
+        .filter(|u| totals(u).is_some())
+        .map(|u| format!("{u}: removed but still present"));
     want.iter()
         .flat_map(|d| {
             let comp = companion_uid(&d.uid);
@@ -877,10 +954,11 @@ fn unsettled(
             [check(&d.uid, d.channels), comp_bad]
         })
         .flatten()
+        .chain(lingering)
         .collect()
 }
 
-fn wait_driver_settled(want: &[DriverDevice]) -> Result<()> {
+fn wait_driver_settled(want: &[DriverDevice], removed: &[String]) -> Result<()> {
     let totals = |uid: &str| {
         hal::device_by_uid(uid).map(|d| {
             (
@@ -892,7 +970,7 @@ fn wait_driver_settled(want: &[DriverDevice]) -> Result<()> {
     let t0 = Instant::now();
     loop {
         let elapsed = t0.elapsed();
-        let bad = unsettled(want, &totals, elapsed >= COMPANION_GRACE);
+        let bad = unsettled(want, &totals, elapsed >= COMPANION_GRACE, removed);
         if bad.is_empty() {
             return Ok(());
         }
@@ -1305,6 +1383,26 @@ fn build_vdev(
     groups: &[AppGroup],
     events: Option<&Sender<Event>>,
 ) -> Result<Vdev> {
+    // Rate listeners first, then the baseline, then the aggregate: a rate change at any point after the
+    // read has an event that compares unequal, one before it is in both the baseline and the aggregate.
+    let listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
+        std::iter::once(&spec.main)
+            .chain(&spec.subs)
+            .filter_map(|uid| {
+                let obj = hal::device_by_uid(uid)?;
+                let u = uid.clone();
+                Listener::new(
+                    obj,
+                    kAudioDevicePropertyNominalSampleRate,
+                    tx.clone(),
+                    move || Event::Rate(u.clone()),
+                )
+                .map_err(|e| log::warn!("no rate listener on '{uid}': {e:#}"))
+                .ok()
+            })
+            .collect()
+    });
+    let rates = read_rates(&spec);
     let mut taps = Vec::new();
     for (id, b, mute) in app_sources(dev) {
         let objs = app_objs(groups, b);
@@ -1405,28 +1503,10 @@ fn build_vdev(
         mixer: mx,
         shared: shared.clone(),
         meters: meters.clone(),
-        in_planar: vec![0.0; SCRATCH_LEN],
-        out_planar: vec![0.0; SCRATCH_LEN],
+        in_planar: Scratch::new(),
+        out_planar: Scratch::new(),
         next_t: f64::NAN,
     }));
-    let rates = read_rates(&spec);
-    let listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
-        std::iter::once(&spec.main)
-            .chain(&spec.subs)
-            .filter_map(|uid| {
-                let obj = hal::device_by_uid(uid)?;
-                let u = uid.clone();
-                Listener::new(
-                    obj,
-                    kAudioDevicePropertyNominalSampleRate,
-                    tx.clone(),
-                    move || Event::Rate(u.clone()),
-                )
-                .map_err(|e| log::warn!("no rate listener on '{uid}': {e:#}"))
-                .ok()
-            })
-            .collect()
-    });
     let mut v = Vdev {
         dev: dev.clone(),
         spec,

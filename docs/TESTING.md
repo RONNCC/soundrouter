@@ -11,6 +11,7 @@
 | BlackHole e2e | `srtone` (into BlackHole ch 8-9) -> process tap -> engine mixer -> BlackHole 16ch ch 0-1 | `cargo test -p sr-audio --test blackhole -- --ignored` |
 | Live driver | Driver inside coreaudiod (sudo) | `packaging/driver-dev.sh test` |
 | Live engine | `srtone` into `soundrouter:v2` -> process tap -> engine aggregate with the hidden companion -> `soundrouter:v1` input, installed driver, no sudo | `packaging/engine-live-test.sh` |
+| Churn soak | Engine apply loops against the installed driver: 200 volume changes, 100 app-source add/removes, 50 disable/enables (aggregate and driver devices torn down and re-created). Asserts every apply succeeds and RSS grows < 8 MiB per loop. Changes the driver list: quit the app first | `cargo test -p sr-audio --test churn -- --ignored --nocapture` |
 
 The BlackHole test sets `SR_MAIN_UID_OVERRIDE=<device uid>` so the engine uses an existing loopback device as the main device and never touches the SoundRouter driver. It needs BlackHole 16ch installed (`brew install --cask blackhole-16ch`) and audio permissions.
 
