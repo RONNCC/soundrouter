@@ -1916,3 +1916,16 @@ fn a_hung_self_test_can_be_cancelled_or_times_out() {
     });
     assert!(!has(&h, "The test did not finish"));
 }
+
+/// The UI used to ask for a frame every 33 ms on its own (about 70 fps next to the worker's
+/// 30 Hz); now only the worker (changed meters), animations and timers ask.
+#[test]
+fn a_settled_window_asks_for_no_more_frames() {
+    let mut h = open(demo_config());
+    h.run_steps(60);
+    assert!(
+        !h.ctx.has_requested_repaint(),
+        "{:?}",
+        h.ctx.repaint_causes()
+    );
+}

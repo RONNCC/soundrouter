@@ -15,6 +15,9 @@ pub struct Meters {
     outputs: Box<[AtomicU32]>,
     /// Blocks silenced because the buffer layout did not match the plan. Written by the audio thread.
     pub mismatch_count: AtomicU64,
+    /// IOProc cycles whose sample time did not follow the previous one: the HAL skipped audio (CPU
+    /// overload or a stalled thread). Written by the audio thread.
+    pub glitch_count: AtomicU64,
 }
 
 impl Default for Meters {
@@ -24,6 +27,7 @@ impl Default for Meters {
             inputs: slots(),
             outputs: slots(),
             mismatch_count: AtomicU64::new(0),
+            glitch_count: AtomicU64::new(0),
         }
     }
 }
@@ -58,6 +62,10 @@ impl Meters {
 
     pub fn mismatch_count(&self) -> u64 {
         self.mismatch_count.load(Relaxed)
+    }
+
+    pub fn glitch_count(&self) -> u64 {
+        self.glitch_count.load(Relaxed)
     }
 
     /// Swaps peaks to 0 and maps indices to names via the layout.

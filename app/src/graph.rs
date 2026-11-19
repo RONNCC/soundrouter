@@ -834,6 +834,10 @@ fn card(
         let lin = if active { row_level(g, c.id, row) } else { 0.0 };
         let lv = level(lin);
         let pk = st.peaks.entry((c.id, row)).or_default().update(lv, dt);
+        if pk > lv {
+            // The peak marker is still holding or falling, and no meter change will wake the UI.
+            ui.request_repaint_after(std::time::Duration::from_millis(33));
+        }
         meter(
             &painter,
             Rect::from_x_y_ranges(meter_l..=(r.right() - 18.0), (y - 3.0)..=(y + 3.0)),

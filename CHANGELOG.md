@@ -5,6 +5,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- Engine: `Engine::glitches(id)` counts IOProc cycles that arrive after the HAL skipped audio (sample-time discontinuity); `sr-cli run` prints it and the shape-mismatch count next to the meters. `cargo test -p sr-audio --test churn -- --ignored` soaks the apply/rebuild loops for leaks against the installed driver.
 - Docs: README "How routing works" diagram and CI badge; a quick-fix table in TROUBLESHOOTING; a first-release checklist in RELEASING; PLAN.md marked historical. The app bundle now also carries `LICENSE-MIT` and `LICENSE-APACHE` next to `ThirdPartyLicenses.html`.
 - App: every permission row of the setup sheet that is not Allowed has its own button: **Allow Microphone** / **Allow System Audio Recording** (macOS's own prompt, off the UI thread; the row shows "Asking…" meanwhile), or **Open Settings** after a denial, with where the switch lives. The status reads **Needs permission** (was "Not asked yet"). The footer button is **Allow All**, the name of the one permission left, or **Continue**, and asks for every permission still unanswered, Microphone first, then System Audio Recording.
 - App: the log's startup line records the raw TCC answers for the app (`TCC audio capture Unknown(2)` = not asked yet).
@@ -26,6 +27,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - README: how to route the Mac's microphone into a virtual device.
 
 ### Changed
+- App: the window repaints at the worker's 30 Hz only when a meter value changed (was ~70 fps always: 6.4 % CPU with the window open on 3 routes, now about 1 %), and a hidden window stops reading meters and wakes twice a second instead of 30 times (2.1 % to 1.1 % with the engine running).
 - App: device rows no longer show a green "running" dot; only starting, waiting-for-permission and failed states show a dot (status stays in the tooltip and accessibility label).
 - Packaging: with `SIGN_ID` the driver, `sr-cli`, app and dmg get the hardened runtime and a secure timestamp; the version comes from `[workspace.package]` in `Cargo.toml` and is stamped into both `Info.plist` files; the driver pkg removes an older driver before installing; `notarize.sh` checks signatures first and reports Apple's log on rejection; release workflow checks the tag, attaches checksums and labels unsigned builds. See `docs/RELEASING.md`.
 - New virtual devices, and the first-run "Loopback Audio" device, start with a Pass-Thru source wired 1→1, 2→2 (Loopback-style). Existing configs are not touched.

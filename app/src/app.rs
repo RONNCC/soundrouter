@@ -889,6 +889,8 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let visible = ctx.input(|i| i.viewport().visible().unwrap_or(true));
+        self.worker.set_visible(visible);
         self.first_apply();
         self.handle_window(ctx);
     }
@@ -919,10 +921,13 @@ impl eframe::App for App {
             s.visuals.slider_trailing_fill = true;
             s.spacing.slider_rail_height = 4.0;
         });
-        ctx.request_repaint_after(Duration::from_millis(33));
+        // Frames come from the worker (meters changed) and from animations; nothing polls here.
         self.now = ctx.input(|i| i.time);
         if self.undo.as_ref().is_some_and(|u| self.now > u.until) {
             self.undo = None;
+        }
+        if let Some(u) = &self.undo {
+            ctx.request_repaint_after(Duration::from_secs_f64(u.until - self.now + 0.05));
         }
 
         let prev_selected = self.selected;

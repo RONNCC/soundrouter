@@ -247,7 +247,12 @@ fn run(path: &PathBuf, self_test: Option<&str>) -> Result<()> {
             };
             if let Some(m) = engine.meters(id) {
                 let ch: Vec<String> = m.channels.iter().map(|&x| db(x)).collect();
-                println!("{id} [{st}] out: {}", ch.join(" "));
+                println!(
+                    "{id} [{st}] out: {} (glitches {}, mismatches {})",
+                    ch.join(" "),
+                    engine.glitches(id),
+                    engine.mismatches(id)
+                );
                 for (s, v) in &m.sources {
                     println!(
                         "    {s}: {}",

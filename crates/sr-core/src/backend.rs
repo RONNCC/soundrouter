@@ -15,7 +15,7 @@ pub struct AppInfo {
     /// agents, helpers and command-line players, which the source picker hides by default.
     pub regular: bool,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeterReading {
     pub sources: Vec<(String, Vec<f32>)>,
     pub channels: Vec<f32>,

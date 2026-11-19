@@ -388,6 +388,7 @@ fn rig(dev: &VirtualDevice, lay: &IoLayout, ain: &[u16], aout: &[u16]) -> Rig {
             meters: meters.clone(),
             in_planar: vec![0.0; SCRATCH_LEN],
             out_planar: vec![0.0; SCRATCH_LEN],
+            next_t: f64::NAN,
         },
         meters,
         _handle: handle,
@@ -909,4 +910,19 @@ fn apply_keeps_the_newest_config_when_the_driver_does_not_settle() {
     bad.devices[0].channels = 3;
     assert!(apply_locked(&mut g, &bad, slow).is_err());
     assert_eq!(g.cfg.unwrap().devices[0].channels, 8);
+}
+
+#[test]
+fn track_time_counts_only_skipped_audio() {
+    let mut r = passthru_rig();
+    // First cycle never counts, contiguous cycles (even with sub-frame jitter) do not either.
+    for (t, frames) in [(1000.0, 512), (1512.0, 512), (2024.3, 512), (2536.3, 256)] {
+        r.cb.track_time(t, frames);
+    }
+    assert_eq!(r.meters.glitch_count(), 0);
+    // One buffer was skipped, then a restart that rewinds the clock.
+    r.cb.track_time(2792.3 + 512.0, 512);
+    assert_eq!(r.meters.glitch_count(), 1);
+    r.cb.track_time(0.0, 512);
+    assert_eq!(r.meters.glitch_count(), 2);
 }

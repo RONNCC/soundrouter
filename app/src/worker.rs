@@ -1,16 +1,20 @@
-//! Backend worker thread: applies configs, polls meters at 30 Hz, refreshes hardware/apps every 2 s.
+//! Backend worker thread: applies configs, polls meters at 30 Hz while the window is visible (and
+//! wakes the UI only when something changed), refreshes hardware/apps every 2 s.
 use crate::fake::FakeBackend;
 use crate::icons::{self, IconResolver};
 use eframe::egui::{ColorImage, Context};
 use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading, SelfTest};
 use sr_core::config::{Config, SourceKind};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const METER_PERIOD: Duration = Duration::from_millis(33);
+/// Wake-up period while the window is hidden: no meters are read, only messages and refreshes.
+const HIDDEN_PERIOD: Duration = Duration::from_millis(500);
 const REFRESH_PERIOD: Duration = Duration::from_secs(2);
 
 /// Progress of the loopback self-test the setup sheet asks for.
@@ -42,12 +46,15 @@ enum Msg {
     SelfTest(String),
     /// Replace the backend with the synthetic one.
     Demo,
+    /// Only to end a wait: the window was shown or hidden.
+    Wake,
 }
 
 pub struct Worker {
     tx: Option<Sender<Msg>>,
     handle: Option<JoinHandle<()>>,
     pub shared: Arc<Mutex<Snapshot>>,
+    visible: Arc<AtomicBool>,
     /// Tests: no thread. The loop body runs on the caller's thread as soon as a message is sent,
     /// so the reply is there before the next frame, whatever the scheduler does.
     #[cfg(test)]
@@ -60,13 +67,25 @@ struct Core {
     rx: Receiver<Msg>,
     snap: Arc<Mutex<Snapshot>>,
     ctx: Context,
+    visible: Arc<AtomicBool>,
 }
 
 impl Core {
+    fn period(&self) -> Duration {
+        if self.visible.load(Relaxed) {
+            METER_PERIOD
+        } else {
+            HIDDEN_PERIOD
+        }
+    }
+
+    /// One wake-up; the UI is only asked to repaint when the snapshot changed.
     fn iterate(&mut self, first: Option<Msg>) {
         let batch = drain_latest(&self.rx, first);
-        self.pump.run(batch, Instant::now(), &self.snap);
-        self.ctx.request_repaint();
+        self.pump.visible = self.visible.load(Relaxed);
+        if self.pump.run(batch, Instant::now(), &self.snap) {
+            self.ctx.request_repaint();
+        }
     }
 }
 
@@ -93,6 +112,7 @@ fn drain_latest(rx: &Receiver<Msg>, first: Option<Msg>) -> Batch {
                 }
             }
             Msg::Demo => b.demo = true,
+            Msg::Wake => {}
         }
     }
     b
@@ -107,24 +127,31 @@ struct Pump {
     resolve_icon: IconResolver,
     /// Keys already looked up (hit or miss), so a refresh never repeats an AppKit call.
     icons_tried: HashSet<String>,
+    /// The window can be seen: only then are meters read.
+    visible: bool,
 }
 
 impl Pump {
     /// Demo swap, then config, then self-tests: the tests see the devices the config creates.
-    fn run(&mut self, b: Batch, now: Instant, snap: &Mutex<Snapshot>) {
+    /// Returns whether the snapshot changed.
+    fn run(&mut self, b: Batch, now: Instant, snap: &Mutex<Snapshot>) -> bool {
         if b.demo {
             self.backend = Box::new(FakeBackend::new());
             self.next_refresh = now;
         }
-        self.tick(b.cfg, now, snap);
+        let mut changed = self.tick(b.cfg, now, snap) || b.demo;
         for id in b.tests {
+            changed = true;
             snap.lock().unwrap().self_test = SelfTestState::Running;
             let r = self.backend.self_test(&id).map_err(|e| format!("{e:#}"));
             snap.lock().unwrap().self_test = SelfTestState::Done(r);
         }
+        changed
     }
 
-    fn tick(&mut self, newest: Option<Config>, now: Instant, snap: &Mutex<Snapshot>) {
+    /// Returns whether the snapshot changed. Meters are read only while visible; the hidden
+    /// snapshot keeps the last ones until the window is shown again.
+    fn tick(&mut self, newest: Option<Config>, now: Instant, snap: &Mutex<Snapshot>) -> bool {
         let mut apply_result = None;
         if let Some(c) = newest {
             let r = self.backend.apply(&c);
@@ -136,13 +163,14 @@ impl Pump {
             }));
             self.cfg = c;
         }
-        let meters: HashMap<String, MeterReading> = self
-            .cfg
-            .devices
-            .iter()
-            .filter(|d| d.enabled)
-            .filter_map(|d| Some((d.id.clone(), self.backend.meters(&d.id)?)))
-            .collect();
+        let meters: Option<HashMap<String, MeterReading>> = self.visible.then(|| {
+            self.cfg
+                .devices
+                .iter()
+                .filter(|d| d.enabled)
+                .filter_map(|d| Some((d.id.clone(), self.backend.meters(&d.id)?)))
+                .collect()
+        });
         let refresh = (now >= self.next_refresh).then(|| {
             self.next_refresh = now + REFRESH_PERIOD;
             let apps = self.backend.apps();
@@ -150,10 +178,16 @@ impl Pump {
             (self.backend.hardware(), apps, self.backend.status(), icons)
         });
         let mut s = snap.lock().unwrap();
+        let mut changed = apply_result.is_some() || refresh.is_some();
         if let Some(r) = apply_result {
             s.apply_error = r;
         }
-        s.meters = meters;
+        if let Some(m) = meters
+            && s.meters != m
+        {
+            s.meters = m;
+            changed = true;
+        }
         if let Some((hw, apps, status, icons)) = refresh {
             s.status = status;
             s.status_ready = true;
@@ -161,6 +195,7 @@ impl Pump {
             s.apps = apps;
             s.icons.extend(icons);
         }
+        changed
     }
 
     /// Icons for running apps and configured App sources not looked up before.
@@ -205,12 +240,14 @@ impl Worker {
             next_refresh: Instant::now(),
             resolve_icon,
             icons_tried: HashSet::new(),
+            visible: true,
         };
         let core = Core {
             pump,
             rx,
             snap: snap.clone(),
             ctx,
+            visible: Arc::new(AtomicBool::new(true)),
         };
         (tx, snap, core)
     }
@@ -222,9 +259,10 @@ impl Worker {
         resolve_icon: IconResolver,
     ) -> Worker {
         let (tx, shared, mut core) = Self::core(backend, ctx, resolve_icon);
+        let visible = core.visible.clone();
         let handle = std::thread::spawn(move || {
             loop {
-                let first = match core.rx.recv_timeout(METER_PERIOD) {
+                let first = match core.rx.recv_timeout(core.period()) {
                     Ok(c) => Some(c),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -236,6 +274,7 @@ impl Worker {
             tx: Some(tx),
             handle: Some(handle),
             shared,
+            visible,
             #[cfg(test)]
             inline: None,
         }
@@ -255,6 +294,7 @@ impl Worker {
             tx: Some(tx),
             handle: None,
             shared,
+            visible: core.visible.clone(),
             inline: Some(std::cell::RefCell::new(core)),
         }
     }
@@ -282,6 +322,14 @@ impl Worker {
     /// Report a self-test that cannot even start.
     pub fn fail_self_test(&self, why: &str) {
         self.shared.lock().unwrap().self_test = SelfTestState::Done(Err(why.to_string()));
+    }
+
+    /// Tell the worker whether the window can be seen; hidden, it stops reading meters and sleeps
+    /// longer between wake-ups. Cheap to call every frame.
+    pub fn set_visible(&self, visible: bool) {
+        if self.visible.swap(visible, Relaxed) != visible {
+            self.send(Msg::Wake);
+        }
     }
 
     /// Swap the real engine for the synthetic one (the setup sheet's "Try Demo").
@@ -392,6 +440,7 @@ mod tests {
             next_refresh: Instant::now(),
             resolve_icon: Box::new(|_| None),
             icons_tried: HashSet::new(),
+            visible: true,
         };
         (pump, log, snap)
     }
@@ -449,6 +498,42 @@ mod tests {
         let s = snap.lock().unwrap();
         assert_eq!(s.meters.keys().collect::<Vec<_>>(), ["v1"]);
         assert!(log.lock().unwrap().lock_free);
+    }
+
+    #[test]
+    fn unchanged_meters_do_not_wake_the_ui_and_hidden_ticks_read_none() {
+        let (mut pump, _log, snap) = setup();
+        let t0 = Instant::now();
+        assert!(pump.tick(Some(default_config()), t0, &snap)); // apply + first refresh + new meters
+        assert!(!pump.tick(None, t0, &snap), "same silent meters");
+        pump.visible = false;
+        snap.lock().unwrap().meters.clear();
+        assert!(!pump.tick(None, t0, &snap));
+        assert!(snap.lock().unwrap().meters.is_empty(), "hidden: not read");
+        pump.visible = true;
+        assert!(pump.tick(None, t0, &snap), "shown again: meters are back");
+        assert!(
+            pump.tick(None, t0 + REFRESH_PERIOD, &snap),
+            "a refresh always counts"
+        );
+    }
+
+    #[test]
+    fn set_visible_wakes_the_thread_only_on_change() {
+        let (tx, rx) = mpsc::channel();
+        let w = Worker {
+            tx: Some(tx),
+            handle: None,
+            shared: Arc::default(),
+            visible: Arc::new(AtomicBool::new(true)),
+            inline: None,
+        };
+        w.set_visible(true);
+        assert!(rx.try_recv().is_err());
+        w.set_visible(false);
+        assert!(matches!(rx.try_recv(), Ok(Msg::Wake)));
+        w.set_visible(false);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

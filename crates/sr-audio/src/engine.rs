@@ -83,6 +83,19 @@ struct Cb {
     meters: Arc<Meters>,
     in_planar: Vec<f32>,
     out_planar: Vec<f32>,
+    /// Sample time the next cycle should start at; NaN before the first cycle.
+    next_t: f64,
+}
+
+impl Cb {
+    /// A cycle starting more than half a buffer away from where the last one ended means the HAL
+    /// skipped (or repeated) audio. The first cycle (NaN) compares false. Audio thread: no allocation.
+    fn track_time(&mut self, t: f64, frames: usize) {
+        if (t - self.next_t).abs() > frames as f64 / 2.0 {
+            self.meters.glitch_count.fetch_add(1, Relaxed);
+        }
+        self.next_t = t + frames as f64;
+    }
 }
 
 struct Tap {
@@ -309,6 +322,14 @@ impl Engine {
             .vdevs
             .get(device_id)
             .map_or(0, |v| v.meters.mismatch_count())
+    }
+
+    /// IOProc cycles that arrived after the HAL skipped audio (overload, stalled thread; diagnostic).
+    pub fn glitches(&self, device_id: &str) -> u64 {
+        lock(&self.inner)
+            .vdevs
+            .get(device_id)
+            .map_or(0, |v| v.meters.glitch_count())
     }
 
     /// The last background (event-driven) update failure, until a later update succeeds.
@@ -1386,6 +1407,7 @@ fn build_vdev(
         meters: meters.clone(),
         in_planar: vec![0.0; SCRATCH_LEN],
         out_planar: vec![0.0; SCRATCH_LEN],
+        next_t: f64::NAN,
     }));
     let rates = read_rates(&spec);
     let listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
@@ -1475,11 +1497,16 @@ unsafe extern "C-unwind" fn ioproc(
     input: NonNull<AudioBufferList>,
     _it: NonNull<AudioTimeStamp>,
     output: NonNull<AudioBufferList>,
-    _ot: NonNull<AudioTimeStamp>,
+    ot: NonNull<AudioTimeStamp>,
     ud: *mut c_void,
 ) -> i32 {
     let r = catch_unwind(AssertUnwindSafe(|| unsafe {
-        run(&mut *(ud as *mut Cb), input.as_ptr(), output.as_ptr())
+        let cb = &mut *(ud as *mut Cb);
+        let frames = bufs(output.as_ptr()).first().map_or(0, |b| {
+            b.mDataByteSize as usize / 4 / (b.mNumberChannels as usize).max(1)
+        });
+        cb.track_time(ot.as_ref().mSampleTime, frames);
+        run(cb, input.as_ptr(), output.as_ptr())
     }));
     if r.is_err() {
         // A panic may have left half-written output: never hand that to the hardware.
