@@ -71,11 +71,12 @@ pub fn db_to_pct(db: f32) -> f32 {
     }
 }
 
-/// Footer label for an engine buffer size. shortcut: assumes 48 kHz, read the live rate if users mind.
+/// Footer label: latency the engine adds for a buffer size, two buffers (input and output side) at
+/// 48 kHz. shortcut: assumes 48 kHz, read the live rate if users mind.
 pub fn latency_label(frames: u32) -> String {
     format!(
-        "Latency: {:.1} ms ({frames} frames)",
-        f64::from(frames) / 48.0
+        "Latency: +{:.1} ms ({frames} frames)",
+        2.0 * f64::from(frames) / 48.0
     )
 }
 
@@ -485,12 +486,13 @@ mod tests {
         let mut c = default_config();
         assert_eq!(
             latency_label(c.buffer_frames),
-            "Latency: 5.3 ms (256 frames)"
+            "Latency: +10.7 ms (256 frames)"
         );
         apply(&mut c, Edit::BufferFrames(128));
         assert_eq!(c.buffer_frames, 128);
         c.validate().unwrap();
-        assert_eq!(latency_label(512), "Latency: 10.7 ms (512 frames)");
+        assert_eq!(latency_label(512), "Latency: +21.3 ms (512 frames)");
+        assert_eq!(latency_label(64), "Latency: +2.7 ms (64 frames)");
     }
 
     #[test]

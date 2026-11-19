@@ -685,7 +685,7 @@ impl App {
                 let label = latency_label(self.cfg.buffer_frames);
                 let resp = setup::footer_button(ui, latency, "latency", &label, t);
                 resp.clone().on_hover_text(
-                    "Engine buffer size. Smaller is faster but uses more CPU and battery.",
+                    "Added by routing through SoundRouter (two buffers at 48 kHz); the virtual device itself adds about 2 buffers more.",
                 );
                 egui::Popup::menu(&resp).show(|ui| {
                     for n in BUFFER_FRAMES {

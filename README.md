@@ -83,7 +83,7 @@ Checked against the code (`crates/sr-core/src/config.rs`, `driver_proto.rs`, `sr
 - An aggregate carries at most 64 input and 64 output channels (wider layouts fail the shape check).
 - Process taps need macOS 14.2+ (the app's `LSMinimumSystemVersion`; every binary is built with `MACOSX_DEPLOYMENT_TARGET=14.2`).
 - Apple silicon only: the app and driver are arm64 builds (no Intel or universal build); the `.pkg` refuses Intel Macs and macOS older than 14.2, and Finder refuses the app there.
-- Engine latency: one IO buffer of 64, 128, 256 (default) or 512 frames (footer **Latency** menu, `sr-cli run --buffer N`); smaller costs more CPU and battery. See [ARCHITECTURE](docs/ARCHITECTURE.md#latency-setting).
+- Engine latency: added latency = two IO buffers (+2.7 to +21.3 ms at 48 kHz; the footer shows it); buffer of 64, 128, 256 (default) or 512 frames (footer **Latency** menu, `sr-cli run --buffer N`); smaller costs more CPU and battery. See [ARCHITECTURE](docs/ARCHITECTURE.md#latency-setting).
 - Virtual devices run at 44.1, 48 (default) or 96 kHz; a request for any other rate (88.2, 192 kHz) is refused. Input devices and monitors at other rates are resampled by the aggregate's drift compensation.
 - Config `version` is 1; other versions are refused.
 
