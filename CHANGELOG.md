@@ -37,6 +37,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
 
 ### Fixed
+- App: renaming a device in the sidebar and then clicking another row's × applied the rename after the removal had shifted the rows, so it was lost or landed on another device; clicking Undo mid-rename renamed the restored device. Device removals now apply after the other edits of a frame, and Undo drops the frame's edits.
+- App: Try Demo kept the previous selection (an empty pane when it pointed past the demo's devices) and the previous Undo, which put the real config back into the demo session.
+- App: quitting while a slider drag held back the config save lost that change; quitting now writes a pending save.
+- App: a new device no longer gets a name ("Loopback Audio 2") that a renamed device already uses.
 - Core: a config may enable at most 16 devices (the driver's limit). A 17th used to pass validation and then fail every apply with `set 'srcf' failed`; now adding or enabling it is refused with "17 enabled devices; at most 16 can be enabled at once".
 - Engine: rebuilding a virtual device's aggregate grew memory by about 0.4 MiB each time (+31 MiB over 38 disable/enable cycles). The IOProc's two 1 MiB scratch buffers came from malloc's medium zone, which kept them dirty after free; they are now mapped from the kernel and unmapped on teardown (+0.7 MiB over the same loop). The churn soak (`cargo test -p sr-audio --test churn -- --ignored`) now asserts it.
 - Engine: enabling a device right after disabling it could fail with "neither the hidden companion nor the visible device is present": the HAL still listed the device the driver had just removed, the settle wait took it as the re-added one and lost it a moment later. An apply now also waits until removed devices are gone.

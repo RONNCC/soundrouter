@@ -1944,3 +1944,188 @@ fn a_settled_window_asks_for_no_more_frames() {
         h.ctx.repaint_causes()
     );
 }
+
+#[test]
+fn a_row_rename_that_loses_focus_to_another_rows_x_renames_its_own_device() {
+    let mut h = open(demo_config());
+    double_click(&mut h, "Rename Zoom Out");
+    select_all(&mut h);
+    h.get_by_label("Rename device").type_text("Podcast");
+    settle(&mut h);
+    // The X sits on a row above: the removal used to shift the rename onto a missing index.
+    click(&mut h, "Remove Loopback Audio");
+    let names: Vec<_> = h.state().cfg.devices.iter().map(|d| &d.name).collect();
+    assert_eq!(names, ["Stream Mix", "Podcast"]);
+}
+
+#[test]
+fn undo_clicked_mid_rename_restores_the_config_and_renames_nothing_else() {
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    click(&mut h, "Remove Loopback Audio");
+    double_click(&mut h, "Rename Stream Mix");
+    select_all(&mut h);
+    h.get_by_label("Rename device").type_text("Podcast");
+    settle(&mut h);
+    // The rename loses focus to the Undo click; its index belongs to the config Undo replaces,
+    // where it used to rename the restored Loopback Audio.
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before);
+    assert_eq!(h.state().selected, 0);
+}
+
+#[test]
+fn try_demo_resets_the_selection_and_the_undo_of_the_replaced_config() {
+    let mut h = with_runner(no_driver(), never_run());
+    {
+        let app = h.state_mut();
+        apply(&mut app.cfg, Edit::NewDevice);
+        apply(&mut app.cfg, Edit::NewDevice);
+        app.selected = 4;
+        app.undo = Some(Undo {
+            name: "Old".into(),
+            prev: app.cfg.clone(),
+            selected: 4,
+            until: 1e6,
+        });
+    }
+    click(&mut h, "Try Demo");
+    until(&mut h, "demo", |h| h.state().demo);
+    let app = h.state();
+    assert!(app.selected < app.cfg.devices.len(), "{}", app.selected);
+    assert!(app.undo.is_none());
+    h.get_by_label("Device name");
+}
+
+#[test]
+fn quitting_mid_slider_drag_still_saves_the_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let mut h = open(demo_config());
+    h.state_mut().path = Some(path.clone());
+    let knob = center(&h, "Loopback Audio volume");
+    h.hover_at(knob);
+    h.step();
+    h.drag_at(knob);
+    h.step();
+    h.hover_at(knob - vec2(60.0, 0.0));
+    h.run_steps(2);
+    assert!(h.state().cfg.devices[0].volume_db < 0.0);
+    assert!(!path.exists(), "the save waits for the button to come up");
+    eframe::App::on_exit(h.state_mut());
+    assert_eq!(store::load(&path).0, h.state().cfg);
+}
+
+/// Remembers the last config the worker applied.
+struct Recording(FakeBackend, Arc<Mutex<Option<Config>>>);
+
+impl Backend for Recording {
+    fn apply(&mut self, cfg: &Config) -> anyhow::Result<()> {
+        *self.1.lock().unwrap() = Some(cfg.clone());
+        self.0.apply(cfg)
+    }
+    fn hardware(&self) -> Vec<HwDevice> {
+        self.0.hardware()
+    }
+    fn apps(&self) -> Vec<AppInfo> {
+        self.0.apps()
+    }
+    fn meters(&self, id: &str) -> Option<MeterReading> {
+        self.0.meters(id)
+    }
+    fn status(&self) -> EngineStatus {
+        self.0.status()
+    }
+}
+
+mod model_based {
+    use super::*;
+    use crate::model::tests::prop::edit;
+    use proptest::prelude::*;
+
+    /// One frame: an edit, maybe with a row rename that lost focus to it (in either order), or
+    /// a click on Undo (`undo`).
+    type Frame = (Edit, Option<(usize, String)>, bool, bool);
+
+    fn frame() -> impl Strategy<Value = Frame> {
+        (
+            edit(),
+            proptest::option::of((0usize..4, "[ -~]{0,6}")),
+            any::<bool>(),
+            proptest::bool::weighted(0.15),
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        /// The real `App::commit`/`undo_removal` and inline worker under random frames: the kept
+        /// config validates, the engine always has exactly it, the selection follows its device,
+        /// a removal can be undone to the exact config before it, and a rename lands on the
+        /// device it was typed on.
+        #[test]
+        fn random_frames_keep_config_engine_selection_and_undo_consistent(
+            frames in proptest::collection::vec(frame(), 0..50)
+        ) {
+            let engine = Arc::new(Mutex::new(None));
+            let backend = Recording(FakeBackend::frozen(1.5), engine.clone());
+            let w = Worker::spawn_inline(Box::new(backend), egui::Context::default(), Box::new(|_| None));
+            let mut app = App::new(demo_config(), None, w, None, false, false);
+            app.first_apply();
+            prop_assert!(app.applied);
+            for (e, rename, rename_first, undo) in frames {
+                let before = app.cfg.clone();
+                let sel = app.selected;
+                let sel_id = before.devices.get(sel).map(|d| d.id.clone());
+                if undo {
+                    let want = app.undo.as_ref().map(|u| (u.prev.clone(), u.selected));
+                    app.undo_removal();
+                    match want {
+                        Some((prev, s)) => {
+                            prop_assert_eq!(&app.cfg, &prev);
+                            prop_assert_eq!(app.selected, s);
+                        }
+                        None => prop_assert_eq!(&app.cfg, &before),
+                    }
+                } else {
+                    let new = e == Edit::NewDevice;
+                    let removes = matches!(e, Edit::RemoveDevice(d) if d < before.devices.len());
+                    let other_rename = matches!(e, Edit::Rename(..));
+                    let mut edits = vec![e];
+                    if let Some((i, n)) = rename.clone() {
+                        let r = Edit::Rename(i, n);
+                        if rename_first { edits.insert(0, r) } else { edits.push(r) }
+                    }
+                    app.commit(edits);
+                    let accepted = app.cfg != before;
+                    if removes {
+                        prop_assert!(app.undo.as_ref().is_some_and(|u| u.prev == before));
+                    }
+                    if new && accepted {
+                        prop_assert_eq!(app.selected, app.cfg.devices.len() - 1);
+                    } else if let Some(id) = &sel_id {
+                        match app.cfg.devices.iter().position(|d| &d.id == id) {
+                            Some(p) => prop_assert_eq!(app.selected, p, "selection left its device"),
+                            None => prop_assert_eq!(app.selected, sel.min(app.cfg.devices.len().saturating_sub(1))),
+                        }
+                    }
+                    if let Some((i, n)) = rename
+                        && accepted
+                        && !other_rename
+                        && !n.trim().is_empty()
+                        && let Some(id) = before.devices.get(i).map(|d| &d.id)
+                        && let Some(d) = app.cfg.devices.iter().find(|d| &d.id == id)
+                    {
+                        prop_assert_eq!(&d.name, &n, "rename landed elsewhere");
+                    }
+                    if accepted {
+                        prop_assert!(app.save_pending);
+                    }
+                }
+                prop_assert!(app.cfg.validate().is_ok());
+                prop_assert!(app.selected <= app.cfg.devices.len().saturating_sub(1));
+                let applied = engine.lock().unwrap().clone();
+                prop_assert_eq!(applied.as_ref(), Some(&app.cfg));
+            }
+        }
+    }
+}

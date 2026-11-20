@@ -286,6 +286,9 @@ impl App {
                 self.engine_error = None;
                 self.path = None; // never overwrite the saved config with demo edits
                 self.cfg = crate::fake::demo_config();
+                // Both index the config just replaced.
+                self.selected = 0;
+                self.undo = None;
                 self.applied = true;
                 self.worker.use_demo();
                 self.worker.apply(&self.cfg);
@@ -302,7 +305,7 @@ impl App {
     fn commit(&mut self, edits: Vec<Edit>) {
         // A blank name can never be valid (the driver rejects it and then drops every device).
         let mut blank_rename = false;
-        let edits: Vec<Edit> = edits
+        let mut edits: Vec<Edit> = edits
             .into_iter()
             .filter(|e| {
                 let blank = matches!(e, Edit::Rename(_, n) if n.trim().is_empty());
@@ -310,6 +313,9 @@ impl App {
                 !blank
             })
             .collect();
+        // Every index was read from this frame's config: a device removal applied first would shift
+        // the others (a row rename committed by losing focus to another row's X in the same frame).
+        edits.sort_by_key(|e| matches!(e, Edit::RemoveDevice(_)));
         if edits.is_empty() {
             if blank_rename {
                 self.toast = Some(BLANK_NAME.into());
@@ -746,6 +752,9 @@ impl App {
                         if hit.hovered() { t.text } else { t.accent },
                     );
                     if hit.clicked() {
+                        // The frame's edits index the config being replaced (a row rename that
+                        // lost focus to this click): drop them rather than hit another device.
+                        edits.clear();
                         self.undo_removal();
                     }
                     return;
@@ -913,6 +922,13 @@ impl eframe::App for App {
 
     /// Cmd-Q ends the process without dropping `App`: stop the worker so the engine shuts down.
     fn on_exit(&mut self) {
+        // A save waits for the mouse button to come up (slider drags); quitting must not drop it.
+        if self.save_pending
+            && let Some(p) = &self.path
+            && let Err(e) = store::save(p, &self.cfg)
+        {
+            log::warn!("could not save config on quit: {e}");
+        }
         log::info!("quitting: stopping the audio engine");
         self.worker.stop();
     }

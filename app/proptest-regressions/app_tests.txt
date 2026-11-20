@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cbadff2200fb4515a29adb3812eb86d5b5f4e430de7bdf1b91179d639e104ee7 # shrinks to frames = [(RemoveDevice(0), Some((1, "a")), false, false)]

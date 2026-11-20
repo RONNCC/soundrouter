@@ -113,12 +113,17 @@ pub fn new_device(cfg: &mut Config) {
     let n = (1..)
         .find(|n| !cfg.devices.iter().any(|d| d.id == format!("v{n}")))
         .unwrap_or(1);
-    let name = if n == 1 {
-        "Loopback Audio".to_string()
-    } else {
-        format!("Loopback Audio {n}")
-    };
-    cfg.version = 1;
+    // Numbered like its id, unless a renamed device already wears that name.
+    let name = (n..)
+        .map(|n| {
+            if n == 1 {
+                "Loopback Audio".to_string()
+            } else {
+                format!("Loopback Audio {n}")
+            }
+        })
+        .find(|name| !cfg.devices.iter().any(|d| d.name.trim() == name))
+        .unwrap_or_default();
     cfg.devices.push(VirtualDevice {
         id: format!("v{n}"),
         name,
@@ -454,7 +459,7 @@ pub fn learn_names(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn cfg_with_dev() -> Config {
@@ -541,6 +546,20 @@ mod tests {
             assert_eq!(w, [(0, 0), (1, 1)]);
             assert!(d.monitors.is_empty());
         }
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn new_device_skips_names_a_renamed_device_already_uses() {
+        let mut c = default_config();
+        apply(&mut c, Edit::Rename(0, "Loopback Audio 2".into()));
+        apply(&mut c, Edit::NewDevice);
+        apply(&mut c, Edit::NewDevice);
+        let names: Vec<_> = c.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Loopback Audio 2", "Loopback Audio 3", "Loopback Audio 4"]
+        );
         c.validate().unwrap();
     }
 
@@ -729,7 +748,7 @@ mod tests {
         assert_eq!(ch_label(3, 4), "4");
     }
 
-    mod prop {
+    pub(crate) mod prop {
         use super::*;
         use proptest::prelude::*;
 
@@ -750,7 +769,7 @@ mod tests {
             ]
         }
 
-        fn edit() -> impl Strategy<Value = Edit> {
+        pub(crate) fn edit() -> impl Strategy<Value = Edit> {
             let d = 0usize..4;
             let i = 0usize..4;
             let db = -100.0f32..12.0;
