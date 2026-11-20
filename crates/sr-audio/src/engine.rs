@@ -518,24 +518,33 @@ impl Drop for HealthThread {
     }
 }
 
+/// Whether a vdev's taps can deliver audio: its main aggregate runs and, when split, so does the tap
+/// aggregate (before both run, silence is a start, not a denied tap).
+fn taps_running(main: IoState, tap: Option<IoState>) -> bool {
+    main == IoState::Running && tap.is_none_or(|t| t == IoState::Running)
+}
+
 /// One observation of every vdev's taps: is a tapped app playing, and did the taps deliver any signal
 /// since the last pass (the mixer's input meters, drained apart from the window's).
 fn health_pass(g: &mut Inner, now: Duration) {
+    let tcc = crate::tcc::audio_capture_status().into();
     for (id, v) in g.vdevs.iter_mut() {
         let signal = v
             .taps
             .iter()
             .map(|t| v.meters.drain_source_peak(&v.layout, &t.source_id))
             .any(|p| p > 0.0);
-        let running = match &v.tapagg {
-            Some(t) => io_state_of(&t.shared) == IoState::Running,
-            None => io_state_of(&v.shared) == IoState::Running,
-        };
+        let running = taps_running(
+            io_state_of(&v.shared),
+            v.tapagg.as_ref().map(|t| io_state_of(&t.shared)),
+        );
         let playing = v
             .taps
             .iter()
             .any(|t| t.objs.iter().any(|&o| health::process_running_output(o)));
-        let silent = v.silence.observe(now, running && playing, signal);
+        let silent = v
+            .silence
+            .observe(now, health::watch_taps(running && playing, tcc), signal);
         if silent != v.tap_silent {
             log::warn!(
                 "device '{id}': tapped apps {} (zero-filled taps look like a denied System Audio Recording permission)",

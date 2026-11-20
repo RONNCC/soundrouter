@@ -1686,3 +1686,20 @@ fn default_tap_cushion_is_one_buffer() {
         "one tap block: a late tap cycle still finds a whole block"
     );
 }
+
+#[test]
+fn taps_run_only_when_the_main_and_the_tap_aggregate_both_run() {
+    use IoState::{Failed, Running, Starting};
+    assert!(taps_running(Running, None), "unsplit: the one aggregate");
+    assert!(taps_running(Running, Some(Running)));
+    assert!(
+        !taps_running(Running, Some(Starting)),
+        "tap aggregate still starting"
+    );
+    assert!(
+        !taps_running(Starting, Some(Running)),
+        "main aggregate still starting"
+    );
+    assert!(!taps_running(Running, Some(Failed(-1))));
+    assert!(!taps_running(Starting, None));
+}
