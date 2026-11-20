@@ -4,6 +4,7 @@ pub mod apps;
 pub mod driver;
 pub mod engine;
 pub mod hal;
+pub mod health;
 pub mod layout;
 pub mod loopback;
 pub mod power;

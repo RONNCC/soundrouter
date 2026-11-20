@@ -28,12 +28,22 @@ pub(super) fn tap_split_enabled() -> bool {
     )
 }
 
-/// Frames the ring keeps behind each read: `SR_TAP_CUSHION` if set to a number, else one IO buffer.
+/// Frames the ring keeps behind each read: `SR_TAP_CUSHION` if set to a number, else
+/// [`default_cushion`].
 fn cushion_frames(buffer_frames: u32) -> usize {
     std::env::var(TAP_CUSHION_ENV)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(buffer_frames as usize)
+        .unwrap_or_else(|| default_cushion(buffer_frames))
+}
+
+/// The cushion between the tap IOProc and the main IOProc, which run on one clock, so it only has to
+/// cover how late one thread wakes against the other: a quarter of the IO buffer, but at least 32 frames
+/// (0.67 ms at 48 kHz) and at most 128. Measured with 32 / 64 / 128 / 256 frames (0 underruns, 0 trims in
+/// 4 restarts each, and under 32 CPU burners), it shortens the apps' path by one buffer minus the
+/// cushion: 37.3 ms (cushion = one 256 buffer, the old rule) -> 33.3 ms at 64 frames.
+pub(super) fn default_cushion(buffer_frames: u32) -> usize {
+    (buffer_frames as usize / 4).clamp(32, 128)
 }
 
 /// Audio-thread state of the tap IOProc.
@@ -58,6 +68,8 @@ pub(super) struct TapAgg {
     /// Taps dropped from the vdev while this aggregate still lists them: destroyed after it is gone.
     pub zombies: Vec<Tap>,
     _lease: Lease,
+    /// Overload and buffer-size listeners on the aggregate; removed with it.
+    _listeners: Vec<Listener>,
 }
 // SAFETY: `cb` is only dereferenced by the IOProc thread; control-side access is limited to the atomics in `Shared`.
 unsafe impl Send for TapAgg {}
@@ -115,6 +127,8 @@ pub(super) struct TapAggSpec<'a> {
     pub stats: &'a Arc<TapStats>,
     pub events: Option<&'a Sender<Event>>,
     pub activity: &'a Arc<Activity>,
+    /// The vdev's processor-overload count: the tap aggregate adds to it.
+    pub xruns: &'a Arc<AtomicU64>,
 }
 
 /// Builds and starts the tap aggregate. Its receiver comes back for the caller to publish to the main
@@ -222,6 +236,30 @@ pub(super) fn build(s: &TapAggSpec) -> Result<(TapAgg, TapRx)> {
         starter: None,
         zombies: Vec::new(),
         _lease: s.activity.lease(),
+        _listeners: [
+            Some(Listener::counter(
+                agg,
+                kAudioDeviceProcessorOverload,
+                s.xruns.clone(),
+            )),
+            s.events.map(|tx| {
+                let id = s.dev_id.to_owned();
+                Listener::new(
+                    agg,
+                    kAudioDevicePropertyBufferFrameSize,
+                    kAudioObjectPropertyScopeGlobal,
+                    tx.clone(),
+                    move || Event::Buffer(id.clone()),
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|l| {
+            l.map_err(|e| log::warn!("no tap aggregate listener: {e:#}"))
+                .ok()
+        })
+        .collect(),
     };
     // From here `Drop` cleans up the aggregate and the callback state; the taps stay the vdev's.
     set_buffer_frames(agg, s.buffer_frames);

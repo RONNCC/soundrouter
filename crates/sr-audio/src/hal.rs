@@ -177,6 +177,11 @@ pub fn device_name(dev: u32) -> String {
     get_string(dev, kAudioObjectPropertyName).unwrap_or_default()
 }
 
+/// `kAudioDevicePropertyDeviceIsAlive`; a device that cannot be asked is not alive.
+pub fn is_alive(dev: u32) -> bool {
+    get_global::<u32>(dev, kAudioDevicePropertyDeviceIsAlive).is_ok_and(|a| a != 0)
+}
+
 pub fn nominal_rate(dev: u32) -> f64 {
     get_global(dev, kAudioDevicePropertyNominalSampleRate).unwrap_or(0.0)
 }

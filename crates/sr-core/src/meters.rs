@@ -12,6 +12,9 @@ pub const METER_SLOTS: usize = 4 * MAX_CH;
 /// Inputs are indexed by aggregate input slot; outputs by virtual-device channel (post gain).
 pub struct Meters {
     inputs: Box<[AtomicU32]>,
+    /// Same peaks as `inputs`, drained by [`Meters::drain_source_peak`] (the engine's own watch) instead
+    /// of the window's [`Meters::take`], so neither reader takes values from the other.
+    watched: Box<[AtomicU32]>,
     outputs: Box<[AtomicU32]>,
     /// Blocks silenced because the buffer layout did not match the plan. Written by the audio thread.
     pub mismatch_count: AtomicU64,
@@ -25,6 +28,7 @@ impl Default for Meters {
         let slots = || (0..METER_SLOTS).map(|_| AtomicU32::new(0)).collect();
         Meters {
             inputs: slots(),
+            watched: slots(),
             outputs: slots(),
             mismatch_count: AtomicU64::new(0),
             glitch_count: AtomicU64::new(0),
@@ -76,6 +80,20 @@ impl Meters {
     /// Audio thread: record a peak for aggregate input slot `idx`. Out-of-range is ignored.
     pub fn update_input(&self, idx: usize, p: f32) {
         bump(self.inputs.get(idx), p);
+        bump(self.watched.get(idx), p);
+    }
+
+    /// Largest input peak of the slots that carry source `source_id` (per `layout`) since the last call
+    /// for that source; resets them. Independent of [`Meters::take`].
+    pub fn drain_source_peak(&self, layout: &IoLayout, source_id: &str) -> f32 {
+        layout
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.as_ref().is_some_and(|(id, _)| id == source_id))
+            .filter_map(|(i, _)| self.watched.get(i))
+            .map(|a| f32::from_bits(a.swap(0, Relaxed)))
+            .fold(0.0, f32::max)
     }
 
     /// Audio thread: record a peak for virtual-device channel `ch`. Out-of-range is ignored.
@@ -147,6 +165,29 @@ mod tests {
             Just(-0.0),
             -1.0f32..=1.0,
         ]
+    }
+
+    #[test]
+    fn watch_and_window_drain_independently() {
+        let m = Meters::new();
+        let layout = IoLayout {
+            inputs: vec![
+                None,
+                Some(("a".into(), 0)),
+                Some(("b".into(), 0)),
+                Some(("a".into(), 1)),
+            ],
+            outputs: vec![],
+        };
+        m.update_input(1, 0.25);
+        m.update_input(3, 0.5);
+        m.update_input(2, 0.75);
+        let dev: VirtualDevice = serde_json::from_str(r#"{"id":"v1","name":"v1"}"#).unwrap();
+        m.take(&layout, &dev); // the window reads first and must not hide the peaks from the watch
+        assert_eq!(m.drain_source_peak(&layout, "a"), 0.5);
+        assert_eq!(m.drain_source_peak(&layout, "a"), 0.0, "drained");
+        assert_eq!(m.drain_source_peak(&layout, "b"), 0.75);
+        assert_eq!(m.drain_source_peak(&layout, "none"), 0.0);
     }
 
     proptest! {

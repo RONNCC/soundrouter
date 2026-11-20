@@ -8,7 +8,7 @@ use std::sync::atomic::{
     Ordering::{Acquire, Relaxed, Release},
 };
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -36,9 +36,11 @@ use crate::activity::{self, Activity, Lease};
 use crate::apps::{self, AppGroup};
 use crate::driver;
 use crate::hal::{self, SYSTEM};
+use crate::health::{self, SilenceWatch};
 use crate::layout::{self, LayoutSpec, SCRATCH_LEN, SubDesc};
 use crate::power::PowerWatch;
 use crate::tapring::{TapCounters, TapIn, TapInHandle, TapRx, TapStats, tap_in};
+use sr_core::backend::HogInfo;
 use tapagg::{TapAgg, TapAggSpec, retire_tap, tap_split_enabled};
 
 /// If the hidden companion cannot be found or joined, run on the visible vdev instead.
@@ -223,6 +225,9 @@ struct AggSpec {
     buffer_frames: u32,
     /// One aggregate for the process taps and another for everything else; part of the reuse key.
     split: bool,
+    /// Devices whose input the IOProc reads (see [`input_readers`]); the input streams of every other
+    /// sub-device are switched off. Part of the reuse key.
+    readers: Vec<String>,
 }
 
 struct Vdev {
@@ -265,6 +270,15 @@ struct Vdev {
     _listeners: Vec<Listener>,
     /// Keeps the process out of App Nap while this vdev's IOProc exists.
     _lease: Lease,
+    /// Processor overloads the HAL reported for this vdev's devices and aggregates (both of them).
+    xruns: Arc<AtomicU64>,
+    /// Zero-fill watch of the tapped apps, advanced by the health thread.
+    silence: SilenceWatch,
+    /// The tapped apps play but the taps deliver only zeros (see [`SilenceWatch`]).
+    tap_silent: bool,
+    /// Times a foreign change of the aggregates' buffer size was set back; capped so a size the HAL
+    /// refuses cannot loop.
+    buffer_resets: u32,
 }
 // SAFETY: `cb` is only dereferenced by the IOProc thread; control-side access is limited to the atomics in `Shared`.
 unsafe impl Send for Vdev {}
@@ -367,6 +381,14 @@ enum Event {
         build: u64,
         ok: bool,
     },
+    /// A device (uid) reported a change of `kAudioDevicePropertyDeviceIsAlive`.
+    Dead(String),
+    /// An aggregate of this vdev id changed its IO buffer size.
+    Buffer(String),
+    /// coreaudiod restarted (`kAudioHardwarePropertyServiceRestarted`): every object id is invalid.
+    ServiceRestarted,
+    /// The system default output device changed.
+    DefaultOutput,
     Shutdown,
 }
 
@@ -379,21 +401,17 @@ struct Listener {
 unsafe impl Send for Listener {}
 
 impl Listener {
-    fn new(
+    /// Runs `f` on the HAL's thread whenever the property changes: keep it to a channel send or an
+    /// atomic update.
+    fn with(
         obj: u32,
         sel: u32,
         scope: u32,
-        tx: Sender<Event>,
-        ev: impl Fn() -> Event + 'static,
+        f: impl Fn() + Send + Sync + 'static,
     ) -> Result<Listener> {
         let addr = hal::addr(sel, scope);
-        let tx = Mutex::new(tx);
         let block: RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>)> =
-            RcBlock::new(move |_n: u32, _a: NonNull<AudioObjectPropertyAddress>| {
-                if let Ok(tx) = tx.lock() {
-                    let _ = tx.send(ev());
-                }
-            });
+            RcBlock::new(move |_n: u32, _a: NonNull<AudioObjectPropertyAddress>| f());
         let st = unsafe {
             AudioObjectAddPropertyListenerBlock(
                 obj,
@@ -404,6 +422,29 @@ impl Listener {
         };
         hal::check("AudioObjectAddPropertyListenerBlock", st)?;
         Ok(Listener { obj, addr, block })
+    }
+
+    /// Sends `ev()` to the worker on every change.
+    fn new(
+        obj: u32,
+        sel: u32,
+        scope: u32,
+        tx: Sender<Event>,
+        ev: impl Fn() -> Event + Send + Sync + 'static,
+    ) -> Result<Listener> {
+        let tx = Mutex::new(tx);
+        Listener::with(obj, sel, scope, move || {
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send(ev());
+            }
+        })
+    }
+
+    /// Counts every change in `n` (a relaxed atomic add: safe wherever the HAL calls from).
+    fn counter(obj: u32, sel: u32, n: Arc<AtomicU64>) -> Result<Listener> {
+        Listener::with(obj, sel, kAudioObjectPropertyScopeGlobal, move || {
+            n.fetch_add(1, Relaxed);
+        })
     }
 }
 impl Drop for Listener {
@@ -426,6 +467,87 @@ pub struct Engine {
     listeners: Vec<Listener>,
     /// `None` when the IOKit registration failed (logged); wake recovery is then off.
     power: Option<PowerWatch>,
+    health: Option<HealthThread>,
+}
+
+/// How often the health thread looks at the vdevs.
+const HEALTH_PERIOD: Duration = Duration::from_millis(500);
+
+/// Advances the per-vdev silence watch twice a second (it needs history, so it cannot live in `status`).
+struct HealthThread {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl HealthThread {
+    fn start(inner: Arc<Mutex<Inner>>) -> Result<HealthThread> {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let s = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("sr-audio-health".into())
+            .spawn(move || {
+                let t0 = Instant::now();
+                loop {
+                    {
+                        let (flag, cv) = &*s;
+                        let g = flag.lock().unwrap_or_else(|e| e.into_inner());
+                        let (g, _) = cv
+                            .wait_timeout_while(g, HEALTH_PERIOD, |stop| !*stop)
+                            .unwrap_or_else(|e| e.into_inner());
+                        if *g {
+                            return;
+                        }
+                    }
+                    health_pass(&mut lock(&inner), t0.elapsed());
+                }
+            })?;
+        Ok(HealthThread {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for HealthThread {
+    fn drop(&mut self) {
+        *self.stop.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.stop.1.notify_all();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// One observation of every vdev's taps: is a tapped app playing, and did the taps deliver any signal
+/// since the last pass (the mixer's input meters, drained apart from the window's).
+fn health_pass(g: &mut Inner, now: Duration) {
+    for (id, v) in g.vdevs.iter_mut() {
+        let signal = v
+            .taps
+            .iter()
+            .map(|t| v.meters.drain_source_peak(&v.layout, &t.source_id))
+            .any(|p| p > 0.0);
+        let running = match &v.tapagg {
+            Some(t) => io_state_of(&t.shared) == IoState::Running,
+            None => io_state_of(&v.shared) == IoState::Running,
+        };
+        let playing = v
+            .taps
+            .iter()
+            .any(|t| t.objs.iter().any(|&o| health::process_running_output(o)));
+        let silent = v.silence.observe(now, running && playing, signal);
+        if silent != v.tap_silent {
+            log::warn!(
+                "device '{id}': tapped apps {} (zero-filled taps look like a denied System Audio Recording permission)",
+                if silent {
+                    "play but deliver only silence"
+                } else {
+                    "deliver audio again"
+                }
+            );
+            v.tap_silent = silent;
+        }
+    }
 }
 
 fn lock(m: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
@@ -452,6 +574,20 @@ impl Engine {
                 tx.clone(),
                 || Event::Processes,
             )?,
+            Listener::new(
+                SYSTEM,
+                kAudioHardwarePropertyServiceRestarted,
+                kAudioObjectPropertyScopeGlobal,
+                tx.clone(),
+                || Event::ServiceRestarted,
+            )?,
+            Listener::new(
+                SYSTEM,
+                kAudioHardwarePropertyDefaultOutputDevice,
+                kAudioObjectPropertyScopeGlobal,
+                tx.clone(),
+                || Event::DefaultOutput,
+            )?,
         ];
         let wake_tx = tx.clone();
         let power = PowerWatch::start(move || {
@@ -463,12 +599,16 @@ impl Engine {
         let worker = std::thread::Builder::new()
             .name("sr-audio-events".into())
             .spawn(move || worker(w, rx))?;
+        let health = HealthThread::start(inner.clone())
+            .map_err(|e| log::warn!("no health watch: {e:#}"))
+            .ok();
         Ok(Engine {
             inner,
             tx,
             worker: Some(worker),
             listeners,
             power,
+            health,
         })
     }
 
@@ -588,6 +728,7 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.power = None;
+        self.health = None;
         self.listeners.clear();
         let _ = self.tx.send(Event::Shutdown);
         if let Some(w) = self.worker.take() {
@@ -735,6 +876,10 @@ struct Pending {
     devs: bool,
     procs: bool,
     wake: bool,
+    /// Uids of devices that reported an IsAlive change.
+    dead: BTreeSet<String>,
+    /// Ids of vdevs whose aggregate changed its buffer size.
+    buffers: BTreeSet<String>,
     /// Uids of devices whose nominal rate changed.
     rates: BTreeSet<String>,
     /// `(vdev id, build, started ok)` per finished `AudioDeviceStart`.
@@ -749,6 +894,16 @@ impl Pending {
             Event::Devices => self.devs = true,
             Event::Processes => self.procs = true,
             Event::Wake => self.wake = true,
+            // Every object id went stale: rebuild everything, as after a wake.
+            Event::ServiceRestarted => self.wake = true,
+            // Re-reads the device list, which only acts when it really changed (status is read live).
+            Event::DefaultOutput => self.devs = true,
+            Event::Dead(uid) => {
+                self.dead.insert(uid);
+            }
+            Event::Buffer(id) => {
+                self.buffers.insert(id);
+            }
             Event::Rate(uid) => {
                 self.rates.insert(uid);
             }
@@ -827,6 +982,53 @@ fn rebuild_targets(
         })
         .map(|(id, _)| (*id).to_owned())
         .collect()
+}
+
+/// Vdev ids built on a device that reported a change of `IsAlive` and is no longer alive (or gone).
+/// `vdevs` is `(id, rates at build)`: the uids the vdev's aggregate was built from.
+fn dead_targets(
+    dead: &BTreeSet<String>,
+    vdevs: &[(&str, &[(String, f64)])],
+    alive: &dyn Fn(&str) -> bool,
+) -> BTreeSet<String> {
+    vdevs
+        .iter()
+        .filter(|(_, built)| {
+            built
+                .iter()
+                .any(|(uid, _)| dead.contains(uid) && !alive(uid))
+        })
+        .map(|(id, _)| (*id).to_owned())
+        .collect()
+}
+
+/// Foreign buffer-size changes are set back at most this often per vdev.
+const MAX_BUFFER_RESETS: u32 = 3;
+
+/// Whether a changed aggregate buffer size (`now`) should be set back to `want`: it differs and the
+/// vdev has not used up its resets.
+fn should_reset_buffer(now: Option<u32>, want: u32, resets: u32) -> bool {
+    resets < MAX_BUFFER_RESETS && now.is_some_and(|n| n != want)
+}
+
+/// Puts back the IO buffer size of the aggregates of the vdevs in `ids` where something else changed it.
+fn reassert_buffers(g: &mut Inner, ids: &BTreeSet<String>) {
+    for id in ids {
+        let Some(v) = g.vdevs.get_mut(id) else {
+            continue;
+        };
+        let want = v.spec.buffer_frames;
+        for agg in std::iter::once(v.agg).chain(v.tapagg.as_ref().map(|t| t.agg)) {
+            let now = hal::get_global::<u32>(agg, kAudioDevicePropertyBufferFrameSize).ok();
+            if should_reset_buffer(now, want, v.buffer_resets) {
+                v.buffer_resets += 1;
+                log::info!(
+                    "device '{id}': aggregate buffer changed to {now:?}, setting {want} again"
+                );
+                set_buffer_frames(agg, want);
+            }
+        }
+    }
 }
 
 fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
@@ -926,6 +1128,9 @@ fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
         .iter()
         .map(|(id, v)| (id.as_str(), v.rates.as_slice()))
         .collect();
+    forced.extend(dead_targets(&p.dead, &watched, &|uid| {
+        hal::device_by_uid(uid).is_some_and(hal::is_alive)
+    }));
     let targets = rebuild_targets(p.wake, &p.rates, &forced, &watched, &|uid| {
         hal::device_by_uid(uid).map_or(0.0, hal::nominal_rate)
     });
@@ -940,7 +1145,55 @@ fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
         retire(g.vdevs.remove(id));
         g.recovering.insert(id.clone());
     }
+    reassert_buffers(g, &std::mem::take(&mut p.buffers));
     targets
+}
+
+/// Uids of the physical devices the enabled virtual devices use: device sources and monitors.
+fn used_device_uids(cfg: &Config) -> Vec<String> {
+    let mut uids: Vec<String> = cfg
+        .devices
+        .iter()
+        .filter(|d| d.enabled)
+        .flat_map(|d| plan_subs(d, &|_| true))
+        .filter(|u| !is_own_uid(u))
+        .collect();
+    uids.sort();
+    uids.dedup();
+    uids
+}
+
+/// Devices of the config held in hog mode by another process, and Bluetooth devices that look switched
+/// to the headset profile. Read from the HAL on each call (both are cheap property reads).
+fn device_trouble(g: &Inner) -> (Vec<HogInfo>, Vec<String>) {
+    let (mut hogged, mut hfp) = (Vec::new(), Vec::new());
+    for uid in g.cfg.as_ref().map(used_device_uids).unwrap_or_default() {
+        let Some(dev) = hal::device_by_uid(&uid) else {
+            continue;
+        };
+        let name = hal::device_name(dev);
+        hogged.extend(health::hog_info(dev));
+        let built = g
+            .vdevs
+            .values()
+            .flat_map(|v| v.subs.iter().map(move |s| (v, s)))
+            .find(|(_, s)| s.uid == uid);
+        if let Some((v, s)) = built {
+            let built_out: u32 = s.out_bufs.iter().map(|&c| u32::from(c)).sum();
+            if health::looks_hfp(
+                health::is_bluetooth(health::transport_type(dev)),
+                hal::nominal_rate(dev),
+                u32::from(hal::total_channels(dev, kAudioObjectPropertyScopeOutput)),
+                built_out,
+                !s.in_bufs.is_empty() && v.spec.readers.contains(&uid),
+            ) {
+                hfp.push(name);
+            }
+        }
+    }
+    hfp.sort();
+    hfp.dedup();
+    (hogged, hfp)
 }
 
 impl Backend for Engine {
@@ -1003,8 +1256,23 @@ impl Backend for Engine {
             .filter_map(|(id, v)| Some((id.clone(), tap_delay(v)?)))
             .collect();
         tap_delays.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut xruns: Vec<(String, u64)> = g
+            .vdevs
+            .iter()
+            .map(|(id, v)| (id.clone(), v.xruns.load(Relaxed)))
+            .collect();
+        xruns.sort();
+        let tap_silent: Vec<String> = g
+            .vdevs
+            .iter()
+            .filter(|(_, v)| v.tap_silent)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let (hogged, bluetooth_hfp) = device_trouble(&g);
         drop(g);
         per_device.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut tap_silent = tap_silent;
+        tap_silent.sort();
         EngineStatus {
             per_device,
             warnings: self.warnings(),
@@ -1015,6 +1283,10 @@ impl Backend for Engine {
             delays,
             tap_delays,
             low_power_mode: activity::low_power_mode(),
+            xruns,
+            tap_silent,
+            hogged,
+            bluetooth_hfp,
         }
     }
 
@@ -1338,16 +1610,18 @@ fn apply_vdev(
     let split = tap_split_enabled();
     if let Some(v) = g.vdevs.get_mut(&dev.id) {
         let io = v.io();
-        if keep_in_place(
-            &v.spec,
-            &v.passed_over,
-            io,
-            &cands,
-            &subs,
-            dev.channels,
-            buffer_frames,
-            split,
-        ) {
+        if v.spec.readers == input_readers(dev, &v.spec.main)
+            && keep_in_place(
+                &v.spec,
+                &v.passed_over,
+                io,
+                &cands,
+                &subs,
+                dev.channels,
+                buffer_frames,
+                split,
+            )
+        {
             v.dev = dev.clone();
             match sync_taps(v, groups).and_then(|()| refresh_layout(v)) {
                 Ok(()) => return Ok(()),
@@ -1371,6 +1645,7 @@ fn apply_vdev(
                 channels: dev.channels,
                 buffer_frames,
                 split,
+                readers: input_readers(dev, &main),
             },
             groups,
             g.tx.as_ref(),
@@ -1604,6 +1879,7 @@ fn rebuild_tap_agg(v: &mut Vdev) -> Result<()> {
             stats: &v.tap_stats,
             events: v.events.as_ref(),
             activity: &v.activity,
+            xruns: &v.xruns,
         })?;
         (Some(agg), rx)
     };
@@ -1803,25 +2079,42 @@ fn build_vdev(
     // Format listeners first, then the baseline, then the aggregate: a rate change at any point after the
     // read has an event that compares unequal, one before it is in both the baseline and the aggregate.
     // A stream layout change (an interface switched to another channel mode) reuses the rate event.
-    let listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
+    let xruns = Arc::new(AtomicU64::new(0));
+    let mut listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
         std::iter::once(&spec.main)
             .chain(&spec.subs)
             .filter_map(|uid| Some((uid, hal::device_by_uid(uid)?)))
             .flat_map(|(uid, obj)| {
+                let (u1, u2) = (uid.clone(), uid.clone());
                 [
-                    (
+                    Listener::new(
+                        obj,
                         kAudioDevicePropertyNominalSampleRate,
                         kAudioObjectPropertyScopeGlobal,
+                        tx.clone(),
+                        move || Event::Rate(u1.clone()),
                     ),
-                    (
+                    Listener::new(
+                        obj,
                         kAudioDevicePropertyStreamConfiguration,
                         kAudioObjectPropertyScopeWildcard,
+                        tx.clone(),
+                        move || Event::Rate(u2.clone()),
                     ),
+                    Listener::new(
+                        obj,
+                        kAudioDevicePropertyDeviceIsAlive,
+                        kAudioObjectPropertyScopeGlobal,
+                        tx.clone(),
+                        {
+                            let u = uid.clone();
+                            move || Event::Dead(u.clone())
+                        },
+                    ),
+                    Listener::counter(obj, kAudioDeviceProcessorOverload, xruns.clone()),
                 ]
-                .map(|(sel, scope)| {
-                    let u = uid.clone();
-                    Listener::new(obj, sel, scope, tx.clone(), move || Event::Rate(u.clone()))
-                        .map_err(|e| log::warn!("no format listener on '{uid}': {e:#}"))
+                .map(|l| {
+                    l.map_err(|e| log::warn!("no device listener on '{uid}': {e:#}"))
                         .ok()
                 })
             })
@@ -1908,6 +2201,26 @@ fn build_vdev(
             hal::fourcc(st)
         );
     }
+    if let Some(tx) = events {
+        let id = dev.id.clone();
+        listeners.extend(
+            [
+                Listener::counter(agg, kAudioDeviceProcessorOverload, xruns.clone()),
+                Listener::new(
+                    agg,
+                    kAudioDevicePropertyBufferFrameSize,
+                    kAudioObjectPropertyScopeGlobal,
+                    tx.clone(),
+                    move || Event::Buffer(id.clone()),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|l| {
+                l.map_err(|e| log::warn!("no aggregate listener: {e:#}"))
+                    .ok()
+            }),
+        );
+    }
     let fail = |taps: &[Tap], agg: u32| {
         unsafe { AudioHardwareDestroyAggregateDevice(agg) };
         destroy_taps(taps);
@@ -1977,6 +2290,10 @@ fn build_vdev(
         rates,
         _listeners: listeners,
         _lease: activity.lease(),
+        xruns,
+        silence: SilenceWatch::default(),
+        tap_silent: false,
+        buffer_resets: 0,
         zombies: parked,
         tap_dirty: false,
         warnings: Vec::new(),
@@ -1996,6 +2313,7 @@ fn build_vdev(
         )
     };
     hal::check("AudioDeviceCreateIOProcID", st).context("creating IOProc")?;
+    restrict_inputs(agg, v.proc_id, &v.subs, &v.spec.readers);
     let (proc_id, sh) = (v.proc_id, v.shared.clone());
     // AudioDeviceStart blocks until the TCC prompt is answered: keep it off the caller's thread.
     // `Drop` joins this thread before stopping or destroying anything it uses (F3).
@@ -2155,6 +2473,71 @@ mod tapagg;
 
 #[cfg(test)]
 mod tests;
+
+/// Uids whose input streams the vdev's IOProc reads: the main device (Pass-Thru) and Device sources.
+/// Monitors are only written to.
+fn input_readers(dev: &VirtualDevice, main: &str) -> Vec<String> {
+    let mut r: Vec<String> = std::iter::once(main.to_owned())
+        .chain(dev.sources.iter().filter_map(|s| match &s.kind {
+            SourceKind::Device { uid } => Some(uid.clone()),
+            _ => None,
+        }))
+        .collect();
+    r.sort();
+    r.dedup();
+    r
+}
+
+/// One flag per input stream of the aggregate, in stream order (sub-devices in list order): on for the
+/// streams of a device that is read. An output-only path must not open a Bluetooth headset's microphone:
+/// that would switch it from A2DP to the 16 kHz mono headset profile.
+fn stream_flags(subs: &[SubDesc], readers: &[String]) -> Vec<bool> {
+    subs.iter()
+        .flat_map(|d| {
+            let on = readers.contains(&d.uid);
+            d.in_bufs.iter().map(move |_| on)
+        })
+        .collect()
+}
+
+/// Switches off the aggregate's input streams nobody reads
+/// (`kAudioDevicePropertyIOProcStreamUsage`, input scope, for `proc`). The buffers keep their shape, so
+/// the layout is unchanged. Not fatal: the aggregate then simply opens every input as before.
+fn restrict_inputs(agg: u32, proc: AudioDeviceIOProcID, subs: &[SubDesc], readers: &[String]) {
+    let on = stream_flags(subs, readers);
+    if on.iter().all(|&b| b) {
+        return;
+    }
+    // struct { void* mIOProc; UInt32 mNumberStreams; UInt32 mStreamIsOn[n]; }
+    let mut buf = vec![0u8; 12 + 4 * on.len()];
+    let id = proc.map_or(0usize, |f| f as usize);
+    buf[..8].copy_from_slice(&id.to_ne_bytes());
+    buf[8..12].copy_from_slice(&(on.len() as u32).to_ne_bytes());
+    for (i, &b) in on.iter().enumerate() {
+        buf[12 + 4 * i..16 + 4 * i].copy_from_slice(&u32::from(b).to_ne_bytes());
+    }
+    let a = hal::addr(
+        kAudioDevicePropertyIOProcStreamUsage,
+        kAudioObjectPropertyScopeInput,
+    );
+    // SAFETY: `buf` holds the struct above and outlives the call.
+    let st = unsafe {
+        AudioObjectSetPropertyData(
+            agg,
+            NonNull::from(&a),
+            0,
+            std::ptr::null(),
+            buf.len() as u32,
+            NonNull::from(&mut buf[0]).cast(),
+        )
+    };
+    if st != 0 {
+        log::warn!(
+            "could not switch off unread input streams {on:?}: OSStatus {}",
+            hal::fourcc(st)
+        );
+    }
+}
 
 #[cfg(test)]
 mod status_tests {

@@ -143,11 +143,13 @@ impl TapRx {
         };
         let ch = self.ch;
         let mut avail = cons.slots() / ch;
+        let mut priming = false;
         if !self.primed {
             if avail < n + self.cushion {
                 return false; // still prefilling: not an underrun
             }
             self.primed = true;
+            priming = true;
         }
         if avail < n {
             self.primed = false;
@@ -163,6 +165,15 @@ impl TapRx {
             }
             avail -= drop_frames;
             self.stats.trims.fetch_add(1, Relaxed);
+        } else if priming && avail > self.cushion + n {
+            // The ring fills in whole blocks, so the start rarely lands on `n + cushion` frames:
+            // align it by dropping the surplus oldest frames (a stream start, not a trim), else a
+            // cushion below one block would still run at a whole block.
+            let drop_frames = avail - self.cushion - n;
+            if let Ok(c) = cons.read_chunk(drop_frames * ch) {
+                c.commit_all();
+            }
+            avail -= drop_frames;
         }
         let ok = cons.pop_entire_slice(&mut self.tmp[..n * ch]).is_ok();
         self.stats.level.store((avail - n) as u32, Relaxed);

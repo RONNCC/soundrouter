@@ -49,6 +49,40 @@ fn waits_for_the_cushion_then_plays_in_order() {
 }
 
 #[test]
+fn a_cushion_below_one_block_is_kept_exactly_by_aligning_the_start() {
+    // The tap IOProc delivers whole blocks of B frames; with a cushion of B/4 the first read finds 2B
+    // frames and must drop the surplus, or the ring would keep a whole block for good.
+    let cushion = B / 4;
+    let stats = Arc::new(TapStats::default());
+    let (mut tx, mut rx) = channel(2, cushion, stats.clone());
+    let mut dst = planar();
+    push(&mut tx, 0, B);
+    rx.pull(B, &mut dst, 0);
+    assert!(
+        dst[..B].iter().all(|&x| x == 0.0),
+        "B < B + cushion: still prefilling"
+    );
+    push(&mut tx, B, B);
+    rx.pull(B, &mut dst, 0);
+    assert_eq!(stats.level.load(Relaxed) as usize, cushion);
+    assert_eq!(
+        dst[0],
+        (2 * B - B - cushion) as f32,
+        "the oldest surplus frames went"
+    );
+    for k in 2..30 {
+        push(&mut tx, k * B, B);
+        rx.pull(B, &mut dst, 0);
+        assert_eq!(stats.level.load(Relaxed) as usize, cushion, "block {k}");
+    }
+    assert_eq!(
+        stats.counters(),
+        TapCounters::default(),
+        "an aligned start is not a trim"
+    );
+}
+
+#[test]
 fn a_dry_ring_is_one_underrun_then_silence_until_the_cushion_is_back() {
     let (mut tx, mut rx, stats) = pair(2);
     let mut dst = planar();

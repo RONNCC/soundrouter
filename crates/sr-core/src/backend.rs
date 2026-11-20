@@ -60,6 +60,16 @@ pub fn frames_to_ms(frames: u32, rate_hz: u32) -> f64 {
     f64::from(frames) * 1000.0 / f64::from(rate_hz)
 }
 
+/// A device the config uses that another process holds in hog (exclusive) mode: the HAL hides it from
+/// everyone else, so routes through it carry nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HogInfo {
+    pub device_name: String,
+    /// The process holding it; `None` when the HAL reported a hog but the pid is unusable.
+    pub pid: Option<i32>,
+    pub process_name: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EngineStatus {
     pub per_device: Vec<(String, DeviceState)>,
@@ -79,6 +89,20 @@ pub struct EngineStatus {
     pub tap_delays: Vec<(String, Delay)>,
     /// macOS Low Power Mode is on: clocks drop and small audio delays may glitch.
     pub low_power_mode: bool,
+    /// Processor overloads (`kAudioDeviceProcessorOverload`: an IOProc did not finish in time) the HAL
+    /// reported for each running virtual device's aggregates since it was built; devices without one
+    /// are absent.
+    pub xruns: Vec<(String, u64)>,
+    /// Virtual device ids with a tapped app that is producing audio while the tap delivers nothing but
+    /// zeros for 3 s or more: what a denied System Audio Recording permission looks like (the HAL
+    /// reports no error).
+    pub tap_silent: Vec<String>,
+    /// Devices the config uses that another process holds in hog mode.
+    pub hogged: Vec<HogInfo>,
+    /// Names of Bluetooth devices that look switched to the headset (HFP) profile: a sample rate of
+    /// 24 kHz or less, or fewer output channels than when the engine built its aggregate, while an input
+    /// stream of the device is open.
+    pub bluetooth_hfp: Vec<String>,
 }
 /// Result of a loopback self-test: a tone into a virtual device, read back from its input.
 #[derive(Clone, Debug, PartialEq)]

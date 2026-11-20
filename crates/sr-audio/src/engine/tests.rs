@@ -867,8 +867,89 @@ fn pending_absorbs_events_until_shutdown() {
             wake: true,
             rates: set(&["mic"]),
             io: vec![("v1".into(), 7, false)],
+            ..Pending::default()
         }
     );
+}
+
+#[test]
+fn new_events_land_in_pending() {
+    let mut p = Pending::default();
+    assert!(p.absorb(Event::Dead("mic".into())));
+    assert!(p.absorb(Event::Buffer("v1".into())));
+    assert!(!p.wake && !p.devs);
+    assert!(p.absorb(Event::DefaultOutput));
+    assert!(
+        p.devs,
+        "re-read the device list (acts only on a real change)"
+    );
+    assert!(p.absorb(Event::ServiceRestarted));
+    assert!(
+        p.wake,
+        "coreaudiod restart: every id is stale, rebuild everything"
+    );
+    assert_eq!((p.dead, p.buffers), (set(&["mic"]), set(&["v1"])));
+}
+
+#[test]
+fn a_dead_device_rebuilds_only_the_vdevs_built_on_it() {
+    let (a, b) = (
+        rates(&[("c1", 48e3), ("mic", 48e3)]),
+        rates(&[("c2", 48e3)]),
+    );
+    let v: Vec<(&str, &[(String, f64)])> = vec![("v1", &a), ("v2", &b)];
+    let alive = |u: &str| u != "mic";
+    assert_eq!(dead_targets(&set(&["mic"]), &v, &alive), set(&["v1"]));
+    // an IsAlive event for a device that is alive again (flapped) changes nothing
+    assert!(dead_targets(&set(&["mic"]), &v, &|_| true).is_empty());
+    assert!(dead_targets(&set(&[]), &v, &alive).is_empty());
+}
+
+#[test]
+fn foreign_buffer_changes_are_set_back_a_few_times() {
+    assert!(!should_reset_buffer(Some(256), 256, 0), "our own echo");
+    assert!(should_reset_buffer(Some(512), 256, 0));
+    assert!(should_reset_buffer(Some(512), 256, MAX_BUFFER_RESETS - 1));
+    assert!(
+        !should_reset_buffer(Some(512), 256, MAX_BUFFER_RESETS),
+        "a size the HAL refuses cannot loop"
+    );
+    assert!(!should_reset_buffer(None, 256, 0), "unreadable");
+}
+
+#[test]
+fn used_devices_are_sources_and_enabled_monitors_of_enabled_devices_without_our_own() {
+    let mut on = vdev(
+        vec![
+            src("a", SourceKind::Device { uid: "mic".into() }),
+            src(
+                "b",
+                SourceKind::Device {
+                    uid: format!("{DEVICE_UID_PREFIX}v2"),
+                },
+            ),
+            src("c", SourceKind::PassThru),
+        ],
+        vec![],
+        vec![mon("spk", true), mon("off", false), mon("mic", true)],
+    );
+    on.enabled = true;
+    let mut off = vdev(
+        vec![src(
+            "d",
+            SourceKind::Device {
+                uid: "other".into(),
+            },
+        )],
+        vec![],
+        vec![],
+    );
+    off.enabled = false;
+    let cfg = Config {
+        devices: vec![on, off],
+        ..Config::default()
+    };
+    assert_eq!(used_device_uids(&cfg), ["mic", "spk"]);
 }
 
 #[test]
@@ -995,6 +1076,7 @@ fn spec(main: &str, subs: &[&str]) -> AggSpec {
         channels: 2,
         buffer_frames: 256,
         split: true,
+        readers: vec![],
     }
 }
 
@@ -1329,13 +1411,14 @@ fn tap_cb(
     in_bufs: &[u16],
     out_bufs: &[u16],
     n_taps: usize,
+    cushion: usize,
 ) -> (tapagg::TapCb, crate::tapring::TapRx) {
     let stats = Arc::new(TapStats::default());
     let ch = in_bufs[in_bufs.len() - n_taps..]
         .iter()
         .map(|&c| usize::from(c))
         .sum();
-    let (tx, rx) = crate::tapring::channel(ch, 32, stats.clone());
+    let (tx, rx) = crate::tapring::channel(ch, cushion, stats.clone());
     let shared = Arc::new(Shared {
         expected: AtomicU64::new(layout::shape_key_of(in_bufs, out_bufs)),
         state: AtomicU64::new(1),
@@ -1356,16 +1439,14 @@ fn tap_cb(
 #[test]
 fn the_tap_ioproc_copies_the_tap_buffers_frame_major_and_skips_the_companion_input() {
     let (ins, outs) = ([2u16, 2, 2], [2u16]);
-    let (mut cb, mut rx) = tap_cb(&ins, &outs, 2);
+    let (mut cb, mut rx) = tap_cb(&ins, &outs, 2, 0);
     let frames = 40;
     let mut inp = Bl::new(&ins, frames);
     let mut out = Bl::new(&outs, frames);
     inp.fill(0, |_| 7.0); // the companion's own input: not copied
     inp.fill(1, |i| i as f32); // tap 1: L R interleaved
     inp.fill(2, |i| 1000.0 + i as f32);
-    for _ in 0..3 {
-        unsafe { tapagg::tap_run(&mut cb, inp.ptr(), out.ptr()) };
-    }
+    unsafe { tapagg::tap_run(&mut cb, inp.ptr(), out.ptr()) };
     assert_eq!(cb.stats.counters(), TapCounters::default());
     let mut dst = vec![0.0; 4 * MAX_FRAMES];
     rx.pull(frames, &mut dst, 0);
@@ -1387,7 +1468,7 @@ fn the_tap_ioproc_copies_the_tap_buffers_frame_major_and_skips_the_companion_inp
 
 #[test]
 fn the_tap_ioproc_skips_a_cycle_of_the_wrong_shape_and_counts_it() {
-    let (mut cb, mut rx) = tap_cb(&[2, 2], &[2], 1);
+    let (mut cb, mut rx) = tap_cb(&[2, 2], &[2], 1, 0);
     let mut out = Bl::new(&[2], 16);
     let mut wrong = Bl::new(&[2, 2, 2], 16); // a second tap appeared that the key does not know
     unsafe { tapagg::tap_run(&mut cb, wrong.ptr(), out.ptr()) };
@@ -1402,18 +1483,31 @@ fn the_tap_ioproc_skips_a_cycle_of_the_wrong_shape_and_counts_it() {
 
 #[test]
 fn tap_copy_chunks_cycles_longer_than_max_frames() {
-    let (mut cb, mut rx) = tap_cb(&[2, 2], &[2], 1);
+    // A cushion of everything but one frame: the first one-frame read starts the stream without
+    // dropping any, so the reads below see the chunks in order.
     let frames = MAX_FRAMES + 100;
+    let (mut cb, mut rx) = tap_cb(&[2, 2], &[2], 1, frames - 1);
     let mut inp = Bl::new(&[2, 2], frames);
     let mut out = Bl::new(&[2], frames);
     inp.fill(1, |i| i as f32);
     unsafe { tapagg::tap_run(&mut cb, inp.ptr(), out.ptr()) };
     assert_eq!(cb.stats.counters(), TapCounters::default());
     let mut dst = vec![0.0; 2 * MAX_FRAMES];
+    rx.pull(1, &mut dst, 0);
+    assert_eq!(dst[0], 0.0);
     rx.pull(MAX_FRAMES, &mut dst, 0);
-    assert_eq!(dst[MAX_FRAMES - 1], ((MAX_FRAMES - 1) * 2) as f32);
-    rx.pull(100, &mut dst, 0);
-    assert_eq!(dst[0], (MAX_FRAMES * 2) as f32, "the second chunk follows");
+    assert_eq!(
+        dst[MAX_FRAMES - 1],
+        (MAX_FRAMES * 2) as f32,
+        "frame MAX_FRAMES is in the second chunk"
+    );
+    rx.pull(99, &mut dst, 0);
+    assert_eq!(
+        dst[0],
+        ((MAX_FRAMES + 1) * 2) as f32,
+        "the second chunk follows"
+    );
+    assert_eq!(dst[98], ((MAX_FRAMES + 99) * 2) as f32);
 }
 
 // ---- split vdev bookkeeping ----
@@ -1493,7 +1587,7 @@ mod no_alloc {
     #[test]
     fn tap_copy_and_ring_pop_do_not_allocate() {
         let mut r = split_rig();
-        let (mut tcb, rx) = tap_cb(&[2, 2], &[2], 1);
+        let (mut tcb, rx) = tap_cb(&[2, 2], &[2], 1, 32);
         r.tap.publish(rx);
         let mut tap_in = Bl::new(&[2, 2], SB);
         let mut tap_out = Bl::new(&[2], SB);
@@ -1536,4 +1630,61 @@ mod no_alloc {
         assert!(c.underruns > 0 || c.trims > 0, "the paths ran: {c:?}");
         r.tap.flush();
     }
+}
+
+#[test]
+fn only_the_main_and_device_sources_are_read() {
+    let d = vdev(
+        vec![
+            src("a", SourceKind::Device { uid: "mic".into() }),
+            src("p", SourceKind::PassThru),
+            src("b", SourceKind::Device { uid: "mic".into() }),
+            src(
+                "c",
+                SourceKind::App {
+                    bundle_id: "x".into(),
+                },
+            ),
+        ],
+        vec![],
+        vec![mon("headset", true), mon("mic", true)],
+    );
+    assert_eq!(
+        input_readers(&d, "c1"),
+        ["c1", "mic"],
+        "monitors are written, not read"
+    );
+}
+
+#[test]
+fn unread_devices_lose_their_input_streams_in_stream_order() {
+    let sub = |uid: &str, i: &[u16]| SubDesc {
+        uid: uid.into(),
+        is_main: uid == "c1",
+        in_bufs: i.to_vec(),
+        out_bufs: vec![2],
+    };
+    let subs = [
+        sub("c1", &[2]),
+        sub("headset", &[1]),
+        sub("mic", &[1, 1]),
+        sub("out", &[]),
+    ];
+    let readers = ["c1".to_owned(), "mic".to_owned()];
+    assert_eq!(stream_flags(&subs, &readers), [true, false, true, true]);
+    let all = ["c1".to_owned(), "headset".to_owned(), "mic".to_owned()];
+    assert!(
+        stream_flags(&subs, &all).iter().all(|&b| b),
+        "nothing to switch off"
+    );
+}
+
+#[test]
+fn default_tap_cushion_is_a_quarter_buffer_between_32_and_128_frames() {
+    use tapagg::default_cushion;
+    assert_eq!(
+        [64, 128, 256, 512].map(default_cushion),
+        [32, 32, 64, 128],
+        "64 and 128 frames sit on the floor, 512 on the ceiling"
+    );
 }

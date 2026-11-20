@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use sr_audio::engine::mic_status;
 use sr_audio::{Engine, IoState, apps, driver, loopback, tcc};
-use sr_core::backend::{Backend, TccStatus};
+use sr_core::backend::{Backend, EngineStatus, HogInfo, TccStatus};
 use sr_core::config::Config;
 use sr_core::driver_proto::{DEVICE_UID_PREFIX, DriverDevice, PLUGIN_BUNDLE_ID, companion_uid};
 use sr_core::lock;
@@ -324,8 +324,13 @@ fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>, force: bool
         };
     }
     println!("running {} device(s); Ctrl-C to stop", ids.len());
+    let mut tick = 0u32;
     while !STOP.load(Relaxed) {
         std::thread::sleep(Duration::from_millis(250));
+        tick += 1;
+        if tick % 8 == 1 {
+            println!("{}", health_line(&engine.status()));
+        }
         for id in &ids {
             let st = match engine.io_state(id) {
                 Some(IoState::Running) => "running".to_owned(),
@@ -366,6 +371,41 @@ fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>, force: bool
     Ok(())
 }
 
+fn hog_owner(h: &HogInfo) -> String {
+    match (h.pid, &h.process_name) {
+        (Some(p), Some(n)) => format!("{n} (pid {p})"),
+        (Some(p), None) => format!("pid {p}"),
+        _ => "an unknown process".to_owned(),
+    }
+}
+
+/// One line of the engine's own health (`run` prints it every few seconds, and when it changes).
+fn health_line(s: &EngineStatus) -> String {
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_owned()
+        } else {
+            v.join(", ")
+        }
+    };
+    format!(
+        "health: xruns [{}], silent taps [{}], hogged [{}], bluetooth HFP [{}]",
+        s.xruns
+            .iter()
+            .map(|(id, n)| format!("{id} {n}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        list(&s.tap_silent),
+        list(
+            &s.hogged
+                .iter()
+                .map(|h| format!("{} by {}", h.device_name, hog_owner(h)))
+                .collect::<Vec<_>>()
+        ),
+        list(&s.bluetooth_hfp),
+    )
+}
+
 fn doctor() -> Result<()> {
     let mut healthy = true;
     let ver = sr_audio::os_version();
@@ -403,6 +443,28 @@ fn doctor() -> Result<()> {
             )
         }
     }
+    let (hogged, hfp) = sr_audio::health::scan_all();
+    if hogged.is_empty() {
+        println!("hog mode:        no device is held by another process");
+    }
+    for h in &hogged {
+        println!(
+            "hog mode:        '{}' is held by {}",
+            h.device_name,
+            hog_owner(h)
+        );
+    }
+    if hfp.is_empty() {
+        println!("bluetooth:       no headset in the headset (HFP) profile");
+    }
+    for n in &hfp {
+        println!(
+            "bluetooth:       '{n}' runs at a headset rate (HFP): quality and latency drop while its microphone is open"
+        );
+    }
+    println!(
+        "engine health:   xruns and silent taps belong to a running engine: see the `health:` line of `sr-cli run`"
+    );
     println!("TCC audio capture: {:?}", tcc::audio_capture_status());
     println!("TCC microphone:    {:?}", tcc::microphone_status());
     if !healthy {
