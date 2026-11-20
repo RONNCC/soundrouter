@@ -32,6 +32,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - README: how to route the Mac's microphone into a virtual device.
 
 ### Changed
+- Engine: the mixer's meter peak is an 8-lane vectorised loop, and the vdev output meters skip the finite check where the mixer's clamps prove the samples finite. Same readings bit for bit; one mixer block takes 2x (stereo) to 2.4x (64 channels) less CPU (`cargo test --release -p sr-core --test bench_mix -- --ignored --nocapture`). This adds **no** latency saving (0 ms by design); it only buys deadline headroom for 64-frame buffers.
 - App: the window repaints at the worker's 30 Hz only when a meter value changed (was ~70 fps always: 6.4 % CPU with the window open on 3 routes, now about 1 %), and a hidden window stops reading meters and wakes twice a second instead of 30 times (2.1 % to 1.1 % with the engine running).
 - App: device rows no longer show a green "running" dot; only starting, waiting-for-permission and failed states show a dot (status stays in the tooltip and accessibility label).
 - Packaging: with `SIGN_ID` the driver, `sr-cli`, app and dmg get the hardened runtime and a secure timestamp; the version comes from `[workspace.package]` in `Cargo.toml` and is stamped into both `Info.plist` files; the driver pkg removes an older driver before installing; `notarize.sh` checks signatures first and reports Apple's log on rejection; release workflow checks the tag, attaches checksums and labels unsigned builds. See `docs/RELEASING.md`.

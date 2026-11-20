@@ -32,11 +32,34 @@ impl Default for Meters {
     }
 }
 
+/// Max of `f(|x|)` over `block` with 8 independent lanes, so the loop vectorises: a serial
+/// `fold(max)` is one dependent chain. `max` is exact and order-free for non-NaN values, so the
+/// result equals the serial fold bit for bit.
+#[inline(always)]
+fn lane_max(block: &[f32], f: impl Fn(f32) -> f32) -> f32 {
+    let mut lanes = [0.0f32; 8];
+    let chunks = block.chunks_exact(8);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for (m, x) in lanes.iter_mut().zip(c) {
+            *m = m.max(f(x.abs()));
+        }
+    }
+    let m = tail.iter().fold(0.0f32, |m, x| m.max(f(x.abs())));
+    lanes.iter().fold(m, |m, l| m.max(*l))
+}
+
 /// Peak |x| of a block. NaN and infinite samples are ignored, as the mixer treats them as silence.
+/// Finite values above the mixer's clamp still count (the meter shows the raw input).
 pub fn peak(block: &[f32]) -> f32 {
-    block
-        .iter()
-        .fold(0.0, |m, x| if x.is_finite() { m.max(x.abs()) } else { m })
+    // `a <= MAX` is false for NaN and inf, so this is `is_finite` as a branch-free select.
+    lane_max(block, |a| if a <= f32::MAX { a } else { 0.0 })
+}
+
+/// `peak` for a block that is known to hold only finite samples (skips the select).
+/// Not meaningful otherwise: inf would be reported as inf.
+pub(crate) fn peak_finite(block: &[f32]) -> f32 {
+    lane_max(block, |a| a)
 }
 
 fn bump(slot: Option<&AtomicU32>, p: f32) {
@@ -94,5 +117,100 @@ impl Meters {
             .map(|c| outs.get(c).copied().unwrap_or(0.0))
             .collect();
         MeterReading { sources, channels }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The pre-vectorisation implementation, kept as the oracle.
+    fn peak_ref(block: &[f32]) -> f32 {
+        block
+            .iter()
+            .fold(0.0, |m, x| if x.is_finite() { m.max(x.abs()) } else { m })
+    }
+
+    /// Every bit pattern (NaN payloads, denormals, inf) plus the awkward values by name.
+    fn sample() -> impl Strategy<Value = f32> {
+        prop_oneof![
+            any::<u32>().prop_map(f32::from_bits),
+            Just(f32::NAN),
+            Just(f32::INFINITY),
+            Just(f32::NEG_INFINITY),
+            Just(1e31),
+            Just(-1e31),
+            Just(f32::MAX),
+            Just(-f32::MAX),
+            Just(f32::MIN_POSITIVE / 2.0),
+            Just(-0.0),
+            -1.0f32..=1.0,
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+        #[test]
+        fn peak_matches_reference(block in prop::collection::vec(sample(), 0..70)) {
+            prop_assert_eq!(peak(&block).to_bits(), peak_ref(&block).to_bits());
+        }
+
+        #[test]
+        fn peak_finite_matches_reference_on_finite(
+            block in prop::collection::vec(sample().prop_filter("finite", |x| x.is_finite()), 0..70)
+        ) {
+            prop_assert_eq!(peak_finite(&block).to_bits(), peak_ref(&block).to_bits());
+        }
+    }
+
+    #[test]
+    fn peak_edge_cases() {
+        for n in 0..=17 {
+            for pos in 0..n {
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    let mut b = vec![0.25f32; n];
+                    b[pos] = bad;
+                    let want = if n > 1 { 0.25 } else { 0.0 };
+                    assert_eq!(peak(&b), want, "n={n} pos={pos} bad={bad}");
+                }
+                let mut b = vec![0.0f32; n];
+                b[pos] = -1e31;
+                assert_eq!(peak(&b), 1e31);
+                assert_eq!(peak_finite(&b), 1e31);
+            }
+        }
+        assert_eq!(peak(&[]), 0.0);
+    }
+
+    /// ns per call of the old and new peak. `cargo test --release -p sr-core --lib -- --ignored --nocapture bench_peak`
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_peak() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        fn time(f: fn(&[f32]) -> f32, b: &[f32]) -> f64 {
+            let iters = 200_000;
+            (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        black_box(f(black_box(b)));
+                    }
+                    t.elapsed().as_nanos() as f64 / iters as f64
+                })
+                .fold(f64::MAX, f64::min)
+        }
+        for n in [64, 128, 256] {
+            let b: Vec<f32> = (0..n)
+                .map(|i| ((i * 7) % 101) as f32 / 101.0 - 0.5)
+                .collect();
+            println!(
+                "n {n:>3}: old {:>6.1} ns  guarded {:>6.1} ns  finite {:>6.1} ns",
+                time(peak_ref, &b),
+                time(peak, &b),
+                time(peak_finite, &b)
+            );
+        }
     }
 }

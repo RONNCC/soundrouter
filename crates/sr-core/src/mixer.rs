@@ -1,5 +1,5 @@
 use crate::config::{MAX_CH, MAX_DB, MAX_FRAMES, VirtualDevice};
-use crate::meters::{METER_SLOTS, Meters, peak};
+use crate::meters::{METER_SLOTS, Meters, peak, peak_finite};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -71,7 +71,14 @@ pub struct MixPlan {
     mons: Vec<MonPlan>,
     meter_in: Vec<usize>,
     acc: Vec<f32>, // nch * MAX_FRAMES vdev channel scratch
+    /// Every `acc` row provably holds finite samples, so its meter can skip the finite check.
+    acc_finite: bool,
 }
+
+/// Taps into one vdev channel up to which `acc` stays finite: each tap adds at most
+/// `SAMPLE_LIMIT` x 15.85 (+24 dB source gain) and the device stage multiplies by at most
+/// 15.85 more, so 2^16 x 1e30 x 15.85^2 = 1.6e37 < f32::MAX (3.4e38). Valid configs have <= 64.
+const MAX_FINITE_TAPS: usize = 1 << 16;
 
 /// Finite samples are clamped here so that even 64 taps through three +24 dB stages (x15.85 each) cannot overflow to inf.
 const SAMPLE_LIMIT: f32 = 1e30;
@@ -184,6 +191,8 @@ impl MixPlan {
             .filter(|(i, s)| s.is_some() && *i < METER_SLOTS)
             .map(|(i, _)| i)
             .collect();
+        let acc_finite =
+            (0..nch).all(|c| taps.iter().filter(|t| t.vch == c).count() <= MAX_FINITE_TAPS);
         MixPlan {
             in_len: layout.inputs.len(),
             out_len: layout.outputs.len(),
@@ -195,6 +204,7 @@ impl MixPlan {
             mons,
             meter_in,
             acc: vec![0.0; nch * MAX_FRAMES],
+            acc_finite,
         }
     }
 
@@ -240,7 +250,12 @@ impl MixPlan {
         for c in 0..self.nch {
             let ch = &mut self.acc[c * MAX_FRAMES..][..n];
             ramp_scale(ch, self.dev_gain.cur, self.dev_gain.target);
-            meters.update_output(c, peak(ch));
+            let p = if self.acc_finite {
+                peak_finite(ch)
+            } else {
+                peak(ch)
+            };
+            meters.update_output(c, p);
         }
         self.dev_gain.cur = self.dev_gain.target;
         for &(c, slot) in &self.dev_out {
