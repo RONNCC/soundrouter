@@ -7,7 +7,7 @@ use crate::tapring::{TapRx, TapStats, TapTx};
 
 /// Env: `0` builds one aggregate per vdev with the taps inside, as before the split.
 pub const TAP_SPLIT_ENV: &str = "SR_TAP_SPLIT";
-/// Env: frames of cushion the ring keeps between the two aggregates (default: the IO buffer).
+/// Env: frames of cushion the ring keeps between the two aggregates (default: the IO buffer; rounded up to whole tap blocks, 0 = no margin).
 pub const TAP_CUSHION_ENV: &str = "SR_TAP_CUSHION";
 /// What an unset [`TAP_SPLIT_ENV`] means.
 pub const TAP_SPLIT_DEFAULT: bool = true;
@@ -37,13 +37,12 @@ fn cushion_frames(buffer_frames: u32) -> usize {
         .unwrap_or_else(|| default_cushion(buffer_frames))
 }
 
-/// The cushion between the tap IOProc and the main IOProc, which run on one clock, so it only has to
-/// cover how late one thread wakes against the other: a quarter of the IO buffer, but at least 32 frames
-/// (0.67 ms at 48 kHz) and at most 128. Measured with 32 / 64 / 128 / 256 frames (0 underruns, 0 trims in
-/// 4 restarts each, and under 32 CPU burners), it shortens the apps' path by one buffer minus the
-/// cushion: 37.3 ms (cushion = one 256 buffer, the old rule) -> 33.3 ms at 64 frames.
+/// The cushion between the tap IOProc and the main IOProc: one IO buffer, which is the tap block. The
+/// tap IOProc pushes whole blocks and the main IOProc pulls whole blocks, so a smaller cushion leaves no
+/// margin at all and one late tap cycle loses a whole block (`crate::tapring::keep_frames` rounds any
+/// cushion up to whole blocks; only `SR_TAP_CUSHION=0` keeps nothing, for measuring).
 pub(super) fn default_cushion(buffer_frames: u32) -> usize {
-    (buffer_frames as usize / 4).clamp(32, 128)
+    buffer_frames as usize
 }
 
 /// Audio-thread state of the tap IOProc.
@@ -346,6 +345,7 @@ pub(super) unsafe fn tap_run(
         cb.stats.mismatches.fetch_add(1, Relaxed);
         return;
     }
+    cb.tx.set_block(frames);
     let mut start = 0;
     while start < frames {
         let n = (frames - start).min(MAX_FRAMES);

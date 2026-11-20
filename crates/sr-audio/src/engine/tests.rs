@@ -1483,31 +1483,29 @@ fn the_tap_ioproc_skips_a_cycle_of_the_wrong_shape_and_counts_it() {
 
 #[test]
 fn tap_copy_chunks_cycles_longer_than_max_frames() {
-    // A cushion of everything but one frame: the first one-frame read starts the stream without
-    // dropping any, so the reads below see the chunks in order.
+    // Two cycles, a cushion of one cycle: the first one-frame read drops the surplus oldest frames
+    // and leaves exactly the second cycle, so the reads below see its two chunks in order.
     let frames = MAX_FRAMES + 100;
-    let (mut cb, mut rx) = tap_cb(&[2, 2], &[2], 1, frames - 1);
+    let (mut cb, mut rx) = tap_cb(&[2, 2], &[2], 1, frames);
     let mut inp = Bl::new(&[2, 2], frames);
     let mut out = Bl::new(&[2], frames);
     inp.fill(1, |i| i as f32);
-    unsafe { tapagg::tap_run(&mut cb, inp.ptr(), out.ptr()) };
+    for _ in 0..2 {
+        unsafe { tapagg::tap_run(&mut cb, inp.ptr(), out.ptr()) };
+    }
     assert_eq!(cb.stats.counters(), TapCounters::default());
     let mut dst = vec![0.0; 2 * MAX_FRAMES];
     rx.pull(1, &mut dst, 0);
-    assert_eq!(dst[0], 0.0);
-    rx.pull(MAX_FRAMES, &mut dst, 0);
-    assert_eq!(
-        dst[MAX_FRAMES - 1],
-        (MAX_FRAMES * 2) as f32,
-        "frame MAX_FRAMES is in the second chunk"
-    );
+    assert_eq!(dst[0], ((frames - 1) * 2) as f32, "last frame of cycle 1");
+    rx.pull(MAX_FRAMES - 10, &mut dst, 0);
+    assert_eq!(dst[0], 0.0, "cycle 2 starts");
     rx.pull(99, &mut dst, 0);
     assert_eq!(
-        dst[0],
-        ((MAX_FRAMES + 1) * 2) as f32,
-        "the second chunk follows"
+        dst[10],
+        (MAX_FRAMES * 2) as f32,
+        "frame MAX_FRAMES is the first of the second chunk"
     );
-    assert_eq!(dst[98], ((MAX_FRAMES + 99) * 2) as f32);
+    assert_eq!(dst[98], ((MAX_FRAMES + 88) * 2) as f32);
 }
 
 // ---- split vdev bookkeeping ----
@@ -1680,11 +1678,11 @@ fn unread_devices_lose_their_input_streams_in_stream_order() {
 }
 
 #[test]
-fn default_tap_cushion_is_a_quarter_buffer_between_32_and_128_frames() {
+fn default_tap_cushion_is_one_buffer() {
     use tapagg::default_cushion;
     assert_eq!(
         [64, 128, 256, 512].map(default_cushion),
-        [32, 32, 64, 128],
-        "64 and 128 frames sit on the floor, 512 on the ceiling"
+        [64, 128, 256, 512],
+        "one tap block: a late tap cycle still finds a whole block"
     );
 }

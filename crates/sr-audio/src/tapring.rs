@@ -32,6 +32,8 @@ pub struct TapStats {
     pub mismatches: AtomicU64,
     /// Frames left in the ring after the receiver's last read (the cushion it actually runs at).
     pub level: AtomicU32,
+    /// Frames of the tap IOProc's latest cycle: the block the ring fills in.
+    pub block: AtomicU32,
 }
 
 /// A snapshot of [`TapStats`].
@@ -67,7 +69,7 @@ pub struct TapTx {
 pub struct TapRx {
     cons: Option<Consumer<f32>>,
     ch: usize,
-    /// Frames to keep in the ring after each read.
+    /// Requested margin; the frames kept are [`keep_frames`] of it.
     cushion: usize,
     /// False until `cushion` frames are buffered, and again after an underrun.
     primed: bool,
@@ -75,8 +77,16 @@ pub struct TapRx {
     stats: Arc<TapStats>,
 }
 
+/// Frames the receiver keeps in the ring after each read. The tap IOProc pushes whole blocks and the
+/// main IOProc pulls whole blocks, so a jitter margin is only real when it is at least one block: with
+/// less, one late tap cycle leaves the ring short and the whole block is lost. `cushion` is therefore
+/// rounded up to a multiple of `block`; `0` stays `0` (no margin: every late cycle is an underrun).
+pub fn keep_frames(cushion: usize, block: usize) -> usize {
+    cushion.next_multiple_of(block.max(1))
+}
+
 /// A connected pair for `ch` interleaved channels per frame. `cushion` is the frames of margin the
-/// receiver keeps; the ring holds [`RING_PERIODS`] times that (at least `MAX_FRAMES` frames, so a
+/// receiver keeps, rounded up to whole tap blocks ([`keep_frames`]); the ring holds [`RING_PERIODS`] times that (at least `MAX_FRAMES` frames, so a
 /// chunked cycle always fits).
 pub fn channel(ch: usize, cushion: usize, stats: Arc<TapStats>) -> (TapTx, TapRx) {
     let cap = (RING_PERIODS * cushion).max(2 * MAX_FRAMES) * ch;
@@ -108,6 +118,12 @@ impl TapTx {
     /// then [`TapTx::push`].
     pub fn stage(&mut self) -> &mut [f32] {
         &mut self.stage
+    }
+
+    /// Frames of the tap IOProc cycle that [`TapTx::push`] chunks come from (a cycle can be longer
+    /// than `MAX_FRAMES`): the block size the receiver's margin is rounded up to.
+    pub fn set_block(&self, frames: usize) {
+        self.stats.block.store(frames as u32, Relaxed);
     }
 
     /// Appends the first `frames` staged frames. A full ring drops the whole block and counts it.
@@ -143,9 +159,10 @@ impl TapRx {
         };
         let ch = self.ch;
         let mut avail = cons.slots() / ch;
+        let keep = keep_frames(self.cushion, self.stats.block.load(Relaxed) as usize);
         let mut priming = false;
         if !self.primed {
-            if avail < n + self.cushion {
+            if avail < n + keep {
                 return false; // still prefilling: not an underrun
             }
             self.primed = true;
@@ -158,18 +175,17 @@ impl TapRx {
         }
         // More than two blocks beyond the cushion means a burst or a stalled reader: drop the oldest
         // frames rather than carry the extra delay for good.
-        if avail > self.cushion + 3 * n {
-            let drop_frames = avail - self.cushion - n;
+        if avail > keep + 3 * n {
+            let drop_frames = avail - keep - n;
             if let Ok(c) = cons.read_chunk(drop_frames * ch) {
                 c.commit_all();
             }
             avail -= drop_frames;
             self.stats.trims.fetch_add(1, Relaxed);
-        } else if priming && avail > self.cushion + n {
-            // The ring fills in whole blocks, so the start rarely lands on `n + cushion` frames:
-            // align it by dropping the surplus oldest frames (a stream start, not a trim), else a
-            // cushion below one block would still run at a whole block.
-            let drop_frames = avail - self.cushion - n;
+        } else if priming && avail > keep + n {
+            // A start that landed on more than `n + keep` frames: drop the surplus oldest frames
+            // (a stream start, not a trim) so the margin is the one asked for, not extra delay.
+            let drop_frames = avail - keep - n;
             if let Ok(c) = cons.read_chunk(drop_frames * ch) {
                 c.commit_all();
             }
