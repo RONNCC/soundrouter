@@ -268,6 +268,8 @@ struct Vdev {
     rates: Vec<(String, f64)>,
     /// Rate listeners on the main and sub devices; removed with the vdev.
     _listeners: Vec<Listener>,
+    /// Listeners on V's volume and mute controls, feeding the mixer's `SysGain`; empty without controls.
+    _sysvol: Vec<Listener>,
     /// Keeps the process out of App Nap while this vdev's IOProc exists.
     _lease: Lease,
     /// Processor overloads the HAL reported for this vdev's devices and aggregates (both of them).
@@ -2262,6 +2264,7 @@ fn build_vdev(
     }
     let meters = Arc::new(Meters::new());
     let (mx, handle) = mixer(meters.clone());
+    let sysvol = sysvol::follow(&format!("{DEVICE_UID_PREFIX}{}", dev.id), handle.sys_gain());
     let split = spec.split;
     let tap_stats = Arc::new(TapStats::default());
     let (tap_cb, tap_handle) = tap_in(tap_stats.clone());
@@ -2310,6 +2313,7 @@ fn build_vdev(
         build: seq,
         rates,
         _listeners: listeners,
+        _sysvol: sysvol,
         _lease: activity.lease(),
         xruns,
         silence: SilenceWatch::default(),
@@ -2496,6 +2500,7 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
     }
 }
 
+mod sysvol;
 mod tapagg;
 
 #[cfg(test)]

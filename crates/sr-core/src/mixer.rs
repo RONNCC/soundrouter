@@ -1,12 +1,12 @@
-use crate::config::{MAX_CH, MAX_DB, MAX_FRAMES, VirtualDevice};
+use crate::config::{MAX_CH, MAX_DB, MAX_FRAMES, SourceKind, VirtualDevice};
 use crate::meters::{METER_SLOTS, Meters, peak, peak_finite};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+use std::sync::atomic::{AtomicPtr, AtomicU32};
 
 pub enum OutPort {
     Device(u16),
@@ -53,6 +53,24 @@ struct Tap {
     in_idx: usize,
     vch: usize,
     src: usize,
+    /// An app source: its level also follows V's system volume (`SysGain`).
+    follow: bool,
+}
+
+/// V's own volume and mute control (what the volume keys move while V is the system output) as one linear
+/// gain, published by the engine's property listener and read by the audio thread once per block.
+/// The driver applies the control to what apps play into V; app taps never pass through V, so the mixer
+/// applies it to them. Unity until a control reports.
+pub struct SysGain(AtomicU32);
+impl SysGain {
+    pub fn set(&self, gain: f32) {
+        self.0.store(gain.to_bits(), Relaxed);
+    }
+    /// 0..=1; a NaN or negative value reads as unity or silence so a bad publish cannot blow up the output.
+    fn get(&self) -> f32 {
+        let g = f32::from_bits(self.0.load(Relaxed));
+        if g.is_nan() { 1.0 } else { g.clamp(0.0, 1.0) }
+    }
 }
 struct MonPlan {
     gain: Gain,
@@ -67,6 +85,9 @@ pub struct MixPlan {
     srcs: Vec<Gain>,
     taps: Vec<Tap>,
     dev_gain: Gain,
+    /// Applied and wanted `SysGain` of this block, for the taps that follow it; ramped like every gain.
+    sys_cur: f32,
+    sys_target: f32,
     dev_out: Vec<(usize, usize)>, // (vdev ch, output slot)
     mons: Vec<MonPlan>,
     meter_in: Vec<usize>,
@@ -148,7 +169,12 @@ impl MixPlan {
                     && *id == w.source
                     && *ch == w.src_ch
                 {
-                    taps.push(Tap { in_idx, vch, src });
+                    taps.push(Tap {
+                        in_idx,
+                        vch,
+                        src,
+                        follow: matches!(dev.sources[src].kind, SourceKind::App { .. }),
+                    });
                 }
             }
         }
@@ -200,6 +226,8 @@ impl MixPlan {
             srcs,
             taps,
             dev_gain: Gain::new("dev", dev.volume_db, dev.muted),
+            sys_cur: 1.0,
+            sys_target: 1.0,
             dev_out,
             mons,
             meter_in,
@@ -212,6 +240,7 @@ impl MixPlan {
     fn inherit(&mut self, old: &MixPlan) {
         self.srcs.iter_mut().for_each(|g| g.inherit(&old.srcs));
         self.dev_gain.cur = old.dev_gain.cur;
+        self.sys_cur = old.sys_cur;
         for m in &mut self.mons {
             if let Some(o) = old.mons.iter().find(|o| o.gain.key == m.gain.key) {
                 m.gain.cur = o.gain.cur;
@@ -234,13 +263,19 @@ impl MixPlan {
         }
         for t in &self.taps {
             let g = &self.srcs[t.src];
+            let (s0, s1) = if t.follow {
+                (self.sys_cur, self.sys_target)
+            } else {
+                (1.0, 1.0)
+            };
             ramp_add(
                 &mut self.acc[t.vch * MAX_FRAMES..][..n],
                 &inputs[t.in_idx][off..end],
-                g.cur,
-                g.target,
+                g.cur * s0,
+                g.target * s1,
             );
         }
+        self.sys_cur = self.sys_target;
         for g in &mut self.srcs {
             g.cur = g.target;
         }
@@ -313,23 +348,31 @@ pub struct Mixer {
     slot: Arc<Mailbox>,
     ret: Producer<Box<MixPlan>>,
     meters: Arc<Meters>,
+    sys: Arc<SysGain>,
 }
 /// Control side.
 pub struct MixerHandle {
     slot: Arc<Mailbox>,
     ret: Consumer<Box<MixPlan>>,
+    sys: Arc<SysGain>,
 }
 pub fn mixer(meters: Arc<Meters>) -> (Mixer, MixerHandle) {
     let slot = Arc::new(Mailbox(AtomicPtr::new(null_mut())));
     let (ret, back) = RingBuffer::new(RETURN_QUEUE);
+    let sys = Arc::new(SysGain(AtomicU32::new(1.0f32.to_bits())));
     (
         Mixer {
             plan: None,
             slot: slot.clone(),
             ret,
             meters,
+            sys: sys.clone(),
         },
-        MixerHandle { slot, ret: back },
+        MixerHandle {
+            slot,
+            ret: back,
+            sys,
+        },
     )
 }
 impl MixerHandle {
@@ -338,6 +381,11 @@ impl MixerHandle {
     pub fn set_plan(&mut self, p: MixPlan) {
         self.flush();
         drop(self.slot.put(Box::new(p)));
+    }
+
+    /// Where the control side publishes V's volume/mute gain for the taps that follow it.
+    pub fn sys_gain(&self) -> Arc<SysGain> {
+        self.sys.clone()
     }
 
     /// Drop plans returned by the audio thread.
@@ -351,6 +399,9 @@ impl Mixer {
             if let Some(old) = self.plan.take() {
                 new.inherit(&old);
                 let _ = self.ret.push(old); // full return queue: drops here, cannot happen by sizing
+            } else {
+                // Nothing applied yet: start at V's level, do not fade in from unity.
+                new.sys_cur = self.sys.get();
             }
             self.plan = Some(new);
         }
@@ -380,6 +431,7 @@ impl Mixer {
             self.meters.mismatch_count.fetch_add(1, Relaxed);
             return;
         }
+        plan.sys_target = self.sys.get();
         let mut off = 0;
         while off < frames {
             let n = (frames - off).min(MAX_FRAMES);
