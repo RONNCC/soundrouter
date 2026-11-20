@@ -1,12 +1,13 @@
 use crate::config::{MAX_CH, MAX_DB, MAX_FRAMES, SourceKind, VirtualDevice};
 use crate::meters::{METER_SLOTS, Meters, peak, peak_finite};
 use rtrb::{Consumer, Producer, RingBuffer};
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
-use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Relaxed};
 use std::sync::atomic::{AtomicPtr, AtomicU32};
+use std::sync::{Arc, Mutex};
 
 pub enum OutPort {
     Device(u16),
@@ -53,22 +54,41 @@ struct Tap {
     in_idx: usize,
     vch: usize,
     src: usize,
-    /// An app source: its level also follows V's system volume (`SysGain`).
-    follow: bool,
+    /// Index into `MixPlan::apps` for an app source: its level also follows V's system volume (`SysGain`).
+    app: Option<usize>,
 }
 
-/// V's own volume and mute control (what the volume keys move while V is the system output) as one linear
-/// gain, published by the engine's property listener and read by the audio thread once per block.
+/// What V's volume and mute (what the volume keys move while V is the system output) do to each app source,
+/// as one linear gain per source id: V's gain while the app plays to V, unity otherwise. The engine's
+/// listeners publish it; the audio thread loads one atomic per app source per block.
 /// The driver applies the control to what apps play into V; app taps never pass through V, so the mixer
-/// applies it to them. Unity until a control reports.
-pub struct SysGain(AtomicU32);
+/// applies it to them. Unity until published.
+#[derive(Default)]
+pub struct SysGain(Mutex<HashMap<String, Arc<AtomicU32>>>);
 impl SysGain {
-    pub fn set(&self, gain: f32) {
-        self.0.store(gain.to_bits(), Relaxed);
+    pub fn set(&self, source: &str, gain: f32) {
+        self.cell(source).store(gain.to_bits(), Relaxed);
     }
+    fn cell(&self, source: &str) -> Arc<AtomicU32> {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(source.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU32::new(1.0f32.to_bits())))
+            .clone()
+    }
+}
+
+/// One app source's `SysGain` cell as the plan applies it, ramped like every gain.
+struct AppSys {
+    key: u64,
+    id: String,
+    cell: Arc<AtomicU32>,
+    cur: f32,
+    target: f32,
+}
+impl AppSys {
     /// 0..=1; a NaN or negative value reads as unity or silence so a bad publish cannot blow up the output.
-    fn get(&self) -> f32 {
-        let g = f32::from_bits(self.0.load(Relaxed));
+    fn read(&self) -> f32 {
+        let g = f32::from_bits(self.cell.load(Relaxed));
         if g.is_nan() { 1.0 } else { g.clamp(0.0, 1.0) }
     }
 }
@@ -85,9 +105,8 @@ pub struct MixPlan {
     srcs: Vec<Gain>,
     taps: Vec<Tap>,
     dev_gain: Gain,
-    /// Applied and wanted `SysGain` of this block, for the taps that follow it; ramped like every gain.
-    sys_cur: f32,
-    sys_target: f32,
+    /// App sources, see [`AppSys`].
+    apps: Vec<AppSys>,
     dev_out: Vec<(usize, usize)>, // (vdev ch, output slot)
     mons: Vec<MonPlan>,
     meter_in: Vec<usize>,
@@ -153,6 +172,18 @@ impl MixPlan {
             .iter()
             .map(|s| Gain::new(&s.id, s.volume_db, s.muted))
             .collect();
+        let apps: Vec<AppSys> = dev
+            .sources
+            .iter()
+            .filter(|s| matches!(s.kind, SourceKind::App { .. }))
+            .map(|s| AppSys {
+                key: Gain::new(&s.id, 0.0, false).key,
+                id: s.id.clone(),
+                cell: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+                cur: 1.0,
+                target: 1.0,
+            })
+            .collect();
         let mut taps = Vec::new();
         for w in &dev.wires {
             let (Some(src), vch) = (
@@ -173,7 +204,7 @@ impl MixPlan {
                         in_idx,
                         vch,
                         src,
-                        follow: matches!(dev.sources[src].kind, SourceKind::App { .. }),
+                        app: apps.iter().position(|a| a.id == dev.sources[src].id),
                     });
                 }
             }
@@ -226,8 +257,7 @@ impl MixPlan {
             srcs,
             taps,
             dev_gain: Gain::new("dev", dev.volume_db, dev.muted),
-            sys_cur: 1.0,
-            sys_target: 1.0,
+            apps,
             dev_out,
             mons,
             meter_in,
@@ -240,7 +270,11 @@ impl MixPlan {
     fn inherit(&mut self, old: &MixPlan) {
         self.srcs.iter_mut().for_each(|g| g.inherit(&old.srcs));
         self.dev_gain.cur = old.dev_gain.cur;
-        self.sys_cur = old.sys_cur;
+        for a in &mut self.apps {
+            if let Some(o) = old.apps.iter().find(|o| o.key == a.key) {
+                a.cur = o.cur;
+            }
+        }
         for m in &mut self.mons {
             if let Some(o) = old.mons.iter().find(|o| o.gain.key == m.gain.key) {
                 m.gain.cur = o.gain.cur;
@@ -263,11 +297,9 @@ impl MixPlan {
         }
         for t in &self.taps {
             let g = &self.srcs[t.src];
-            let (s0, s1) = if t.follow {
-                (self.sys_cur, self.sys_target)
-            } else {
-                (1.0, 1.0)
-            };
+            let (s0, s1) = t
+                .app
+                .map_or((1.0, 1.0), |i| (self.apps[i].cur, self.apps[i].target));
             ramp_add(
                 &mut self.acc[t.vch * MAX_FRAMES..][..n],
                 &inputs[t.in_idx][off..end],
@@ -275,7 +307,9 @@ impl MixPlan {
                 g.target * s1,
             );
         }
-        self.sys_cur = self.sys_target;
+        for a in &mut self.apps {
+            a.cur = a.target;
+        }
         for g in &mut self.srcs {
             g.cur = g.target;
         }
@@ -348,7 +382,6 @@ pub struct Mixer {
     slot: Arc<Mailbox>,
     ret: Producer<Box<MixPlan>>,
     meters: Arc<Meters>,
-    sys: Arc<SysGain>,
 }
 /// Control side.
 pub struct MixerHandle {
@@ -359,14 +392,13 @@ pub struct MixerHandle {
 pub fn mixer(meters: Arc<Meters>) -> (Mixer, MixerHandle) {
     let slot = Arc::new(Mailbox(AtomicPtr::new(null_mut())));
     let (ret, back) = RingBuffer::new(RETURN_QUEUE);
-    let sys = Arc::new(SysGain(AtomicU32::new(1.0f32.to_bits())));
+    let sys = Arc::new(SysGain::default());
     (
         Mixer {
             plan: None,
             slot: slot.clone(),
             ret,
             meters,
-            sys: sys.clone(),
         },
         MixerHandle {
             slot,
@@ -378,12 +410,17 @@ pub fn mixer(meters: Arc<Meters>) -> (Mixer, MixerHandle) {
 impl MixerHandle {
     /// Publish `p`; the audio thread applies it at its next block, replacing any plan it has
     /// not picked up yet. Plans the audio thread retired come back on a ring and drop here.
-    pub fn set_plan(&mut self, p: MixPlan) {
+    pub fn set_plan(&mut self, mut p: MixPlan) {
         self.flush();
+        for a in &mut p.apps {
+            a.cell = self.sys.cell(&a.id);
+            a.target = a.read();
+            a.cur = a.target;
+        }
         drop(self.slot.put(Box::new(p)));
     }
 
-    /// Where the control side publishes V's volume/mute gain for the taps that follow it.
+    /// Where the control side publishes V's volume/mute gain per app source.
     pub fn sys_gain(&self) -> Arc<SysGain> {
         self.sys.clone()
     }
@@ -401,7 +438,7 @@ impl Mixer {
                 let _ = self.ret.push(old); // full return queue: drops here, cannot happen by sizing
             } else {
                 // Nothing applied yet: start at V's level, do not fade in from unity.
-                new.sys_cur = self.sys.get();
+                new.apps.iter_mut().for_each(|a| a.cur = a.read());
             }
             self.plan = Some(new);
         }
@@ -431,7 +468,7 @@ impl Mixer {
             self.meters.mismatch_count.fetch_add(1, Relaxed);
             return;
         }
-        plan.sys_target = self.sys.get();
+        plan.apps.iter_mut().for_each(|a| a.target = a.read());
         let mut off = 0;
         while off < frames {
             let n = (frames - off).min(MAX_FRAMES);

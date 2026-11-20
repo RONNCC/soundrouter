@@ -455,14 +455,14 @@ fn app_dev() -> VirtualDevice {
 #[test]
 fn system_gain_scales_app_sources_from_the_first_sample_and_leaves_other_sources_alone() {
     let (mut m, h, _) = setup(&app_dev(), &layout());
-    h.sys_gain().set(0.5);
+    h.sys_gain().set("s1", 0.5);
     let o = run(&mut m, &ones(16), 4, 16);
     assert!(
         o[0].iter().all(|x| *x == 0.5) && o[1].iter().all(|x| *x == 0.25),
         "app: no fade-in"
     );
     let (mut m, h, _) = setup(&dev(), &layout());
-    h.sys_gain().set(0.0);
+    h.sys_gain().set("s1", 0.0);
     let o = run(&mut m, &ones(16), 4, 16);
     assert!(
         o[0].iter().all(|x| *x == 1.0),
@@ -476,7 +476,7 @@ fn system_gain_changes_ramp_without_a_step_and_survive_a_plan_swap() {
     let n = 64;
     let ins = vec![vec![1.0; n], vec![1.0; n]];
     run(&mut m, &ins, 4, n);
-    h.sys_gain().set(0.0);
+    h.sys_gain().set("s1", 0.0);
     let step = 1.0 / n as f32;
     let mut prev = 1.0;
     for x in &run(&mut m, &ins, 4, n)[0] {
@@ -489,14 +489,32 @@ fn system_gain_changes_ramp_without_a_step_and_survive_a_plan_swap() {
     h.set_plan(MixPlan::compile(&app_dev(), &layout()));
     assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 0.0));
     // Unmute ramps up from silence, and the source's own gain still multiplies.
-    h.sys_gain().set(1.0);
+    h.sys_gain().set("s1", 1.0);
     let o = run(&mut m, &ins, 4, n);
     assert!(o[0][0] <= step + 1e-5 && close(o[0][n - 1], 1.0));
     // Garbage published by the control side cannot blow up the output.
-    h.sys_gain().set(f32::NAN);
+    h.sys_gain().set("s1", f32::NAN);
     run(&mut m, &ins, 4, n);
     assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 1.0));
-    h.sys_gain().set(1e9);
+    h.sys_gain().set("s1", 1e9);
     run(&mut m, &ins, 4, n);
     assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 1.0));
+}
+
+#[test]
+fn system_gain_is_per_source() {
+    let (mut m, h, _) = setup(&app_dev(), &layout());
+    h.sys_gain().set("other", 0.0);
+    let o = run(&mut m, &ones(16), 4, 16);
+    assert!(
+        o[0].iter().all(|x| *x == 1.0),
+        "another source's gain is not this source's"
+    );
+    h.sys_gain().set("s1", 0.5);
+    h.sys_gain().set("s1", 1.0);
+    let o = run(&mut m, &ones(16), 4, 16);
+    assert!(
+        o[0].iter().all(|x| close(*x, 1.0)),
+        "back to unity: the app plays elsewhere"
+    );
 }

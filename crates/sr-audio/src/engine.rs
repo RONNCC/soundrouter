@@ -268,8 +268,8 @@ struct Vdev {
     rates: Vec<(String, f64)>,
     /// Rate listeners on the main and sub devices; removed with the vdev.
     _listeners: Vec<Listener>,
-    /// Listeners on V's volume and mute controls, feeding the mixer's `SysGain`; empty without controls.
-    _sysvol: Vec<Listener>,
+    /// V's volume and mute (and whether each app plays to V) feeding the mixer's per-source `SysGain`.
+    sysvol: sysvol::SysVol,
     /// Keeps the process out of App Nap while this vdev's IOProc exists.
     _lease: Lease,
     /// Processor overloads the HAL reported for this vdev's devices and aggregates (both of them).
@@ -1767,6 +1767,13 @@ fn app_sources(dev: &VirtualDevice) -> impl Iterator<Item = (&str, &str, bool)> 
     })
 }
 
+/// `(source id, process objects)` of every app source; no objects while the app does not run.
+fn app_procs(dev: &VirtualDevice, groups: &[AppGroup]) -> Vec<(String, Vec<u32>)> {
+    app_sources(dev)
+        .map(|(id, b, _)| (id.to_owned(), app_objs(groups, b)))
+        .collect()
+}
+
 /// What `sync_taps` must do to move `current` to the desired state. Indices refer to `current`.
 #[derive(Debug, Default, PartialEq)]
 struct TapPlan {
@@ -1816,6 +1823,7 @@ fn tap_plan(current: &[Tap], dev: &VirtualDevice, groups: &[AppGroup]) -> TapPla
 /// wait in `v.zombies` and are destroyed only once the aggregate's tap list no longer names them; a failed
 /// list update leaves `v.tap_dirty` so the next sync repeats it instead of seeing "no diff" and staying silent.
 fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
+    v.sysvol.set_apps(app_procs(&v.dev, groups));
     let plan = tap_plan(&v.taps, &v.dev, groups);
     log::debug!(
         "taps for '{}': keep {} update {} remove {} create {}",
@@ -2264,7 +2272,12 @@ fn build_vdev(
     }
     let meters = Arc::new(Meters::new());
     let (mx, handle) = mixer(meters.clone());
-    let sysvol = sysvol::follow(&format!("{DEVICE_UID_PREFIX}{}", dev.id), handle.sys_gain());
+    let mut sysvol = sysvol::SysVol::start(
+        &spec.main,
+        &format!("{DEVICE_UID_PREFIX}{}", dev.id),
+        handle.sys_gain(),
+    );
+    sysvol.set_apps(app_procs(dev, groups));
     let split = spec.split;
     let tap_stats = Arc::new(TapStats::default());
     let (tap_cb, tap_handle) = tap_in(tap_stats.clone());
@@ -2313,7 +2326,7 @@ fn build_vdev(
         build: seq,
         rates,
         _listeners: listeners,
-        _sysvol: sysvol,
+        sysvol,
         _lease: activity.lease(),
         xruns,
         silence: SilenceWatch::default(),

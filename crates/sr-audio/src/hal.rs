@@ -74,7 +74,11 @@ pub fn get_global<T: Copy>(obj: u32, sel: u32) -> Result<T, i32> {
 }
 
 pub fn get_u32s(obj: u32, sel: u32) -> Result<Vec<u32>, i32> {
-    let a = addr(sel, kAudioObjectPropertyScopeGlobal);
+    get_u32s_in(obj, sel, kAudioObjectPropertyScopeGlobal)
+}
+
+pub fn get_u32s_in(obj: u32, sel: u32, scope: u32) -> Result<Vec<u32>, i32> {
+    let a = addr(sel, scope);
     let mut sz = 0u32;
     let st = unsafe {
         AudioObjectGetPropertyDataSize(obj, NonNull::from(&a), 0, null(), NonNull::from(&mut sz))
