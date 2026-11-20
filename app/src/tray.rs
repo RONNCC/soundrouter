@@ -6,7 +6,9 @@
 use eframe::egui::Context;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 pub const HINT: &str = "SoundRouter is still running in the menu bar";
@@ -89,6 +91,10 @@ pub enum Cmd {
     Quit,
     /// New checked state of "Start at Login".
     Login(bool),
+    /// A preset in the Presets submenu, by name.
+    Preset(String),
+    /// "Save current as…" in the Presets submenu.
+    SavePreset,
 }
 
 pub struct Tray {
@@ -96,6 +102,11 @@ pub struct Tray {
     status: MenuItem,
     status_text: String,
     login: CheckMenuItem,
+    /// The Presets submenu, its rows, and the names they were built from.
+    presets: Submenu,
+    preset_rows: Vec<(MenuItem, String)>,
+    save_preset_id: MenuId,
+    preset_names: Vec<String>,
     open_id: MenuId,
     quit_id: MenuId,
     rx: Receiver<MenuId>,
@@ -158,11 +169,15 @@ impl Tray {
         let open = MenuItem::new("Open SoundRouter", true, None);
         let login = CheckMenuItem::new("Start at Login", true, login_enabled, None);
         let quit = MenuItem::new("Quit SoundRouter", true, None);
+        let presets = Submenu::new("Presets", true);
+        let save_preset = MenuItem::new("Save current as…", true, None);
+        presets.append(&save_preset).map_err(|e| e.to_string())?;
         let menu = Menu::new();
         menu.append_items(&[
             &open,
             &status,
             &PredefinedMenuItem::separator(),
+            &presets,
             &login,
             &PredefinedMenuItem::separator(),
             &quit,
@@ -187,6 +202,10 @@ impl Tray {
             status,
             status_text: String::new(),
             login,
+            presets,
+            preset_rows: Vec::new(),
+            save_preset_id: save_preset.id().clone(),
+            preset_names: Vec::new(),
             open_id: open.id().clone(),
             quit_id: quit.id().clone(),
             rx,
@@ -209,8 +228,13 @@ impl Tray {
                     Some(Cmd::Quit)
                 } else if id == *self.login.id() {
                     Some(Cmd::Login(self.login.is_checked()))
+                } else if id == self.save_preset_id {
+                    Some(Cmd::SavePreset)
                 } else {
-                    None
+                    self.preset_rows
+                        .iter()
+                        .find(|(row, _)| *row.id() == id)
+                        .map(|(_, name)| Cmd::Preset(name.clone()))
                 }
             })
             .collect()
@@ -221,6 +245,23 @@ impl Tray {
             self.status.set_text(&text);
             self.status_text = text;
         }
+    }
+
+    /// Rows above "Save current as…", one per preset; rebuilt only when the names change.
+    pub fn set_presets(&mut self, names: &[String]) {
+        if self.preset_names == names {
+            return;
+        }
+        for (row, _) in self.preset_rows.drain(..) {
+            let _ = self.presets.remove(&row);
+        }
+        for (i, name) in names.iter().enumerate() {
+            let row = MenuItem::new(name, true, None);
+            if self.presets.insert(&row, i).is_ok() {
+                self.preset_rows.push((row, name.clone()));
+            }
+        }
+        self.preset_names = names.to_vec();
     }
 
     pub fn set_login_checked(&self, on: bool) {

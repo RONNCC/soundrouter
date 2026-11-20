@@ -1,7 +1,10 @@
 pub mod backend;
 pub mod config;
 pub mod driver_proto;
+pub mod fsio;
 pub mod lock;
 pub mod meters;
 pub mod mixer;
+pub mod preset;
+pub mod preset_store;
 pub mod selftest;

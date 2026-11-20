@@ -322,6 +322,12 @@ pub enum Kind {
 }
 
 pub fn button(ui: &mut Ui, t: &Tokens, label: &str, kind: Kind) -> bool {
+    button_named(ui, t, label, label, kind)
+}
+
+/// `button` whose screen-reader name differs from its label ("Apply" in a row of a list is
+/// "Apply Streaming").
+pub fn button_named(ui: &mut Ui, t: &Tokens, label: &str, name: &str, kind: Kind) -> bool {
     let font = theme::label();
     let text = if kind == Kind::Secondary {
         t.ink
@@ -331,7 +337,7 @@ pub fn button(ui: &mut Ui, t: &Tokens, label: &str, kind: Kind) -> bool {
     let galley = ui.painter().layout_no_wrap(label.to_string(), font, text);
     let size = vec2((galley.size().x + 28.0).max(72.0), BUTTON_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    name_button(&resp, label);
+    name_button(&resp, name);
     let base = match kind {
         Kind::Primary => t.accent,
         Kind::Danger => t.danger,

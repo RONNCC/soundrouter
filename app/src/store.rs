@@ -25,34 +25,12 @@ fn future_version_msg(v: u64) -> String {
     )
 }
 
-/// Move a file we cannot use out of the way so the next save cannot destroy it.
-/// `config.json.bad`, or `config.json.bad.<unix secs>[.n]` if that exists.
-fn quarantine(path: &Path) -> std::io::Result<PathBuf> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let mut dest = path.with_file_name(format!("{name}.bad"));
-    let mut n = 0;
-    while dest.exists() {
-        let sfx = if n == 0 {
-            String::new()
-        } else {
-            format!(".{n}")
-        };
-        dest = path.with_file_name(format!("{name}.bad.{secs}{sfx}"));
-        n += 1;
-    }
-    std::fs::rename(path, &dest)?;
-    Ok(dest)
-}
-
 /// A real config is a few KB; anything this big is corrupt or hostile and is not read into memory.
 const MAX_CONFIG_BYTES: u64 = 4 << 20;
 
 /// Quarantine the unusable file at `path` and fall back to defaults with a message.
 fn set_aside(path: &Path, problem: &str) -> (Config, Option<String>) {
-    let kept = match quarantine(path) {
+    let kept = match sr_core::fsio::quarantine(path) {
         Ok(p) => format!("saved as {}", p.display()),
         Err(e) => format!("could not move it aside: {e}"),
     };
@@ -97,8 +75,6 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
 /// (shortcut: `Config` has no catch-all; the version refusal protects newer files, upgrade if
 /// same-version extensions appear).
 pub fn save(path: &Path, cfg: &Config) -> std::io::Result<()> {
-    use std::io::Write;
-    let ctx = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()));
     if let Some(v) = std::fs::read(path)
         .ok()
         .and_then(|t| file_version(&t))
@@ -109,20 +85,7 @@ pub fn save(path: &Path, cfg: &Config) -> std::io::Result<()> {
             path.display()
         )));
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(ctx)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let res = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&serde_json::to_vec_pretty(cfg)?)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    res.map_err(ctx)
+    sr_core::fsio::write_atomic(path, &serde_json::to_vec_pretty(cfg)?)
 }
 
 #[cfg(test)]
@@ -149,6 +112,46 @@ mod tests {
         let (back, msg) = load(&path);
         assert_eq!(back, cfg);
         assert!(msg.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A physical input or monitor that is unplugged keeps its wires, gain, mute and name in the
+    /// file, so it routes the same when it comes back, also across a restart.
+    #[test]
+    fn an_unplugged_devices_routing_gain_and_mute_survive_a_restart() {
+        use sr_core::backend::HwDevice;
+        let hw = |uid: &str, name: &str| HwDevice {
+            uid: uid.into(),
+            name: name.into(),
+            in_ch: 2,
+            out_ch: 2,
+        };
+        let dir = tmpdir("unplugged");
+        let path = dir.join("config.json");
+        let mut cfg = default_config();
+        let mic = SourceKind::Device { uid: "mic".into() };
+        apply(&mut cfg, Edit::AddSource(0, mic, 2));
+        apply(&mut cfg, Edit::AddMonitor(0, "spk".into(), 2));
+        let present = [hw("mic", "USB Mic"), hw("spk", "Desk Speakers")];
+        crate::model::learn_names(&mut cfg, &present, &[], &[]);
+        let mic_idx = cfg.devices[0].sources.len() - 1;
+        apply(&mut cfg, Edit::SourceVolume(0, mic_idx, -9.0));
+        apply(&mut cfg, Edit::SourceOn(0, mic_idx, false));
+        apply(&mut cfg, Edit::MonitorVolume(0, 0, -4.0));
+        let before = cfg.clone();
+        // Unplugged for a whole session: the engine drops them, the config keeps them.
+        crate::model::learn_names(&mut cfg, &[], &[], &[]);
+        save(&path, &cfg).unwrap();
+        let (back, msg) = load(&path);
+        assert!(msg.is_none());
+        assert_eq!(back, before);
+        let s = &back.devices[0].sources[mic_idx];
+        assert_eq!(
+            (s.volume_db, s.muted, s.name.as_str()),
+            (-9.0, true, "USB Mic")
+        );
+        assert_eq!(back.devices[0].monitors[0].volume_db, -4.0);
+        assert!(back.devices[0].wires.iter().any(|w| w.source == s.id));
         let _ = std::fs::remove_dir_all(dir);
     }
 

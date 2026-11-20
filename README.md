@@ -29,11 +29,12 @@ The driver (`SoundRouter.driver`, loaded by `coreaudiod`) only publishes the vir
 - Every source and monitor card has a × to remove it; a "Removed … · Undo" toast (6 s) brings back the card with its wires. Deleting a whole device offers the same Undo.
 - Per-app capture through CoreAudio process taps, with "Mute in original output" per app source and "Choose App…" for apps that are not running.
 - Device sources (microphones, interfaces), pass-thru sources, monitors (physical outputs), per-node volume and mute, level meters.
+- Presets: save the whole routing (devices, sources, wires, volumes, mutes, audio delay) under a name from the toolbar's **Presets** button or the menu-bar **Presets** submenu, apply it later (undoable), rename or delete it. `sr-cli preset list|save|apply`, and `soundrouter://preset/<name>` links (e.g. `open soundrouter://preset/Streaming`) apply one; a preset that needs virtual devices you have not set up asks before adding them. Stored in `presets.json` next to `config.json`.
 - Menu-bar background mode: closing the window keeps routing alive; Dock reopen; Start at Login (per-user LaunchAgent).
 - First-run setup sheet: install or uninstall the driver in the app, permission steps, and a self-test.
 - Single instance (lock file), config safety (corrupt config quarantined, newer-version config protected, fsync on save).
 - Log file at `~/Library/Logs/SoundRouter/soundrouter.log`.
-- `sr-cli`: `list`, `driver`, `loopback-test`, `run`, `meter`, `doctor`; `-v`/`-vv` for logging. `run` and `driver set` refuse (exit 1) while SoundRouter.app or another `sr-cli run` owns the audio engine (two engines keep resetting each other's driver list); `--force` overrides. Installed copies have it at `/Applications/SoundRouter.app/Contents/MacOS/sr-cli` (from source: `target/release/sr-cli`).
+- `sr-cli`: `list`, `driver`, `loopback-test`, `run`, `meter`, `doctor`, `preset`; `-v`/`-vv` for logging. `run` and `driver set` refuse (exit 1) while SoundRouter.app or another `sr-cli run` owns the audio engine (two engines keep resetting each other's driver list); `--force` overrides. Installed copies have it at `/Applications/SoundRouter.app/Contents/MacOS/sr-cli` (from source: `target/release/sr-cli`).
 
 ## Install
 

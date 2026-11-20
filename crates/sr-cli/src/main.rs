@@ -1,3 +1,5 @@
+mod preset;
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -58,6 +60,26 @@ enum Cmd {
     Meter { device_id: String },
     /// Check driver, plug-in, TCC and system state
     Doctor,
+    /// Saved routings: list, save the current one, apply one
+    Preset {
+        #[command(subcommand)]
+        op: PresetOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum PresetOp {
+    /// List saved presets
+    List,
+    /// Save the app's current routing (config.json) under a name, replacing a preset of that name
+    Save { name: String },
+    /// Apply a preset: asks the running app (which confirms before adding devices), else edits config.json
+    Apply {
+        name: String,
+        /// Without the app running, also allow the preset to add, turn on or resize virtual devices
+        #[arg(long)]
+        add_devices: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -187,6 +209,14 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Doctor => doctor(),
+        Cmd::Preset { op } => {
+            let paths = preset::Paths::from_home()?;
+            match op {
+                PresetOp::List => preset::list(&paths),
+                PresetOp::Save { name } => preset::save(&paths, &name),
+                PresetOp::Apply { name, add_devices } => preset::apply(&paths, &name, add_devices),
+            }
+        }
     }
 }
 

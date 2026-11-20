@@ -1,5 +1,6 @@
 //! SoundRouter: Loopback-style virtual audio device router.
 mod app;
+mod deeplink;
 mod fake;
 mod graph;
 mod icons;
@@ -9,6 +10,7 @@ mod logging;
 mod login;
 mod meter;
 mod model;
+mod presets;
 mod setup;
 mod sheet;
 mod store;
@@ -98,6 +100,7 @@ fn main() -> eframe::Result {
         }
     };
     let demo = args.demo;
+    deeplink::install();
     let vibrancy_wanted = cfg!(target_os = "macos");
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -115,6 +118,7 @@ fn main() -> eframe::Result {
         opts,
         Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
+            deeplink::wake_on_link(&cc.egui_ctx);
             cc.egui_ctx.set_theme(args.theme);
             #[cfg(target_os = "macos")]
             let vibrancy = vibrancy_wanted

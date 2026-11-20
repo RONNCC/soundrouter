@@ -236,3 +236,162 @@ fn force_bypasses_the_lock_check() {
             .stderr(predicate::str::contains("reading /nonexistent"));
     }
 }
+
+// --- presets ---------------------------------------------------------------------------------
+
+fn support(home: &std::path::Path) -> std::path::PathBuf {
+    let d = home.join("Library/Application Support/SoundRouter");
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// A scratch HOME whose config has one device `id` at `volume_db`.
+fn home_with_config(id: &str, volume_db: f32) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    write_config(home.path(), &[(id, volume_db)]);
+    home
+}
+
+fn write_config(home: &std::path::Path, devs: &[(&str, f32)]) {
+    let devs: Vec<String> = devs
+        .iter()
+        .map(|(id, db)| {
+            format!(
+                r#"{{"id":"{id}","name":"Dev {id}","enabled":true,"channels":2,"volume_db":{db:?},"muted":false,"sources":[],"wires":[],"monitors":[]}}"#
+            )
+        })
+        .collect();
+    std::fs::write(
+        support(home).join("config.json"),
+        format!(r#"{{"version":1,"devices":[{}]}}"#, devs.join(",")),
+    )
+    .unwrap();
+}
+
+fn config_volumes(home: &std::path::Path) -> Vec<f64> {
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(support(home).join("config.json")).unwrap()).unwrap();
+    v["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["volume_db"].as_f64().unwrap())
+        .collect()
+}
+
+fn preset(home: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Assert {
+    cli().env("HOME", home).arg("preset").args(args).assert()
+}
+
+#[test]
+fn preset_list_starts_empty_then_shows_saved_presets() {
+    let home = home_with_config("v1", 0.0);
+    preset(home.path(), &["list"])
+        .code(0)
+        .stdout(predicate::str::contains("no presets"));
+    preset(home.path(), &["save", "Streaming"])
+        .code(0)
+        .stdout(predicate::str::contains("saved preset \"Streaming\""));
+    preset(home.path(), &["save", "streaming"])
+        .code(0)
+        .stdout(predicate::str::contains("replaced preset"));
+    preset(home.path(), &["list"])
+        .code(0)
+        .stdout(predicate::str::contains("streaming  (1 device)"));
+}
+
+#[test]
+fn preset_save_needs_a_config_and_a_name() {
+    let home = tempfile::tempdir().unwrap();
+    preset(home.path(), &["save", "x"])
+        .code(1)
+        .stderr(predicate::str::contains("config.json"));
+    let home = home_with_config("v1", 0.0);
+    preset(home.path(), &["save", "  "])
+        .code(1)
+        .stderr(predicate::str::contains("Give the preset a name"));
+}
+
+#[test]
+fn preset_apply_unknown_name_exits_1_and_lists_the_known_ones() {
+    let home = home_with_config("v1", 0.0);
+    preset(home.path(), &["apply", "nope"])
+        .code(1)
+        .stderr(predicate::str::contains("no preset named \"nope\""));
+    preset(home.path(), &["save", "Mine"]).code(0);
+    preset(home.path(), &["apply", "nope"])
+        .code(1)
+        .stderr(predicate::str::contains("(have: Mine)"));
+}
+
+#[test]
+fn preset_apply_restores_the_saved_routing_in_the_config() {
+    let home = home_with_config("v1", -6.0);
+    preset(home.path(), &["save", "Quiet"]).code(0);
+    write_config(home.path(), &[("v1", 0.0)]);
+    preset(home.path(), &["apply", "quiet"])
+        .code(0)
+        .stdout(predicate::str::contains("applied \"Quiet\""));
+    assert_eq!(config_volumes(home.path()), [-6.0]);
+}
+
+#[test]
+fn preset_apply_that_adds_a_device_needs_the_flag() {
+    let home = tempfile::tempdir().unwrap();
+    write_config(home.path(), &[("v1", 0.0), ("v2", -3.0)]);
+    preset(home.path(), &["save", "Two"]).code(0);
+    write_config(home.path(), &[("v1", 0.0)]);
+    preset(home.path(), &["apply", "Two"])
+        .code(1)
+        .stderr(predicate::str::contains("Add Dev v2"))
+        .stderr(predicate::str::contains("--add-devices"));
+    assert_eq!(config_volumes(home.path()), [0.0], "config untouched");
+    preset(home.path(), &["apply", "Two", "--add-devices"]).code(0);
+    assert_eq!(config_volumes(home.path()), [0.0, -3.0]);
+}
+
+#[test]
+fn a_corrupt_presets_file_warns_and_is_backed_up() {
+    let home = home_with_config("v1", 0.0);
+    let p = support(home.path()).join("presets.json");
+    std::fs::write(&p, "{nope").unwrap();
+    preset(home.path(), &["list"])
+        .code(0)
+        .stderr(predicate::str::contains("presets.json.bad"))
+        .stdout(predicate::str::contains("no presets"));
+    assert!(!p.exists() && support(home.path()).join("presets.json.bad").exists());
+}
+
+#[test]
+fn preset_apply_hands_over_to_the_running_app_instead_of_editing_its_config() {
+    let home = home_with_config("v1", 0.0);
+    preset(home.path(), &["save", "Café 1"]).code(0);
+    let _app = sr_core::lock::try_lock(&support(home.path()).join("instance.lock"))
+        .unwrap()
+        .unwrap();
+    let log = home.path().join("opened");
+    let opener = home.path().join("open.sh");
+    std::fs::write(
+        &opener,
+        format!("#!/bin/sh\necho \"$1\" > '{}'\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&opener, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    write_config(home.path(), &[("v1", -1.0)]);
+    cli()
+        .env("HOME", home.path())
+        .env("SR_OPEN", &opener)
+        .args(["preset", "apply", "café 1"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("asked SoundRouter"));
+    assert_eq!(
+        std::fs::read_to_string(log).unwrap().trim(),
+        "soundrouter://preset/Caf%C3%A9%201"
+    );
+    assert_eq!(
+        config_volumes(home.path()),
+        [-1.0],
+        "the app owns the config"
+    );
+}

@@ -114,7 +114,7 @@ fn window_with(
     h
 }
 
-fn open(cfg: Config) -> Harness<'static, App> {
+pub(super) fn open(cfg: Config) -> Harness<'static, App> {
     window(
         cfg,
         Box::new(FakeBackend::frozen(1.5)),
@@ -125,13 +125,13 @@ fn open(cfg: Config) -> Harness<'static, App> {
 }
 
 /// Process queued input, let the UI react, and require every control to have an accessible name.
-fn settle(h: &mut Harness<App>) {
+pub(super) fn settle(h: &mut Harness<App>) {
     h.step();
     h.run_steps(3);
     h.check_accessibility();
 }
 
-fn click(h: &mut Harness<App>, label: &str) {
+pub(super) fn click(h: &mut Harness<App>, label: &str) {
     h.get_by_label(label).click();
     settle(h);
 }
@@ -177,7 +177,7 @@ fn double_click(h: &mut Harness<App>, label: &str) {
     settle(h);
 }
 
-fn select_all(h: &mut Harness<App>) {
+pub(super) fn select_all(h: &mut Harness<App>) {
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     settle(h);
 }
@@ -1032,6 +1032,60 @@ mod snapshots {
         }
     }
 
+    /// Three presets of the window's current routing.
+    fn seed_presets(h: &mut Harness<App>) {
+        let cfg = h.state().cfg.clone();
+        for name in ["Streaming", "Podcast", "Game night"] {
+            h.state_mut().presets.seed(name, &cfg);
+        }
+    }
+
+    #[test]
+    fn presets_menu_open() {
+        both("presets_menu", demo_config, None, |h| {
+            seed_presets(h);
+            click(h, presets::BUTTON);
+        });
+    }
+
+    #[test]
+    fn presets_save_sheet() {
+        both("presets_save", demo_config, None, |h| {
+            click(h, presets::BUTTON);
+            click(h, presets::SAVE_AS);
+            h.get_by_label("Preset name").type_text("Streaming");
+            settle(h);
+        });
+    }
+
+    #[test]
+    fn presets_manage_sheet() {
+        both("presets_manage", demo_config, None, |h| {
+            seed_presets(h);
+            click(h, presets::BUTTON);
+            click(h, presets::MANAGE);
+        });
+    }
+
+    #[test]
+    fn presets_confirm_sheet() {
+        both("presets_confirm", demo_config, None, |h| {
+            seed_presets(h);
+            h.state_mut().cfg.devices.remove(1);
+            click(h, presets::BUTTON);
+            click(h, "Streaming");
+        });
+    }
+
+    #[test]
+    fn presets_applied_offers_undo() {
+        both("presets_applied", demo_config, None, |h| {
+            seed_presets(h);
+            click(h, presets::BUTTON);
+            click(h, "Podcast");
+        });
+    }
+
     #[test]
     fn measure_delay_sheet() {
         both("measure_delay", demo_config, None, |h| {
@@ -1491,7 +1545,7 @@ fn with_runner(status: EngineStatus, runner: Runner) -> Harness<'static, App> {
     window_with(demo_config(), Box::new(b), None, Theme::Dark, false, runner)
 }
 
-fn has(h: &Harness<App>, label: &str) -> bool {
+pub(super) fn has(h: &Harness<App>, label: &str) -> bool {
     h.query_by_label(label).is_some()
 }
 
@@ -2076,6 +2130,7 @@ fn try_demo_resets_the_selection_and_the_undo_of_the_replaced_config() {
         apply(&mut app.cfg, Edit::NewDevice);
         app.selected = 4;
         app.undo = Some(Undo {
+            verb: "Removed",
             name: "Old".into(),
             prev: app.cfg.clone(),
             selected: 4,

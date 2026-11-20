@@ -7,6 +7,7 @@ use crate::model::{
     delay_ms, delay_name, delay_option, delay_readout, delay_readout_tip, device_delay_ms,
     device_tap_ms, low_power_hint_due, pct_to_db,
 };
+use crate::presets::{self, Presets};
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, OPEN_SETTINGS, Setup};
 use crate::store;
 use crate::theme::{
@@ -43,8 +44,10 @@ const TITLEBAR_H: f32 = 46.0;
 /// How long "Removed …. Undo" stays up, in egui seconds (frame time, so tests step it).
 const UNDO_SECS: f64 = 6.0;
 
-/// The config as it was before a removal, kept briefly so the removal can be taken back.
+/// The config as it was before a removal or a preset, kept briefly so it can be taken back.
 struct Undo {
+    /// What happened, so the toast reads "{verb} {name}.": "Removed" or "Applied preset".
+    verb: &'static str,
     name: String,
     prev: Config,
     selected: usize,
@@ -75,6 +78,9 @@ pub struct App {
     /// The config has been sent to the engine at least once (and the driver is still there).
     applied: bool,
     undo: Option<Undo>,
+    presets: Presets,
+    /// A preset chosen in the toolbar menu this frame; applied after the frame's edits.
+    preset_pick: Option<String>,
     /// egui time of the current frame.
     now: f64,
     /// Why the real audio engine did not start; the app then only edits and saves the config.
@@ -198,6 +204,12 @@ fn delay_menu(
     }
 }
 
+/// Bring the window forward (it may be hidden in the menu bar).
+fn show_window(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
 impl App {
     pub fn new(
         cfg: Config,
@@ -207,6 +219,10 @@ impl App {
         vibrancy: bool,
         demo: bool,
     ) -> Self {
+        // Next to config.json; demo mode has no path and keeps its presets in memory.
+        let (presets, preset_msg) =
+            Presets::load(path.as_deref().map(|p| p.with_file_name("presets.json")));
+        let toast = toast.or(preset_msg);
         Self {
             cfg,
             path,
@@ -232,6 +248,8 @@ impl App {
             },
             applied: false,
             undo: None,
+            presets,
+            preset_pick: None,
             now: 0.0,
             engine_error: None,
         }
@@ -253,6 +271,8 @@ impl App {
 
     fn handle_window(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
+        let mut presets_wanted = Vec::new();
+        let mut save_wanted = false;
         if self.hide_in > 0 {
             self.hide_in -= 1;
             if self.hide_in == 0 {
@@ -273,10 +293,13 @@ impl App {
             .count();
         if let Some(t) = &mut self.tray {
             t.set_status(tray::status_text(running));
+            t.set_presets(&self.presets.names());
             for cmd in t.poll() {
                 match cmd {
                     tray::Cmd::Open => events.push(Event::Open),
                     tray::Cmd::Quit => events.push(Event::Quit),
+                    tray::Cmd::Preset(name) => presets_wanted.push(name),
+                    tray::Cmd::SavePreset => save_wanted = true,
                     tray::Cmd::Login(on) => {
                         if let Err(e) = login::set_enabled(on) {
                             t.set_login_checked(!on);
@@ -311,6 +334,85 @@ impl App {
                 Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
+        for url in crate::deeplink::take() {
+            self.open_link(ctx, &url);
+        }
+        for name in presets_wanted {
+            self.apply_preset(ctx, &name);
+        }
+        if save_wanted {
+            show_window(ctx);
+            self.presets.open_save();
+        }
+    }
+
+    /// A `soundrouter://` link. A problem is shown in the window, which then comes forward.
+    fn open_link(&mut self, ctx: &egui::Context, url: &str) {
+        match sr_core::preset::parse_url(url) {
+            Ok(sr_core::preset::UrlAction::Preset(name)) => self.apply_preset(ctx, &name),
+            Err(e) => {
+                self.toast = Some(e);
+                show_window(ctx);
+            }
+        }
+    }
+
+    /// Apply a preset, or ask first when it needs virtual devices that are not set up (the driver's
+    /// list is never changed without a yes). Problems show in the window, which comes forward.
+    fn apply_preset(&mut self, ctx: &egui::Context, name: &str) {
+        match self.presets.plan_for(&self.cfg, name) {
+            Err(e) => {
+                self.toast = Some(e);
+                show_window(ctx);
+            }
+            Ok(plan) => {
+                let name = self.presets.stored_name(name).unwrap_or(name).to_owned();
+                if plan.confirm().is_some() {
+                    self.presets.ask(&name, plan);
+                    show_window(ctx);
+                } else {
+                    self.commit_preset(&name, plan.config);
+                }
+            }
+        }
+    }
+
+    /// The user agreed to the device changes: plan again against the config as it is now.
+    fn apply_confirmed(&mut self, name: &str) {
+        match self.presets.plan_for(&self.cfg, name) {
+            Ok(plan) => self.commit_preset(name, plan.config),
+            Err(e) => self.toast = Some(e),
+        }
+    }
+
+    /// Make `cfg` (a validated merge of the preset) the config, undoable like a removal.
+    fn commit_preset(&mut self, name: &str, cfg: Config) {
+        let count = |c: &Config| {
+            c.devices
+                .iter()
+                .flat_map(|d| &d.sources)
+                .filter(|s| matches!(s.kind, SourceKind::Device { .. }))
+                .count()
+        };
+        let adds_input = count(&cfg) > count(&self.cfg);
+        let prev = std::mem::replace(&mut self.cfg, cfg);
+        self.toast = None;
+        self.undo = Some(Undo {
+            verb: "Applied preset",
+            name: name.to_owned(),
+            prev,
+            selected: self.selected,
+            until: self.now + UNDO_SECS,
+        });
+        // As in `commit`: a microphone nobody asked macOS about waits for the setup sheet.
+        if adds_input && self.engine_status().mic == TccStatus::Unknown {
+            self.applied = false;
+        }
+        self.selected = self.selected.min(self.cfg.devices.len().saturating_sub(1));
+        if self.applied {
+            self.worker.apply(&self.cfg);
+        }
+        self.save_pending = true;
     }
 
     fn engine_status(&self) -> EngineStatus {
@@ -419,6 +521,7 @@ impl App {
                 self.demo = true;
                 self.engine_error = None;
                 self.path = None; // never overwrite the saved config with demo edits
+                self.presets = Presets::load(None).0; // nor the saved presets
                 self.cfg = crate::fake::demo_config();
                 // Both index the config just replaced.
                 self.selected = 0;
@@ -430,6 +533,7 @@ impl App {
             Some(SetupAction::SettingsDeleted) => {
                 // The settings folder is gone: stop writing it back with every edit.
                 self.path = None;
+                self.presets = Presets::load(None).0;
                 self.save_pending = false;
             }
             None => {}
@@ -502,6 +606,7 @@ impl App {
         }
         self.toast = blank_rename.then(|| BLANK_NAME.to_string());
         self.undo = removed.map(|name| Undo {
+            verb: "Removed",
             name,
             prev,
             selected: prev_selected,
@@ -842,6 +947,21 @@ impl App {
         );
     }
 
+    /// The Presets button in the titlebar zone, right-aligned; its menu lists the presets.
+    fn presets_button(&mut self, ui: &mut egui::Ui, t: &Tokens, full: Rect) {
+        let w = setup::footer_width(ui, presets::BUTTON);
+        let rect = Rect::from_min_size(
+            pos2(full.right() - 18.0 - w, full.top() + 10.0),
+            vec2(w, 26.0),
+        );
+        let resp = setup::footer_button(ui, rect, "presets", presets::BUTTON, t);
+        resp.clone()
+            .on_hover_text("Save the whole setup under a name, and switch between setups");
+        let mut picked = None;
+        egui::Popup::menu(&resp).show(|ui| picked = self.presets.menu(ui, t));
+        self.preset_pick = picked.or(self.preset_pick.take());
+    }
+
     fn main_pane(&mut self, ui: &mut egui::Ui, t: &Tokens, edits: &mut Vec<Edit>) {
         egui::Panel::bottom("bottom")
             .exact_size(FOOTER_H)
@@ -978,7 +1098,7 @@ impl App {
                 {
                     let x = btn.right() + 18.0;
                     let width = r.right() - 18.0 - x - reserved;
-                    let text = format!("Removed {}.", u.name);
+                    let text = format!("{} {}.", u.verb, u.name);
                     let font = body();
                     let tw = ui
                         .painter()
@@ -993,7 +1113,7 @@ impl App {
                         Sense::hover(),
                     )
                     .widget_info(|| {
-                        WidgetInfo::labeled(Role::Label, true, format!("Removed {}", u.name))
+                        WidgetInfo::labeled(Role::Label, true, format!("{} {}", u.verb, u.name))
                     });
                     let hit = ui.interact(
                         Rect::from_center_size(
@@ -1087,6 +1207,7 @@ impl App {
             .frame(egui::Frame::default().fill(t.canvas))
             .show(ui, |ui| {
                 let full = ui.max_rect();
+                self.presets_button(ui, t, full);
                 let Some(dev) = self.cfg.devices.get(self.selected) else {
                     if graph::no_devices(ui, t, full) {
                         edits.push(Edit::NewDevice);
@@ -1230,7 +1351,19 @@ impl eframe::App for App {
             edits.clear();
         }
         self.commit(edits);
+        if let Some(name) = self.preset_pick.take() {
+            self.apply_preset(&ctx, &name);
+        }
         self.drive_setup(&ctx);
+        let out = self.presets.show(&ctx, &t, &self.cfg);
+        if let Some(msg) = out.toast {
+            self.toast = Some(msg);
+        }
+        match out.apply {
+            Some((name, true)) => self.apply_confirmed(&name),
+            Some((name, false)) => self.apply_preset(&ctx, &name),
+            None => {}
+        }
 
         if self.save_pending && !ctx.input(|i| i.pointer.any_down()) {
             self.save_pending = false;
@@ -1248,3 +1381,7 @@ impl eframe::App for App {
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "presets_tests.rs"]
+mod preset_tests;
