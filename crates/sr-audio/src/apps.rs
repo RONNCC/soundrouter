@@ -45,7 +45,9 @@ pub struct AppGroup {
 
 pub fn group(procs: &[ProcInfo], r: &dyn Resolver) -> Vec<AppGroup> {
     let mut map: BTreeMap<String, AppGroup> = BTreeMap::new();
-    for p in procs {
+    // Our own output is the engine's mix: tapping it would feed the mix back into itself.
+    let me = std::process::id() as i32;
+    for p in procs.iter().filter(|p| p.pid != me) {
         let resp = r.responsible_pid(p.pid);
         let app = [resp, p.pid]
             .into_iter()
@@ -296,6 +298,18 @@ mod tests {
             .map(|a| a.bundle_id)
             .collect();
         assert_eq!(regular, ["com.apple.Safari", "com.google.Chrome"]);
+    }
+
+    /// Our own process plays the engine's mix; a tap on it would feed that mix back into itself
+    /// (measured live: the own-process tap carries the engine output).
+    #[test]
+    fn own_process_is_never_a_source() {
+        let me = std::process::id() as i32;
+        let r = Fake(
+            HashMap::new(),
+            HashMap::from([(me, ("com.ronncc.soundrouter", "SoundRouter", true))]),
+        );
+        assert!(group(&[p(1, me, "com.ronncc.soundrouter", true)], &r).is_empty());
     }
 
     #[test]

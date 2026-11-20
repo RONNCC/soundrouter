@@ -976,3 +976,119 @@ fn track_time_counts_only_skipped_audio() {
     r.cb.track_time(0.0, 512);
     assert_eq!(r.meters.glitch_count(), 2);
 }
+
+// ---- in-place reuse vs rebuild ----
+
+fn spec(main: &str, subs: &[&str]) -> AggSpec {
+    AggSpec {
+        main: main.into(),
+        subs: subs.iter().map(|s| (*s).to_owned()).collect(),
+        channels: 2,
+        buffer_frames: 256,
+    }
+}
+
+#[test]
+fn keep_in_place_only_for_the_same_aggregate() {
+    let (comp, vis) = ("soundrouter:v1~c".to_owned(), "soundrouter:v1".to_owned());
+    let both = [comp.clone(), vis.clone()];
+    let live = spec(&comp, &["mic"]);
+    let keep = |l: &AggSpec, io, cands: &[String], subs: &[&str]| {
+        let subs: Vec<String> = subs.iter().map(|s| (*s).to_owned()).collect();
+        keep_in_place(l, &[], io, cands, &subs, 2, 256)
+    };
+    assert!(keep(&live, IoState::Running, &both, &["mic"]));
+    assert!(keep(&live, IoState::Starting, &both, &["mic"]));
+    assert!(!keep(&live, IoState::Running, &both, &[]));
+    assert!(!keep(&live, IoState::Running, &both[1..], &["mic"]));
+    let subs = ["mic".to_owned()];
+    assert!(!keep_in_place(
+        &live,
+        &[],
+        IoState::Running,
+        &both,
+        &subs,
+        4,
+        256
+    ));
+    assert!(!keep_in_place(
+        &live,
+        &[],
+        IoState::Running,
+        &both,
+        &subs,
+        2,
+        128
+    ));
+}
+
+/// A start that failed (e.g. a monitor held in hog mode) is only retried by a new build; after the
+/// background retries were spent, an apply reused the dead aggregate and the device stayed silent.
+#[test]
+fn a_failed_io_start_is_rebuilt_by_the_next_apply() {
+    let live = spec("c", &[]);
+    assert!(!keep_in_place(
+        &live,
+        &[],
+        IoState::Failed(-50),
+        &["c".into()],
+        &[],
+        2,
+        256
+    ));
+}
+
+/// A vdev built on the visible-device fallback (its companion not published yet, e.g. many devices
+/// added at once) moves to the companion once it appears, else Pass-Thru stayed off for good. One whose
+/// companion build failed stays on the fallback rather than rebuilding on every apply.
+#[test]
+fn a_fallback_main_moves_to_the_companion_once_present() {
+    let (comp, vis) = ("c".to_owned(), "v".to_owned());
+    let live = spec(&vis, &[]);
+    let run = IoState::Running;
+    assert!(keep_in_place(
+        &live,
+        &[],
+        run,
+        std::slice::from_ref(&vis),
+        &[],
+        2,
+        256
+    ));
+    let both = [comp.clone(), vis.clone()];
+    assert!(!keep_in_place(&live, &[], run, &both, &[], 2, 256));
+    assert!(keep_in_place(&live, &[comp], run, &both, &[], 2, 256));
+}
+
+#[test]
+fn apply_drops_disabled_devices_from_recovery_and_clears_background_errors() {
+    let mut g = Inner::default();
+    let mut cfg = Config {
+        devices: vec![vdev(vec![], vec![], vec![])],
+        ..Config::default()
+    };
+    cfg.devices[0].enabled = false;
+    // A wake rebuild of v1 failed and its retries ran out ...
+    g.recovering.insert("v1".into());
+    g.bg_errors
+        .insert(Op::Apply, "device 'v1': no companion".into());
+    // ... then the user disables v1: the apply succeeds, so neither may linger in the status.
+    apply_locked(&mut g, &cfg, |_| Ok(())).unwrap();
+    assert!(g.recovering.is_empty());
+    assert_eq!(background_message(&g.bg_errors), None);
+}
+
+/// Measured live: a monitor whose stream layout changed (2 -> 4 channels, no device-list or rate change)
+/// left the whole vdev silent (every cycle a shape mismatch) with the status still Running.
+#[test]
+fn a_sub_with_new_stream_buffers_rebuilds_its_vdev() {
+    let subs = [sub("main", true, &[2], &[2]), sub("mon", false, &[], &[2])];
+    let changed = set(&["mon"]);
+    let now = |o: &'static [u16]| move |uid: &str| (uid == "mon").then(|| (vec![], o.to_vec()));
+    assert!(reshaped(&subs, &changed, &now(&[4])));
+    assert!(reshaped(&subs, &changed, &now(&[2, 2])));
+    // The same buffers (an echo, or a rate-only change), a device not in the batch, or one gone.
+    assert!(!reshaped(&subs, &changed, &now(&[2])));
+    assert!(!reshaped(&subs, &set(&["main"]), &now(&[4])));
+    assert!(!reshaped(&subs, &changed, &|_| None));
+}

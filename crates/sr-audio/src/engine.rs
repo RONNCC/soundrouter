@@ -167,6 +167,8 @@ struct AggSpec {
 struct Vdev {
     dev: VirtualDevice,
     spec: AggSpec,
+    /// Better main candidates that failed to build when this one was built; see [`keep_in_place`].
+    passed_over: Vec<String>,
     agg: u32,
     proc_id: AudioDeviceIOProcID,
     cb: *mut Cb,
@@ -254,7 +256,7 @@ enum Event {
     Processes,
     /// The system woke from sleep.
     Wake,
-    /// The nominal sample rate of the device with this uid changed.
+    /// The nominal sample rate or the stream layout of the device with this uid changed.
     Rate(String),
     /// A vdev's `AudioDeviceStart` returned; `build` tells a stale build from the current one.
     IoStart {
@@ -277,10 +279,11 @@ impl Listener {
     fn new(
         obj: u32,
         sel: u32,
+        scope: u32,
         tx: Sender<Event>,
         ev: impl Fn() -> Event + 'static,
     ) -> Result<Listener> {
-        let addr = hal::addr(sel, kAudioObjectPropertyScopeGlobal);
+        let addr = hal::addr(sel, scope);
         let tx = Mutex::new(tx);
         let block: RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>)> =
             RcBlock::new(move |_n: u32, _a: NonNull<AudioObjectPropertyAddress>| {
@@ -332,12 +335,17 @@ impl Engine {
         let (tx, rx) = channel();
         lock(&inner).tx = Some(tx.clone());
         let listeners = vec![
-            Listener::new(SYSTEM, kAudioHardwarePropertyDevices, tx.clone(), || {
-                Event::Devices
-            })?,
+            Listener::new(
+                SYSTEM,
+                kAudioHardwarePropertyDevices,
+                kAudioObjectPropertyScopeGlobal,
+                tx.clone(),
+                || Event::Devices,
+            )?,
             Listener::new(
                 SYSTEM,
                 kAudioHardwarePropertyProcessObjectList,
+                kAudioObjectPropertyScopeGlobal,
                 tx.clone(),
                 || Event::Processes,
             )?,
@@ -621,20 +629,21 @@ fn io_retry(
         .collect()
 }
 
-/// Vdev ids to tear down and rebuild. `vdevs` is `(id, rates at build)`. A wake rebuilds all (the
-/// HAL may have replaced devices and streams); a rate event rebuilds a vdev only when a device's rate
-/// really differs from the one it was built against, so our own aggregate's echoes do not loop.
+/// Vdev ids to tear down and rebuild. `vdevs` is `(id, rates at build)`; `forced` ids always are (failed
+/// start, new stream layout). A wake rebuilds all (the HAL may have replaced devices and streams); a rate
+/// event rebuilds a vdev only when a device's rate really differs from the one it was built against, so
+/// our own aggregate's echoes do not loop.
 fn rebuild_targets(
     wake: bool,
     changed: &BTreeSet<String>,
-    io_failed: &BTreeSet<String>,
+    forced: &BTreeSet<String>,
     vdevs: &[(&str, &[(String, f64)])],
     rate_now: &dyn Fn(&str) -> f64,
 ) -> BTreeSet<String> {
     vdevs
         .iter()
         .filter(|(id, built)| {
-            wake || io_failed.contains(*id)
+            wake || forced.contains(*id)
                 || built.iter().any(|(uid, was)| {
                     let now = rate_now(uid);
                     changed.contains(uid) && now > 0.0 && now != *was
@@ -685,6 +694,23 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
     }
 }
 
+/// A device's `(input, output)` channels per stream buffer.
+type StreamBufs = (Vec<u16>, Vec<u16>);
+
+/// True when a device in `changed` now has other stream buffers than `subs` recorded at build: the
+/// aggregate's buffer lists no longer match its layout, so the IOProc outputs silence until a rebuild.
+/// `now(uid)` is `None` when the device is gone (a device event handles that).
+fn reshaped(
+    subs: &[SubDesc],
+    changed: &BTreeSet<String>,
+    now: &dyn Fn(&str) -> Option<StreamBufs>,
+) -> bool {
+    subs.iter().any(|s| {
+        changed.contains(&s.uid)
+            && now(&s.uid).is_some_and(|(i, o)| i != s.in_bufs || o != s.out_bufs)
+    })
+}
+
 /// Applies the IOProc-start and rate news in `p`: tears down the vdevs that need a rebuild (the
 /// following apply rebuilds them, with backoff while it fails) and returns their ids.
 fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
@@ -701,18 +727,31 @@ fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
             failed.push(id);
         }
     }
-    let io_failed = io_retry(&mut g.io_fails, &failed, &ok);
+    let mut forced = io_retry(&mut g.io_fails, &failed, &ok);
+    let streams = |uid: &str| {
+        let d = hal::device_by_uid(uid)?;
+        Some((
+            hal::stream_channels(d, kAudioObjectPropertyScopeInput),
+            hal::stream_channels(d, kAudioObjectPropertyScopeOutput),
+        ))
+    };
+    forced.extend(
+        g.vdevs
+            .iter()
+            .filter(|(_, v)| reshaped(&v.subs, &p.rates, &streams))
+            .map(|(id, _)| id.clone()),
+    );
     let watched: Vec<(&str, &[(String, f64)])> = g
         .vdevs
         .iter()
         .map(|(id, v)| (id.as_str(), v.rates.as_slice()))
         .collect();
-    let targets = rebuild_targets(p.wake, &p.rates, &io_failed, &watched, &|uid| {
+    let targets = rebuild_targets(p.wake, &p.rates, &forced, &watched, &|uid| {
         hal::device_by_uid(uid).map_or(0.0, hal::nominal_rate)
     });
     if !targets.is_empty() {
         log::info!(
-            "rebuilding {targets:?} (wake: {}, rate change: {:?}, io failed: {io_failed:?})",
+            "rebuilding {targets:?} (wake: {}, format change: {:?}, io failed or reshaped: {forced:?})",
             p.wake,
             p.rates
         );
@@ -1022,13 +1061,39 @@ fn apply_locked(g: &mut Inner, cfg: &Config, sync: fn(&Config) -> Result<()>) ->
             errors.push(format!("device '{}': {e:#}", dev.id));
         }
     }
-    let up: Vec<String> = g.vdevs.keys().cloned().collect();
-    g.recovering.retain(|id| !up.contains(id));
+    // A device disabled or removed while it was waiting to be rebuilt is not recovering any more.
+    g.recovering
+        .retain(|id| enabled.contains_key(id.as_str()) && !g.vdevs.contains_key(id));
     if errors.is_empty() {
+        // Everything a background update does is now in place: its old failure no longer holds.
+        g.bg_errors.clear();
         Ok(())
     } else {
         bail!("{}", errors.join("; "))
     }
+}
+
+/// Whether the live vdev (`live`, built after `passed_over` failed as its main) can take the new config
+/// in place instead of being rebuilt. Not when its IOProc failed to start: only a new build retries that
+/// (`io_retry` bounds the background ones). Not when a better main is present that was not tried at its
+/// build: a fallback built before the companion was published then moves to it.
+fn keep_in_place(
+    live: &AggSpec,
+    passed_over: &[String],
+    io: IoState,
+    cands: &[String],
+    subs: &[String],
+    channels: u16,
+    buffer_frames: u32,
+) -> bool {
+    !matches!(io, IoState::Failed(_))
+        && live.subs == subs
+        && live.channels == channels
+        && live.buffer_frames == buffer_frames
+        && cands
+            .iter()
+            .find(|c| **c == live.main || !passed_over.contains(c))
+            == Some(&live.main)
 }
 
 fn apply_vdev(
@@ -1046,11 +1111,16 @@ fn apply_vdev(
     }
     let subs = plan_subs(dev, &|u| hal::device_by_uid(u).is_some());
     if let Some(v) = g.vdevs.get_mut(&dev.id) {
-        if v.spec.subs == subs
-            && v.spec.channels == dev.channels
-            && v.spec.buffer_frames == buffer_frames
-            && cands.contains(&v.spec.main)
-        {
+        let io = io_state_of(&v.shared);
+        if keep_in_place(
+            &v.spec,
+            &v.passed_over,
+            io,
+            &cands,
+            &subs,
+            dev.channels,
+            buffer_frames,
+        ) {
             v.dev = dev.clone();
             match sync_taps(v, groups).and_then(|()| refresh_layout(v)) {
                 Ok(()) => return Ok(()),
@@ -1064,6 +1134,7 @@ fn apply_vdev(
         retire(g.vdevs.remove(&dev.id));
     }
     let mut last = anyhow!("no candidate main device");
+    let mut passed_over = Vec::new();
     for main in cands {
         match build_vdev(
             dev,
@@ -1076,13 +1147,15 @@ fn apply_vdev(
             groups,
             g.tx.as_ref(),
         ) {
-            Ok(v) => {
+            Ok(mut v) => {
                 log::info!("device '{}': aggregate main device '{main}'", dev.id);
+                v.passed_over = passed_over;
                 g.vdevs.insert(dev.id.clone(), v);
                 return Ok(());
             }
             Err(e) => {
                 log::warn!("device '{}': main '{main}' failed: {e:#}", dev.id);
+                passed_over.push(main);
                 last = e;
             }
         }
@@ -1414,23 +1487,32 @@ fn build_vdev(
     groups: &[AppGroup],
     events: Option<&Sender<Event>>,
 ) -> Result<Vdev> {
-    // Rate listeners first, then the baseline, then the aggregate: a rate change at any point after the
+    // Format listeners first, then the baseline, then the aggregate: a rate change at any point after the
     // read has an event that compares unequal, one before it is in both the baseline and the aggregate.
+    // A stream layout change (an interface switched to another channel mode) reuses the rate event.
     let listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
         std::iter::once(&spec.main)
             .chain(&spec.subs)
-            .filter_map(|uid| {
-                let obj = hal::device_by_uid(uid)?;
-                let u = uid.clone();
-                Listener::new(
-                    obj,
-                    kAudioDevicePropertyNominalSampleRate,
-                    tx.clone(),
-                    move || Event::Rate(u.clone()),
-                )
-                .map_err(|e| log::warn!("no rate listener on '{uid}': {e:#}"))
-                .ok()
+            .filter_map(|uid| Some((uid, hal::device_by_uid(uid)?)))
+            .flat_map(|(uid, obj)| {
+                [
+                    (
+                        kAudioDevicePropertyNominalSampleRate,
+                        kAudioObjectPropertyScopeGlobal,
+                    ),
+                    (
+                        kAudioDevicePropertyStreamConfiguration,
+                        kAudioObjectPropertyScopeWildcard,
+                    ),
+                ]
+                .map(|(sel, scope)| {
+                    let u = uid.clone();
+                    Listener::new(obj, sel, scope, tx.clone(), move || Event::Rate(u.clone()))
+                        .map_err(|e| log::warn!("no format listener on '{uid}': {e:#}"))
+                        .ok()
+                })
             })
+            .flatten()
             .collect()
     });
     let rates = read_rates(&spec);
@@ -1560,6 +1642,7 @@ fn build_vdev(
         zombies: Vec::new(),
         tap_dirty: false,
         warnings: Vec::new(),
+        passed_over: Vec::new(),
     };
     // From here `Drop` cleans up the aggregate, taps and callback state.
     refresh_layout(&mut v)?;
