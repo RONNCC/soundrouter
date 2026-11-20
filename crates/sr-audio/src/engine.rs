@@ -1876,6 +1876,7 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
             std::thread::sleep(Duration::from_millis(10));
         }
         refresh_layout(v)?;
+        restrict_inputs(v.agg, v.proc_id, &v.subs, &v.spec.readers, v.taps.len());
         v.tap_dirty = false;
     }
     Ok(())
@@ -2333,7 +2334,13 @@ fn build_vdev(
         )
     };
     hal::check("AudioDeviceCreateIOProcID", st).context("creating IOProc")?;
-    restrict_inputs(agg, v.proc_id, &v.subs, &v.spec.readers);
+    restrict_inputs(
+        agg,
+        v.proc_id,
+        &v.subs,
+        &v.spec.readers,
+        if split { 0 } else { v.taps.len() },
+    );
     let (proc_id, sh) = (v.proc_id, v.shared.clone());
     // AudioDeviceStart blocks until the TCC prompt is answered: keep it off the caller's thread.
     // `Drop` joins this thread before stopping or destroying anything it uses (F3).
@@ -2510,21 +2517,31 @@ fn input_readers(dev: &VirtualDevice, main: &str) -> Vec<String> {
 
 /// One flag per input stream of the aggregate, in stream order (sub-devices in list order): on for the
 /// streams of a device that is read. An output-only path must not open a Bluetooth headset's microphone:
-/// that would switch it from A2DP to the 16 kHz mono headset profile.
-fn stream_flags(subs: &[SubDesc], readers: &[String]) -> Vec<bool> {
+/// that would switch it from A2DP to the 16 kHz mono headset profile. An unsplit aggregate carries one
+/// input stream per tap after the sub-devices' streams (`n_taps`, 0 when split); the property covers
+/// every stream, so those stay on.
+fn stream_flags(subs: &[SubDesc], readers: &[String], n_taps: usize) -> Vec<bool> {
     subs.iter()
         .flat_map(|d| {
             let on = readers.contains(&d.uid);
             d.in_bufs.iter().map(move |_| on)
         })
+        .chain(std::iter::repeat_n(true, n_taps))
         .collect()
 }
 
 /// Switches off the aggregate's input streams nobody reads
 /// (`kAudioDevicePropertyIOProcStreamUsage`, input scope, for `proc`). The buffers keep their shape, so
-/// the layout is unchanged. Not fatal: the aggregate then simply opens every input as before.
-fn restrict_inputs(agg: u32, proc: AudioDeviceIOProcID, subs: &[SubDesc], readers: &[String]) {
-    let on = stream_flags(subs, readers);
+/// the layout is unchanged. Not fatal: the aggregate then simply opens every input as before. Changing
+/// an unsplit aggregate's tap list changes its stream count, so call it again then.
+fn restrict_inputs(
+    agg: u32,
+    proc: AudioDeviceIOProcID,
+    subs: &[SubDesc],
+    readers: &[String],
+    n_taps: usize,
+) {
+    let on = stream_flags(subs, readers, n_taps);
     if on.iter().all(|&b| b) {
         return;
     }

@@ -1669,10 +1669,15 @@ fn unread_devices_lose_their_input_streams_in_stream_order() {
         sub("out", &[]),
     ];
     let readers = ["c1".to_owned(), "mic".to_owned()];
-    assert_eq!(stream_flags(&subs, &readers), [true, false, true, true]);
+    assert_eq!(stream_flags(&subs, &readers, 0), [true, false, true, true]);
+    assert_eq!(
+        stream_flags(&subs, &readers, 2),
+        [true, false, true, true, true, true],
+        "an unsplit aggregate's tap streams stay on"
+    );
     let all = ["c1".to_owned(), "headset".to_owned(), "mic".to_owned()];
     assert!(
-        stream_flags(&subs, &all).iter().all(|&b| b),
+        stream_flags(&subs, &all, 0).iter().all(|&b| b),
         "nothing to switch off"
     );
 }
