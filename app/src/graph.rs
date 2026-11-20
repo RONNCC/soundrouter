@@ -7,14 +7,14 @@ use crate::layout::{
 };
 use crate::meter::{PeakHold, level};
 use crate::model::{Edit, Link, Port, can_link, ch_label, links};
-use crate::theme::{Tokens, semibold, tile_tint};
+use crate::theme::{Tokens, cable_color, caption, label, num, radius, strong, tile_tint};
 use crate::widgets::{
     chevron, loops, menu_hint, meter, name_button, name_widget, plus_circle, slider_knob, switch,
     tile, xmark,
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Popup, PopupCloseBehavior, Rect, Response,
-    Sense, Shadow, Slider, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo,
+    Sense, Slider, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo,
     epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
 };
 use sr_core::backend::{AppInfo, HwDevice, MeterReading, TccStatus};
@@ -249,8 +249,8 @@ fn column_headers(
             x + 2.0,
             base - 38.0,
             title,
-            FontId::new(14.0, semibold()),
-            t.text,
+            strong(),
+            t.ink,
             layout.card_w - 50.0,
         );
         text_left(
@@ -258,8 +258,8 @@ fn column_headers(
             x + 2.0,
             base - 20.0,
             sub,
-            FontId::proportional(11.0),
-            t.text2,
+            caption(),
+            t.muted,
             layout.card_w - 50.0,
         );
         let right = x + layout.card_w;
@@ -336,7 +336,7 @@ fn column_headers(
 }
 
 fn hint_color(resp: &Response, t: &Tokens) -> Color32 {
-    if resp.hovered() { t.text } else { t.text2 }
+    if resp.hovered() { t.ink } else { t.muted }
 }
 
 /// One menu line: icon, label, accent highlight on hover. Returns true when clicked.
@@ -364,8 +364,8 @@ fn menu_row(
     }
     let color = match (enabled, hot) {
         (_, true) => Color32::WHITE,
-        (true, _) => t.text,
-        _ => t.text2.gamma_multiply(0.6),
+        (true, _) => t.ink,
+        _ => t.muted.gamma_multiply(0.6),
     };
     let icon_rect = Rect::from_center_size(
         pos2(rect.left() + 8.0 + ICON / 2.0, rect.center().y),
@@ -374,13 +374,9 @@ fn menu_row(
     icon(p, icon_rect);
     let mut text_w = rect.width() - ICON - 22.0;
     if !detail.is_empty() {
-        let d = p.layout_no_wrap(
-            detail.to_string(),
-            FontId::proportional(11.0),
-            Color32::PLACEHOLDER,
-        );
+        let d = p.layout_no_wrap(detail.to_string(), caption(), Color32::PLACEHOLDER);
         text_w -= d.size().x + 8.0;
-        let dc = if hot { color } else { t.text2 };
+        let dc = if hot { color } else { t.muted };
         p.galley(
             pos2(
                 rect.right() - 8.0 - d.size().x,
@@ -510,6 +506,15 @@ fn source_menu(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<E
             .desired_width(f32::INFINITY),
     );
     name_widget(ui, &search, "Search sources");
+    if search.has_focus() {
+        // egui outlines a focused field in the selected-text colour (white): draw the focus ring.
+        ui.painter().rect_stroke(
+            search.rect,
+            CornerRadius::same(radius::INPUT),
+            Stroke::new(2.0, t.focus),
+            StrokeKind::Inside,
+        );
+    }
     if std::mem::take(&mut st.focus_search) {
         search.request_focus();
     }
@@ -517,7 +522,7 @@ fn source_menu(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<E
     let p = picks(g.hw, g.apps, &st.filter);
     let room = ui.ctx().content_rect().bottom() - ui.cursor().top() - MENU_FOOT_H;
     let heading = |ui: &mut Ui, text: &str| {
-        ui.label(egui::RichText::new(text).size(11.0).color(t.text2));
+        ui.label(egui::RichText::new(text).size(11.0).color(t.muted));
     };
     egui::ScrollArea::vertical()
         .max_height(room.clamp(96.0, 420.0))
@@ -598,7 +603,7 @@ fn monitor_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
     ui.label(
         egui::RichText::new("Output Devices")
             .size(11.0)
-            .color(g.t.text2),
+            .color(g.t.muted),
     );
     let room = ui.ctx().content_rect().bottom() - ui.cursor().top() - 16.0;
     egui::ScrollArea::vertical()
@@ -686,27 +691,19 @@ fn card(
         0.45
     };
     let painter = ui.painter().clone();
-    painter.add(
-        Shadow {
-            offset: [0, 3],
-            blur: 14,
-            spread: 0,
-            color: t.shadow,
-        }
-        .as_shape(r, CornerRadius::same(11)),
-    );
+    // Cards are raised by fill and hairline alone: shadows belong to floating layers.
     painter.rect(
         r,
-        CornerRadius::same(11),
-        t.card,
-        Stroke::new(1.0, t.card_stroke),
+        CornerRadius::same(radius::STRIP),
+        t.raised,
+        Stroke::new(1.0, t.hairline),
         StrokeKind::Inside,
     );
 
     // Header: title and On/Off switch.
     let note_w = note.map_or(0.0, |n| {
         painter
-            .layout_no_wrap(n.to_string(), FontId::proportional(11.0), t.text2)
+            .layout_no_wrap(n.to_string(), caption(), t.muted)
             .size()
             .x
             - 14.0
@@ -723,8 +720,8 @@ fn card(
         r.left() + 14.0,
         r.top() + HEAD_H / 2.0,
         &title,
-        FontId::new(13.0, semibold()),
-        t.text,
+        label(),
+        t.ink,
         title_w,
     );
     if let Some(n) = note {
@@ -745,7 +742,7 @@ fn card(
             Sense::click(),
         );
         name_button(&x, &format!("{label} {title}"));
-        xmark(&painter, at, if x.hovered() { t.danger } else { t.text2 });
+        xmark(&painter, at, if x.hovered() { t.bad_ink } else { t.muted });
         // A double-click's second click would remove the card that moved up under the pointer.
         if x.clicked() && !x.double_clicked() {
             edits.push(edit);
@@ -769,8 +766,8 @@ fn card(
             pos2(sw.left() - 6.0, sw.center().y),
             Align2::RIGHT_CENTER,
             note.unwrap_or(if new { "On" } else { "Off" }),
-            FontId::proportional(11.0),
-            if note.is_some() { t.warn } else { t.text2 },
+            caption(),
+            if note.is_some() { t.warn_ink } else { t.muted },
         );
         if new != on_now {
             edits.push(match c.id {
@@ -781,11 +778,7 @@ fn card(
         }
     }
 
-    painter.hline(
-        r.x_range(),
-        r.top() + HEAD_H,
-        Stroke::new(1.0, t.card_stroke),
-    );
+    painter.hline(r.x_range(), r.top() + HEAD_H, Stroke::new(1.0, t.hairline));
 
     // Body: icon and channel rows with meters.
     let body_top = r.top() + HEAD_H;
@@ -832,8 +825,8 @@ fn card(
             pos2(label_x, y),
             Align2::LEFT_CENTER,
             lbl,
-            FontId::proportional(11.0),
-            t.text2.gamma_multiply(dim),
+            caption(),
+            t.muted.gamma_multiply(dim),
         );
         let lin = if active { row_level(g, c.id, row) } else { 0.0 };
         let lv = level(lin);
@@ -857,11 +850,11 @@ fn card(
         return;
     }
     let y0 = body_top + body_h;
-    painter.hline(r.x_range(), y0, Stroke::new(1.0, t.card_stroke));
+    painter.hline(r.x_range(), y0, Stroke::new(1.0, t.hairline));
     let opt = Rect::from_min_size(pos2(r.left(), y0), vec2(r.width(), FOOT_H));
     let resp = ui.interact(opt, Id::unique(("opt", d, c.id)), Sense::click());
     name_button(&resp, &format!("{title} options"));
-    let col = if resp.hovered() { t.text } else { t.text2 };
+    let col = if resp.hovered() { t.ink } else { t.muted };
     chevron(
         &painter,
         pos2(r.left() + 20.0, opt.center().y),
@@ -872,7 +865,7 @@ fn card(
         pos2(r.left() + 32.0, opt.center().y),
         Align2::LEFT_CENTER,
         "Options",
-        FontId::proportional(11.5),
+        caption(),
         col,
     );
     if resp.clicked() && !st.expanded.remove(&opt_key) {
@@ -889,8 +882,8 @@ fn card(
         pos2(vrow.left(), vrow.center().y),
         Align2::LEFT_CENTER,
         "Volume",
-        FontId::proportional(11.0),
-        t.text2,
+        caption(),
+        t.muted,
     );
     // A volume outside the slider range (CLI or hand-edited config) is shown as is and only
     // changes when the slider is moved.
@@ -909,8 +902,8 @@ fn card(
         pos2(vrow.right(), vrow.center().y),
         Align2::RIGHT_CENTER,
         format!("{:+.1} dB", if moved { v } else { vol_db }),
-        FontId::proportional(11.0),
-        t.text2,
+        num(11.0),
+        t.muted,
     );
     if moved {
         edits.push(match c.id {
@@ -953,11 +946,11 @@ fn card(
         rm.left_center(),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(11.5),
+        caption(),
         if resp.hovered() {
-            t.danger
+            t.bad_ink
         } else {
-            t.danger.gamma_multiply(0.75)
+            t.bad_ink.gamma_multiply(0.75)
         },
     );
     if resp.clicked() && !resp.double_clicked() {
@@ -996,16 +989,16 @@ fn row_level(g: &GraphCtx, id: CardId, row: u16) -> f32 {
     }
 }
 
-fn link_color(l: Link, t: &Tokens) -> Color32 {
+fn link_color(l: Link) -> Color32 {
     let ch = match l.from {
         Port::Src { ch, .. } | Port::OutOut { ch } => ch,
         _ => 0,
     };
-    t.ch[usize::from(ch % 2)]
+    cable_color(usize::from(ch % 2))
 }
 
-fn port_color(p: Port, t: &Tokens) -> Color32 {
-    link_color(Link { from: p, to: p }, t)
+fn port_color(p: Port) -> Color32 {
+    link_color(Link { from: p, to: p })
 }
 
 /// Accessible name of a port, e.g. "Safari channel 1 output".
@@ -1111,7 +1104,7 @@ fn wires_and_ports(
             continue;
         };
         let hot = hover == Some(l.from) || hover == Some(l.to) || hovered_wire == Some(n);
-        let mut c = link_color(*l, t);
+        let mut c = link_color(*l);
         if !src_active(l.from) || !dev.enabled {
             c = c.gamma_multiply(0.35);
         }
@@ -1124,7 +1117,7 @@ fn wires_and_ports(
         painter.add(wire_shape(
             a,
             end,
-            port_color(from, t).gamma_multiply(0.75),
+            port_color(from).gamma_multiply(0.75),
             2.0,
         ));
     }
@@ -1132,14 +1125,14 @@ fn wires_and_ports(
         let Some(pos) = layout.port_pos(p) else {
             continue;
         };
-        let c = port_color(p, t);
+        let c = port_color(p);
         let linked = all.iter().any(|l| l.from == p || l.to == p);
         let hot = hover == Some(p) || target == Some(p);
         let radius = if hot { PORT_R + 1.5 } else { PORT_R };
         painter.circle(
             pos,
             radius,
-            if linked || hot { c } else { t.card },
+            if linked || hot { c } else { t.raised },
             Stroke::new(1.5, c),
         );
     }

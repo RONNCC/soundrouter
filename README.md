@@ -114,12 +114,12 @@ packaging/engine-live-test.sh                             # live engine check: s
 
 The BlackHole test sets `SR_MAIN_UID_OVERRIDE` so the engine routes into an installed BlackHole device instead of SoundRouter's driver and never touches the driver. All tests are silent by design (tones only go into virtual devices). Details: [docs/TESTING.md](docs/TESTING.md).
 
-Regenerate the screenshots: `cargo test -p soundrouter-app --features snapshots -- --ignored docs_screenshots`.
+Regenerate the screenshots: `cargo test -p soundrouter-app --features snapshots -- --ignored docs_screenshots`. The app embeds its fonts, so the screenshots and snapshot tests render the same on every Mac.
 
 ## Docs
 
-[Architecture](docs/ARCHITECTURE.md), [Testing](docs/TESTING.md), [Troubleshooting](docs/TROUBLESHOOTING.md), [Releasing](docs/RELEASING.md), [Changelog](CHANGELOG.md), [original plan](docs/PLAN.md) (historical; superseded by the architecture doc).
+[Architecture](docs/ARCHITECTURE.md), [Design](docs/DESIGN.md), [Testing](docs/TESTING.md), [Troubleshooting](docs/TROUBLESHOOTING.md), [Releasing](docs/RELEASING.md), [Changelog](CHANGELOG.md), [original plan](docs/PLAN.md) (historical; superseded by the architecture doc).
 
 ## Provenance and license
 
-SoundRouter is a clean-room implementation. It is not derived from BlackHole (GPL) or Loopback code. The icon artwork is original. Licensed MIT OR Apache-2.0.
+SoundRouter is a clean-room implementation. It is not derived from BlackHole (GPL) or Loopback code. The icon artwork is original. Licensed MIT OR Apache-2.0. The embedded fonts, Bricolage Grotesque and JetBrains Mono, are under the SIL Open Font License 1.1 (`app/assets/fonts/`, and `Contents/Resources/Licenses/` in the app).

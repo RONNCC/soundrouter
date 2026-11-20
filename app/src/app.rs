@@ -5,14 +5,16 @@ use crate::login;
 use crate::model::{Edit, apply, db_to_pct, delay_label, delay_ms, delay_option, pct_to_db};
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, Setup};
 use crate::store;
-use crate::theme::{Tokens, semibold, tokens};
+use crate::theme::{
+    Tokens, body, caption, device_title, label, num, radius, section, strong, tokens,
+};
 use crate::tray::{self, Action, Event, Tray, WinState};
 use crate::widgets::{
     name_button, name_widget, pencil, plus_glyph, slider_knob, speaker, switch, xmark,
 };
 use crate::worker::Worker;
 use eframe::egui::{
-    self, Align2, CornerRadius, FontId, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit, Theme,
+    self, Align2, CornerRadius, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit, Theme,
     UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
@@ -72,10 +74,10 @@ pub struct App {
 fn state_look(s: &DeviceState, t: &Tokens) -> Option<(String, egui::Color32)> {
     Some(match s {
         DeviceState::Idle => return None,
-        DeviceState::Running => ("Running".into(), t.meter[0]),
-        DeviceState::Starting => ("Starting".into(), t.meter[1]),
-        DeviceState::WaitingForPermission => ("Waiting for permission".into(), t.meter[1]),
-        DeviceState::Failed(e) => (format!("Failed: {e}"), t.danger),
+        DeviceState::Running => ("Running".into(), t.ok),
+        DeviceState::Starting => ("Starting".into(), t.warn),
+        DeviceState::WaitingForPermission => ("Waiting for permission".into(), t.warn),
+        DeviceState::Failed(e) => (format!("Failed: {e}"), t.bad),
     })
 }
 
@@ -87,15 +89,15 @@ fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>
     ui.set_width(W);
     ui.label(
         egui::RichText::new("Audio delay")
-            .font(FontId::new(13.5, semibold()))
-            .color(t.text),
+            .font(strong())
+            .color(t.ink),
     );
     ui.add(
         egui::Label::new(
             egui::RichText::new("How long audio takes to pass through SoundRouter. Lower is snappier for live monitoring and calls, but uses more CPU and can crackle on a busy Mac. Higher is the most reliable.")
-                .size(12.0)
-                .line_height(Some(16.0))
-                .color(t.text2),
+                .font(body())
+                .line_height(Some(18.0))
+                .color(t.muted),
         )
         .wrap(),
     );
@@ -105,15 +107,11 @@ fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>
         let (name, rest) = text.split_once("  ·  ").unwrap_or((&text, ""));
         let mut job = LayoutJob::default();
         job.wrap.max_width = W - CHECK_W - 8.0;
-        job.append(
-            name,
-            0.0,
-            TextFormat::simple(FontId::new(12.5, semibold()), t.text),
-        );
+        job.append(name, 0.0, TextFormat::simple(label(), t.ink));
         job.append(
             &format!("  ·  {rest}"),
             0.0,
-            TextFormat::simple(FontId::proportional(12.0), t.text2),
+            TextFormat::simple(body(), t.muted),
         );
         let galley = ui.painter().layout_job(job);
         let (rect, resp) = ui.allocate_exact_size(vec2(W, galley.size().y + 10.0), Sense::click());
@@ -121,7 +119,7 @@ fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>
         resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, on, &text));
         let p = ui.painter();
         if resp.hovered() {
-            p.rect_filled(rect, CornerRadius::same(4), t.card_stroke);
+            p.rect_filled(rect, CornerRadius::same(radius::INPUT), t.hairline);
         }
         if on {
             let c = pos2(rect.left() + 11.0, rect.top() + 5.0 + 8.0);
@@ -134,11 +132,7 @@ fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>
                 Stroke::new(1.8, t.accent),
             );
         }
-        p.galley(
-            pos2(rect.left() + CHECK_W, rect.top() + 5.0),
-            galley,
-            t.text,
-        );
+        p.galley(pos2(rect.left() + CHECK_W, rect.top() + 5.0), galley, t.ink);
         let tip = format!(
             "{n} frames per buffer. Added delay = 2 × {n} frames ÷ 48,000 per second = {:.1} ms, assuming 48 kHz.",
             delay_ms(n)
@@ -469,9 +463,9 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &Tokens, edits: &mut Vec<Edit>) {
         let fill = if self.vibrancy {
-            t.sidebar.gamma_multiply(0.55)
+            t.panel.gamma_multiply(0.55)
         } else {
-            t.sidebar
+            t.panel
         };
         egui::Panel::left("devices")
             .exact_size(SIDEBAR_W)
@@ -483,13 +477,13 @@ impl App {
                     pos2(full.left() + 84.0, full.top() + 23.0),
                     Align2::LEFT_CENTER,
                     "Devices",
-                    FontId::new(13.0, semibold()),
-                    t.text,
+                    section(),
+                    t.ink,
                 );
                 ui.painter().hline(
                     full.x_range(),
                     full.top() + TITLEBAR_H + 0.5,
-                    Stroke::new(1.0, t.card_stroke.gamma_multiply(0.6)),
+                    Stroke::new(1.0, t.hairline.gamma_multiply(0.6)),
                 );
                 let footer_h = 48.0;
                 let list = Rect::from_min_max(
@@ -512,7 +506,7 @@ impl App {
                 ui.painter().hline(
                     foot.x_range(),
                     foot.top() + 0.5,
-                    Stroke::new(1.0, t.card_stroke.gamma_multiply(0.6)),
+                    Stroke::new(1.0, t.hairline.gamma_multiply(0.6)),
                 );
                 let cy = foot.center().y;
                 let new = ui.interact(
@@ -521,13 +515,13 @@ impl App {
                     Sense::click(),
                 );
                 name_button(&new, "New Virtual Device");
-                let c = if new.hovered() { t.text } else { t.text2 };
+                let c = if new.hovered() { t.ink } else { t.muted };
                 plus_glyph(ui.painter(), pos2(foot.left() + 22.0, cy), c, false);
                 ui.painter().text(
                     pos2(foot.left() + 38.0, cy),
                     Align2::LEFT_CENTER,
                     "New Virtual Device",
-                    FontId::proportional(12.5),
+                    body(),
                     c,
                 );
                 if new.clicked() {
@@ -549,7 +543,7 @@ impl App {
         let inner = row.shrink2(vec2(8.0, 4.0));
         if i == self.selected {
             ui.painter()
-                .rect_filled(inner, CornerRadius::same(9), t.row_sel);
+                .rect_filled(inner, CornerRadius::same(radius::ROW), t.selected);
         }
         let dim = if dev.enabled { 1.0 } else { 0.55 };
         let icon = Rect::from_min_size(
@@ -570,10 +564,10 @@ impl App {
             let te = ui.put(
                 name_rect,
                 TextEdit::singleline(buf)
-                    .font(FontId::new(13.5, semibold()))
+                    .font(label())
                     .margin(Margin::ZERO)
                     .frame(egui::Frame::NONE)
-                    .text_color(t.text)
+                    .text_color(t.ink)
                     .char_limit(MAX_NAME_CHARS),
             );
             name_widget(ui, &te, "Rename device");
@@ -588,16 +582,14 @@ impl App {
                 te.request_focus();
             }
         } else {
-            let g = ui.painter().layout_no_wrap(
-                dev.name.clone(),
-                FontId::new(13.5, semibold()),
-                t.text.gamma_multiply(dim),
-            );
+            let g =
+                ui.painter()
+                    .layout_no_wrap(dev.name.clone(), label(), t.ink.gamma_multiply(dim));
             let shown = g.size().x.min(name_rect.width());
             ui.painter().with_clip_rect(name_rect).galley(
                 pos2(name_pos.x, name_pos.y - g.size().y / 2.0),
                 g,
-                t.text,
+                t.ink,
             );
             let hit = ui.interact(
                 Rect::from_min_size(name_rect.min, vec2(shown.max(40.0), 20.0)),
@@ -615,8 +607,8 @@ impl App {
             pos2(name_pos.x, inner.top() + 34.0),
             Align2::LEFT_CENTER,
             chans,
-            FontId::proportional(11.0),
-            t.text2.gamma_multiply(dim),
+            caption(),
+            t.muted.gamma_multiply(dim),
         );
         let state = self
             .engine_status()
@@ -648,7 +640,7 @@ impl App {
         xmark(
             ui.painter(),
             x_at,
-            if x.hovered() { t.danger } else { t.text2 },
+            if x.hovered() { t.bad_ink } else { t.muted },
         );
         // A double-click's second click would remove the row that moved up under the pointer.
         if x.clicked() && !x.double_clicked() {
@@ -702,8 +694,8 @@ impl App {
             pos2(inner.right() - 10.0, vy),
             Align2::RIGHT_CENTER,
             format!("{pct:.0}%"),
-            FontId::proportional(11.0),
-            t.text2,
+            num(11.0),
+            t.muted,
         );
     }
 
@@ -711,13 +703,13 @@ impl App {
         egui::Panel::bottom("bottom")
             .exact_size(44.0)
             .resizable(false)
-            .frame(egui::Frame::default().fill(t.window))
+            .frame(egui::Frame::default().fill(t.panel))
             .show(ui, |ui| {
                 let r = ui.max_rect();
                 ui.painter().hline(
                     r.x_range(),
                     r.top() + 0.5,
-                    Stroke::new(1.0, t.card_stroke.gamma_multiply(0.6)),
+                    Stroke::new(1.0, t.hairline.gamma_multiply(0.6)),
                 );
                 let has = self.selected < self.cfg.devices.len();
                 let btn =
@@ -725,24 +717,24 @@ impl App {
                 let resp = ui.interact(btn, Id::unique("delete"), Sense::click());
                 name_button(&resp, "Delete");
                 let fill = if resp.hovered() && has {
-                    t.card_stroke
+                    t.hairline
                 } else {
-                    t.card
+                    t.raised
                 };
                 let a = if has { 1.0 } else { 0.4 };
                 ui.painter().rect(
                     btn,
-                    CornerRadius::same(6),
+                    CornerRadius::same(radius::PILL),
                     fill.gamma_multiply(a),
-                    Stroke::new(1.0, t.card_stroke),
+                    Stroke::new(1.0, t.hairline),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().text(
                     btn.center(),
                     Align2::CENTER_CENTER,
                     "Delete",
-                    FontId::proportional(12.5),
-                    t.text.gamma_multiply(a),
+                    label(),
+                    t.ink.gamma_multiply(a),
                 );
                 if has && resp.clicked() && !resp.double_clicked() {
                     edits.push(Edit::RemoveDevice(self.selected));
@@ -795,14 +787,14 @@ impl App {
                     let x = btn.right() + 18.0;
                     let width = r.right() - 18.0 - x - reserved;
                     let text = format!("Removed {} ·", u.name);
-                    let font = FontId::proportional(12.0);
+                    let font = body();
                     let tw = ui
                         .painter()
-                        .layout_no_wrap(text.clone(), font.clone(), t.text2)
+                        .layout_no_wrap(text.clone(), font.clone(), t.muted)
                         .size()
                         .x
                         .min((width - 52.0).max(0.0));
-                    graph::text_left(ui, x, r.center().y, &text, font.clone(), t.text2, tw);
+                    graph::text_left(ui, x, r.center().y, &text, font.clone(), t.muted, tw);
                     ui.interact(
                         Rect::from_min_size(pos2(x, r.top()), vec2(tw, r.height())),
                         Id::unique("removed"),
@@ -825,7 +817,7 @@ impl App {
                         Align2::LEFT_CENTER,
                         "Undo",
                         font,
-                        if hit.hovered() { t.text } else { t.accent },
+                        if hit.hovered() { t.ink } else { t.accent_ink },
                     );
                     if hit.clicked() {
                         // The frame's edits index the config being replaced (a row rename that
@@ -836,10 +828,10 @@ impl App {
                     return;
                 }
                 let (msg, color) = match status {
-                    Some(m) => (m, t.danger),
+                    Some(m) => (m, t.bad_ink),
                     None if self.demo => (
                         "Demo mode: synthetic audio, nothing is saved".to_string(),
-                        t.text2,
+                        t.muted,
                     ),
                     None => return,
                 };
@@ -850,7 +842,7 @@ impl App {
                     x,
                     r.center().y,
                     &msg,
-                    FontId::proportional(12.0),
+                    body(),
                     color,
                     width,
                 );
@@ -875,7 +867,7 @@ impl App {
             egui::Panel::top("permission")
                 .frame(
                     egui::Frame::default()
-                        .fill(t.card)
+                        .fill(t.raised)
                         .inner_margin(Margin::same(10)),
                 )
                 .show(ui, |ui| {
@@ -894,19 +886,19 @@ impl App {
             egui::Panel::top("engine_unavailable")
                 .frame(
                     egui::Frame::default()
-                        .fill(t.card)
+                        .fill(t.raised)
                         .inner_margin(Margin::same(10)),
                 )
                 .show(ui, |ui| {
                     ui.colored_label(
-                        t.danger,
+                        t.bad_ink,
                         format!("Audio engine unavailable: {why}. Routing is not running."),
                     );
                 });
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(t.window))
+            .frame(egui::Frame::default().fill(t.canvas))
             .show(ui, |ui| {
                 let full = ui.max_rect();
                 let Some(dev) = self.cfg.devices.get(self.selected) else {
@@ -914,30 +906,30 @@ impl App {
                         full.center(),
                         Align2::CENTER_CENTER,
                         "No virtual devices.\nUse “New Virtual Device” to create one.",
-                        FontId::proportional(14.0),
-                        t.text2,
+                        strong(),
+                        t.muted,
                     );
                     return;
                 };
                 // Title (editable) in the titlebar zone.
                 let title_rect = Rect::from_min_size(
-                    pos2(full.left() + 26.0, full.top() + 12.0),
-                    vec2(360.0, 26.0),
+                    pos2(full.left() + 26.0, full.top() + 7.0),
+                    vec2(360.0, 32.0),
                 );
                 let mut name = dev.name.clone();
                 let te = ui.put(
                     title_rect,
                     TextEdit::singleline(&mut name)
-                        .font(FontId::new(19.0, semibold()))
+                        .font(device_title())
                         .margin(Margin::ZERO)
                         .frame(egui::Frame::NONE)
-                        .text_color(t.text)
+                        .text_color(t.ink)
                         .char_limit(MAX_NAME_CHARS),
                 );
                 name_widget(ui, &te, "Device name");
                 let w = ui
                     .painter()
-                    .layout_no_wrap(name.clone(), FontId::new(19.0, semibold()), t.text)
+                    .layout_no_wrap(name.clone(), device_title(), t.ink)
                     .size()
                     .x;
                 pencil(
@@ -947,9 +939,9 @@ impl App {
                         title_rect.center().y,
                     ),
                     if te.hovered() || te.has_focus() {
-                        t.text
+                        t.ink
                     } else {
-                        t.text2
+                        t.muted
                     },
                 );
                 if name != dev.name {
@@ -1020,15 +1012,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let t = tokens(ctx.theme() == Theme::Dark);
-        ctx.global_style_mut(|s| {
-            s.visuals.selection.bg_fill = t.accent;
-            s.visuals.override_text_color = Some(t.text);
-            s.visuals.widgets.inactive.bg_fill = t.switch_off;
-            s.interaction.selectable_labels = false;
-            s.visuals.handle_shape = egui::style::HandleShape::Circle;
-            s.visuals.slider_trailing_fill = true;
-            s.spacing.slider_rail_height = 4.0;
-        });
+        ctx.global_style_mut(|s| crate::theme::apply_style(s, &t));
         // Frames come from the worker (meters changed) and from animations; nothing polls here.
         self.now = ctx.input(|i| i.time);
         if self.undo.as_ref().is_some_and(|u| self.now > u.until) {

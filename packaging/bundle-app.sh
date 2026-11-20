@@ -23,6 +23,8 @@ cp target/release/sr-cli "$APP/Contents/MacOS/sr-cli"
 check_minos "$APP/Contents/MacOS/SoundRouter" "$APP/Contents/MacOS/sr-cli"
 cp app/assets/icon.icns "$APP/Contents/Resources/icon.icns"
 cp LICENSE-MIT LICENSE-APACHE "$APP/Contents/Resources/"
+mkdir -p "$APP/Contents/Resources/Licenses"
+cp app/assets/fonts/OFL-*.txt "$APP/Contents/Resources/Licenses/"
 cp packaging/uninstall.sh "$APP/Contents/Resources/uninstall.sh"
 chmod +x "$APP/Contents/Resources/uninstall.sh"
 

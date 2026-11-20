@@ -1,11 +1,11 @@
 //! The one modal sheet every pop-up uses: dimmed window, centred rounded card, icon + title + intro,
 //! scrolling body, and a button row with the default (primary) action on the right.
-use crate::theme::{Tokens, semibold};
+use crate::theme::{self, Tokens, radius};
 use crate::widgets::{loops, name_button};
 use eframe::egui::{
-    self, Align, Align2, Color32, Context, CornerRadius, FontId, Frame, Id, Key, Label, Layout,
-    Margin, Modal, Modifiers, Rect, RichText, ScrollArea, Sense, Shadow, Spinner, Stroke,
-    StrokeKind, Ui, WidgetInfo, accesskit::Role, pos2, vec2,
+    self, Align, Align2, Color32, Context, CornerRadius, Frame, Id, Key, Label, Layout, Margin,
+    Modal, Modifiers, Rect, RichText, ScrollArea, Sense, Spinner, Stroke, StrokeKind, Ui,
+    WidgetInfo, accesskit::Role, pos2, vec2,
 };
 
 /// Card content width; the card is this plus its padding.
@@ -48,16 +48,11 @@ pub fn modal<S>(
     footer: impl FnOnce(&mut Ui, &mut S),
 ) {
     let frame = Frame::new()
-        .fill(t.card)
-        .stroke(Stroke::new(1.0, t.card_stroke))
-        .corner_radius(CornerRadius::same(12))
+        .fill(t.raised)
+        .stroke(Stroke::new(1.0, t.hairline))
+        .corner_radius(CornerRadius::same(radius::SHEET))
         .inner_margin(Margin::same(PAD as i8))
-        .shadow(Shadow {
-            offset: [0, 10],
-            blur: 32,
-            spread: 0,
-            color: Color32::from_black_alpha(110),
-        });
+        .shadow(theme::soft_shadow(t));
     let screen = ctx.content_rect();
     let inner_w = INNER_W
         .min(screen.width() - 2.0 * (MARGIN + PAD))
@@ -105,8 +100,8 @@ fn header(ui: &mut Ui, t: &Tokens, sheet: &Sheet, inner_w: f32) {
             ui.add(
                 Label::new(
                     RichText::new(sheet.title)
-                        .font(FontId::new(18.0, semibold()))
-                        .color(t.text),
+                        .font(theme::section())
+                        .color(t.ink),
                 )
                 .wrap(),
             );
@@ -124,7 +119,7 @@ pub fn body(ui: &mut Ui, t: &Tokens, text: &str) {
             RichText::new(text)
                 .size(13.0)
                 .line_height(Some(18.0))
-                .color(t.text2),
+                .color(t.muted),
         )
         .wrap(),
     );
@@ -137,7 +132,7 @@ pub fn error(ui: &mut Ui, t: &Tokens, text: &str) {
             RichText::new(text)
                 .size(13.0)
                 .line_height(Some(18.0))
-                .color(t.danger),
+                .color(t.bad_ink),
         )
         .wrap(),
     );
@@ -147,9 +142,9 @@ fn icon_tile(ui: &Ui, r: Rect, glyph: Glyph, t: &Tokens) {
     let p = ui.painter();
     let tint = match glyph {
         Glyph::App => t.accent,
-        Glyph::Ok => t.meter[0],
-        Glyph::Warn => t.ch[1],
-        Glyph::Fail => t.danger,
+        Glyph::Ok => t.ok,
+        Glyph::Warn => t.warn,
+        Glyph::Fail => t.bad,
     };
     p.rect_filled(r, CornerRadius::same(12), tint);
     let (c, s) = (r.center(), Stroke::new(3.2, Color32::WHITE));
@@ -196,9 +191,9 @@ pub fn checklist(ui: &mut Ui, t: &Tokens, rows: &[Row]) -> Option<usize> {
     let mut clicked = None;
     let w = ui.available_width();
     Frame::new()
-        .fill(t.window)
-        .stroke(Stroke::new(1.0, t.card_stroke))
-        .corner_radius(CornerRadius::same(8))
+        .fill(t.canvas)
+        .stroke(Stroke::new(1.0, t.hairline))
+        .corner_radius(CornerRadius::same(radius::ROW))
         .inner_margin(Margin::symmetric(12, 0))
         .show(ui, |ui| {
             ui.set_width(w - 26.0);
@@ -207,7 +202,7 @@ pub fn checklist(ui: &mut Ui, t: &Tokens, rows: &[Row]) -> Option<usize> {
                 if i > 0 {
                     let (line, _) =
                         ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-                    ui.painter().rect_filled(line, 0.0, t.card_stroke);
+                    ui.painter().rect_filled(line, 0.0, t.hairline);
                 }
                 if row(ui, t, r) {
                     clicked = Some(i);
@@ -220,11 +215,12 @@ pub fn checklist(ui: &mut Ui, t: &Tokens, rows: &[Row]) -> Option<usize> {
 fn row(ui: &mut Ui, t: &Tokens, r: &Row) -> bool {
     let mut clicked = false;
     let w = ui.available_width();
-    let (color, spin) = match r.state {
-        Status::Ok => (t.meter[0], false),
-        Status::Pending => (t.ch[1], false),
-        Status::Running => (t.accent, true),
-        Status::Fail => (t.danger, false),
+    // Dot and chip tint use the signal colour; the chip's text uses its 4.5:1 ink.
+    let (color, ink, spin) = match r.state {
+        Status::Ok => (t.ok, t.ok_ink, false),
+        Status::Pending => (t.warn, t.warn_ink, false),
+        Status::Running => (t.accent, t.accent_ink, true),
+        Status::Fail => (t.bad, t.bad_ink, false),
     };
     ui.add_space(10.0);
     ui.horizontal_top(|ui| {
@@ -246,23 +242,27 @@ fn row(ui: &mut Ui, t: &Tokens, r: &Row) -> bool {
                 line.left_center(),
                 Align2::LEFT_CENTER,
                 r.title,
-                FontId::new(13.5, semibold()),
-                t.text,
+                theme::label(),
+                t.ink,
             );
-            let g = p.layout_no_wrap(r.status.to_string(), FontId::new(12.0, semibold()), color);
+            let g = p.layout_no_wrap(r.status.to_string(), theme::label(), ink);
             let chip = Rect::from_center_size(
                 pos2(line.right() - (g.size().x + 16.0) / 2.0, line.center().y),
                 g.size() + vec2(16.0, 6.0),
             );
-            p.rect_filled(chip, CornerRadius::same(10), color.gamma_multiply(0.16));
-            p.galley(chip.center() - g.size() / 2.0, g, color);
+            p.rect_filled(
+                chip,
+                CornerRadius::same(radius::PILL),
+                color.gamma_multiply(0.16),
+            );
+            p.galley(chip.center() - g.size() / 2.0, g, ink);
             if !r.detail.is_empty() {
                 ui.add(
                     Label::new(
                         RichText::new(r.detail)
                             .size(12.0)
                             .line_height(Some(16.0))
-                            .color(t.text2),
+                            .color(t.muted),
                     )
                     .wrap(),
                 );
@@ -299,7 +299,7 @@ fn status_dot(ui: &Ui, c: egui::Pos2, state: Status, color: Color32) {
 
 /// Indeterminate thin bar with a caption, for work of unknown length.
 pub fn progress(ui: &mut Ui, t: &Tokens, label: &str) {
-    ui.add(Label::new(RichText::new(label).size(13.0).color(t.text)).wrap());
+    ui.add(Label::new(RichText::new(label).size(13.0).color(t.ink)).wrap());
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
     let p = ui.painter();
     let round = CornerRadius::same(2);
@@ -322,9 +322,9 @@ pub enum Kind {
 }
 
 pub fn button(ui: &mut Ui, t: &Tokens, label: &str, kind: Kind) -> bool {
-    let font = FontId::new(13.0, semibold());
+    let font = theme::label();
     let text = if kind == Kind::Secondary {
-        t.text
+        t.ink
     } else {
         Color32::WHITE
     };
@@ -335,24 +335,25 @@ pub fn button(ui: &mut Ui, t: &Tokens, label: &str, kind: Kind) -> bool {
     let base = match kind {
         Kind::Primary => t.accent,
         Kind::Danger => t.danger,
-        Kind::Secondary => t.card.lerp_to_gamma(t.card_stroke, 0.5),
+        Kind::Secondary => t.raised.lerp_to_gamma(t.hairline, 0.5),
     };
+    // Hover and press darken, so white text keeps its 4.5:1 on the accent and danger fills.
     let fill = if resp.is_pointer_button_down_on() {
         base.lerp_to_gamma(Color32::BLACK, 0.18)
     } else if resp.hovered() {
-        base.lerp_to_gamma(Color32::WHITE, 0.12)
+        base.lerp_to_gamma(Color32::BLACK, 0.08)
     } else {
         base
     };
     let stroke = if kind == Kind::Secondary {
-        Stroke::new(1.0, t.card_stroke)
+        Stroke::new(1.0, t.hairline)
     } else {
         Stroke::NONE
     };
     let p = ui.painter();
     p.rect(
         rect,
-        CornerRadius::same(6),
+        CornerRadius::same(radius::PILL),
         fill,
         stroke,
         StrokeKind::Inside,
@@ -360,8 +361,8 @@ pub fn button(ui: &mut Ui, t: &Tokens, label: &str, kind: Kind) -> bool {
     if resp.has_focus() {
         p.rect_stroke(
             rect.expand(2.0),
-            CornerRadius::same(8),
-            Stroke::new(2.0, t.accent.gamma_multiply(0.6)),
+            CornerRadius::same(radius::PILL),
+            Stroke::new(2.0, t.focus),
             StrokeKind::Inside,
         );
     }

@@ -30,25 +30,20 @@ pub fn switch(ui: &mut Ui, rect: Rect, id: Id, on: bool, t: &Tokens, label: &str
     );
     let knob = r - 2.0;
     let x = egui::lerp((rect.left() + knob + 2.0)..=(rect.right() - knob - 2.0), k);
-    p.circle_filled(
-        pos2(x, rect.center().y + 0.5),
-        knob + 0.5,
-        Color32::from_black_alpha(40),
-    );
     p.circle_filled(pos2(x, rect.center().y), knob, Color32::WHITE);
     new
 }
 
-/// Continuous bar: 0..=1 `level`, 2 px peak tick at `peak`. Colour turns yellow from 70 % and red from 90 %.
+/// Continuous bar: 0..=1 `level`, 2 px peak tick at `peak`. Colour turns amber from 70 % and red from 90 %.
 pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) {
     let color = |pos: f32| {
-        t.meter[if pos > 0.9 {
-            2
+        if pos > 0.9 {
+            t.bad
         } else if pos > 0.7 {
-            1
+            t.warn
         } else {
-            0
-        }]
+            t.ok
+        }
         .gamma_multiply(dim)
     };
     let round = CornerRadius::same((r.height() / 2.0) as u8);
@@ -69,7 +64,7 @@ pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) 
     }
 }
 
-/// White knob with a soft shadow, painted over egui's grey slider handle.
+/// White knob with a hairline edge, painted over egui's grey slider handle.
 /// `r` is the slider's response rect, `frac` the value in 0..=1.
 pub fn slider_knob(p: &Painter, r: Rect, frac: f32, t: &Tokens) {
     let rad = r.height() / 2.5; // egui's handle radius
@@ -77,9 +72,7 @@ pub fn slider_knob(p: &Painter, r: Rect, frac: f32, t: &Tokens) {
         egui::lerp((r.left() + rad)..=(r.right() - rad), frac.clamp(0.0, 1.0)),
         r.center().y,
     );
-    p.circle_filled(c + vec2(0.0, 1.0), rad + 1.5, t.shadow);
-    p.circle_filled(c, rad + 1.0, Color32::WHITE);
-    p.circle_stroke(c, rad + 1.0, Stroke::new(0.5, t.card_stroke));
+    p.circle(c, rad + 1.0, Color32::WHITE, Stroke::new(1.0, t.hairline));
 }
 
 /// The ⊕ / ⊖ mark, without any interaction.
@@ -121,7 +114,7 @@ pub fn plus_circle(
     let rect = Rect::from_center_size(center, vec2(22.0, 22.0));
     let resp = ui.interact(rect, id, Sense::click());
     name_button(&resp, label);
-    let c = if resp.hovered() { t.text } else { t.text2 };
+    let c = if resp.hovered() { t.ink } else { t.muted };
     plus_glyph(ui.painter(), center, c, minus);
     resp
 }
@@ -156,11 +149,11 @@ pub fn speaker(
     let resp = ui.interact(rect, id, Sense::click());
     resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, muted, label));
     let c = if muted {
-        t.danger
+        t.bad_ink
     } else if resp.hovered() {
-        t.text
+        t.ink
     } else {
-        t.text2
+        t.muted
     };
     let p = ui.painter();
     let s = Stroke::new(1.4, c);

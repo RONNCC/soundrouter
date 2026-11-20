@@ -10,7 +10,7 @@ No release exists yet. Work through this in order.
 2. `CHANGELOG.md`: rename `[Unreleased]` to `[0.1.0] - YYYY-MM-DD` and fold in the current `[0.1.0]` stub (it still says "First release"); start a new empty `[Unreleased]`.
 3. `[workspace.package] version` in `Cargo.toml` is `0.1.0` (bump and `cargo check` to refresh `Cargo.lock` otherwise).
 4. Local gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo test -p soundrouter-app --features snapshots`, `cargo deny check licenses bans sources`.
-5. `REQUIRE_NOTICES=1 packaging/bundle-app.sh`: the app has `Contents/Resources/ThirdPartyLicenses.html`, `LICENSE-MIT` and `LICENSE-APACHE`.
+5. `REQUIRE_NOTICES=1 packaging/bundle-app.sh`: the app has `Contents/Resources/ThirdPartyLicenses.html`, `LICENSE-MIT`, `LICENSE-APACHE` and the font licenses in `Contents/Resources/Licenses/`.
 6. Hardware checklist in [TESTING.md](TESTING.md) on a Mac with the driver installed (driver test, `engine-live-test.sh`, app steps 5-11). Turn the system volume down before the steps that play real audio.
 7. Decide signing: with Developer ID secrets set, the workflow signs and notarizes; without them the release says "UNSIGNED build" and the README install text applies. Do not call a build notarized unless `notarize.sh` finished without error (it fails on anything but Apple status `Accepted`).
 8. Commit, `git tag v0.1.0`, `git push origin main v0.1.0`. The workflow refuses a tag that differs from the Cargo version.
