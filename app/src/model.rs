@@ -114,13 +114,19 @@ pub fn delay_option(frames: u32) -> String {
     )
 }
 
-/// What the engine's IOProc last measured through device `id`, in ms; `None` until it has run.
+/// What the engine's IOProc last measured through device `id`'s main path (mic, pass-thru), in ms;
+/// `None` until it has run.
 pub fn device_delay_ms(status: &EngineStatus, id: &str) -> Option<f64> {
-    status
-        .delays
-        .iter()
-        .find(|(d, _)| d == id)
-        .map(|(_, d)| d.ms())
+    live_ms(&status.delays, id)
+}
+
+/// The path of apps captured into device `id`, in ms; `None` without a running app tap.
+pub fn device_tap_ms(status: &EngineStatus, id: &str) -> Option<f64> {
+    live_ms(&status.tap_delays, id)
+}
+
+fn live_ms(list: &[(String, sr_core::backend::Delay)], id: &str) -> Option<f64> {
+    list.iter().find(|(d, _)| d == id).map(|(_, d)| d.ms())
 }
 
 /// Quiet readout in a device row, e.g. "Delay 5.3 ms".
@@ -128,10 +134,19 @@ pub fn delay_readout(ms: f64) -> String {
     format!("Delay {ms:.1} ms")
 }
 
-/// Tooltip of the readout. A process tap makes macOS add about 43 ms (two safety offsets of 1024
-/// frames at 48 kHz) to what an app sends through it.
-pub const DELAY_READOUT_TIP: &str =
-    "Time audio takes to pass through this device. Apps you capture add about 43 ms more.";
+/// The muted second part of the readout while apps are captured, e.g. "Apps 29 ms".
+pub fn apps_readout(ms: f64) -> String {
+    format!("Apps {ms:.0} ms")
+}
+
+/// Tooltip of the readout; the second sentence only while apps are captured.
+pub fn delay_readout_tip(apps_ms: Option<f64>) -> String {
+    let tip = "Time audio takes to pass through this device.";
+    match apps_ms {
+        Some(ms) => format!("{tip} Apps you capture take about {ms:.0} ms."),
+        None => tip.into(),
+    }
+}
 
 /// Footer chip tooltip: what SoundRouter adds, from the live reading when there is one, else the
 /// two-buffer formula at 48 kHz. `live` is the device's name and its measured delay in ms.
@@ -590,11 +605,21 @@ pub(crate) mod tests {
                     rate_hz: 48_000,
                 },
             )],
+            tap_delays: vec![(
+                "v1".into(),
+                Delay {
+                    frames: 1384,
+                    rate_hz: 48_000,
+                },
+            )],
             ..EngineStatus::default()
         };
         let ms = device_delay_ms(&status, "v1").unwrap();
         assert_eq!(delay_readout(ms), "Delay 5.3 ms");
         assert_eq!(device_delay_ms(&status, "v2"), None);
+        let apps = device_tap_ms(&status, "v1").unwrap();
+        assert_eq!(apps_readout(apps), "Apps 29 ms");
+        assert_eq!(device_tap_ms(&status, "v2"), None);
         assert_eq!(
             delay_chip_tip(128, Some(("Loopback Audio", ms))),
             "Added by SoundRouter: 5.3 ms, measured on Loopback Audio. Click to change."
@@ -605,7 +630,14 @@ pub(crate) mod tests {
         );
         assert!(low_power_hint_due(true, 64) && low_power_hint_due(true, 128));
         assert!(!low_power_hint_due(true, 256) && !low_power_hint_due(false, 64));
-        assert!(DELAY_READOUT_TIP.ends_with("Apps you capture add about 43 ms more."));
+        assert_eq!(
+            delay_readout_tip(None),
+            "Time audio takes to pass through this device."
+        );
+        assert_eq!(
+            delay_readout_tip(Some(28.8)),
+            "Time audio takes to pass through this device. Apps you capture take about 29 ms."
+        );
     }
 
     #[test]

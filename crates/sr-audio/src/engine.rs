@@ -994,7 +994,7 @@ impl Backend for Engine {
         let mut delays: Vec<(String, Delay)> = g
             .vdevs
             .iter()
-            .filter_map(|(id, v)| Some((id.clone(), vdev_delay(v)?)))
+            .filter_map(|(id, v)| Some((id.clone(), main_delay(v)?)))
             .collect();
         delays.sort_by(|a, b| a.0.cmp(&b.0));
         let mut tap_delays: Vec<(String, Delay)> = g

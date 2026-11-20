@@ -4,6 +4,10 @@
 use sr_audio::Engine;
 use sr_core::backend::Backend;
 use sr_core::config::*;
+use std::sync::{Mutex, PoisonError};
+
+/// Both tests rebuild the driver's device list: one at a time, even under plain `cargo test -- --ignored`.
+static DRIVER: Mutex<()> = Mutex::new(());
 
 fn src(id: &str, kind: SourceKind) -> Source {
     Source {
@@ -82,6 +86,7 @@ fn grow(name: &str, n: usize, mut step: impl FnMut(usize)) -> u64 {
 #[test]
 #[ignore = "needs the SoundRouter driver installed; changes the driver device list"]
 fn rebuild_loops_do_not_leak() {
+    let _one = DRIVER.lock().unwrap_or_else(PoisonError::into_inner);
     let mut e = Engine::new().unwrap();
     e.apply(&cfg(true, 0.0, false)).unwrap();
     let mut worst = 0;
@@ -132,6 +137,7 @@ fn tap_cfg(with_app: bool, player: &str) -> Config {
 #[test]
 #[ignore = "needs the SoundRouter driver installed; changes the driver device list; needs clang"]
 fn tap_aggregate_loops_do_not_leak() {
+    let _one = DRIVER.lock().unwrap_or_else(PoisonError::into_inner);
     let dir = std::env::temp_dir().join(format!("sr-churn-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let player = dir.canonicalize().unwrap().join("srtone"); // the tap keys the process by its real path

@@ -71,10 +71,11 @@ pub struct EngineStatus {
     pub mic: TccStatus,
     /// Protocol version of the installed driver plug-in; `None` = driver not installed.
     pub driver_version: Option<String>,
-    /// Measured delay per running device (devices that have not run a cycle yet are absent).
+    /// Measured delay of each running device's main path: mic, pass-thru and monitors (devices that
+    /// have not run a cycle yet are absent). In an unsplit device it is also the apps' path.
     pub delays: Vec<(String, Delay)>,
     /// The path of tapped apps where a split vdev keeps them in an aggregate of their own; it is longer
-    /// than the device's other paths. Absent for devices without a running app tap.
+    /// than `delays`. Absent for devices without a running app tap.
     pub tap_delays: Vec<(String, Delay)>,
     /// macOS Low Power Mode is on: clocks drop and small audio delays may glitch.
     pub low_power_mode: bool,

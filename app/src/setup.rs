@@ -1061,7 +1061,7 @@ impl Setup {
                 let (glyph, intro) = match v.measure {
                     MeasureState::Idle | MeasureState::Running => (
                         Glyph::App,
-                        "SoundRouter plays one very quiet click into the virtual device and times how long it takes to come back.",
+                        "SoundRouter plays one very quiet click into the virtual device and times how long it takes to come back. That is the mic and pass-thru path; apps you capture take longer.",
                     ),
                     MeasureState::Done(Ok(_)) => {
                         (Glyph::Ok, "The click made it through the virtual device.")
@@ -1086,7 +1086,7 @@ impl Setup {
                         MeasureState::Done(Ok(ms)) => {
                             let status = format!("{ms:.1} ms");
                             let detail = format!(
-                                "Through {} as it is routed now. Apps you capture add about 43 ms more.",
+                                "Through {} as it is routed now. Apps you capture take longer.",
                                 v.device_name
                             );
                             checklist(

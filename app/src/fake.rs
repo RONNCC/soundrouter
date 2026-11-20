@@ -75,6 +75,7 @@ impl FakeBackend {
             ..Self::new()
         };
         b.status.delays = vec![("v1".into(), at(512)), ("v2".into(), at(512))];
+        b.status.tap_delays = vec![("v1".into(), at(1_384))]; // apps captured into v1 take longer
         b
     }
 }

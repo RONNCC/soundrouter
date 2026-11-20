@@ -3,9 +3,9 @@ use crate::graph::{self, GraphCtx, GraphState};
 use crate::icons::IconTextures;
 use crate::login;
 use crate::model::{
-    DELAY_READOUT_TIP, Edit, LOW_POWER_HINT, apply, db_to_pct, delay_chip_tip, delay_hint,
-    delay_label, delay_ms, delay_name, delay_option, delay_readout, device_delay_ms,
-    low_power_hint_due, pct_to_db,
+    Edit, LOW_POWER_HINT, apply, apps_readout, db_to_pct, delay_chip_tip, delay_hint, delay_label,
+    delay_ms, delay_name, delay_option, delay_readout, delay_readout_tip, device_delay_ms,
+    device_tap_ms, low_power_hint_due, pct_to_db,
 };
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, OPEN_SETTINGS, Setup};
 use crate::store;
@@ -701,34 +701,54 @@ impl App {
             }
             hit.on_hover_text("Double-click to rename");
         }
-        let chans = format!("{} channels", dev.channels);
-        let chans_rect = ui.painter().text(
-            pos2(name_pos.x, inner.top() + 36.0),
-            Align2::LEFT_CENTER,
-            chans,
-            caption(),
-            t.muted.gamma_multiply(dim),
-        );
         let status = self.engine_status();
-        // A quiet live readout beside the channel count, when the row has room for it.
+        // A quiet live readout in the channel-count line: beside the count when the row has room,
+        // else (apps captured: the longer readout) in its place.
+        let ink = t.muted.gamma_multiply(dim);
+        let line_y = inner.top() + 36.0;
+        let chans =
+            ui.painter()
+                .layout_no_wrap(format!("{} channels", dev.channels), caption(), ink);
+        let mut show_chans = true;
         if let Some(ms) = device_delay_ms(&status, &dev.id) {
-            let g = ui.painter().layout_no_wrap(
-                delay_readout(ms),
-                num(11.0),
-                t.muted.gamma_multiply(dim),
-            );
-            let at = pos2(
-                inner.right() - 30.0 - g.size().x,
-                inner.top() + 36.0 - g.size().y / 2.0,
-            );
-            let rect = Rect::from_min_size(at, g.size());
-            if rect.left() > chans_rect.right() + 8.0 {
-                let label = format!("{} {}", dev.name, g.text());
-                ui.painter().galley(at, g, t.muted);
+            use egui::text::{LayoutJob, TextFormat};
+            let apps = device_tap_ms(&status, &dev.id);
+            let readout = |with_apps: bool| {
+                let mut job = LayoutJob::default();
+                job.append(&delay_readout(ms), 0.0, TextFormat::simple(num(11.0), ink));
+                if let (true, Some(a)) = (with_apps, apps) {
+                    // The second part is quieter than the first.
+                    let quiet = TextFormat::simple(num(11.0), ink.gamma_multiply(0.7));
+                    job.append(&format!(" {}", apps_readout(a)), 0.0, quiet);
+                }
+                ui.painter().layout_job(job)
+            };
+            let full = readout(true);
+            let (g, x) = if apps.is_some() && name_pos.x + full.size().x <= inner.right() - 22.0 {
+                show_chans = false;
+                (full, name_pos.x)
+            } else {
+                let g = readout(false);
+                let x = inner.right() - 30.0 - g.size().x;
+                (g, x)
+            };
+            let rect = Rect::from_min_size(pos2(x, line_y - g.size().y / 2.0), g.size());
+            if !show_chans || rect.left() > name_pos.x + chans.size().x + 8.0 {
+                let label = match apps {
+                    Some(a) if !show_chans => {
+                        format!("{} {}, {}", dev.name, delay_readout(ms), apps_readout(a))
+                    }
+                    _ => format!("{} {}", dev.name, delay_readout(ms)),
+                };
+                ui.painter().galley(rect.min, g, t.muted);
                 let hit = ui.interact(rect.expand(2.0), Id::unique(("delay", i)), Sense::hover());
                 hit.widget_info(|| WidgetInfo::labeled(Role::Label, true, &label));
-                hit.on_hover_text(DELAY_READOUT_TIP);
+                hit.on_hover_text(delay_readout_tip(apps));
             }
+        }
+        if show_chans {
+            let at = pos2(name_pos.x, line_y - chans.size().y / 2.0);
+            ui.painter().galley(at, chans, ink);
         }
         let state = status
             .per_device

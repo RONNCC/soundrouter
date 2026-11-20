@@ -2382,7 +2382,7 @@ fn the_delay_menu_stays_inside_the_window_and_picks_a_size() {
 fn device_rows_show_the_live_delay() {
     let h = open(demo_config());
     // Two buffers of 256 frames at 48 kHz.
-    h.get_by_label("Loopback Audio Delay 10.7 ms");
+    h.get_by_label("Loopback Audio Delay 10.7 ms, Apps 29 ms"); // apps are captured into it
     h.get_by_label("Stream Mix Delay 10.7 ms");
     assert!(
         !has(&h, "Zoom Out Delay 10.7 ms"),
