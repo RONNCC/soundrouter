@@ -2,6 +2,8 @@
 //   srctl get                         print current config plist
 //   srctl set uid:name:ch [...]       replace device list (e.g. sr.v1:"Loopback 1":2)
 //   srctl list                        UIDs of soundrouter: devices the system lists (hidden companions must NOT appear)
+//   srctl vol|mute <uid> in|out [value]  read or set V's volume (scalar) / mute control
+//   srctl vmv <uid> [scalar]          the virtual main volume (output scope) the system volume keys set
 //   srctl loop <uid> [frames]         write impulses to the device output, read its input, report delay
 #include <CoreAudio/CoreAudio.h>
 #include <mach/mach_time.h>
@@ -23,6 +25,22 @@ static AudioObjectID device(const char* uid) {
     AudioObjectPropertyAddress a = { kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     CFStringRef u = CFStringCreateWithCString(0, uid, kCFStringEncodingUTF8); AudioObjectID id = 0; UInt32 sz = sizeof id;
     AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof u, &u, &sz, &id); return id;
+}
+
+// Volume/mute control objects of a device scope (what Sound settings and the volume keys drive).
+static AudioObjectID control(AudioObjectID d, UInt32 cls, UInt32 scope) {
+    AudioObjectPropertyAddress ca = { kAudioObjectPropertyControlList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectID ids[16]; UInt32 sz = sizeof ids;
+    if (AudioObjectGetPropertyData(d, &ca, 0, NULL, &sz, ids)) return 0;
+    for (UInt32 k = 0; k < sz / sizeof(AudioObjectID); k++) {
+        AudioObjectPropertyAddress ka = { kAudioObjectPropertyClass, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        AudioObjectPropertyAddress sa = { kAudioControlPropertyScope, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        UInt32 c = 0, s = 0, n = 4;
+        AudioObjectGetPropertyData(ids[k], &ka, 0, NULL, &n, &c); n = 4;
+        AudioObjectGetPropertyData(ids[k], &sa, 0, NULL, &n, &s);
+        if (c == cls && s == scope) return ids[k];
+    }
+    return 0;
 }
 
 // Loopback probe: impulse every 4800 frames into output ch1; measure host-time delay until it shows on input ch1.
@@ -79,6 +97,34 @@ int main(int argc, char** argv) {
         }
         OSStatus e = AudioObjectSetPropertyData(plugin(), &a, 0, NULL, sizeof(CFPropertyListRef), &arr);
         printf("set -> %d\n", (int)e); return e != 0;
+    }
+    // srctl vol <uid> in|out [scalar]; srctl mute <uid> in|out [0|1]: the control objects (print the value, or set it).
+    // srctl vmv <uid> [scalar]: the system's virtual main volume on the output scope, which is what the volume keys set.
+    if ((!strcmp(argv[1], "vol") || !strcmp(argv[1], "mute")) && argc >= 4) {
+        int vol = !strcmp(argv[1], "vol");
+        AudioObjectID d = device(argv[2]); if (!d) { fprintf(stderr, "no device %s\n", argv[2]); return 2; }
+        AudioObjectID c = control(d, vol ? kAudioVolumeControlClassID : kAudioMuteControlClassID, !strcmp(argv[3], "in") ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput);
+        if (!c) { fprintf(stderr, "no %s control on %s (driver without controls?)\n", argv[1], argv[2]); return 3; }
+        AudioObjectPropertyAddress pa = { vol ? kAudioLevelControlPropertyScalarValue : kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        if (argc > 4) {
+            OSStatus e;
+            if (vol) { Float32 v = atof(argv[4]); e = AudioObjectSetPropertyData(c, &pa, 0, NULL, 4, &v); }
+            else { UInt32 v = atoi(argv[4]); e = AudioObjectSetPropertyData(c, &pa, 0, NULL, 4, &v); }
+            if (e) { printf("set err %d\n", (int)e); return 1; }
+        }
+        if (vol) {
+            Float32 v = 0, db = 0; UInt32 n = 4; AudioObjectGetPropertyData(c, &pa, 0, NULL, &n, &v);
+            AudioObjectPropertyAddress da = { kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+            n = 4; AudioObjectGetPropertyData(c, &da, 0, NULL, &n, &db); printf("scalar %.4f  %.2f dB\n", v, db);
+        } else { UInt32 v = 0, n = 4; AudioObjectGetPropertyData(c, &pa, 0, NULL, &n, &v); printf("mute %u\n", v); }
+        return 0;
+    }
+    if (!strcmp(argv[1], "vmv") && argc >= 3) {
+        AudioObjectID d = device(argv[2]); if (!d) { fprintf(stderr, "no device %s\n", argv[2]); return 2; }
+        AudioObjectPropertyAddress pa = { 'vmvc', kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+        if (argc > 3) { Float32 v = atof(argv[3]); OSStatus e = AudioObjectSetPropertyData(d, &pa, 0, NULL, 4, &v); if (e) { printf("set err %d\n", (int)e); return 1; } }
+        Float32 v = -1; UInt32 n = 4; OSStatus e = AudioObjectGetPropertyData(d, &pa, 0, NULL, &n, &v);
+        printf("virtual main volume %.4f (err %d)\n", v, (int)e); return e != 0;
     }
     if (!strcmp(argv[1], "loop") && argc >= 3) {
         AudioObjectID d = device(argv[2]); if (!d) { fprintf(stderr, "no device %s\n", argv[2]); return 2; }

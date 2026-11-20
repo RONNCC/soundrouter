@@ -2,7 +2,7 @@
 use crate::config::MAX_CHANNELS;
 use crate::ring::{ReadAhead, Ring};
 use coreaudio_sys::*;
-use sr_core::driver_proto::{DEFAULT_RATE, DriverDevice, MAX_DEVICES, SAMPLE_RATES};
+use sr_core::driver_proto::{DEFAULT_RATE, DriverDevice, MAX_DEVICES, SAMPLE_RATES, VOLUME_MIN_DB};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
@@ -116,7 +116,9 @@ pub fn rate_index(rate: f64) -> Option<usize> {
 }
 
 /// Lowest level of V's volume controls; at this value the gain is exactly 0.
-pub const MIN_DB: f32 = -64.0;
+pub const MIN_DB: f32 = VOLUME_MIN_DB;
+/// `Slot::gain_last` before any read: a NaN.
+pub const NO_GAIN: u32 = 0x7fc0_0000;
 
 /// dB is the primary value and scalar its linear-in-dB view (0 -> `MIN_DB`, 1 -> 0 dB), like the
 /// HAL's default level-control mapping. `gain` is derived on the (non-real-time) set path so that
@@ -206,6 +208,9 @@ pub struct Slot {
     pub seed: AtomicU64,
     /// Volume/mute on V, applied when reading: [input scope, output scope]. C has none.
     pub levels: [Level; 2],
+    /// Gain the last read of each reading side (index = `Side as usize`) ended on, as f32 bits; `NO_GAIN` = none
+    /// yet (the next read starts at its target). A changed level ramps from it, see `io::apply_gain`.
+    pub gain_last: [AtomicU32; 2],
     /// Read-ahead calibration per reading side (index = `Side as usize`), and the epoch that restarts it
     /// (bumped when I/O starts or stops on either side).
     pub read_ahead: [ReadAhead; 2],
@@ -233,6 +238,7 @@ impl Slot {
             anchor: AtomicU64::new(0),
             seed: AtomicU64::new(0),
             levels: [const { Level::new() }; 2],
+            gain_last: [const { AtomicU32::new(NO_GAIN) }; 2],
             overloads: [AtomicU64::new(0), AtomicU64::new(0)],
             read_ahead: [const { ReadAhead::new() }; 2],
             ra_epoch: AtomicU32::new(0),
@@ -350,6 +356,9 @@ impl Slot {
         for l in &self.levels {
             l.set_db(0.0);
             l.set_muted(false);
+        }
+        for g in &self.gain_last {
+            g.store(NO_GAIN, Relaxed);
         }
         for o in &self.overloads {
             o.store(0, Relaxed);
@@ -753,6 +762,12 @@ mod tests {
         assert_eq!((l.effective(), l.db()), (0.0, 0.0));
         l.set_muted(false);
         assert_eq!(l.effective(), 1.0);
+        // The engine's copy of the mapping (app taps follow V's volume) must agree with the driver's.
+        for s in [0.0, 0.1, 0.5, 0.9, 1.0] {
+            l.set_scalar(s);
+            let want = sr_core::driver_proto::volume_gain(s, false);
+            assert!((l.effective() - want).abs() <= want * 1e-6, "{s}");
+        }
     }
 
     #[test]

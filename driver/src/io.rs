@@ -3,7 +3,7 @@
 use crate::state::*;
 use coreaudio_sys::*;
 use std::ffi::c_void;
-use std::sync::atomic::Ordering::*;
+use std::sync::atomic::{AtomicU32, Ordering::*};
 
 const BAD_OBJECT: OSStatus = kAudioHardwareBadObjectError as OSStatus;
 
@@ -38,6 +38,7 @@ pub unsafe extern "C" fn stop_io(
         .fetch_update(AcqRel, Acquire, |n| n.checked_sub(1))
         .map_or(0, |n| n - 1);
     if left == 0 {
+        slot.gain_last[side as usize].store(NO_GAIN, Relaxed);
         slot.restart_read_ahead();
         // The ring this side writes goes silent: V writes ring A, C writes ring B.
         if let Some(r) = slot.ring(side == Side::Visible) {
@@ -184,12 +185,44 @@ pub unsafe extern "C" fn do_io(
         (Side::Visible, true) => out() * slot.levels[0].effective(),
         (Side::Visible, false) => slot.levels[0].effective(),
     };
-    if g == 0.0 {
-        buf.fill(0.0); // exact silence, also for non-finite input
-    } else if g != 1.0 {
-        buf.iter_mut().for_each(|x| *x *= g);
-    }
+    apply_gain(buf, ch, &slot.gain_last[side as usize], g, slot.rate(side));
     0
+}
+
+/// A mute or volume change fades over about this long instead of stepping: a step is a click.
+const RAMP_SECS: f64 = 0.010;
+
+/// Scale `buf` (`ch` interleaved channels) by a gain that moves from where the previous read ended (`last`) to
+/// `to`, at most `1 / (RAMP_SECS * rate)` per frame, so full scale to silence takes 10 ms. Steady unity leaves
+/// the samples alone and steady silence is exact zeros, also for non-finite input.
+fn apply_gain(buf: &mut [f32], ch: usize, last: &AtomicU32, to: f32, rate: f64) {
+    let from = f32::from_bits(last.load(Relaxed));
+    let from = if from.is_nan() { to } else { from };
+    let reach = (1.0 / (RAMP_SECS * rate)) as f32 * (buf.len() / ch) as f32;
+    let end = if (to - from).abs() <= reach {
+        to
+    } else {
+        from + reach.copysign(to - from)
+    };
+    last.store(end.to_bits(), Relaxed);
+    if from == to {
+        if to == 0.0 {
+            buf.fill(0.0);
+        } else if to != 1.0 {
+            buf.iter_mut().for_each(|x| *x *= to);
+        }
+        return;
+    }
+    let step = ((1.0 / (RAMP_SECS * rate)) as f32).copysign(to - from);
+    for (k, frame) in buf.chunks_exact_mut(ch).enumerate() {
+        let g = from + step * (k + 1) as f32;
+        let g = if step > 0.0 { g.min(to) } else { g.max(to) };
+        if g == 0.0 {
+            frame.fill(0.0);
+        } else {
+            frame.iter_mut().for_each(|x| *x *= g);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +541,13 @@ mod tests {
         assert!(same, "V and C disagree at the same rate");
     }
 
+    /// Reads until a level change has finished fading (10 ms = 480 frames at 48 kHz; each read is `FRAMES`).
+    fn settled(dev: u32, t: f64, buf: &mut Vec<f32>, n: usize) {
+        for _ in 0..10 {
+            run(dev, READ, t, buf, n);
+        }
+    }
+
     /// The engine path (V.out -> C.in) and the direct loop (V.out -> V.in) both apply V's output level;
     /// V.in via the engine applies V's input level only; C.out is stored untouched.
     #[test]
@@ -523,51 +563,100 @@ mod tests {
 
         // Defaults: unity, bit-exact pass-through.
         assert_eq!(run(v, WRITE, 1000.0, &mut out.clone(), n), 0);
-        run(c, READ, 1000.0, &mut buf, n);
+        settled(c, 1000.0, &mut buf, n);
         assert_eq!(&buf[..n], &out[..]);
 
         // Engine path honours the output level; the stored samples stay raw.
         SLOTS[8].levels[1].set_db(db);
-        run(c, READ, 1000.0, &mut buf, n);
+        settled(c, 1000.0, &mut buf, n);
         assert_eq!(&buf[..n], &scaled(&out, g)[..]);
         SLOTS[8].levels[1].set_db(0.0);
-        run(c, READ, 1000.0, &mut buf, n);
+        settled(c, 1000.0, &mut buf, n);
         assert_eq!(&buf[..n], &out[..], "stored data is not attenuated");
 
         // Direct loop (C idle): output level times input level.
         SLOTS[8].levels[1].set_db(db);
         SLOTS[8].levels[0].set_db(db);
-        run(v, READ, 1000.0, &mut buf, n);
+        settled(v, 1000.0, &mut buf, n);
         assert_eq!(&buf[..n], &scaled(&out, g * g)[..]);
         SLOTS[8].levels[0].set_db(0.0);
-        run(v, READ, 1000.0, &mut buf, n);
+        settled(v, 1000.0, &mut buf, n);
         assert_eq!(&buf[..n], &scaled(&out, g)[..]);
 
         // Engine running: V.in is ring B, which only the input level touches; C.out is not scaled.
         SLOTS[8].clients[Side::Engine as usize].store(1, Release);
         let mix = ramp(2).iter().map(|x| -x).collect::<Vec<_>>();
         assert_eq!(run(c, WRITE, 2000.0, &mut mix.clone(), n), 0);
-        run(v, READ, 2000.0, &mut buf, n);
+        settled(v, 2000.0, &mut buf, n);
         assert_eq!(&buf[..n], &mix[..], "output level must not touch V.in");
         SLOTS[8].levels[0].set_db(db);
-        run(v, READ, 2000.0, &mut buf, n);
+        settled(v, 2000.0, &mut buf, n);
         assert_eq!(&buf[..n], &scaled(&mix, g)[..]);
 
         // Mute: exact zeros, on either scope, with and without a non-finite sample in the data.
         SLOTS[8].levels[0].set_db(0.0);
         SLOTS[8].levels[0].set_muted(true);
-        run(v, READ, 2000.0, &mut buf, n);
+        settled(v, 2000.0, &mut buf, n);
         assert!(buf[..n].iter().all(|&x| x.to_bits() == 0));
         SLOTS[8].levels[0].set_muted(false);
         SLOTS[8].levels[1].set_muted(true);
         let mut nan = out.clone();
         nan[0] = f32::NAN;
         assert_eq!(run(v, WRITE, 3000.0, &mut nan, n), 0);
-        run(c, READ, 3000.0, &mut buf, n);
+        settled(c, 3000.0, &mut buf, n);
         assert!(buf[..n].iter().all(|&x| x.to_bits() == 0));
         SLOTS[8].levels[1].set_muted(false);
-        run(c, READ, 3000.0, &mut buf, n);
+        settled(c, 3000.0, &mut buf, n);
         assert!(buf[0].is_nan(), "unmuted unity passes data through");
+    }
+
+    /// Runs `apply_gain` over unit samples in blocks of `frames`, one target per block, returns channel 0.
+    fn fade(last: &AtomicU32, rate: f64, frames: usize, targets: &[f32]) -> Vec<f32> {
+        let mut out = vec![];
+        for &to in targets {
+            let mut b = vec![1.0f32; frames * 2];
+            apply_gain(&mut b, 2, last, to, rate);
+            assert!(b.chunks(2).all(|f| f[0] == f[1]), "channels share one gain");
+            out.extend(b.chunks(2).map(|f| f[0]));
+        }
+        out
+    }
+
+    /// A mute or volume change fades in 10 ms at the most per unit of gain, whatever the block size, and a new
+    /// target in mid-fade continues from where the last block ended: no sample steps by more than one ramp step.
+    #[test]
+    fn apply_gain_fades_without_steps_and_lands_exactly() {
+        let step = 1.0 / 480.0 + 1e-6;
+        for frames in [32, 128, 512] {
+            let last = AtomicU32::new(NO_GAIN);
+            let mut series = fade(&last, 48_000.0, frames, &[1.0]);
+            assert!(
+                series.iter().all(|&g| g == 1.0),
+                "first read snaps, unity untouched"
+            );
+            let mut targets = vec![0.0, 0.0, 0.0, 1.0, 0.3, 0.0];
+            targets.extend([1.0; 40]);
+            series.extend(fade(&last, 48_000.0, frames, &targets));
+            for w in series.windows(2) {
+                assert!(
+                    (w[1] - w[0]).abs() <= step,
+                    "{frames}: {} -> {}",
+                    w[0],
+                    w[1]
+                );
+            }
+            assert_eq!(*series.last().unwrap(), 1.0);
+        }
+        // Mute from unity: strictly falling, exact zeros from the 481st frame on (96 kHz: from the 961st).
+        for (rate, n) in [(48_000.0, 480), (96_000.0, 960)] {
+            let last = AtomicU32::new(1.0f32.to_bits());
+            let s = fade(&last, rate, 100, &[0.0; 12]);
+            assert!(s[..n - 1].windows(2).all(|w| w[1] < w[0]), "{rate}");
+            assert!(s[n..].iter().all(|&g| g == 0.0), "{rate}");
+        }
+        // After I/O stopped the history is gone: a muted device starts silent, it does not fade out a burst.
+        let last = AtomicU32::new(NO_GAIN);
+        assert!(fade(&last, 48_000.0, 64, &[0.0]).iter().all(|&g| g == 0.0));
     }
 
     /// V.out -> C.in under the HAL's call pattern (read at now-F, then write at now+F): after the calibration
