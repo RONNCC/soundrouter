@@ -51,10 +51,24 @@ fn mute_and_gain_changed_while_unplugged_apply_when_it_returns() {
     let ins = vec![vec![1.0; 16], vec![0.5; 16]];
     let muted = run(&mut mixer_for(&d, &layout()), &ins, 4, 16);
     assert!(muted.iter().flatten().all(|x| *x == 0.0), "mute survives");
+
+    // Unplugged: the edits are made while the plan has no slot for the device.
+    let kept = d.clone();
+    run(&mut mixer_for(&d, &unplugged()), &[], 2, 16);
+    assert_eq!(
+        d, kept,
+        "building a plan without it leaves the config alone"
+    );
     d.sources[0].muted = false;
     d.sources[0].volume_db = 0.0;
     d.monitors[0].volume_db = -80.0;
+    let gone = run(&mut mixer_for(&d, &unplugged()), &[], 2, 16);
+    assert!(gone.iter().flatten().all(|x| *x == 0.0), "still silent");
+    assert_ne!(d, kept, "the edits are in the config");
+    let edited = d.clone();
+
     let back = run(&mut mixer_for(&d, &layout()), &ins, 4, 16);
+    assert_eq!(d, edited, "plugging in changes nothing either");
     assert_eq!(back[0][15], 1.0);
     assert!(back[2][15] < 1e-3, "monitor gain edited while away");
 }

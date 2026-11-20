@@ -4,6 +4,9 @@ use super::*;
 use crate::fake::demo_config;
 use crate::model::{Edit, apply};
 use egui_kittest::{Harness, kittest::Queryable};
+use sr_core::preset::PresetFile;
+use sr_core::preset_store;
+use std::path::Path;
 
 fn open_menu(h: &mut Harness<App>) {
     click(h, presets::BUTTON);
@@ -25,8 +28,8 @@ fn link(h: &mut Harness<App>, url: &str) {
 }
 
 /// The preset `name` applied to the current config, as a config.
-fn merged(h: &Harness<App>, name: &str) -> Config {
-    let app = h.state();
+fn merged(h: &mut Harness<App>, name: &str) -> Config {
+    let app = h.state_mut();
     app.presets.plan_for(&app.cfg, name).unwrap().config
 }
 
@@ -35,11 +38,12 @@ fn saving_stores_the_whole_routing_and_says_so() {
     let mut h = open(demo_config());
     save_as(&mut h, "  Streaming ");
     assert_eq!(h.state().presets.names(), ["Streaming"]);
-    assert_eq!(
-        merged(&h, "Streaming"),
-        h.state().cfg,
-        "everything is in it"
-    );
+    let saved = h.state().cfg.clone();
+    apply(&mut h.state_mut().cfg, Edit::Mute(0, true));
+    apply(&mut h.state_mut().cfg, Edit::Volume(1, -20.0));
+    apply(&mut h.state_mut().cfg, Edit::BufferFrames(64));
+    assert_ne!(h.state().cfg, saved);
+    assert_eq!(merged(&mut h, "Streaming"), saved, "everything is in it");
     h.get_by_label("Saved preset \"Streaming\".");
     assert!(!has(&h, "Preset name"), "the sheet closed");
 }
@@ -57,7 +61,7 @@ fn saving_over_a_name_says_replace_and_keeps_one_preset() {
     click(&mut h, "Replace");
     assert_eq!(h.state().presets.names(), ["mix"]);
     h.get_by_label("Replaced preset \"mix\".");
-    assert!(merged(&h, "mix").devices[0].muted);
+    assert!(merged(&mut h, "mix").devices[0].muted);
 }
 
 #[test]
@@ -140,12 +144,12 @@ fn a_link_never_turns_on_a_device_the_user_turned_off_without_asking() {
     apply(&mut h.state_mut().cfg, Edit::Enable(1, false));
     let before = h.state().cfg.clone();
     link(&mut h, "soundrouter://preset/All%20on");
-    h.get_by_label("Add virtual devices?");
+    h.get_by_label("Turn on virtual devices?");
     assert_eq!(h.state().cfg, before);
     click(&mut h, "Cancel");
     assert_eq!(h.state().cfg, before, "declined");
     link(&mut h, "soundrouter://preset/All%20on");
-    click(&mut h, "Add devices");
+    click(&mut h, "Turn on");
     assert!(h.state().cfg.devices[1].enabled, "after the yes");
 }
 
@@ -233,4 +237,92 @@ fn presets_survive_a_restart_and_a_corrupt_file_is_moved_aside() {
     assert!(none.names().is_empty());
     assert!(msg.unwrap().contains("presets.json.bad"));
     assert!(dir.path().join("presets.json.bad").exists());
+}
+
+/// `presets.json` as it is on disk, for tests that play `sr-cli preset save`.
+fn disk(path: &Path) -> PresetFile {
+    preset_store::load(path).0
+}
+
+/// What another process does: load, add a preset of `cfg`, write.
+fn save_externally(path: &Path, name: &str, cfg: &Config) {
+    let mut f = disk(path);
+    f.save_as(name, cfg).unwrap();
+    preset_store::save(path, &f).unwrap();
+}
+
+fn with_file(h: &mut Harness<App>) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("presets.json");
+    h.state_mut().presets = Presets::load(Some(path.clone())).0;
+    (dir, path)
+}
+
+#[test]
+fn a_preset_saved_by_the_cli_is_found_without_a_restart() {
+    let mut h = open(demo_config());
+    let (_dir, path) = with_file(&mut h);
+    assert!(
+        h.state_mut()
+            .presets
+            .plan_for(&demo_config(), "Ext")
+            .is_err()
+    );
+    save_externally(&path, "Ext", &demo_config());
+    assert!(
+        h.state_mut()
+            .presets
+            .plan_for(&demo_config(), "Ext")
+            .is_ok()
+    );
+    assert_eq!(h.state().presets.names(), ["Ext"]);
+    link(&mut h, "soundrouter://preset/Ext");
+    h.get_by_label("Applied preset Ext");
+}
+
+#[test]
+fn saving_and_deleting_in_the_app_keep_presets_added_from_outside() {
+    let mut h = open(demo_config());
+    let (_dir, path) = with_file(&mut h);
+    save_as(&mut h, "Mine");
+    save_externally(&path, "Ext", &demo_config());
+    save_as(&mut h, "Second");
+    let names = |p: &Path| {
+        let mut n: Vec<_> = disk(p).presets.into_iter().map(|p| p.name).collect();
+        n.sort();
+        n
+    };
+    assert_eq!(names(&path), ["Ext", "Mine", "Second"], "the save merged");
+
+    save_externally(&path, "Later", &demo_config());
+    open_menu(&mut h);
+    click(&mut h, presets::MANAGE);
+    click(&mut h, "Delete Mine");
+    click(&mut h, "Delete");
+    assert_eq!(
+        names(&path),
+        ["Ext", "Later", "Second"],
+        "the delete merged"
+    );
+}
+
+#[test]
+fn a_preset_that_needs_asking_does_not_replace_a_sheet_being_filled_in() {
+    let mut h = open(demo_config());
+    save_as(&mut h, "Three");
+    h.state_mut().cfg.devices.remove(1);
+    open_menu(&mut h);
+    click(&mut h, presets::SAVE_AS);
+    link(&mut h, "soundrouter://preset/Three");
+    h.get_by_label("Finish what you are doing first.");
+    assert!(has(&h, "Preset name"), "the name sheet is still there");
+    assert!(!has(&h, "Add virtual devices?"));
+    click(&mut h, "Cancel");
+
+    open_menu(&mut h);
+    click(&mut h, presets::MANAGE);
+    click(&mut h, "Delete Three");
+    link(&mut h, "soundrouter://preset/Three");
+    h.get_by_label("Finish what you are doing first.");
+    h.get_by_label("Delete \"Three\"?");
 }

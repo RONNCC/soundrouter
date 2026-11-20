@@ -293,6 +293,7 @@ impl App {
             .count();
         if let Some(t) = &mut self.tray {
             t.set_status(tray::status_text(running));
+            self.presets.refresh();
             t.set_presets(&self.presets.names());
             for cmd in t.poll() {
                 match cmd {
@@ -369,7 +370,9 @@ impl App {
             Ok(plan) => {
                 let name = self.presets.stored_name(name).unwrap_or(name).to_owned();
                 if plan.confirm().is_some() {
-                    self.presets.ask(&name, plan);
+                    if let Err(e) = self.presets.ask(&name, plan) {
+                        self.toast = Some(e.into());
+                    }
                     show_window(ctx);
                 } else {
                     self.commit_preset(&name, plan.config);

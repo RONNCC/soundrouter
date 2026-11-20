@@ -239,7 +239,7 @@ pub fn default_config() -> Config {
 }
 
 /// `default_config` with its device stripped to no sources and no wires, a blank canvas.
-#[cfg(any(test, feature = "snapshots"))]
+#[cfg(test)]
 pub fn bare_config() -> Config {
     let mut cfg = default_config();
     cfg.devices[0].sources.clear();

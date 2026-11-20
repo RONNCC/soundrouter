@@ -256,7 +256,7 @@ impl Tray {
             let _ = self.presets.remove(&row);
         }
         for (i, name) in names.iter().enumerate() {
-            let row = MenuItem::new(name, true, None);
+            let row = MenuItem::new(menu_title(name), true, None);
             if self.presets.insert(&row, i).is_ok() {
                 self.preset_rows.push((row, name.clone()));
             }
@@ -273,6 +273,11 @@ impl Tray {
         self.icon.set_title(Some(HINT));
         self.hint_until = Some(Instant::now() + HINT_FOR);
     }
+}
+
+/// muda treats a single `&` in a title as a mnemonic marker and drops it; `&&` shows one.
+fn menu_title(name: &str) -> String {
+    name.replace('&', "&&")
 }
 
 pub fn status_text(running: usize) -> String {
@@ -363,6 +368,12 @@ mod tests {
 
     fn fresh() -> WinState {
         WinState::default()
+    }
+
+    #[test]
+    fn menu_titles_keep_their_ampersands() {
+        assert_eq!(menu_title("Rock & Roll"), "Rock && Roll");
+        assert_eq!(menu_title("Plain"), "Plain");
     }
 
     #[test]

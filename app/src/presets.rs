@@ -12,7 +12,8 @@ use sr_core::config::{Config, MAX_NAME_CHARS};
 use sr_core::preset::{Plan, PresetFile, plan};
 use sr_core::preset_store;
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Toolbar button, menu rows and sheet buttons; tests click them by these names.
 pub const BUTTON: &str = "Presets";
@@ -52,10 +53,22 @@ enum Sheet {
     Delete(String),
 }
 
+/// Modified time and size: when either changes, someone else wrote the file. `None`: no file.
+type Stamp = Option<(SystemTime, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
 pub struct Presets {
     file: PresetFile,
     /// `None` in demo mode: presets live in memory only.
     path: Option<PathBuf>,
+    /// The file as `file` last read or wrote it; `refresh` reloads when the disk differs.
+    seen: Stamp,
+    /// A problem found while reloading, shown as a toast by the next `show`.
+    notice: Option<String>,
     sheet: Sheet,
 }
 
@@ -65,14 +78,33 @@ impl Presets {
         let (file, msg) = path
             .as_deref()
             .map_or_else(|| (PresetFile::default(), None), preset_store::load);
+        let seen = path.as_deref().and_then(stamp);
         (
             Presets {
                 file,
                 path,
+                seen,
+                notice: None,
                 sheet: Sheet::None,
             },
             msg,
         )
+    }
+
+    /// Pick up what another process (`sr-cli preset save`) wrote since we last looked, so the
+    /// next read or change works on the file as it is on disk. A corrupt file is set aside and
+    /// reported by the next `show`.
+    pub fn refresh(&mut self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        if stamp(path) == self.seen {
+            return;
+        }
+        let (file, msg) = preset_store::load(path);
+        self.file = file;
+        self.seen = stamp(path);
+        self.notice = msg.or(self.notice.take());
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -80,7 +112,8 @@ impl Presets {
     }
 
     /// What applying `name` to `cfg` would do, or why it cannot be done.
-    pub fn plan_for(&self, cfg: &Config, name: &str) -> Result<Plan, String> {
+    pub fn plan_for(&mut self, cfg: &Config, name: &str) -> Result<Plan, String> {
+        self.refresh();
         let p = self
             .file
             .find(name)
@@ -109,24 +142,31 @@ impl Presets {
         });
     }
 
-    /// Ask before applying: the preset needs devices that are not set up.
-    pub fn ask(&mut self, name: &str, plan: Plan) {
+    /// Ask before applying: the preset needs devices that are not set up. A name or delete sheet
+    /// that is open stays; the answer is `Err` with what to tell the user.
+    pub fn ask(&mut self, name: &str, plan: Plan) -> Result<(), &'static str> {
+        if matches!(self.sheet, Sheet::Name(_) | Sheet::Delete(_)) {
+            return Err("Finish what you are doing first.");
+        }
         self.sheet = Sheet::Confirm {
             name: name.to_owned(),
             plan,
         };
+        Ok(())
     }
 
-    fn persist(&self) -> Option<String> {
+    fn persist(&mut self) -> Option<String> {
         let path = self.path.as_ref()?;
-        preset_store::save(path, &self.file)
-            .err()
+        let res = preset_store::save(path, &self.file);
+        self.seen = stamp(path);
+        res.err()
             .map(|e| format!("Could not save your presets: {e}. Changes last until you quit."))
     }
 
     /// The popup under the toolbar button: one row per preset (a click applies it), then the
     /// actions. Returns the preset to apply.
     pub fn menu(&mut self, ui: &mut Ui, t: &Tokens) -> Option<String> {
+        self.refresh();
         ui.set_min_width(220.0);
         ui.set_max_width(320.0);
         let mut apply = None;
@@ -162,6 +202,7 @@ impl Presets {
                     }
                 }
                 Some(true) => {
+                    self.refresh();
                     let done = match &st.rename_of {
                         None => self.file.save_as(&st.text, cfg).map(|replaced| {
                             let verb = if replaced { "Replaced" } else { "Saved" };
@@ -216,6 +257,7 @@ impl Presets {
                 None => self.sheet = Sheet::Delete(name),
                 Some(false) => self.sheet = Sheet::Manage,
                 Some(true) => {
+                    self.refresh();
                     self.file.delete(&name);
                     out.toast = self
                         .persist()
@@ -224,6 +266,7 @@ impl Presets {
                 }
             },
         }
+        out.toast = out.toast.or(self.notice.take());
         out
     }
 }

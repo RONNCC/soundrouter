@@ -149,31 +149,44 @@ pub struct Plan {
 
 impl Plan {
     /// Title, question and button label for the confirm sheet; `None` when nothing needs asking.
+    /// The words follow what changes: only turning on, only adding, or any resize.
     pub fn confirm(&self) -> Option<(String, String, &'static str)> {
         if self.changes.is_empty() {
             return None;
         }
-        let resizes = self
-            .changes
-            .iter()
-            .any(|c| matches!(c, DeviceChange::Channels(..)));
-        Some(if resizes {
-            (
+        let any = |f: fn(&DeviceChange) -> bool| self.changes.iter().any(f);
+        if any(|c| matches!(c, DeviceChange::Channels(..))) {
+            return Some((
                 "Change virtual devices?".into(),
                 "This preset changes your virtual devices; apply it?".into(),
                 "Apply",
-            )
+            ));
+        }
+        let n = self.changes.len();
+        let (noun, be, it) = if n == 1 {
+            ("device", "is", "it")
         } else {
-            let n = self.changes.len();
-            let (noun, be, it) = if n == 1 {
-                ("device", "is", "it")
-            } else {
-                ("devices", "are", "them")
-            };
+            ("devices", "are", "them")
+        };
+        Some(if !any(|c| matches!(c, DeviceChange::Add(_))) {
+            (
+                "Turn on virtual devices?".into(),
+                format!("This preset needs {n} virtual {noun} that {be} turned off; turn {it} on?"),
+                "Turn on",
+            )
+        } else if !any(|c| matches!(c, DeviceChange::TurnOn(_))) {
             (
                 "Add virtual devices?".into(),
                 format!("This preset needs {n} virtual {noun} that {be} not set up; add {it}?"),
                 "Add devices",
+            )
+        } else {
+            (
+                "Set up virtual devices?".into(),
+                format!(
+                    "This preset needs {n} virtual {noun} that {be} not set up or turned off; set {it} up?"
+                ),
+                "Set up",
             )
         })
     }
@@ -498,6 +511,30 @@ mod tests {
         assert_eq!(p.changes[0].describe(), "Set My name to 4 channels");
         let (title, _, ok) = p.confirm().unwrap();
         assert_eq!((title.as_str(), ok), ("Change virtual devices?", "Apply"));
+    }
+
+    #[test]
+    fn the_confirm_words_follow_the_kinds_of_change() {
+        let plan = |changes| Plan {
+            config: Config::default(),
+            changes,
+        };
+        let on = || DeviceChange::TurnOn("A".into());
+        let add = || DeviceChange::Add("B".into());
+        let (t, q, ok) = plan(vec![on()]).confirm().unwrap();
+        assert_eq!(t, "Turn on virtual devices?");
+        assert_eq!(
+            q,
+            "This preset needs 1 virtual device that is turned off; turn it on?"
+        );
+        assert_eq!(ok, "Turn on");
+        let (_, q, _) = plan(vec![on(), on()]).confirm().unwrap();
+        assert!(q.contains("2 virtual devices that are turned off; turn them on?"));
+        let (t, q, ok) = plan(vec![on(), add()]).confirm().unwrap();
+        assert_eq!((t.as_str(), ok), ("Set up virtual devices?", "Set up"));
+        assert!(q.contains("2 virtual devices that are not set up or turned off; set them up?"));
+        let all = plan(vec![on(), add(), DeviceChange::Channels("C".into(), 4)]);
+        assert_eq!(all.confirm().unwrap().2, "Apply");
     }
 
     #[test]
