@@ -1,7 +1,7 @@
 //! In-app backend for `--demo`: synthetic meters, fake apps and hardware.
 use crate::model::{Edit, apply, default_config};
 use sr_core::backend::{
-    AppInfo, Backend, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
+    AppInfo, Backend, Delay, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
 };
 use sr_core::config::{Config, SourceKind};
 use std::time::Instant;
@@ -28,6 +28,8 @@ pub struct FakeBackend {
     pub status: EngineStatus,
     /// What `self_test` returns; `None` makes it fail.
     pub self_test: Option<SelfTest>,
+    /// What `measure_delay` returns, in ms; `None` makes it fail.
+    pub measured_ms: Option<f64>,
     /// Meters stay at silence: stands in for the engine when the real one could not start.
     silent: bool,
 }
@@ -45,6 +47,7 @@ impl FakeBackend {
                 rate: 48_000.0,
                 passed: true,
             }),
+            measured_ms: Some(5.4),
             silent: false,
         }
     }
@@ -54,17 +57,25 @@ impl FakeBackend {
         Self {
             silent: true,
             self_test: None, // never claim audio flows
+            measured_ms: None,
             ..Self::new()
         }
     }
 
-    /// Meters pinned to second `t`: same readings every call, for snapshot tests.
+    /// Meters pinned to second `t`: same readings every call, for snapshot tests. It reports the
+    /// delays `demo_config` would at 256 frames from the first poll, which comes before the apply.
     #[cfg(test)]
     pub fn frozen(t: f32) -> Self {
-        Self {
+        let at = |frames| Delay {
+            frames,
+            rate_hz: 48_000,
+        };
+        let mut b = Self {
             frozen: Some(t),
             ..Self::new()
-        }
+        };
+        b.status.delays = vec![("v1".into(), at(512)), ("v2".into(), at(512))];
+        b
     }
 }
 
@@ -113,13 +124,35 @@ impl Backend for FakeBackend {
     }
 
     fn status(&self) -> EngineStatus {
-        self.status.clone()
+        let mut s = self.status.clone();
+        // The demo engine reports a delay per enabled device like the real one: two buffers.
+        if s.delays.is_empty() && s.driver_version.as_deref() == Some(DEMO_DRIVER) {
+            s.delays = self
+                .cfg
+                .devices
+                .iter()
+                .filter(|d| d.enabled)
+                .map(|d| {
+                    let delay = Delay {
+                        frames: 2 * self.cfg.buffer_frames,
+                        rate_hz: 48_000,
+                    };
+                    (d.id.clone(), delay)
+                })
+                .collect();
+        }
+        s
     }
 
     fn self_test(&mut self, _id: &str) -> anyhow::Result<SelfTest> {
         self.self_test
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no audio came back"))
+    }
+
+    fn measure_delay(&mut self, _id: &str) -> anyhow::Result<f64> {
+        self.measured_ms
+            .ok_or_else(|| anyhow::anyhow!("The click did not come back through the device."))
     }
 
     fn meters(&self, device_id: &str) -> Option<MeterReading> {

@@ -99,13 +99,13 @@ impl Drop for Restore<'_> {
 /// `cfg` is the config the backend currently runs; `engine_running` says whether an engine holds
 /// device `id`. Without one, `probe` runs on the driver's direct loop and nothing is applied.
 /// Otherwise the probe route is applied first and `cfg` applied again afterwards, on every exit.
-pub fn run_routed(
+pub fn run_routed<T>(
     backend: &mut dyn Backend,
     cfg: &Config,
     id: &str,
     engine_running: bool,
-    probe: impl FnOnce() -> Result<SelfTest>,
-) -> Result<SelfTest> {
+    probe: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let tmp = engine_running.then(|| probe_config(cfg, id)).flatten();
     let Some(tmp) = tmp else {
         return probe();
@@ -297,7 +297,7 @@ mod tests {
     fn probe_failure_still_restores() {
         let c = cfg();
         let mut b = Mock::default();
-        let r = run_routed(&mut b, &c, "v1", true, || bail!("no device"));
+        let r = run_routed::<SelfTest>(&mut b, &c, "v1", true, || bail!("no device"));
         assert_eq!(r.unwrap_err().to_string(), "no device");
         assert_eq!(b.applied.last(), Some(&c));
         assert_eq!(b.applied.len(), 2);
@@ -308,7 +308,7 @@ mod tests {
         let c = cfg();
         let mut b = Mock::default();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_routed(&mut b, &c, "v1", true, || panic!("probe died"))
+            run_routed::<SelfTest>(&mut b, &c, "v1", true, || panic!("probe died"))
         }));
         assert!(r.is_err());
         assert_eq!(b.applied.last(), Some(&c));
@@ -321,7 +321,8 @@ mod tests {
             fail_apply_at: Some(1),
             ..Mock::default()
         };
-        let e = run_routed(&mut b, &c, "v1", true, || panic!("probe must not run")).unwrap_err();
+        let e = run_routed::<SelfTest>(&mut b, &c, "v1", true, || panic!("probe must not run"))
+            .unwrap_err();
         assert!(
             format!("{e:#}").contains("could not route the test tone"),
             "{e:#}"

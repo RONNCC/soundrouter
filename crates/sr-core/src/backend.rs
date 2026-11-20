@@ -97,6 +97,11 @@ pub trait Backend {
     fn self_test(&mut self, _id: &str) -> anyhow::Result<SelfTest> {
         anyhow::bail!("self-test is not supported by this backend")
     }
+    /// Time one click from `id`'s output to its input, in milliseconds: the delay through the virtual
+    /// device as it is routed now. Blocks for a couple of seconds, so callers run it off the UI thread.
+    fn measure_delay(&mut self, _id: &str) -> anyhow::Result<f64> {
+        anyhow::bail!("delay measurement is not supported by this backend")
+    }
 }
 
 #[cfg(test)]

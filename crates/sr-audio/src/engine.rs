@@ -896,6 +896,23 @@ impl Backend for Engine {
         selftest::verdict(t, mic_status())
     }
 
+    fn measure_delay(&mut self, id: &str) -> Result<f64> {
+        let uid = format!("{DEVICE_UID_PREFIX}{id}");
+        let cfg = lock(&self.inner).cfg.clone();
+        if mic_status() == TccStatus::Unknown {
+            crate::tcc::request_microphone(MIC_PROMPT_WAIT);
+        }
+        let probe = || crate::loopback::measure_delay(&uid);
+        let r = match cfg {
+            Some(cfg) => selftest::run_routed(self, &cfg, id, true, probe),
+            None => probe(),
+        };
+        r.map_err(|e| match mic_status() {
+            TccStatus::Granted => e,
+            _ => e.context("Microphone access is not allowed, which hands SoundRouter silence"),
+        })
+    }
+
     fn meters(&self, device_id: &str) -> Option<MeterReading> {
         let mut g = lock(&self.inner);
         let v = g.vdevs.get_mut(device_id)?;

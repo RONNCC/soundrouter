@@ -26,6 +26,15 @@ pub enum SelfTestState {
     Done(Result<SelfTest, String>),
 }
 
+/// Progress of the delay measurement the "Measure delay" sheet asks for: milliseconds, or why not.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum MeasureState {
+    #[default]
+    Idle,
+    Running,
+    Done(Result<f64, String>),
+}
+
 #[derive(Default)]
 pub struct Snapshot {
     pub meters: HashMap<String, MeterReading>,
@@ -39,11 +48,13 @@ pub struct Snapshot {
     /// False until the first status poll, so the GUI does not mistake "not asked yet" for "no driver".
     pub status_ready: bool,
     pub self_test: SelfTestState,
+    pub measure: MeasureState,
 }
 
 enum Msg {
     Apply(Config),
     SelfTest(String),
+    MeasureDelay(String),
     /// Replace the backend with the synthetic one.
     Demo,
     /// Only to end a wait: the window was shown or hidden.
@@ -95,6 +106,7 @@ impl Core {
 struct Batch {
     cfg: Option<Config>,
     tests: Vec<String>,
+    measures: Vec<String>,
     demo: bool,
 }
 
@@ -109,6 +121,11 @@ fn drain_latest(rx: &Receiver<Msg>, first: Option<Msg>) -> Batch {
             Msg::SelfTest(id) => {
                 if !b.tests.contains(&id) {
                     b.tests.push(id);
+                }
+            }
+            Msg::MeasureDelay(id) => {
+                if !b.measures.contains(&id) {
+                    b.measures.push(id);
                 }
             }
             Msg::Demo => b.demo = true,
@@ -145,6 +162,15 @@ impl Pump {
             snap.lock().unwrap().self_test = SelfTestState::Running;
             let r = self.backend.self_test(&id).map_err(|e| format!("{e:#}"));
             snap.lock().unwrap().self_test = SelfTestState::Done(r);
+        }
+        for id in b.measures {
+            changed = true;
+            snap.lock().unwrap().measure = MeasureState::Running;
+            let r = self
+                .backend
+                .measure_delay(&id)
+                .map_err(|e| format!("{e:#}"));
+            snap.lock().unwrap().measure = MeasureState::Done(r);
         }
         changed
     }
@@ -324,6 +350,17 @@ impl Worker {
         self.shared.lock().unwrap().self_test = SelfTestState::Done(Err(why.to_string()));
     }
 
+    /// Time a click through virtual device `id` off the UI thread; the result lands in `Snapshot::measure`.
+    pub fn measure_delay(&self, id: &str) {
+        self.shared.lock().unwrap().measure = MeasureState::Running;
+        self.send(Msg::MeasureDelay(id.to_string()));
+    }
+
+    /// Report a measurement that cannot even start.
+    pub fn fail_measure_delay(&self, why: &str) {
+        self.shared.lock().unwrap().measure = MeasureState::Done(Err(why.to_string()));
+    }
+
     /// Tell the worker whether the window can be seen; hidden, it stops reading meters and sleeps
     /// longer between wake-ups. Cheap to call every frame.
     pub fn set_visible(&self, visible: bool) {
@@ -421,6 +458,11 @@ mod tests {
                 rate: 48_000.0,
                 passed: true,
             })
+        }
+        fn measure_delay(&mut self, id: &str) -> anyhow::Result<f64> {
+            self.probe();
+            anyhow::ensure!(id == "v1", "no device {id}");
+            Ok(5.4)
         }
     }
 
@@ -609,6 +651,32 @@ mod tests {
             panic!("no result");
         };
         assert!(t.passed);
+        assert!(log.lock().unwrap().lock_free);
+    }
+
+    #[test]
+    fn measured_delay_reaches_the_snapshot_and_requests_collapse() {
+        let (tx, rx) = mpsc::channel();
+        for id in ["v1", "v1", "nope"] {
+            tx.send(Msg::MeasureDelay(id.into())).unwrap();
+        }
+        let batch = drain_latest(&rx, None);
+        assert_eq!(batch.measures, ["v1", "nope"]);
+        let (mut pump, log, snap) = setup();
+        pump.run(batch, Instant::now(), &snap);
+        assert_eq!(
+            snap.lock().unwrap().measure,
+            MeasureState::Done(Err("no device nope".into()))
+        );
+        pump.run(
+            Batch {
+                measures: vec!["v1".into()],
+                ..Batch::default()
+            },
+            Instant::now(),
+            &snap,
+        );
+        assert_eq!(snap.lock().unwrap().measure, MeasureState::Done(Ok(5.4)));
         assert!(log.lock().unwrap().lock_free);
     }
 

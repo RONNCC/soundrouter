@@ -5,7 +5,7 @@ use crate::sheet::{
 };
 use crate::theme::{Tokens, tokens};
 use crate::widgets::name_button;
-use crate::worker::SelfTestState;
+use crate::worker::{MeasureState, SelfTestState};
 use eframe::egui::{self, Align2, Context, CornerRadius, Id, Rect, Sense, Stroke, Theme};
 use sr_core::backend::{EngineStatus, TccStatus};
 use std::path::{Path, PathBuf};
@@ -312,6 +312,8 @@ pub enum Step {
     Permissions,
     Verify,
     Done,
+    /// "Measure delay": one click timed through a virtual device.
+    Delay,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -326,6 +328,8 @@ pub enum Action {
     /// Create the devices if that has not happened yet, then loopback-test (the Microphone prompt).
     AllowMic,
     Test,
+    /// Time a click through the device (`Backend::measure_delay`).
+    Measure,
     /// Leave the real engine for the synthetic one.
     Demo,
     /// The uninstall deleted the settings folder.
@@ -338,6 +342,7 @@ pub struct View<'a> {
     /// The first status poll has landed.
     pub ready: bool,
     pub test: &'a SelfTestState,
+    pub measure: &'a MeasureState,
     pub device_name: &'a str,
     /// The driver is there but nothing has been applied yet, because the Microphone prompt would
     /// otherwise appear unexplained (`Needs::hold_first_apply`).
@@ -461,6 +466,12 @@ impl Setup {
         self.step = Step::Permissions;
         self.open = true;
         self.copied = false;
+    }
+
+    /// "Measure delay…" in the delay menu: the sheet that shows the click's way through the device.
+    pub fn open_measure(&mut self) {
+        self.step = Step::Delay;
+        self.open = true;
     }
 
     pub fn ask_uninstall(&mut self) {
@@ -593,7 +604,7 @@ impl Setup {
     pub fn show(&mut self, ctx: &Context, v: &View) -> Option<Action> {
         let deleted = self.poll(v.now);
         self.shown = false;
-        if self.demo || !v.ready {
+        if (self.demo && self.step != Step::Delay) || !v.ready {
             return deleted;
         }
         self.sync(v);
@@ -703,6 +714,12 @@ impl Setup {
         if let Some(p) = &self.marker {
             mark_seen_at(p);
         }
+    }
+
+    /// Closing the measurement leaves the setup's "seen" mark alone: it says nothing about setup.
+    fn close_measure(&mut self) {
+        self.open = false;
+        self.step = Step::Welcome;
     }
 
     fn sheet(&mut self, ctx: &Context, t: &Tokens, v: &View) -> Option<Action> {
@@ -1036,6 +1053,89 @@ impl Setup {
                                 }
                             },
                         ),
+                    },
+                )
+            }
+            Step::Delay => {
+                let running = matches!(v.measure, MeasureState::Idle | MeasureState::Running);
+                let (glyph, intro) = match v.measure {
+                    MeasureState::Idle | MeasureState::Running => (
+                        Glyph::App,
+                        "SoundRouter plays one very quiet click into the virtual device and times how long it takes to come back.",
+                    ),
+                    MeasureState::Done(Ok(_)) => {
+                        (Glyph::Ok, "The click made it through the virtual device.")
+                    }
+                    MeasureState::Done(Err(_)) => (Glyph::Fail, "The click did not come back."),
+                };
+                modal(
+                    ctx,
+                    t,
+                    &Sheet {
+                        id: "setup_delay",
+                        buttons: true,
+                        glyph,
+                        title: "Measure delay",
+                        intro,
+                    },
+                    self,
+                    |ui, _| match v.measure {
+                        MeasureState::Idle | MeasureState::Running => {
+                            progress(ui, t, "Playing a quiet click through the virtual device…");
+                        }
+                        MeasureState::Done(Ok(ms)) => {
+                            let status = format!("{ms:.1} ms");
+                            let detail = format!(
+                                "Through {} as it is routed now. Apps you capture add about 43 ms more.",
+                                v.device_name
+                            );
+                            checklist(
+                                ui,
+                                t,
+                                &[Row {
+                                    state: Status::Ok,
+                                    title: "Measured delay",
+                                    status: &status,
+                                    detail: &detail,
+                                    action: None,
+                                }],
+                            );
+                        }
+                        MeasureState::Done(Err(e)) => {
+                            let detail = format!("The measurement failed: {e}");
+                            checklist(
+                                ui,
+                                t,
+                                &[Row {
+                                    state: Status::Fail,
+                                    title: "Measured delay",
+                                    status: "Failed",
+                                    detail: &detail,
+                                    action: None,
+                                }],
+                            );
+                        }
+                    },
+                    |ui, s| {
+                        buttons(
+                            ui,
+                            s,
+                            |_, _| {},
+                            |ui, s| {
+                                if running {
+                                    if button(ui, t, "Cancel", Kind::Secondary) {
+                                        s.close_measure();
+                                    }
+                                } else {
+                                    if button(ui, t, "Done", Kind::Primary) {
+                                        s.close_measure();
+                                    }
+                                    if button(ui, t, "Measure again", Kind::Secondary) {
+                                        action = Some(Action::Measure);
+                                    }
+                                }
+                            },
+                        );
                     },
                 )
             }

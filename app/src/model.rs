@@ -1,6 +1,6 @@
 //! Pure edit operations on the `Config` the GUI owns. The UI never mutates the config while
 //! drawing: it emits `Edit`s, and `apply` runs them after the frame.
-use sr_core::backend::{AppInfo, HwDevice};
+use sr_core::backend::{AppInfo, EngineStatus, HwDevice};
 use sr_core::config::{
     Config, MAX_CH, Monitor, MonitorWire, Source, SourceKind, VirtualDevice, Wire,
 };
@@ -112,6 +112,48 @@ pub fn delay_option(frames: u32) -> String {
         delay_name(frames),
         delay_ms(frames)
     )
+}
+
+/// What the engine's IOProc last measured through device `id`, in ms; `None` until it has run.
+pub fn device_delay_ms(status: &EngineStatus, id: &str) -> Option<f64> {
+    status
+        .delays
+        .iter()
+        .find(|(d, _)| d == id)
+        .map(|(_, d)| d.ms())
+}
+
+/// Quiet readout in a device row, e.g. "Delay 5.3 ms".
+pub fn delay_readout(ms: f64) -> String {
+    format!("Delay {ms:.1} ms")
+}
+
+/// Tooltip of the readout. A process tap makes macOS add about 43 ms (two safety offsets of 1024
+/// frames at 48 kHz) to what an app sends through it.
+pub const DELAY_READOUT_TIP: &str =
+    "Time audio takes to pass through this device. Apps you capture add about 43 ms more.";
+
+/// Footer chip tooltip: what SoundRouter adds, from the live reading when there is one, else the
+/// two-buffer formula at 48 kHz. `live` is the device's name and its measured delay in ms.
+pub fn delay_chip_tip(frames: u32, live: Option<(&str, f64)>) -> String {
+    match live {
+        Some((name, ms)) => {
+            format!("Added by SoundRouter: {ms:.1} ms, measured on {name}. Click to change.")
+        }
+        None => format!(
+            "Added by SoundRouter: about {:.1} ms (two buffers at 48 kHz). Click to change.",
+            delay_ms(frames)
+        ),
+    }
+}
+
+/// Shown in the delay menu while Low Power Mode is on and the chosen delay is a small one.
+pub const LOW_POWER_HINT: &str =
+    "Low Power Mode is on. Lower delay can crackle; choose Balanced or Safest.";
+
+/// Whether to show `LOW_POWER_HINT`: Lowest (64) and Low (128) are the settings that glitch first.
+pub fn low_power_hint_due(low_power_mode: bool, frames: u32) -> bool {
+    low_power_mode && frames <= 128
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -535,6 +577,35 @@ pub(crate) mod tests {
             delay_option(512),
             "Safest, +21.3 ms. Best for recording and streaming, where delay does not matter"
         );
+    }
+
+    #[test]
+    fn live_delay_readouts_and_hints() {
+        use sr_core::backend::Delay;
+        let status = EngineStatus {
+            delays: vec![(
+                "v1".into(),
+                Delay {
+                    frames: 256,
+                    rate_hz: 48_000,
+                },
+            )],
+            ..EngineStatus::default()
+        };
+        let ms = device_delay_ms(&status, "v1").unwrap();
+        assert_eq!(delay_readout(ms), "Delay 5.3 ms");
+        assert_eq!(device_delay_ms(&status, "v2"), None);
+        assert_eq!(
+            delay_chip_tip(128, Some(("Loopback Audio", ms))),
+            "Added by SoundRouter: 5.3 ms, measured on Loopback Audio. Click to change."
+        );
+        assert_eq!(
+            delay_chip_tip(256, None),
+            "Added by SoundRouter: about 10.7 ms (two buffers at 48 kHz). Click to change."
+        );
+        assert!(low_power_hint_due(true, 64) && low_power_hint_due(true, 128));
+        assert!(!low_power_hint_due(true, 256) && !low_power_hint_due(false, 64));
+        assert!(DELAY_READOUT_TIP.ends_with("Apps you capture add about 43 ms more."));
     }
 
     #[test]

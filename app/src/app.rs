@@ -3,7 +3,9 @@ use crate::graph::{self, GraphCtx, GraphState};
 use crate::icons::IconTextures;
 use crate::login;
 use crate::model::{
-    Edit, apply, db_to_pct, delay_hint, delay_label, delay_ms, delay_name, delay_option, pct_to_db,
+    DELAY_READOUT_TIP, Edit, LOW_POWER_HINT, apply, db_to_pct, delay_chip_tip, delay_hint,
+    delay_label, delay_ms, delay_name, delay_option, delay_readout, device_delay_ms,
+    low_power_hint_due, pct_to_db,
 };
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, OPEN_SETTINGS, Setup};
 use crate::store;
@@ -90,8 +92,17 @@ fn state_look(s: &DeviceState, t: &Tokens) -> Option<(String, egui::Color32)> {
     })
 }
 
-/// The "Audio delay" popup: one plain sentence, then a radio-style row per buffer size.
-fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>) {
+/// The "Audio delay" popup: one plain sentence, then a radio-style row per buffer size, and the
+/// action that measures the delay for real (`measure` is set when it is clicked).
+fn delay_menu(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    current: u32,
+    low_power: bool,
+    can_measure: bool,
+    edits: &mut Vec<Edit>,
+    measure: &mut bool,
+) {
     use egui::text::{LayoutJob, TextFormat};
     const W: f32 = 360.0;
     const CHECK_W: f32 = 24.0;
@@ -114,6 +125,20 @@ fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>
             .wrap(),
         );
     });
+    if low_power_hint_due(low_power, current) {
+        ui.add_space(4.0);
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(LOW_POWER_HINT)
+                        .font(body())
+                        .line_height(Some(18.0))
+                        .color(t.muted),
+                )
+                .wrap(),
+            );
+        });
+    }
     ui.add_space(4.0);
     for n in BUFFER_FRAMES {
         let mut job = LayoutJob::default();
@@ -162,6 +187,14 @@ fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>
         if resp.on_hover_text(tip).clicked() && !on {
             edits.push(Edit::BufferFrames(n));
         }
+    }
+    ui.separator();
+    let btn = ui.add_enabled(can_measure, egui::Button::new("Measure delay…"));
+    let btn = btn
+        .on_hover_text("Plays one very quiet click into the virtual device and times how long it takes to come back.")
+        .on_disabled_hover_text("Turn a device on first.");
+    if btn.clicked() {
+        *measure = true;
     }
 }
 
@@ -324,12 +357,13 @@ impl App {
     /// The setup sheet and what it asks for.
     fn drive_setup(&mut self, ctx: &egui::Context) {
         let pending = self.first_apply();
-        let (ready, status, test, apply_error) = {
+        let (ready, status, test, measure, apply_error) = {
             let s = self.worker.shared.lock().unwrap();
             (
                 s.status_ready,
                 s.status.clone(),
                 s.self_test.clone(),
+                s.measure.clone(),
                 s.apply_error.clone(),
             )
         };
@@ -358,6 +392,7 @@ impl App {
             status: &status,
             ready,
             test: &test,
+            measure: &measure,
             device_name: name,
             first_apply_pending: pending,
             missing,
@@ -379,6 +414,7 @@ impl App {
                         .fail_self_test("There is no enabled device to test. Turn one on in the sidebar, then try again."),
                 }
             }
+            Some(SetupAction::Measure) => self.measure_now(),
             Some(SetupAction::Demo) => {
                 self.demo = true;
                 self.engine_error = None;
@@ -397,6 +433,24 @@ impl App {
                 self.save_pending = false;
             }
             None => {}
+        }
+    }
+
+    /// Time a click through the selected device, else the first enabled one (like the setup test).
+    fn measure_now(&mut self) {
+        let enabled = |d: &&sr_core::config::VirtualDevice| d.enabled;
+        let id = self
+            .cfg
+            .devices
+            .get(self.selected)
+            .filter(enabled)
+            .or_else(|| self.cfg.devices.iter().find(enabled))
+            .map(|d| d.id.clone());
+        match id {
+            Some(id) => self.worker.measure_delay(&id),
+            None => self.worker.fail_measure_delay(
+                "There is no enabled device to measure. Turn one on in the sidebar, then try again.",
+            ),
         }
     }
 
@@ -648,15 +702,35 @@ impl App {
             hit.on_hover_text("Double-click to rename");
         }
         let chans = format!("{} channels", dev.channels);
-        ui.painter().text(
+        let chans_rect = ui.painter().text(
             pos2(name_pos.x, inner.top() + 36.0),
             Align2::LEFT_CENTER,
             chans,
             caption(),
             t.muted.gamma_multiply(dim),
         );
-        let state = self
-            .engine_status()
+        let status = self.engine_status();
+        // A quiet live readout beside the channel count, when the row has room for it.
+        if let Some(ms) = device_delay_ms(&status, &dev.id) {
+            let g = ui.painter().layout_no_wrap(
+                delay_readout(ms),
+                num(11.0),
+                t.muted.gamma_multiply(dim),
+            );
+            let at = pos2(
+                inner.right() - 30.0 - g.size().x,
+                inner.top() + 36.0 - g.size().y / 2.0,
+            );
+            let rect = Rect::from_min_size(at, g.size());
+            if rect.left() > chans_rect.right() + 8.0 {
+                let label = format!("{} {}", dev.name, g.text());
+                ui.painter().galley(at, g, t.muted);
+                let hit = ui.interact(rect.expand(2.0), Id::unique(("delay", i)), Sense::hover());
+                hit.widget_info(|| WidgetInfo::labeled(Role::Label, true, &label));
+                hit.on_hover_text(DELAY_READOUT_TIP);
+            }
+        }
+        let state = status
             .per_device
             .into_iter()
             .find_map(|(id, s)| (id == dev.id).then_some(s))
@@ -804,8 +878,11 @@ impl App {
                     name_button(&resp, "More actions");
                     let tint = if resp.hovered() { t.ink } else { t.muted };
                     if resp.hovered() {
-                        ui.painter()
-                            .rect_filled(more, CornerRadius::same(radius::PILL), t.hairline);
+                        ui.painter().rect_filled(
+                            more,
+                            CornerRadius::same(radius::PILL),
+                            t.hairline,
+                        );
                     }
                     for dx in [-5.0, 0.0, 5.0] {
                         ui.painter()
@@ -835,10 +912,34 @@ impl App {
                 let chip_w = setup::footer_width(ui, &label);
                 let latency = Rect::from_min_size(pos2(right - chip_w, by), vec2(chip_w, 26.0));
                 let resp = setup::footer_button(ui, latency, "latency", &label, t);
-                resp.clone().on_hover_text(
-                    "How long audio takes to pass through SoundRouter: two buffers, shown at 48 kHz. The virtual device adds about two more. Click to change.",
-                );
-                egui::Popup::menu(&resp).show(|ui| delay_menu(ui, t, self.cfg.buffer_frames, edits));
+                let live = self.engine_status();
+                // The selected device's reading, else any device's.
+                let reading = self
+                    .cfg
+                    .devices
+                    .get(self.selected)
+                    .into_iter()
+                    .chain(&self.cfg.devices)
+                    .find_map(|d| Some((d.name.as_str(), device_delay_ms(&live, &d.id)?)));
+                resp.clone()
+                    .on_hover_text(delay_chip_tip(self.cfg.buffer_frames, reading));
+                let can_measure = self.cfg.devices.iter().any(|d| d.enabled);
+                let mut measure = false;
+                egui::Popup::menu(&resp).show(|ui| {
+                    delay_menu(
+                        ui,
+                        t,
+                        self.cfg.buffer_frames,
+                        live.low_power_mode,
+                        can_measure,
+                        edits,
+                        &mut measure,
+                    )
+                });
+                if measure {
+                    self.setup.open_measure();
+                    self.measure_now();
+                }
                 let reserved = r.right() - latency.left() + 12.0;
                 let (apply_error, es) = {
                     let s = self.worker.shared.lock().unwrap();
@@ -908,15 +1009,7 @@ impl App {
                 };
                 let x = btn.right() + 18.0;
                 let width = r.right() - 18.0 - x - reserved;
-                graph::text_left(
-                    ui,
-                    x,
-                    r.center().y,
-                    &msg,
-                    body(),
-                    color,
-                    width,
-                );
+                graph::text_left(ui, x, r.center().y, &msg, body(), color, width);
                 let status = ui.interact(
                     Rect::from_min_max(
                         pos2(x, r.top()),

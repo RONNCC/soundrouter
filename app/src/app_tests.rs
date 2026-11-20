@@ -5,7 +5,10 @@ use crate::fake::{FakeBackend, demo_config, demo_status};
 use crate::model::bare_config;
 use crate::setup::{Runner, SetupError};
 use crate::worker::SelfTestState;
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::{
+    Harness,
+    kittest::{NodeT, Queryable},
+};
 use sr_core::backend::{
     AppInfo, Backend, DeviceState, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
 };
@@ -869,6 +872,18 @@ mod snapshots {
         before: impl FnOnce(&mut Harness<'static, App>),
         results: &mut egui_kittest::SnapshotResults,
     ) {
+        shot_with(name, theme, cfg, toast, false, before, results);
+    }
+
+    fn shot_with(
+        name: &str,
+        theme: Theme,
+        cfg: Config,
+        toast: Option<&str>,
+        low_power_mode: bool,
+        before: impl FnOnce(&mut Harness<'static, App>),
+        results: &mut egui_kittest::SnapshotResults,
+    ) {
         let suffix = if theme == Theme::Dark {
             "dark"
         } else {
@@ -881,7 +896,9 @@ mod snapshots {
             .with_context_setup(crate::theme::install_fonts)
             .wgpu()
             .build_eframe(move |cc| {
-                let backend = Box::new(FakeBackend::frozen(1.5));
+                let mut backend = FakeBackend::frozen(1.5);
+                backend.status.low_power_mode = low_power_mode;
+                let backend = Box::new(backend);
                 let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
                 let mut app = App::new(cfg, None, w, toast.map(str::to_string), false, false);
                 app.setup.skip_intro(); // the real marker may not exist on this machine
@@ -994,6 +1011,32 @@ mod snapshots {
         both("delay_menu", demo_config, None, |h| {
             let label = delay_label(h.state().cfg.buffer_frames);
             click(h, &label);
+        });
+    }
+
+    #[test]
+    fn delay_menu_low_power_mode() {
+        let mut results = egui_kittest::SnapshotResults::new();
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut cfg = demo_config();
+            cfg.buffer_frames = 128;
+            shot_with(
+                "delay_menu_low_power",
+                theme,
+                cfg,
+                None,
+                true,
+                |h| click(h, &delay_label(128)),
+                &mut results,
+            );
+        }
+    }
+
+    #[test]
+    fn measure_delay_sheet() {
+        both("measure_delay", demo_config, None, |h| {
+            click(h, &delay_label(256));
+            click(h, "Measure delay…");
         });
     }
 
@@ -2333,6 +2376,82 @@ fn the_delay_menu_stays_inside_the_window_and_picks_a_size() {
         "closed"
     );
     assert!(!has(&h, "Audio delay"), "closed");
+}
+
+#[test]
+fn device_rows_show_the_live_delay() {
+    let h = open(demo_config());
+    // Two buffers of 256 frames at 48 kHz.
+    h.get_by_label("Loopback Audio Delay 10.7 ms");
+    h.get_by_label("Stream Mix Delay 10.7 ms");
+    assert!(
+        !has(&h, "Zoom Out Delay 10.7 ms"),
+        "a device that is off reports no delay"
+    );
+}
+
+#[test]
+fn the_delay_menu_warns_about_low_power_mode_only_for_small_delays() {
+    let low_power = |frames: u32| {
+        let mut cfg = demo_config();
+        cfg.buffer_frames = frames;
+        let mut b = FakeBackend::frozen(1.5);
+        b.status = EngineStatus {
+            low_power_mode: true,
+            ..demo_status()
+        };
+        let mut h = window(cfg, Box::new(b), None, Theme::Dark, false);
+        click(&mut h, &delay_label(frames));
+        h
+    };
+    assert!(has(&low_power(64), crate::model::LOW_POWER_HINT));
+    assert!(has(&low_power(128), crate::model::LOW_POWER_HINT));
+    assert!(!has(&low_power(256), crate::model::LOW_POWER_HINT));
+    let mut h = open(demo_config());
+    click(&mut h, &delay_label(256));
+    assert!(
+        !has(&h, crate::model::LOW_POWER_HINT),
+        "Low Power Mode is off"
+    );
+}
+
+#[test]
+fn measure_delay_runs_from_the_menu_and_shows_the_result() {
+    let mut h = open(demo_config());
+    click(&mut h, &delay_label(256));
+    click(&mut h, "Measure delay…");
+    h.get_by_label("Measure delay");
+    h.get_by_label("Measured delay: 5.4 ms");
+    h.get_by_label_contains("Through Loopback Audio");
+    click(&mut h, "Measure again");
+    h.get_by_label("Measured delay: 5.4 ms");
+    click(&mut h, "Done");
+    assert!(!has(&h, "Measured delay: 5.4 ms"), "closed");
+}
+
+#[test]
+fn a_failed_measurement_says_why() {
+    let mut b = FakeBackend::frozen(1.5);
+    b.measured_ms = None;
+    let mut h = window(demo_config(), Box::new(b), None, Theme::Dark, false);
+    click(&mut h, &delay_label(256));
+    click(&mut h, "Measure delay…");
+    h.get_by_label("Measured delay: Failed");
+    h.get_by_label_contains("The measurement failed");
+    click(&mut h, "Done");
+}
+
+#[test]
+fn measure_delay_needs_an_enabled_device() {
+    let mut cfg = demo_config();
+    cfg.devices.iter_mut().for_each(|d| d.enabled = false);
+    let mut h = open(cfg);
+    click(&mut h, &delay_label(256));
+    assert!(
+        h.get_by_label("Measure delay…")
+            .accesskit_node()
+            .is_disabled()
+    );
 }
 
 #[test]

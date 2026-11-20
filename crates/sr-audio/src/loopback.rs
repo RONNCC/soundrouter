@@ -1,9 +1,10 @@
 //! Direct IOProc on one device: optional 1 kHz output tone, input RMS/peak + dropout accounting.
-//! Used by `sr-cli loopback-test` and `sr-cli meter`.
+//! Used by `sr-cli loopback-test` and `sr-cli meter`. `measure_delay` plays one click instead of the
+//! tone and times its way back.
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -115,10 +116,78 @@ impl Tone {
     }
 }
 
+/// Level of the delay probe's click: one sample, so it is not an audible sound, and it only ever
+/// enters a virtual device (`tone_allowed`).
+pub const CLICK_AMP: f32 = 0.25;
+/// What counts as the click coming back; well under `CLICK_AMP` so a lowered device volume still shows it.
+const CLICK_THRESHOLD: f32 = 0.02;
+
+/// Sample times of the delay probe's click, shared by the IO thread and `measure_delay`.
+/// Times are f64 bits; NaN = not happened yet.
+pub struct ImpulseTimes {
+    /// Set by the caller once the route has settled; the IO thread plays no click before.
+    armed: AtomicBool,
+    /// Output sample time of the click's one frame.
+    out: AtomicU64,
+    /// Input sample time of the first sample over the threshold at or after `out`.
+    back: AtomicU64,
+}
+
+impl ImpulseTimes {
+    fn new() -> ImpulseTimes {
+        ImpulseTimes {
+            armed: AtomicBool::new(false),
+            out: AtomicU64::new(f64::NAN.to_bits()),
+            back: AtomicU64::new(f64::NAN.to_bits()),
+        }
+    }
+
+    fn out(&self) -> f64 {
+        f64::from_bits(self.out.load(Relaxed))
+    }
+
+    fn back(&self) -> f64 {
+        f64::from_bits(self.back.load(Relaxed))
+    }
+
+    /// True once, at the first output buffer (starting at sample time `time`) after arming: play the
+    /// click in that buffer's first frame.
+    fn fire(&self, time: f64) -> bool {
+        if !self.armed.load(Relaxed) || !self.out().is_nan() {
+            return false;
+        }
+        self.out.store(time.to_bits(), Relaxed);
+        true
+    }
+
+    /// Look for the click in one interleaved input block starting at sample time `time`.
+    fn scan(&self, data: &[f32], ch: usize, time: f64) {
+        let out = self.out();
+        if out.is_nan() || !self.back().is_nan() {
+            return;
+        }
+        let hit = data.chunks(ch.max(1)).enumerate().find_map(|(i, f)| {
+            let t = time + i as f64;
+            (t >= out && f.iter().any(|x| x.abs() > CLICK_THRESHOLD)).then_some(t)
+        });
+        if let Some(t) = hit {
+            self.back.store(t.to_bits(), Relaxed);
+        }
+    }
+
+    /// Frames from the click's output time to its input time, once it has come back.
+    fn frames(&self) -> Option<f64> {
+        let d = self.back() - self.out();
+        (!d.is_nan()).then_some(d)
+    }
+}
+
 struct Ctx {
     stats: Arc<Stats>,
     enabled: bool,
     tone: Tone,
+    /// `Some` in the delay probe: no tone, one click.
+    impulse: Option<Arc<ImpulseTimes>>,
 }
 
 unsafe extern "C-unwind" fn ioproc(
@@ -127,7 +196,7 @@ unsafe extern "C-unwind" fn ioproc(
     input: NonNull<AudioBufferList>,
     it: NonNull<AudioTimeStamp>,
     output: NonNull<AudioBufferList>,
-    _ot: NonNull<AudioTimeStamp>,
+    ot: NonNull<AudioTimeStamp>,
     ud: *mut c_void,
 ) -> i32 {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -138,8 +207,11 @@ unsafe extern "C-unwind" fn ioproc(
             if !b.mData.is_null() && b.mNumberChannels > 0 {
                 let s =
                     std::slice::from_raw_parts(b.mData as *const f32, b.mDataByteSize as usize / 4);
-                ctx.stats
-                    .feed(s, b.mNumberChannels as usize, it.as_ref().mSampleTime);
+                let ch = b.mNumberChannels as usize;
+                ctx.stats.feed(s, ch, it.as_ref().mSampleTime);
+                if let Some(i) = &ctx.impulse {
+                    i.scan(s, ch, it.as_ref().mSampleTime);
+                }
             }
         }
         let outs = std::slice::from_raw_parts_mut(
@@ -160,6 +232,23 @@ unsafe extern "C-unwind" fn ioproc(
             end.fill(s, ch, ctx.enabled);
         }
         ctx.tone = end;
+        if let Some(i) = &ctx.impulse
+            && i.fire(ot.as_ref().mSampleTime)
+        {
+            let outs = std::slice::from_raw_parts_mut(
+                (*out).mBuffers.as_mut_ptr(),
+                (*out).mNumberBuffers as usize,
+            );
+            for b in outs.iter_mut().filter(|b| !b.mData.is_null()) {
+                let s = std::slice::from_raw_parts_mut(
+                    b.mData as *mut f32,
+                    b.mDataByteSize as usize / 4,
+                );
+                s.iter_mut()
+                    .take((b.mNumberChannels as usize).max(1))
+                    .for_each(|x| *x = CLICK_AMP);
+            }
+        }
     }));
     0
 }
@@ -176,9 +265,15 @@ pub struct Probe {
 impl Probe {
     /// Start an IOProc on the device with `uid`. Blocks while a TCC prompt is open.
     pub fn start(uid: &str, tone: bool) -> Result<Probe> {
+        Self::start_with(uid, tone, None)
+    }
+
+    fn start_with(uid: &str, tone: bool, impulse: Option<Arc<ImpulseTimes>>) -> Result<Probe> {
         let dev = hal::device_by_uid(uid).ok_or_else(|| anyhow!("no device with uid '{uid}'"))?;
-        if tone && !tone_allowed(hal::get_global(dev, kAudioDevicePropertyTransportType).ok()) {
-            bail!("refusing to play a tone on '{uid}': not a virtual device");
+        if (tone || impulse.is_some())
+            && !tone_allowed(hal::get_global(dev, kAudioDevicePropertyTransportType).ok())
+        {
+            bail!("refusing to play a sound on '{uid}': not a virtual device");
         }
         let stats = Arc::new(Stats::new());
         let rate = hal::nominal_rate(dev);
@@ -186,6 +281,7 @@ impl Probe {
             stats: stats.clone(),
             enabled: tone,
             tone: Tone::new(if rate > 0.0 { rate } else { 48_000.0 }),
+            impulse,
         }));
         let mut p = Probe {
             dev,
@@ -271,9 +367,90 @@ pub fn loopback_test(uid: &str, secs: u64) -> Result<LoopbackReport> {
     })
 }
 
+/// Play one click into `uid`'s output and time its way back to the input, in milliseconds. Like the
+/// tone test it only plays into a virtual device, and while an engine runs for the device the caller
+/// must route the click through it (`sr_core::selftest::run_routed`) to measure the engine's path.
+pub fn measure_delay(uid: &str) -> Result<f64> {
+    let times = Arc::new(ImpulseTimes::new());
+    let p = Probe::start_with(uid, false, Some(times.clone()))?;
+    std::thread::sleep(Duration::from_millis(500)); // let the route settle
+    times.armed.store(true, Relaxed);
+    let t0 = Instant::now();
+    let frames = loop {
+        if let Some(f) = times.frames() {
+            break f;
+        }
+        if t0.elapsed() > Duration::from_secs(2) {
+            bail!("The click did not come back through the device.");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if p.rate <= 0.0 || frames < 0.0 {
+        bail!("The device reported an unusable clock, so the delay cannot be read.");
+    }
+    Ok(frames * 1000.0 / p.rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drive an `ImpulseTimes` with fake callbacks over a loop that returns audio `delay` frames
+    /// late; the output clock leads the input clock by `lead` frames, like a real device's.
+    fn simulate(delay: usize, block: usize, lead: f64) -> Option<f64> {
+        let times = ImpulseTimes::new();
+        let mut wire = vec![0.0f32; 100 * block + 1000]; // played samples by output sample time
+        for k in 0..100usize {
+            let in_time = (k * block) as f64;
+            let input: Vec<f32> = (0..block)
+                .map(|i| {
+                    let t = k * block + i;
+                    t.checked_sub(delay).map_or(0.0, |w| wire[w])
+                })
+                .collect();
+            times.scan(&input, 1, in_time);
+            if k == 3 {
+                times.armed.store(true, Relaxed);
+            }
+            let out_time = in_time + lead;
+            if times.fire(out_time) {
+                wire[out_time as usize] = CLICK_AMP;
+            }
+        }
+        times.frames()
+    }
+
+    #[test]
+    fn click_delay_is_the_distance_between_output_and_input_time() {
+        for (delay, block, lead) in [
+            (300, 128, 0.0),
+            (1100, 64, 256.0),
+            (420, 512, 100.0), // the click returns in a later buffer than it was played in
+            (128, 128, 0.0),
+        ] {
+            assert_eq!(
+                simulate(delay, block, lead),
+                Some(delay as f64),
+                "{delay} {block} {lead}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_click_before_arming_and_none_when_nothing_returns() {
+        let t = ImpulseTimes::new();
+        assert!(!t.fire(10.0));
+        t.armed.store(true, Relaxed);
+        assert!(t.fire(10.0));
+        assert!(!t.fire(20.0), "one click only");
+        assert_eq!(t.frames(), None);
+        t.scan(&[0.0, 0.01, 0.0], 1, 10.0); // under the threshold
+        assert_eq!(t.frames(), None);
+        t.scan(&[0.5, 0.0], 1, 0.0); // loud, but before the click was played
+        assert_eq!(t.frames(), None);
+        t.scan(&[0.0, 0.0, 0.0, 0.0, 0.2, 0.0], 2, 10.0); // frame 2 of 3 stereo frames
+        assert_eq!(t.frames(), Some(2.0));
+    }
 
     #[test]
     fn rms_and_dropouts() {
