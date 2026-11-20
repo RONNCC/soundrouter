@@ -348,6 +348,7 @@ impl App {
 
     /// A `soundrouter://` link. A problem is shown in the window, which then comes forward.
     fn open_link(&mut self, ctx: &egui::Context, url: &str) {
+        log::info!("link: {url:?}");
         match sr_core::preset::parse_url(url) {
             Ok(sr_core::preset::UrlAction::Preset(name)) => self.apply_preset(ctx, &name),
             Err(e) => {
@@ -394,6 +395,7 @@ impl App {
                 .filter(|s| matches!(s.kind, SourceKind::Device { .. }))
                 .count()
         };
+        log::info!("applying preset \"{name}\"");
         let adds_input = count(&cfg) > count(&self.cfg);
         let prev = std::mem::replace(&mut self.cfg, cfg);
         self.toast = None;

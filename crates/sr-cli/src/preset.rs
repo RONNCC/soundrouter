@@ -4,7 +4,7 @@ use sr_core::config::Config;
 use sr_core::lock;
 use sr_core::preset::{PresetFile, plan, preset_url};
 use sr_core::preset_store;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub struct Paths {
@@ -70,6 +70,17 @@ pub fn save(p: &Paths, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `open` arguments for a link: to the very copy that holds the instance lock (it records its
+/// bundle in the lock file) when that still exists, else to whichever app LaunchServices picks.
+fn open_args(lock_content: &str, url: &str) -> Vec<String> {
+    let app = lock_content.trim();
+    if !app.is_empty() && Path::new(app).is_dir() {
+        vec!["-a".into(), app.into(), url.into()]
+    } else {
+        vec![url.into()]
+    }
+}
+
 /// With the app running, ask it (its config and undo are the live ones); otherwise edit
 /// `config.json`. Offline, changes to the virtual devices themselves need `add_devices`.
 pub fn apply(p: &Paths, name: &str, add_devices: bool) -> Result<()> {
@@ -88,9 +99,10 @@ pub fn apply(p: &Paths, name: &str, add_devices: bool) -> Result<()> {
     if matches!(lock::try_lock(&p.instance_lock), Ok(None)) {
         // The URL names the preset as saved, so a case-only difference still resolves in the app.
         let url = preset_url(&preset.name);
+        let app = std::fs::read_to_string(&p.instance_lock).unwrap_or_default();
         let opener = std::env::var_os("SR_OPEN").unwrap_or_else(|| "/usr/bin/open".into());
         let ok = Command::new(&opener)
-            .arg(&url)
+            .args(open_args(&app, &url))
             .status()
             .is_ok_and(|s| s.success());
         if !ok {
@@ -118,4 +130,21 @@ pub fn apply(p: &Paths, name: &str, add_devices: bool) -> Result<()> {
     sr_core::fsio::write_atomic(&p.config, &serde_json::to_vec_pretty(&plan.config)?)?;
     println!("applied \"{}\" to {}", preset.name, p.config.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_link_goes_to_the_copy_that_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().to_str().unwrap();
+        let url = "soundrouter://preset/A";
+        assert_eq!(open_args(app, url), ["-a", app, url]);
+        assert_eq!(open_args(&format!("{app}\n"), url), ["-a", app, url]);
+        // No record, or a bundle that was moved or deleted: let LaunchServices choose.
+        assert_eq!(open_args("", url), [url]);
+        assert_eq!(open_args("/no/such/SoundRouter.app", url), [url]);
+    }
 }
