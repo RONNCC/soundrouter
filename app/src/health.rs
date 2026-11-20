@@ -154,13 +154,14 @@ pub struct Dropouts {
 
 impl Dropouts {
     /// Feed the engine's counters. A device seen for the first time sets the baseline (the window may
-    /// have been closed while they piled up); a counter that fell was reset by a rebuild.
+    /// have been closed while they piled up); a counter that fell was reset by a rebuild, and one that fell
+    /// to a nonzero count already dropped out again since.
     pub fn observe(&mut self, xruns: &[(String, u64)], now: f64) {
         self.seen.retain(|id, _| xruns.iter().any(|(x, _)| x == id));
         for (id, n) in xruns {
             match self.seen.get_mut(id) {
                 Some((count, grew)) => {
-                    if n > count {
+                    if *n > *count || (*n < *count && *n > 0) {
                         *grew = Some(now);
                     }
                     *count = *n;
@@ -483,6 +484,18 @@ mod tests {
         assert_eq!(d.total(), 0);
         d.observe(&xr(9), 33.0); // comes back: a new baseline
         assert_eq!(d.growing("v1", 33.0), None);
+    }
+
+    #[test]
+    fn a_rebuilt_device_that_drops_out_again_before_the_next_look_is_news() {
+        let mut d = Dropouts::default();
+        d.observe(&xr(4), 0.0);
+        d.observe(&xr(2), 1.0); // rebuilt, and already 2 dropouts
+        assert_eq!(d.growing("v1", 1.0), Some(2));
+        let mut d = Dropouts::default();
+        d.observe(&xr(4), 0.0);
+        d.observe(&xr(0), 1.0); // rebuilt, clean
+        assert_eq!(d.growing("v1", 1.0), None);
     }
 
     #[test]
