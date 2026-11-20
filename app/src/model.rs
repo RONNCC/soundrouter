@@ -795,7 +795,7 @@ mod tests {
                     apply(&mut cfg, e.clone());
                     if cfg.validate().is_err() {
                         prop_assert!(
-                            matches!(e, Edit::Rename(..) | Edit::AddSource(..) | Edit::AddMonitor(..)),
+                            matches!(e, Edit::Rename(..) | Edit::AddSource(..) | Edit::AddMonitor(..) | Edit::NewDevice | Edit::Enable(..)),
                             "unexpected invalid result from {e:?}"
                         );
                         cfg = prev;

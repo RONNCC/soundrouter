@@ -1,4 +1,4 @@
-use crate::driver_proto::COMPANION_SUFFIX;
+use crate::driver_proto::{COMPANION_SUFFIX, MAX_DEVICES};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -131,7 +131,7 @@ fn check_db(what: &str, db: f32) -> Result<(), String> {
 }
 
 impl Config {
-    /// Checks version, ids are unique, names usable, volumes sane, channel counts in range,
+    /// Checks version, at most `MAX_DEVICES` enabled, ids are unique, names usable, volumes sane, channel counts in range,
     /// and wires reference existing source ids and in-range channels.
     /// `MonitorWire::dst_ch` is not checked: the hardware channel count is unknown here,
     /// so the mixer silently drops wires to channels the monitor device lacks.
@@ -146,6 +146,13 @@ impl Config {
             return Err(format!(
                 "buffer_frames {} must be one of {BUFFER_FRAMES:?}",
                 self.buffer_frames
+            ));
+        }
+        // Each enabled device is a driver device; the driver refuses a longer list outright.
+        let enabled = self.devices.iter().filter(|d| d.enabled).count();
+        if enabled > MAX_DEVICES {
+            return Err(format!(
+                "{enabled} enabled devices; at most {MAX_DEVICES} can be enabled at once"
             ));
         }
         let mut dev_ids = HashSet::new();
@@ -426,6 +433,23 @@ mod tests {
             cfg.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
         }
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_devices_are_capped_at_what_the_driver_hosts() {
+        // The driver refuses a list longer than MAX_DEVICES, which failed the whole apply.
+        let mut cfg = example();
+        let d = cfg.devices[0].clone();
+        cfg.devices = (0..=MAX_DEVICES)
+            .map(|i| VirtualDevice {
+                id: format!("v{i}"),
+                ..d.clone()
+            })
+            .collect();
+        assert!(cfg.validate().unwrap_err().contains("enabled devices"));
+        // Disabled devices never reach the driver, so they do not count.
+        cfg.devices[0].enabled = false;
+        cfg.validate().unwrap();
     }
 
     #[test]
