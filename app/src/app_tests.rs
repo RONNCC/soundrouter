@@ -982,6 +982,14 @@ mod snapshots {
     }
 
     #[test]
+    fn delay_menu_open() {
+        both("delay_menu", demo_config, None, |h| {
+            let label = delay_label(h.state().cfg.buffer_frames);
+            click(h, &label);
+        });
+    }
+
+    #[test]
     fn source_menu_with_background_processes() {
         let mut results = egui_kittest::SnapshotResults::new();
         let open = |h: &mut Harness<'static, App>| {
@@ -2257,26 +2265,28 @@ fn a_new_device_in_a_long_list_is_scrolled_into_view() {
 }
 
 #[test]
-fn the_latency_menu_stays_inside_the_window_and_picks_a_size() {
+fn the_delay_menu_stays_inside_the_window_and_picks_a_size() {
     let mut h = open(demo_config());
-    let label = latency_label(h.state().cfg.buffer_frames);
+    let label = delay_label(h.state().cfg.buffer_frames);
     click(&mut h, &label);
+    h.get_by_label("Audio delay");
     let win = h.ctx.content_rect();
     let other = *BUFFER_FRAMES
         .iter()
         .find(|n| **n != h.state().cfg.buffer_frames)
         .unwrap();
     for n in BUFFER_FRAMES {
-        let r = h.get_all_by_label(&latency_label(n)).last().unwrap().rect();
+        let r = h.get_all_by_label(&delay_option(n)).last().unwrap().rect();
         assert!(win.contains_rect(r), "{n}: {r:?} leaves {win:?}");
     }
-    h.get_all_by_label(&latency_label(other))
+    h.get_all_by_label(&delay_option(other))
         .last()
         .unwrap()
         .click();
     settle(&mut h);
     assert_eq!(h.state().cfg.buffer_frames, other);
-    assert_eq!(h.get_all_by_label_contains("Latency:").count(), 1, "closed");
+    assert_eq!(h.get_all_by_label_contains("Delay:").count(), 1, "closed");
+    assert!(!has(&h, "Audio delay"), "closed");
 }
 
 #[test]
@@ -2516,7 +2526,7 @@ fn a_click_that_closes_a_menu_only_closes_it() {
     let [p0, p1, p2, p3] = crate::layout::wire_points(a, b);
     let mid =
         ((p0.to_vec2() + 3.0 * p1.to_vec2() + 3.0 * p2.to_vec2() + p3.to_vec2()) / 8.0).to_pos2();
-    let l = latency_label(before.buffer_frames);
+    let l = delay_label(before.buffer_frames);
     click(&mut h, &l);
     for _ in 0..2 {
         h.hover_at(mid);
@@ -2526,7 +2536,7 @@ fn a_click_that_closes_a_menu_only_closes_it() {
         h.drop_at(mid);
         settle(&mut h);
         if h.state().cfg == before {
-            assert_eq!(h.get_all_by_label_contains("Latency:").count(), 1, "closed");
+            assert_eq!(h.get_all_by_label_contains("Delay:").count(), 1, "closed");
         }
     }
     let wires = |c: &Config| c.devices[0].monitors[0].wires.len();

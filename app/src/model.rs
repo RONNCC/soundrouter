@@ -71,13 +71,40 @@ pub fn db_to_pct(db: f32) -> f32 {
     }
 }
 
-/// Footer label: latency the engine adds for a buffer size, two buffers (input and output side) at
-/// 48 kHz. shortcut: assumes 48 kHz, read the live rate if users mind.
-pub fn latency_label(frames: u32) -> String {
-    format!(
-        "Latency: +{:.1} ms ({frames} frames)",
-        2.0 * f64::from(frames) / 48.0
-    )
+/// Extra delay the engine adds for a buffer size: two buffers (input and output side) at 48 kHz.
+/// shortcut: assumes 48 kHz, read the live rate if users mind.
+pub fn delay_ms(frames: u32) -> f64 {
+    2.0 * f64::from(frames) / 48.0
+}
+
+/// Plain name of a buffer size in the footer and menu (`Config::buffer_frames`).
+pub fn delay_name(frames: u32) -> &'static str {
+    match frames {
+        64 => "Lowest",
+        128 => "Low",
+        256 => "Balanced",
+        512 => "Safest",
+        _ => "Custom",
+    }
+}
+
+/// Footer button label, e.g. "Delay: Balanced".
+pub fn delay_label(frames: u32) -> String {
+    format!("Delay: {}", delay_name(frames))
+}
+
+/// Menu row text: "<name>  ·  +<ms> ms[ · hint]". The menu paints what follows the first "  ·  " muted.
+pub fn delay_option(frames: u32) -> String {
+    let (name, hint) = match frames {
+        64 => ("Lowest", " · uses the most CPU"),
+        256 => ("Balanced (recommended)", ""),
+        512 => (
+            "Safest",
+            " · best for recording/streaming where delay does not matter",
+        ),
+        _ => (delay_name(frames), ""),
+    };
+    format!("{name}  ·  +{:.1} ms{hint}", delay_ms(frames))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -489,15 +516,18 @@ pub(crate) mod tests {
     #[test]
     fn buffer_frames_edit_and_label() {
         let mut c = default_config();
-        assert_eq!(
-            latency_label(c.buffer_frames),
-            "Latency: +10.7 ms (256 frames)"
-        );
+        assert_eq!(delay_label(c.buffer_frames), "Delay: Balanced");
         apply(&mut c, Edit::BufferFrames(128));
         assert_eq!(c.buffer_frames, 128);
         c.validate().unwrap();
-        assert_eq!(latency_label(512), "Latency: +21.3 ms (512 frames)");
-        assert_eq!(latency_label(64), "Latency: +2.7 ms (64 frames)");
+        assert_eq!(delay_label(128), "Delay: Low");
+        assert_eq!(delay_option(64), "Lowest  ·  +2.7 ms · uses the most CPU");
+        assert_eq!(delay_option(128), "Low  ·  +5.3 ms");
+        assert_eq!(delay_option(256), "Balanced (recommended)  ·  +10.7 ms");
+        assert_eq!(
+            delay_option(512),
+            "Safest  ·  +21.3 ms · best for recording/streaming where delay does not matter"
+        );
     }
 
     #[test]

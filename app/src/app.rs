@@ -2,7 +2,7 @@
 use crate::graph::{self, GraphCtx, GraphState};
 use crate::icons::IconTextures;
 use crate::login;
-use crate::model::{Edit, apply, db_to_pct, latency_label, pct_to_db};
+use crate::model::{Edit, apply, db_to_pct, delay_label, delay_ms, delay_option, pct_to_db};
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, Setup};
 use crate::store;
 use crate::theme::{Tokens, semibold, tokens};
@@ -77,6 +77,76 @@ fn state_look(s: &DeviceState, t: &Tokens) -> Option<(String, egui::Color32)> {
         DeviceState::WaitingForPermission => ("Waiting for permission".into(), t.meter[1]),
         DeviceState::Failed(e) => (format!("Failed: {e}"), t.danger),
     })
+}
+
+/// The "Audio delay" popup: one plain sentence, then a radio-style row per buffer size.
+fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>) {
+    use egui::text::{LayoutJob, TextFormat};
+    const W: f32 = 340.0;
+    const CHECK_W: f32 = 24.0;
+    ui.set_width(W);
+    ui.label(
+        egui::RichText::new("Audio delay")
+            .font(FontId::new(13.5, semibold()))
+            .color(t.text),
+    );
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new("How long audio takes to pass through SoundRouter. Lower is snappier for live monitoring and calls, but uses more CPU and can crackle on a busy Mac. Higher is the most reliable.")
+                .size(12.0)
+                .line_height(Some(16.0))
+                .color(t.text2),
+        )
+        .wrap(),
+    );
+    ui.add_space(4.0);
+    for n in BUFFER_FRAMES {
+        let text = delay_option(n);
+        let (name, rest) = text.split_once("  ·  ").unwrap_or((&text, ""));
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = W - CHECK_W - 8.0;
+        job.append(
+            name,
+            0.0,
+            TextFormat::simple(FontId::new(12.5, semibold()), t.text),
+        );
+        job.append(
+            &format!("  ·  {rest}"),
+            0.0,
+            TextFormat::simple(FontId::proportional(12.0), t.text2),
+        );
+        let galley = ui.painter().layout_job(job);
+        let (rect, resp) = ui.allocate_exact_size(vec2(W, galley.size().y + 10.0), Sense::click());
+        let on = n == current;
+        resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, on, &text));
+        let p = ui.painter();
+        if resp.hovered() {
+            p.rect_filled(rect, CornerRadius::same(4), t.card_stroke);
+        }
+        if on {
+            let c = pos2(rect.left() + 11.0, rect.top() + 5.0 + 8.0);
+            p.line(
+                vec![
+                    c + vec2(-3.5, 0.5),
+                    c + vec2(-1.0, 3.0),
+                    c + vec2(3.5, -3.0),
+                ],
+                Stroke::new(1.8, t.accent),
+            );
+        }
+        p.galley(
+            pos2(rect.left() + CHECK_W, rect.top() + 5.0),
+            galley,
+            t.text,
+        );
+        let tip = format!(
+            "{n} frames per buffer. Added delay = 2 × {n} frames ÷ 48,000 per second = {:.1} ms, assuming 48 kHz.",
+            delay_ms(n)
+        );
+        if resp.on_hover_text(tip).clicked() && !on {
+            edits.push(Edit::BufferFrames(n));
+        }
+    }
 }
 
 impl App {
@@ -699,20 +769,13 @@ impl App {
                     }
                     right = test.left() - 8.0;
                 }
-                let latency = Rect::from_min_size(pos2(right - 176.0, by), vec2(176.0, 26.0));
-                let label = latency_label(self.cfg.buffer_frames);
+                let latency = Rect::from_min_size(pos2(right - 124.0, by), vec2(124.0, 26.0));
+                let label = delay_label(self.cfg.buffer_frames);
                 let resp = setup::footer_button(ui, latency, "latency", &label, t);
                 resp.clone().on_hover_text(
-                    "Added by routing through SoundRouter (two buffers at 48 kHz); the virtual device itself adds about 2 buffers more.",
+                    "Audio delay: how long audio takes to pass through SoundRouter (two buffers, shown at 48 kHz; the virtual device itself adds about 2 buffers more). Click to change.",
                 );
-                egui::Popup::menu(&resp).show(|ui| {
-                    for n in BUFFER_FRAMES {
-                        let on = n == self.cfg.buffer_frames;
-                        if ui.selectable_label(on, latency_label(n)).clicked() && !on {
-                            edits.push(Edit::BufferFrames(n));
-                        }
-                    }
-                });
+                egui::Popup::menu(&resp).show(|ui| delay_menu(ui, t, self.cfg.buffer_frames, edits));
                 let reserved = r.right() - latency.left() + 12.0;
                 let (apply_error, es) = {
                     let s = self.worker.shared.lock().unwrap();
