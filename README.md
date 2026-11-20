@@ -33,7 +33,7 @@ The driver (`SoundRouter.driver`, loaded by `coreaudiod`) only publishes the vir
 - First-run setup sheet: install or uninstall the driver in the app, permission steps, and a self-test.
 - Single instance (lock file), config safety (corrupt config quarantined, newer-version config protected, fsync on save).
 - Log file at `~/Library/Logs/SoundRouter/soundrouter.log`.
-- `sr-cli`: `list`, `driver`, `loopback-test`, `run`, `meter`, `doctor`; `-v`/`-vv` for logging. Installed copies have it at `/Applications/SoundRouter.app/Contents/MacOS/sr-cli` (from source: `target/release/sr-cli`).
+- `sr-cli`: `list`, `driver`, `loopback-test`, `run`, `meter`, `doctor`; `-v`/`-vv` for logging. `run` and `driver set` refuse (exit 1) while SoundRouter.app or another `sr-cli run` owns the audio engine (two engines keep resetting each other's driver list); `--force` overrides. Installed copies have it at `/Applications/SoundRouter.app/Contents/MacOS/sr-cli` (from source: `target/release/sr-cli`).
 
 ## Install
 

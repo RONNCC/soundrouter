@@ -12,6 +12,14 @@ fn file(content: &str) -> tempfile::NamedTempFile {
     f
 }
 
+/// The CLI with a scratch HOME, so a SoundRouter.app running on this machine cannot hold its locks.
+fn isolated() -> (Command, tempfile::TempDir) {
+    let home = tempfile::tempdir().unwrap();
+    let mut c = cli();
+    c.env("HOME", home.path());
+    (c, home)
+}
+
 fn driver_installed() -> bool {
     cli().arg("doctor").output().unwrap().status.success()
 }
@@ -45,8 +53,8 @@ fn missing_arg_exits_2() {
 
 #[test]
 fn run_missing_config_file_exits_1() {
-    cli()
-        .args(["run", "/nonexistent/sr-config.json"])
+    let (mut c, _home) = isolated();
+    c.args(["run", "/nonexistent/sr-config.json"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains(
@@ -57,8 +65,8 @@ fn run_missing_config_file_exits_1() {
 #[test]
 fn run_bad_json_exits_1() {
     let f = file("{not json");
-    cli()
-        .arg("run")
+    let (mut c, _home) = isolated();
+    c.arg("run")
         .arg(f.path())
         .assert()
         .code(1)
@@ -71,8 +79,8 @@ fn run_invalid_config_surfaces_validate_error() {
         r#"{{"version":1,"devices":[{},{}]}}"#,
         GOOD_DEV, GOOD_DEV
     ));
-    cli()
-        .arg("run")
+    let (mut c, _home) = isolated();
+    c.arg("run")
         .arg(f.path())
         .assert()
         .code(1)
@@ -84,8 +92,8 @@ fn run_invalid_config_surfaces_validate_error() {
 #[test]
 fn driver_set_bad_json_exits_1() {
     let f = file("[{\"uid\":");
-    cli()
-        .args(["driver", "set"])
+    let (mut c, _home) = isolated();
+    c.args(["driver", "set"])
         .arg(f.path())
         .assert()
         .code(1)
@@ -94,8 +102,8 @@ fn driver_set_bad_json_exits_1() {
 
 #[test]
 fn driver_set_missing_file_exits_1() {
-    cli()
-        .args(["driver", "set", "/nonexistent/devs.json"])
+    let (mut c, _home) = isolated();
+    c.args(["driver", "set", "/nonexistent/devs.json"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("reading /nonexistent/devs.json"));
@@ -129,8 +137,8 @@ fn run_without_driver_says_not_installed() {
         return; // driver present: this scenario cannot occur on this machine
     }
     let f = file(&format!(r#"{{"version":1,"devices":[{GOOD_DEV}]}}"#));
-    cli()
-        .arg("run")
+    let (mut c, _home) = isolated();
+    c.arg("run")
         .arg(f.path())
         .assert()
         .code(1)
@@ -167,4 +175,64 @@ fn run_exits_0_on_sigint() {
         .unwrap();
     assert!(st.success());
     assert_eq!(child.wait().unwrap().code(), Some(0));
+}
+
+/// HOME is where both lock files live; point the CLI at a scratch one so no real app is involved.
+fn home_with_lock(name: &str) -> (tempfile::TempDir, std::fs::File) {
+    let home = tempfile::tempdir().unwrap();
+    let p = home
+        .path()
+        .join("Library/Application Support/SoundRouter")
+        .join(name);
+    let held = sr_core::lock::try_lock(&p)
+        .unwrap()
+        .expect("test takes the lock");
+    (home, held)
+}
+
+#[test]
+fn run_refuses_while_the_app_holds_its_locks() {
+    let cfg = file(r#"{"version":1,"devices":[]}"#);
+    for name in ["instance.lock", "engine.lock"] {
+        let (home, _held) = home_with_lock(name);
+        cli()
+            .env("HOME", home.path())
+            .arg("run")
+            .arg(cfg.path())
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("owns the audio engine"))
+            .stderr(predicate::str::contains("--force"));
+    }
+}
+
+#[test]
+fn driver_set_refuses_while_engine_lock_is_held() {
+    let list = file("[]");
+    let (home, _held) = home_with_lock("engine.lock");
+    cli()
+        .env("HOME", home.path())
+        .args(["driver", "set"])
+        .arg(list.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("owns the audio engine"));
+}
+
+#[test]
+fn force_bypasses_the_lock_check() {
+    // The missing config file stops the run before any engine exists, so this is safe to run
+    // anywhere: reaching "reading" instead of the refusal proves --force skipped the held lock.
+    for args in [
+        &["run", "--force", "/nonexistent/sr-config.json"][..],
+        &["driver", "set", "--force", "/nonexistent/devs.json"][..],
+    ] {
+        let (home, _held) = home_with_lock("instance.lock");
+        cli()
+            .env("HOME", home.path())
+            .args(args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("reading /nonexistent"));
+    }
 }

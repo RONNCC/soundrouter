@@ -1,44 +1,30 @@
 //! Single-instance guard: an advisory file lock held for the process lifetime.
 //! The OS drops it on exit or crash, so a stale lock can never block a launch.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const BUNDLE_ID: &str = "com.ronncc.soundrouter";
 
 pub fn lock_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/SoundRouter/instance.lock"))
+    sr_core::lock::instance_lock_path()
 }
 
-/// Held lock; released on drop.
-pub struct Guard(#[allow(dead_code)] File);
-
-/// `Ok(None)` means another instance holds the lock. The holder records its app bundle in the
-/// file so that a second launch can raise exactly this copy (see `raise_existing`).
-pub fn acquire(path: &Path) -> std::io::Result<Option<Guard>> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)?;
-    match f.try_lock() {
-        Ok(()) => {
-            let exe = std::env::current_exe().ok();
-            let app = exe.as_deref().and_then(bundle_of).unwrap_or(Path::new(""));
-            // Best effort: without a record a second launch falls back to `open -b`.
-            let _ = f
-                .set_len(0)
-                .and_then(|()| (&f).write_all(app.as_os_str().as_encoded_bytes()));
-            Ok(Some(Guard(f)))
-        }
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(e)) => Err(e),
-    }
+/// `Ok(None)` means another instance holds the lock; the returned file holds it until dropped.
+/// The holder records its app bundle in the file so that a second launch can raise exactly this
+/// copy (see `raise_existing`).
+pub fn acquire(path: &Path) -> std::io::Result<Option<File>> {
+    let Some(f) = sr_core::lock::try_lock(path)? else {
+        return Ok(None);
+    };
+    let exe = std::env::current_exe().ok();
+    let app = exe.as_deref().and_then(bundle_of).unwrap_or(Path::new(""));
+    // Best effort: without a record a second launch falls back to `open -b`.
+    let _ = f
+        .set_len(0)
+        .and_then(|()| (&f).write_all(app.as_os_str().as_encoded_bytes()));
+    Ok(Some(f))
 }
 
 /// `X.app` for an executable at `X.app/Contents/MacOS/<exe>`.

@@ -15,6 +15,7 @@ Start with `sr-cli -v doctor` (exits 1 when unhealthy) and the log `~/Library/Lo
 | Device exists, apps hear nothing | The app must be running (or in the menu bar) for routing; check the node is not muted and the setup self-test passes. Without the engine a device only loops what apps play into it back to its own input. |
 | "Needs permission" / mic or app source silent | Microphone and System Audio Recording, see the sections below. |
 | First launch blocked by macOS | Unsigned or ad-hoc build: right-click the app, Open (macOS 14), or System Settings > Privacy & Security > Open Anyway (macOS 15); `xattr -dr com.apple.quarantine /Applications/SoundRouter.app` from a shell. |
+| `sr-cli run` / `driver set`: "SoundRouter.app is running and owns the audio engine" | Quit the app (or the other `sr-cli run`) first. Two engines each reset the other's driver list, so the devices flicker. `--force` overrides at your own risk. The locks are `engine.lock` and `instance.lock` in `~/Library/Application Support/SoundRouter`; the OS drops them when their holder exits, so a leftover file is harmless. |
 | Still broken | `sr-cli -v doctor` (reports driver, devices and permissions of the terminal) and the log file above. |
 
 ## Permissions reset after a rebuild

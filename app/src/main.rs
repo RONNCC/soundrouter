@@ -81,6 +81,22 @@ fn main() -> eframe::Result {
     };
     let log_file = logging::init();
     logging::banner(log_file.as_deref());
+    // Lets `sr-cli run` / `driver set` refuse while this engine owns the driver list. Held until
+    // exit; a stale file is harmless (OS lock). Contended (an `sr-cli run` is up): start anyway.
+    let _engine_lock = if instance::bypasses_guard(args.demo) {
+        None
+    } else {
+        match sr_core::lock::engine_lock_path().map(|p| sr_core::lock::try_lock(&p)) {
+            Some(Ok(Some(f))) => Some(f),
+            Some(Ok(None)) => {
+                log::warn!(
+                    "engine.lock is held by another process (`sr-cli run`?): both engines will fight over the driver list"
+                );
+                None
+            }
+            _ => None,
+        }
+    };
     let demo = args.demo;
     let vibrancy_wanted = cfg!(target_os = "macos");
     let opts = eframe::NativeOptions {

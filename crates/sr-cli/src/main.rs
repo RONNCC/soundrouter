@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use sr_audio::{Engine, IoState, apps, driver, loopback, tcc};
 use sr_core::backend::{Backend, TccStatus};
 use sr_core::config::Config;
 use sr_core::driver_proto::{DEVICE_UID_PREFIX, DriverDevice, PLUGIN_BUNDLE_ID, companion_uid};
+use sr_core::lock;
 use sr_core::selftest;
 
 #[derive(Parser)]
@@ -48,6 +50,9 @@ enum Cmd {
         /// Smaller buffers cut latency but cost CPU and battery.
         #[arg(long, value_name = "FRAMES")]
         buffer: Option<u32>,
+        /// Run even if SoundRouter.app or another `sr-cli run` owns the audio engine (they fight over the driver list)
+        #[arg(long)]
+        force: bool,
     },
     /// Print per-channel input peaks of a virtual device (what apps record from it) at 4 Hz
     Meter { device_id: String },
@@ -61,6 +66,9 @@ enum DriverOp {
     /// JSON file: [{"uid":"soundrouter:v1","name":"Loopback","channels":2}]
     Set {
         json: PathBuf,
+        /// Write even if SoundRouter.app or `sr-cli run` owns the audio engine (it resets the list on its next apply)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -86,6 +94,42 @@ fn db(x: f32) -> String {
     }
 }
 
+/// Two engines apply their own driver list, each resetting the other's, forever. The app holds
+/// `instance.lock` and `engine.lock`; `sr-cli run` holds `engine.lock`. Refuse while either is held
+/// (unless `force`); otherwise take `engine.lock` for the caller to hold. An unusable lock file
+/// never blocks. `None` when forced out or the lock is unavailable.
+fn claim_engine(force: bool) -> Result<Option<File>> {
+    claim_engine_at(
+        lock::instance_lock_path().as_deref(),
+        lock::engine_lock_path().as_deref(),
+        force,
+    )
+}
+
+fn claim_engine_at(
+    instance: Option<&Path>,
+    engine: Option<&Path>,
+    force: bool,
+) -> Result<Option<File>> {
+    if !force {
+        if let Some(p) = instance
+            && matches!(lock::try_lock(p), Ok(None))
+        {
+            bail!(
+                "SoundRouter.app is running and owns the audio engine. Quit it first, or pass --force to override"
+            );
+        }
+        if let Some(p) = engine
+            && matches!(lock::try_lock(p), Ok(None))
+        {
+            bail!(
+                "another `sr-cli run` owns the audio engine. Stop it first, or pass --force to override"
+            );
+        }
+    }
+    Ok(engine.and_then(|p| lock::try_lock(p).ok().flatten()))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let level = match cli.verbose {
@@ -102,8 +146,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Driver {
-            op: DriverOp::Set { json },
+            op: DriverOp::Set { json, force },
         } => {
+            let _engine = claim_engine(force)?;
             let list: Vec<DriverDevice> = serde_json::from_str(
                 &std::fs::read_to_string(&json)
                     .with_context(|| format!("reading {}", json.display()))?,
@@ -123,7 +168,8 @@ fn main() -> Result<()> {
             config,
             self_test,
             buffer,
-        } => run(&config, self_test.as_deref(), buffer),
+            force,
+        } => run(&config, self_test.as_deref(), buffer, force),
         Cmd::Meter { device_id } => {
             install_ctrlc()?;
             let uid = full_uid(&device_id);
@@ -213,7 +259,8 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>) -> Result<()> {
+fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>, force: bool) -> Result<()> {
+    let _engine_lock = claim_engine(force)?;
     let mut cfg: Config = serde_json::from_str(
         &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
     )
@@ -319,4 +366,39 @@ fn doctor() -> Result<()> {
         bail!("doctor: problems found (see above)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_refuses_while_held_unless_forced() {
+        let d = tempfile::tempdir().unwrap();
+        let (inst, eng) = (d.path().join("instance.lock"), d.path().join("engine.lock"));
+        let app = lock::try_lock(&inst).unwrap().unwrap();
+        let e = claim_engine_at(Some(&inst), Some(&eng), false).unwrap_err();
+        assert!(e.to_string().contains("SoundRouter.app is running"), "{e}");
+        assert!(
+            claim_engine_at(Some(&inst), Some(&eng), true)
+                .unwrap()
+                .is_some()
+        );
+        drop(app);
+        let first = claim_engine_at(Some(&inst), Some(&eng), false).unwrap();
+        assert!(first.is_some());
+        let e = claim_engine_at(Some(&inst), Some(&eng), false).unwrap_err();
+        assert!(e.to_string().contains("another `sr-cli run`"), "{e}");
+        assert!(
+            claim_engine_at(Some(&inst), Some(&eng), true)
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            claim_engine_at(Some(&inst), Some(&eng), false)
+                .unwrap()
+                .is_some()
+        );
+    }
 }

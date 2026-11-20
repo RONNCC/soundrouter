@@ -4310,6 +4310,7 @@ dependencies = [
  "rtrb",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

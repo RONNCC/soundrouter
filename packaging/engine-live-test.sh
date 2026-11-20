@@ -18,7 +18,7 @@ PLAYER=soundrouter:v2 # player target: a virtual device that nothing reads, so t
 case $PLAYER in soundrouter:*) ;; *) echo "refusing: player target '$PLAYER' is not a soundrouter: device"; exit 1 ;; esac
 "$CLI" driver get >"$W/orig.json" || { echo "driver not installed"; rm -rf "$W"; exit 1; }
 # shellcheck disable=SC2046
-cleanup() { kill $(jobs -p) 2>/dev/null; "$CLI" driver set "$W/orig.json" >/dev/null 2>&1; rm -rf "$W"; }
+cleanup() { kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; "$CLI" driver set "$W/orig.json" >/dev/null 2>&1; rm -rf "$W"; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 fails=0
