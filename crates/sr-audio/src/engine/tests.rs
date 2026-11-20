@@ -1092,3 +1092,27 @@ fn a_sub_with_new_stream_buffers_rebuilds_its_vdev() {
     assert!(!reshaped(&subs, &set(&["main"]), &now(&[4])));
     assert!(!reshaped(&subs, &changed, &|_| None));
 }
+
+#[test]
+fn an_identical_device_list_is_still_pushed_to_the_driver() {
+    let dev = |id: &str, channels| DriverDevice {
+        uid: format!("{DEVICE_UID_PREFIX}{id}"),
+        name: id.into(),
+        channels,
+    };
+    let want = vec![dev("v1", 2), dev("v2", 8)];
+    // Same list: still set (the driver's pass re-asks a side whose format change the host aborted), nothing removed.
+    let mut pushed = vec![];
+    let removed = push_devices(&want, want.clone(), |l| {
+        pushed.push(l.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!((pushed, removed), (vec![want.clone()], vec![]));
+    // A changed list: set, and the dropped uid is reported for the settle wait.
+    let old = vec![dev("v1", 2), dev("gone", 2)];
+    let removed = push_devices(&want, old, |_| Ok(())).unwrap();
+    assert_eq!(removed, vec![format!("{DEVICE_UID_PREFIX}gone")]);
+    // A refused set is an error.
+    assert!(push_devices(&want, vec![], |_| Err(anyhow::anyhow!("refused"))).is_err());
+}

@@ -1,5 +1,5 @@
 #!/bin/bash
-# build | fakehost | install | uninstall | restart | test for the SoundRouter HAL driver.
+# build | fakehost | fuzz | install | uninstall | restart | test for the SoundRouter HAL driver.
 # install/uninstall/restart/test use sudo internally: run this script as your user, not with sudo.
 set -euo pipefail
 [ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH" || true
@@ -15,7 +15,10 @@ tools() {
   clang -O2 -Wall -framework CoreAudio -framework CoreFoundation -o "$TOOLS/srctl" packaging/srctl.c
 }
 build() { packaging/build-driver.sh; tools; }
-fakehost() { build; "$TOOLS/fakehost" "$PWD/$OUT"; }   # no sudo: CFPlugIn load + vtable drive
+# Randomized scenario fuzz (fakehost.c section 9): seeds 1..SEEDS, STEPS steps each, in parallel. Any failure fails the run.
+fuzz_run() { seq "${SEEDS:-50}" | xargs -P "$(sysctl -n hw.ncpu)" -I{} "$TOOLS/fakehost" "$PWD/$OUT" fuzz {} "${STEPS:-1000}" | grep -E '^(FUZZ OK|FAIL|  )'; }
+fakehost() { build; "$TOOLS/fakehost" "$PWD/$OUT"; SEEDS=8 fuzz_run; }   # no sudo: CFPlugIn load + vtable drive
+fuzz() { build; fuzz_run; }
 restart() { sudo killall coreaudiod || true; sleep 3; } # launchd respawns it; audio drops ~1-2 s
 install() {
   build
@@ -69,7 +72,7 @@ test_live() {
 }
 
 case "${1:-}" in
-  build) build ;; fakehost) fakehost ;; install) install ;; uninstall) uninstall ;; restart) restart ;;
+  build) build ;; fakehost) fakehost ;; fuzz) fuzz ;; install) install ;; uninstall) uninstall ;; restart) restart ;;
   test) test_live ;;
-  *) echo "usage: $0 build|fakehost|install|uninstall|restart|test"; exit 2 ;;
+  *) echo "usage: $0 build|fakehost|fuzz|install|uninstall|restart|test"; exit 2 ;;
 esac

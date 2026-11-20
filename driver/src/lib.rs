@@ -110,3 +110,42 @@ unsafe extern "C" fn add_ref(_: *mut c_void) -> ULONG {
 unsafe extern "C" fn release(_: *mut c_void) -> ULONG {
     1
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn factory_and_query_interface_refuse_what_is_not_theirs() {
+        // SAFETY: CFUUIDBytes is 16 bytes, repr(C).
+        let id = |b: [u8; 16]| unsafe { std::mem::transmute::<[u8; 16], CFUUIDBytes>(b) };
+        let d: *mut c_void = driver_ref().cast();
+        let bad = kAudioHardwareBadObjectError as HRESULT;
+        unsafe {
+            assert!(SoundRouter_Create(std::ptr::null(), std::ptr::null()).is_null());
+            for (t, ok) in [
+                (TYPE_UUID, true),
+                (DRIVER_UUID, false),
+                (IUNKNOWN_UUID, false),
+            ] {
+                let u = CFUUIDCreateFromUUIDBytes(std::ptr::null(), id(t));
+                assert_eq!(SoundRouter_Create(std::ptr::null(), u) == d, ok);
+                assert_eq!(SoundRouter_Create(std::ptr::null(), u).is_null(), !ok);
+                CFRelease(u as CFTypeRef);
+            }
+            for (iid, want) in [
+                (DRIVER_UUID, 0),
+                (IUNKNOWN_UUID, 0),
+                (TYPE_UUID, E_NOINTERFACE),
+            ] {
+                let mut out: LPVOID = 1 as LPVOID;
+                assert_eq!(query_interface(d, id(iid), &mut out), want);
+                assert_eq!(out, if want == 0 { d } else { null_mut() });
+            }
+            let mut out = null_mut();
+            assert_eq!(query_interface(null_mut(), id(DRIVER_UUID), &mut out), bad);
+            assert_eq!(query_interface(d, id(DRIVER_UUID), null_mut()), bad);
+            assert_eq!((add_ref(d), release(d), release(d)), (1, 1, 1)); // static singleton
+        }
+    }
+}

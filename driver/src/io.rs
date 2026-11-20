@@ -578,4 +578,58 @@ mod tests {
         run_at(c, READ, 5000.0, 9999.0, &mut out, n);
         assert_eq!((count(Side::Visible), count(Side::Engine)), (1, 1));
     }
+
+    proptest::proptest! {
+        /// A side's channel count only moves when the host performs a change on that side, so a host that sizes
+        /// each I/O buffer by the format it last read is never written past, whatever the device list, the rate,
+        /// the other side and I/O start/stop do in between.
+        #[test]
+        fn io_stays_inside_the_buffer_the_host_sized(
+            ops in proptest::collection::vec((0u8..6, proptest::num::u32::ANY, 0usize..2), 1..48),
+        ) {
+            let (v, c) = activate(3, 2);
+            let devs = [v, c];
+            let mut view = [2usize; 2]; // per side (index = `Side as usize`): the channel count the host last read
+            for (k, x, side) in ops {
+                match k {
+                    // The device list asks for a channel count; a client asks for a rate.
+                    0 => {
+                        SLOTS[3].want(&Change::Channels((x % crate::config::MAX_CHANNELS as u32 + 1) as u16));
+                    }
+                    1 => {
+                        SLOTS[3].want(&Change::Rate(x as usize % 3));
+                    }
+                    // The host performs a (maybe stale) request on one side, then re-reads that side's format.
+                    2 => {
+                        change(devs[side], if x % 2 == 0 { Change::Channels(1) } else { Change::Rate(0) });
+                        view[side] = SLOTS[3].channels[side].load(Acquire) as usize;
+                    }
+                    3 => unsafe {
+                        if x % 2 == 0 {
+                            start_io(std::ptr::null_mut(), devs[side], 0);
+                        } else {
+                            stop_io(std::ptr::null_mut(), devs[side], 0);
+                        }
+                    },
+                    _ => {
+                        let frames = if x % 50 == 0 { RING_FRAMES / 2 + 1 } else { 1 + x % 600 };
+                        let n = frames as usize * view[side];
+                        let mut buf = vec![SENTINEL; n + GUARD];
+                        let mut cycle: AudioServerPlugInIOCycleInfo = unsafe { std::mem::zeroed() };
+                        cycle.mInputTime.mSampleTime = (x / 64) as f64;
+                        cycle.mOutputTime.mSampleTime = (x / 64) as f64;
+                        let op = if k == 4 { READ } else { WRITE };
+                        let st = unsafe {
+                            do_io(std::ptr::null_mut(), devs[side], 0, 0, op, frames, &cycle, buf.as_mut_ptr().cast(), std::ptr::null_mut())
+                        };
+                        proptest::prop_assert_eq!(st, 0);
+                        proptest::prop_assert!(buf[n..].iter().all(|&s| s == SENTINEL), "guard words overwritten");
+                    }
+                }
+                for (have, &want) in SLOTS[3].channels.iter().zip(&view) {
+                    proptest::prop_assert_eq!(have.load(Acquire) as usize, want);
+                }
+            }
+        }
+    }
 }

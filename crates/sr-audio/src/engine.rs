@@ -945,15 +945,24 @@ fn sync_driver(cfg: &Config) -> Result<()> {
         None => driver::require_plugin()?,
     };
     let old = driver::get_devices(plugin).unwrap_or_default();
-    if old != want {
-        driver::set_devices(plugin, &want)?;
-    }
-    let removed: Vec<String> = old
+    let removed = push_devices(&want, old, |l| driver::set_devices(plugin, l))?;
+    wait_driver_settled(&want, &removed)
+}
+
+/// Sets `want` even when the driver already has it: an identical list stores and announces nothing, but the
+/// driver re-asks a device side whose format change the host aborted (that pair stays silent until then).
+/// Returns the uids in `old` that `want` drops.
+fn push_devices(
+    want: &[DriverDevice],
+    old: Vec<DriverDevice>,
+    set: impl FnOnce(&[DriverDevice]) -> Result<()>,
+) -> Result<Vec<String>> {
+    set(want)?;
+    Ok(old
         .into_iter()
         .filter(|o| !want.iter().any(|w| w.uid == o.uid))
         .map(|o| o.uid)
-        .collect();
-    wait_driver_settled(&want, &removed)
+        .collect())
 }
 
 /// How long after `set_devices` the driver's devices may take to appear and take their channel counts.

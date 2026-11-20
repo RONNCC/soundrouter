@@ -453,11 +453,12 @@ fn set_devices(sz: u32, data: *const c_void) -> OSStatus {
     };
     {
         let mut w = wanted();
-        if *w == list {
-            return 0;
+        // The same list again is not stored, but still runs a pass: that re-asks a side whose format change the
+        // host aborted, which otherwise leaves the pair silent until some other list is set.
+        if *w != list {
+            unsafe { store(&list) };
+            *w = list;
         }
-        unsafe { store(&list) };
-        *w = list;
     }
     let mut w = work();
     w.pending = true;

@@ -5,7 +5,8 @@
 | Layer | Covers | Command |
 |-------|--------|---------|
 | Unit + property | sr-core config/mixer/meters (incl. no-alloc test), driver slot pool, rings, parsing, engine layout planning, CLI exit codes | `cargo test --workspace` |
-| Fake host | Driver loaded through CFPlugIn and driven through its vtable, no sudo | `packaging/driver-dev.sh fakehost` |
+| Fake host | Driver loaded through CFPlugIn and driven through its vtable, no sudo; then 8 seeds of the randomized scenario fuzz | `packaging/driver-dev.sh fakehost` |
+| Fake host fuzz | Seeded random lists (valid, invalid, repeated), rates, volumes, I/O start/stop, Performs and Aborts in any order, I/O on removed ids, concurrent property reads; guard words behind every buffer, slot quarantine, convergence to the last list | `packaging/driver-dev.sh fuzz` (`SEEDS=50 STEPS=1000` default; one seed: `fakehost <driver> fuzz <seed> [steps]`) |
 | GUI | egui kittest interaction tests; GPU (Metal) snapshot baselines | `cargo test -p soundrouter-app --features snapshots` (`UPDATE_SNAPSHOTS=1` rewrites baselines) |
 | Hardware (ignored) | Needs driver installed, permissions, audio hardware | `cargo test -- --ignored` |
 | BlackHole e2e | `srtone` (into BlackHole ch 8-9) -> process tap -> engine mixer -> BlackHole 16ch ch 0-1 | `cargo test -p sr-audio --test blackhole -- --ignored` |
