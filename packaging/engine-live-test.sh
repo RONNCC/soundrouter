@@ -27,7 +27,7 @@ check() { # name got want
 }
 play() { # start the tone player on $PLAYER (sets $ap) and prove from its own output that it opened that device
   "$SRTONE" "$PLAYER" 30 0.2 0.1 >"$W/play.log" 2>&1 & ap=$!
-  sleep 0.5
+  for _ in $(seq 50); do grep -q "($PLAYER) ch 0-1" "$W/play.log" && break; sleep 0.1; done # start takes 0.25-0.6 s, longer under load
   grep -q "($PLAYER) ch 0-1" "$W/play.log" || { echo "FAIL player did not open $PLAYER: $(cat "$W/play.log")"; fails=$((fails + 1)); }
 }
 
