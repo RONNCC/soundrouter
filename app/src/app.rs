@@ -3,19 +3,19 @@ use crate::graph::{self, GraphCtx, GraphState};
 use crate::icons::IconTextures;
 use crate::login;
 use crate::model::{Edit, apply, db_to_pct, delay_label, delay_ms, delay_option, pct_to_db};
-use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, Setup};
+use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, OPEN_SETTINGS, Setup};
 use crate::store;
 use crate::theme::{
-    Tokens, body, caption, device_title, label, num, radius, section, strong, tokens,
+    Tokens, body, cable_color, caption, device_title, label, num, radius, section, strong, tokens,
 };
 use crate::tray::{self, Action, Event, Tray, WinState};
 use crate::widgets::{
-    name_button, name_widget, pencil, plus_glyph, slider_knob, speaker, switch, xmark,
+    loops, name_button, name_widget, pencil, plus_glyph, slider_knob, speaker, switch, xmark,
 };
 use crate::worker::Worker;
 use eframe::egui::{
-    self, Align2, CornerRadius, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit, Theme,
-    UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
+    self, Align2, Color32, CornerRadius, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit,
+    TextStyle, Theme, UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
 use sr_core::config::{BUFFER_FRAMES, Config, MAX_NAME_CHARS, SourceKind};
@@ -24,12 +24,19 @@ use std::time::Duration;
 
 const SIDEBAR_W: f32 = 250.0;
 const ROW_H: f32 = 78.0;
+/// Sidebar footer and window footer share a height, so their hairlines are one line.
+const FOOTER_H: f32 = 44.0;
 pub const PERMISSION_BANNER: &str =
-    "Waiting for System Audio Recording permission — allow it in the prompt / System Settings";
-const BLANK_NAME: &str = "A device name can't be empty.";
+    "Waiting for System Audio Recording permission. Allow it in the prompt or in System Settings.";
+const BLANK_NAME: &str = "Device names can't be empty, so SoundRouter kept the old name.";
+/// Sidebar button, empty-state hint and tests all use this one name.
+pub const NEW_DEVICE: &str = "New device";
+/// Window footer buttons; tests click them by these names.
+const REMOVE_DEVICE: &str = "Remove device";
+const TEST_SETUP: &str = "Test setup";
 /// Room for the traffic lights in the unified titlebar.
 const TITLEBAR_H: f32 = 46.0;
-/// How long "Removed … · Undo" stays up, in egui seconds (frame time, so tests step it).
+/// How long "Removed …. Undo" stays up, in egui seconds (frame time, so tests step it).
 const UNDO_SECS: f64 = 6.0;
 
 /// The config as it was before a removal, kept briefly so the removal can be taken back.
@@ -168,7 +175,13 @@ impl App {
             tray: None,
             win: WinState::default(),
             hide_in: 0,
-            setup: Setup::system(),
+            setup: {
+                let mut s = Setup::system();
+                if demo {
+                    s.skip_intro();
+                }
+                s
+            },
             applied: false,
             undo: None,
             now: 0.0,
@@ -219,7 +232,7 @@ impl App {
                     tray::Cmd::Login(on) => {
                         if let Err(e) = login::set_enabled(on) {
                             t.set_login_checked(!on);
-                            self.toast = Some(format!("Could not change Start at Login: {e}"));
+                            self.toast = Some(format!("Start at Login did not change: {e}"));
                         }
                     }
                 }
@@ -348,7 +361,7 @@ impl App {
                     Some(id) => self.worker.self_test(&id),
                     None => self
                         .worker
-                        .fail_self_test("There is no enabled virtual device to test."),
+                        .fail_self_test("There is no enabled device to test. Turn one on in the sidebar, then try again."),
                 }
             }
             Some(SetupAction::Demo) => {
@@ -415,7 +428,7 @@ impl App {
         }
         if let Err(e) = self.cfg.validate() {
             self.cfg = prev;
-            self.toast = Some(e);
+            self.toast = Some(format!("That change was not applied: {e}."));
             return;
         }
         self.toast = blank_rename.then(|| BLANK_NAME.to_string());
@@ -462,15 +475,12 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui, t: &Tokens, edits: &mut Vec<Edit>) {
-        let fill = if self.vibrancy {
-            t.panel.gamma_multiply(0.55)
-        } else {
-            t.panel
-        };
+        // Opaque: a translucent sidebar over the blur view made the row text and the cable-coloured
+        // tiles shift with the wallpaper, and the flat panel is part of the look (docs/DESIGN.md).
         egui::Panel::left("devices")
             .exact_size(SIDEBAR_W)
             .resizable(false)
-            .frame(egui::Frame::default().fill(fill))
+            .frame(egui::Frame::default().fill(t.panel))
             .show(ui, |ui| {
                 let full = ui.max_rect();
                 ui.painter().text(
@@ -485,10 +495,9 @@ impl App {
                     full.top() + TITLEBAR_H + 0.5,
                     Stroke::new(1.0, t.hairline.gamma_multiply(0.6)),
                 );
-                let footer_h = 48.0;
                 let list = Rect::from_min_max(
                     pos2(full.left(), full.top() + TITLEBAR_H + 1.0),
-                    pos2(full.right(), full.bottom() - footer_h),
+                    pos2(full.right(), full.bottom() - FOOTER_H),
                 );
                 ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
                     egui::ScrollArea::vertical()
@@ -500,9 +509,9 @@ impl App {
                             }
                         });
                 });
-                // Footer: New Virtual Device.
+                // Footer: the one primary action, kept quiet so the cables stay the loudest thing.
                 let foot =
-                    Rect::from_min_max(pos2(full.left(), full.bottom() - footer_h), full.max);
+                    Rect::from_min_max(pos2(full.left(), full.bottom() - FOOTER_H), full.max);
                 ui.painter().hline(
                     foot.x_range(),
                     foot.top() + 0.5,
@@ -510,7 +519,7 @@ impl App {
                 );
                 let cy = foot.center().y;
                 let new = ui.interact(
-                    Rect::from_min_size(pos2(foot.left() + 8.0, cy - 14.0), vec2(170.0, 28.0)),
+                    Rect::from_min_size(pos2(foot.left() + 10.0, cy - 14.0), vec2(132.0, 28.0)),
                     Id::unique("new_dev"),
                     Sense::click(),
                 );
@@ -518,11 +527,11 @@ impl App {
                 let c = if new.hovered() { t.ink } else { t.muted };
                 plus_glyph(ui.painter(), pos2(foot.left() + 22.0, cy), c, false);
                 ui.painter().text(
-                    pos2(foot.left() + 38.0, cy),
+                    pos2(foot.left() + 44.0, cy),
                     Align2::LEFT_CENTER,
-                    "New Virtual Device",
-                    body(),
-                    c,
+                    NEW_DEVICE,
+                    label(),
+                    t.accent_ink,
                 );
                 if new.clicked() {
                     edits.push(Edit::NewDevice);
@@ -541,17 +550,20 @@ impl App {
             resp.scroll_to_me(None);
         }
         let inner = row.shrink2(vec2(8.0, 4.0));
+        let cable = cable_color(i);
         if i == self.selected {
             ui.painter()
                 .rect_filled(inner, CornerRadius::same(radius::ROW), t.selected);
         }
         let dim = if dev.enabled { 1.0 } else { 0.55 };
         let icon = Rect::from_min_size(
-            pos2(inner.left() + 8.0, inner.top() + 9.0),
+            pos2(inner.left() + 10.0, inner.top() + 11.0),
             vec2(30.0, 30.0),
         );
-        crate::widgets::tile(ui.painter(), icon, t.accent, "∞", 19.0, dim);
-        let name_pos = pos2(icon.right() + 10.0, inner.top() + 16.0);
+        ui.painter()
+            .rect_filled(icon, CornerRadius::same(8), cable.gamma_multiply(dim));
+        loops(ui.painter(), icon, Color32::WHITE.gamma_multiply(dim));
+        let name_pos = pos2(icon.right() + 10.0, inner.top() + 18.0);
         let name_rect = Rect::from_min_size(
             pos2(name_pos.x, name_pos.y - 10.0),
             vec2(inner.right() - 72.0 - name_pos.x, 20.0),
@@ -604,7 +616,7 @@ impl App {
         }
         let chans = format!("{} channels", dev.channels);
         ui.painter().text(
-            pos2(name_pos.x, inner.top() + 34.0),
+            pos2(name_pos.x, inner.top() + 36.0),
             Align2::LEFT_CENTER,
             chans,
             caption(),
@@ -617,7 +629,7 @@ impl App {
             .find_map(|(id, s)| (id == dev.id).then_some(s))
             .unwrap_or_default();
         if let Some((text, color)) = state_look(&state, t) {
-            let c = pos2(inner.right() - 24.0, inner.top() + 34.0);
+            let c = pos2(inner.right() - 16.0, inner.top() + 36.0);
             if state != DeviceState::Running {
                 ui.painter().circle_filled(c, 4.0, color);
             }
@@ -663,10 +675,10 @@ impl App {
             edits.push(Edit::Enable(i, on));
         }
         // Volume row: mute, slider, percent.
-        let vy = inner.top() + 56.0;
+        let vy = inner.top() + 57.0;
         let mute = speaker(
             ui,
-            pos2(inner.left() + 20.0, vy),
+            pos2(inner.left() + 22.0, vy),
             Id::unique(("mute", i)),
             dev.muted,
             t,
@@ -678,10 +690,17 @@ impl App {
         let mut pct = db_to_pct(dev.volume_db).clamp(0.0, 100.0);
         let before = pct;
         let sl = Rect::from_x_y_ranges(
-            (inner.left() + 36.0)..=(inner.right() - 52.0),
-            (vy - 10.0)..=(vy + 10.0),
+            (inner.left() + 38.0)..=(inner.right() - 52.0),
+            (vy - 7.5)..=(vy + 7.5),
         );
         let slider = ui.scope_builder(UiBuilder::new().max_rect(sl), |ui| {
+            // egui sizes a slider from the body text height and `interact_size`; shrink both so the
+            // knob painted over its handle can be the sidebar's 14 px one.
+            let style = ui.style_mut();
+            style.spacing.interact_size.y = sl.height();
+            if let Some(body) = style.text_styles.get_mut(&TextStyle::Body) {
+                body.size = 8.0;
+            }
             ui.spacing_mut().slider_width = sl.width() - 4.0;
             ui.add(Slider::new(&mut pct, 0.0..=100.0).show_value(false))
         });
@@ -691,7 +710,7 @@ impl App {
             edits.push(Edit::Volume(i, pct_to_db(pct)));
         }
         ui.painter().text(
-            pos2(inner.right() - 10.0, vy),
+            pos2(x_at.x + 4.0, vy),
             Align2::RIGHT_CENTER,
             format!("{pct:.0}%"),
             num(11.0),
@@ -701,7 +720,7 @@ impl App {
 
     fn main_pane(&mut self, ui: &mut egui::Ui, t: &Tokens, edits: &mut Vec<Edit>) {
         egui::Panel::bottom("bottom")
-            .exact_size(44.0)
+            .exact_size(FOOTER_H)
             .resizable(false)
             .frame(egui::Frame::default().fill(t.panel))
             .show(ui, |ui| {
@@ -712,10 +731,13 @@ impl App {
                     Stroke::new(1.0, t.hairline.gamma_multiply(0.6)),
                 );
                 let has = self.selected < self.cfg.devices.len();
-                let btn =
-                    Rect::from_center_size(pos2(r.left() + 58.0, r.center().y), vec2(72.0, 26.0));
+                let remove_w = setup::footer_width(ui, REMOVE_DEVICE);
+                let btn = Rect::from_center_size(
+                    pos2(r.left() + 26.0 + remove_w / 2.0, r.center().y),
+                    vec2(remove_w, 26.0),
+                );
                 let resp = ui.interact(btn, Id::unique("delete"), Sense::click());
-                name_button(&resp, "Delete");
+                name_button(&resp, REMOVE_DEVICE);
                 let fill = if resp.hovered() && has {
                     t.hairline
                 } else {
@@ -732,7 +754,7 @@ impl App {
                 ui.painter().text(
                     btn.center(),
                     Align2::CENTER_CENTER,
-                    "Delete",
+                    REMOVE_DEVICE,
                     label(),
                     t.ink.gamma_multiply(a),
                 );
@@ -746,26 +768,45 @@ impl App {
                 let mut right = r.right() - 18.0;
                 let by = r.center().y - 13.0;
                 if real_driver {
-                    let uninstall =
-                        Rect::from_min_size(pos2(r.right() - 18.0 - 90.0, by), vec2(90.0, 26.0));
-                    let test = Rect::from_min_size(
-                        uninstall.min - vec2(8.0 + 104.0, 0.0),
-                        vec2(104.0, 26.0),
-                    );
-                    if setup::footer_button(ui, test, "test_setup", "Test Setup…", t).clicked() {
-                        self.setup.open_test();
+                    // Uninstall is destructive and rare: it lives behind a quiet "…" menu.
+                    let more = Rect::from_min_size(pos2(right - 28.0, by), vec2(28.0, 26.0));
+                    let resp = ui.interact(more, Id::unique("more"), Sense::click());
+                    name_button(&resp, "More actions");
+                    let tint = if resp.hovered() { t.ink } else { t.muted };
+                    if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(more, CornerRadius::same(radius::PILL), t.hairline);
                     }
-                    if setup::footer_button(ui, uninstall, "uninstall", "Uninstall…", t).clicked()
-                    {
-                        self.setup.ask_uninstall();
+                    for dx in [-5.0, 0.0, 5.0] {
+                        ui.painter()
+                            .circle_filled(more.center() + vec2(dx, 0.0), 1.6, tint);
+                    }
+                    resp.clone().on_hover_text("More actions");
+                    egui::Popup::menu(&resp).show(|ui| {
+                        ui.set_min_width(140.0);
+                        if ui
+                            .button(egui::RichText::new("Uninstall…").color(t.bad_ink))
+                            .clicked()
+                        {
+                            self.setup.ask_uninstall();
+                        }
+                    });
+                    let test_w = setup::footer_width(ui, TEST_SETUP);
+                    let test = Rect::from_min_size(
+                        pos2(more.left() - 8.0 - test_w, by),
+                        vec2(test_w, 26.0),
+                    );
+                    if setup::footer_button(ui, test, "test_setup", TEST_SETUP, t).clicked() {
+                        self.setup.open_test();
                     }
                     right = test.left() - 8.0;
                 }
-                let latency = Rect::from_min_size(pos2(right - 124.0, by), vec2(124.0, 26.0));
                 let label = delay_label(self.cfg.buffer_frames);
+                let chip_w = setup::footer_width(ui, &label);
+                let latency = Rect::from_min_size(pos2(right - chip_w, by), vec2(chip_w, 26.0));
                 let resp = setup::footer_button(ui, latency, "latency", &label, t);
                 resp.clone().on_hover_text(
-                    "Audio delay: how long audio takes to pass through SoundRouter (two buffers, shown at 48 kHz; the virtual device itself adds about 2 buffers more). Click to change.",
+                    "How long audio takes to pass through SoundRouter: two buffers, shown at 48 kHz. The virtual device adds about two more. Click to change.",
                 );
                 egui::Popup::menu(&resp).show(|ui| delay_menu(ui, t, self.cfg.buffer_frames, edits));
                 let reserved = r.right() - latency.left() + 12.0;
@@ -786,7 +827,7 @@ impl App {
                 {
                     let x = btn.right() + 18.0;
                     let width = r.right() - 18.0 - x - reserved;
-                    let text = format!("Removed {} ·", u.name);
+                    let text = format!("Removed {}.", u.name);
                     let font = body();
                     let tw = ui
                         .painter()
@@ -830,7 +871,7 @@ impl App {
                 let (msg, color) = match status {
                     Some(m) => (m, t.bad_ink),
                     None if self.demo => (
-                        "Demo mode: synthetic audio, nothing is saved".to_string(),
+                        "Demo mode: the audio is synthetic and nothing is saved.".to_string(),
                         t.muted,
                     ),
                     None => return,
@@ -873,7 +914,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(PERMISSION_BANNER);
-                        if ui.button("Open Settings").clicked() {
+                        if ui.button(OPEN_SETTINGS).clicked() {
                             let _ = std::process::Command::new("/usr/bin/open")
                                 .arg(AUDIO_CAPTURE_SETTINGS)
                                 .spawn();
@@ -892,7 +933,9 @@ impl App {
                 .show(ui, |ui| {
                     ui.colored_label(
                         t.bad_ink,
-                        format!("Audio engine unavailable: {why}. Routing is not running."),
+                        format!(
+                            "SoundRouter could not start its audio engine ({why}). Nothing is routed. Quit and reopen SoundRouter to try again."
+                        ),
                     );
                 });
         }
@@ -902,13 +945,9 @@ impl App {
             .show(ui, |ui| {
                 let full = ui.max_rect();
                 let Some(dev) = self.cfg.devices.get(self.selected) else {
-                    ui.painter().text(
-                        full.center(),
-                        Align2::CENTER_CENTER,
-                        "No virtual devices.\nUse “New Virtual Device” to create one.",
-                        strong(),
-                        t.muted,
-                    );
+                    if graph::no_devices(ui, t, full) {
+                        edits.push(Edit::NewDevice);
+                    }
                     return;
                 };
                 // Title (editable) in the titlebar zone.
@@ -1055,7 +1094,9 @@ impl eframe::App for App {
             if let Some(p) = &self.path
                 && let Err(e) = store::save(p, &self.cfg)
             {
-                self.toast = Some(format!("Could not save config: {e}"));
+                self.toast = Some(format!(
+                    "Could not save your settings: {e}. Changes last until you quit."
+                ));
             }
         }
     }

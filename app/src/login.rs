@@ -70,7 +70,7 @@ fn write_agent(path: &Path, exe: &Path, on: bool) -> io::Result<()> {
     let exe_str = exe.to_string_lossy();
     if exe_str.starts_with("/Volumes/SoundRouter") || exe_str.contains("/AppTranslocation/") {
         return Err(io::Error::other(
-            "SoundRouter is running from a disk image or a temporary location; move it to Applications first",
+            "SoundRouter is running from a disk image or a temporary folder. Move it to Applications, open it from there, then try again.",
         ));
     }
     let text = plist(exe);

@@ -52,7 +52,7 @@ pub type Runner = Arc<dyn Fn(&str) -> Result<(), SetupError> + Send + Sync>;
 /// Asks macOS for System Audio Recording and returns the answer. Injected so tests never prompt.
 pub type Asker = Arc<dyn Fn() -> TccStatus + Send + Sync>;
 
-/// What decides whether the setup sheet opens by itself (it always opens on "Test Setup…").
+/// What decides whether the setup sheet opens by itself (it always opens on "Test setup").
 #[derive(Clone, Copy, Debug)]
 pub struct Needs {
     pub driver: bool,
@@ -206,6 +206,9 @@ pub fn locate_driver() -> Option<PathBuf> {
 pub type DriverCheck = fn(&Path) -> Result<(), String>;
 
 pub const DRIVER_MISMATCH: &str = "The bundled driver does not match this app.";
+const REDOWNLOAD: &str = "Download SoundRouter again and replace this copy.";
+/// One name for the button that opens System Settings, in the banner and in the sheets.
+pub const OPEN_SETTINGS: &str = "Open System Settings";
 
 /// Who signed some code, from `codesign -dvvv` plus `codesign -dr -` output.
 #[derive(Debug, PartialEq, Eq)]
@@ -280,7 +283,7 @@ fn check_driver_for(exe: &Path, driver: &Path) -> Result<(), String> {
         .map_err(|e| format!("could not run codesign: {e}"))?;
     if !verify.status.success() {
         return Err(format!(
-            "{DRIVER_MISMATCH} Its signature is invalid: {}",
+            "{DRIVER_MISMATCH} Its signature is invalid: {}. {REDOWNLOAD}",
             String::from_utf8_lossy(&verify.stderr).trim()
         ));
     }
@@ -298,7 +301,7 @@ fn check_driver_for(exe: &Path, driver: &Path) -> Result<(), String> {
     if driver_matches_app(&app, &codesign_info(driver)?, driver_in_app) {
         Ok(())
     } else {
-        Err(DRIVER_MISMATCH.into())
+        Err(format!("{DRIVER_MISMATCH} {REDOWNLOAD}"))
     }
 }
 
@@ -352,7 +355,7 @@ pub struct Setup {
     source: Option<PathBuf>,
     driver_check: DriverCheck,
     step: Step,
-    /// Opened by "Test Setup…", after an install, or when `should_show_setup` says so.
+    /// Opened by "Test setup", after an install, or when `should_show_setup` says so.
     open: bool,
     busy: Option<Busy>,
     rx: Option<Receiver<Result<(), SetupError>>>,
@@ -380,6 +383,8 @@ pub struct Setup {
     seen: bool,
     /// Where `seen` is remembered; `None` in tests.
     marker: Option<PathBuf>,
+    /// Brand-new install (no marker file yet): the welcome sheet comes before anything else.
+    intro: bool,
 }
 
 impl Setup {
@@ -407,6 +412,7 @@ impl Setup {
             test_since: None,
             seen: false,
             marker: None,
+            intro: false,
         }
     }
 
@@ -416,6 +422,7 @@ impl Setup {
         let marker = seen_marker();
         Self {
             seen: marker.as_deref().is_some_and(seen_at),
+            intro: marker.as_deref().is_some_and(|p| !p.exists()),
             marker,
             ..Self::new(Arc::new(run_admin), locate_driver())
         }
@@ -449,7 +456,7 @@ impl Setup {
         self.shown
     }
 
-    /// "Test Setup…": start at the permissions, the driver is already there.
+    /// "Test setup": start at the permissions, the driver is already there.
     pub fn open_test(&mut self) {
         self.step = Step::Permissions;
         self.open = true;
@@ -523,10 +530,9 @@ impl Setup {
         match self.source.clone() {
             Some(src) => self.spawn(ctx, Busy::Installing, install_script(&src), Some(src)),
             None => {
-                self.error = Some(
-                    "This copy of SoundRouter does not contain the driver (SoundRouter.driver)."
-                        .into(),
-                );
+                self.error = Some(format!(
+                    "This copy of SoundRouter does not contain its driver (SoundRouter.driver). {REDOWNLOAD}"
+                ));
             }
         }
     }
@@ -562,7 +568,7 @@ impl Setup {
             if self.deadline.is_some_and(|d| v.now > d) {
                 self.deadline = None;
                 self.error = Some(
-                    "The driver was installed but macOS has not loaded it yet. Try again, or log out and back in."
+                    "The driver was installed but macOS has not loaded it yet. Choose Install driver again, or log out and back in."
                         .into(),
                 );
             }
@@ -595,6 +601,11 @@ impl Setup {
             }
         }
         let t = tokens(ctx.theme() == Theme::Dark);
+        if self.intro {
+            self.shown = true;
+            self.intro_sheet(ctx, &t);
+            return deleted;
+        }
         let mut action = None;
         if self.open || v.status.driver_version.is_none() {
             self.shown = true;
@@ -604,6 +615,70 @@ impl Setup {
             self.uninstall_dialog(ctx, &t);
         }
         deleted.or(action)
+    }
+
+    /// Demo and tests start without the welcome.
+    pub fn skip_intro(&mut self) {
+        self.intro = false;
+    }
+
+    /// The welcome sheet. Its marker is an empty file, so "finished this version" stays false.
+    fn intro_sheet(&mut self, ctx: &Context, t: &Tokens) {
+        const POINTS: [(&str, &str); 3] = [
+            (
+                "Virtual device",
+                "A pretend microphone and speaker. Zoom, OBS and other apps pick it like real hardware.",
+            ),
+            (
+                "Source",
+                "Anything that makes sound: an app, a microphone or another input.",
+            ),
+            (
+                "Where audio goes",
+                "Sources flow into the device. Apps that record from it hear the mix, and you can play it on your speakers too.",
+            ),
+        ];
+        modal(
+            ctx,
+            t,
+            &Sheet {
+                id: "setup_intro",
+                buttons: true,
+                glyph: Glyph::App,
+                title: "Welcome to SoundRouter",
+                intro: "Route sound between apps, mics and virtual devices.",
+            },
+            self,
+            |ui, _| {
+                for (i, (term, what)) in POINTS.into_iter().enumerate() {
+                    if i > 0 {
+                        ui.add_space(6.0);
+                    }
+                    ui.label(
+                        egui::RichText::new(term)
+                            .font(crate::theme::label())
+                            .color(t.ink),
+                    );
+                    body(ui, t, what);
+                }
+            },
+            |ui, s| {
+                buttons(
+                    ui,
+                    s,
+                    |_, _| {},
+                    |ui, s| {
+                        if button(ui, t, "Get started", Kind::Primary) {
+                            s.intro = false;
+                            if let Some(p) = s.marker.as_deref().filter(|p| !p.exists()) {
+                                let _ = std::fs::create_dir_all(p.parent().unwrap_or(p));
+                                let _ = std::fs::write(p, "");
+                            }
+                        }
+                    },
+                );
+            },
+        );
     }
 
     fn close(&mut self) {
@@ -629,9 +704,7 @@ impl Setup {
                     buttons: true,
                     glyph: Glyph::App,
                     title: "Set up SoundRouter",
-                    intro: "SoundRouter creates virtual audio devices and routes app and microphone audio \
-                            between them. It needs a small system audio driver; macOS will ask for your \
-                            password to install it.",
+                    intro: "SoundRouter needs a small audio driver to create virtual devices. macOS asks for your password to install it.",
                 },
                 self,
                 |ui, _| {
@@ -652,13 +725,13 @@ impl Setup {
                         ui,
                         s,
                         |ui, s| {
-                            if button(ui, t, "Try Demo", Kind::Secondary) {
+                            if button(ui, t, "Try the demo", Kind::Secondary) {
                                 s.demo = true;
                                 action = Some(Action::Demo);
                             }
                         },
                         |ui, s| {
-                            if button(ui, t, "Install Driver…", Kind::Primary) {
+                            if button(ui, t, "Install driver", Kind::Primary) {
                                 s.start_install(ctx);
                             }
                         },
@@ -720,14 +793,14 @@ impl Setup {
                             ui,
                             s,
                             |ui, s| {
-                                if button(ui, t, "Try Demo", Kind::Secondary) {
+                                if button(ui, t, "Try the demo", Kind::Secondary) {
                                     s.demo = true;
                                     action = Some(Action::Demo);
                                 }
                                 s.copy_button(ui, t, v);
                             },
                             |ui, s| {
-                                if button(ui, t, "Retry", Kind::Primary) {
+                                if button(ui, t, "Install driver", Kind::Primary) {
                                     s.start_install(ctx);
                                 }
                             },
@@ -739,10 +812,10 @@ impl Setup {
                 let mic = v.status.mic;
                 let cap = self.capture(v);
                 let go = match (mic == TccStatus::Unknown, cap == TccStatus::Unknown) {
-                    (true, true) => "Allow All",
-                    (true, false) => "Allow Microphone",
+                    (true, true) => "Allow both",
+                    (true, false) => "Allow microphone",
                     (false, true) => "Allow System Audio Recording",
-                    (false, false) => "Continue",
+                    (false, false) => "Run test",
                 };
                 modal(
                     ctx,
@@ -834,7 +907,7 @@ impl Setup {
                                 state: Status::Fail,
                                 title: "Loopback test",
                                 status: "Failed",
-                                detail: "The test did not finish",
+                                detail: "The test did not finish in 30 seconds.",
                                 action: None,
                             },
                             SelfTestState::Idle | SelfTestState::Running => Row {
@@ -889,9 +962,9 @@ impl Setup {
                                 ui,
                                 t,
                                 if v.status.mic == TccStatus::Granted {
-                                    "Microphone access is allowed, so the audio path itself looks silent. Try again, or copy diagnostics for support."
+                                    "Microphone access is allowed, so the audio path itself looks silent. Test again, or copy diagnostics for support."
                                 } else {
-                                    "Check the Microphone permission, then try again."
+                                    "Microphone access is not allowed yet. Allow it above, then test again."
                                 },
                             ),
                         }
@@ -915,7 +988,7 @@ impl Setup {
                             s,
                             |ui, s| s.copy_button(ui, t, v),
                             |ui, s| {
-                                if button(ui, t, "Retry", Kind::Primary) {
+                                if button(ui, t, "Test again", Kind::Primary) {
                                     s.test_since = None;
                                     action = Some(Action::Test);
                                 }
@@ -940,7 +1013,7 @@ impl Setup {
                             s,
                             |ui, s| s.copy_button(ui, t, v),
                             |ui, s| {
-                                if button(ui, t, "Retry", Kind::Primary) {
+                                if button(ui, t, "Test again", Kind::Primary) {
                                     s.test_since = None;
                                     action = Some(Action::Test);
                                 }
@@ -1017,7 +1090,7 @@ impl Setup {
                 if busy {
                     progress(ui, t, "Waiting for the password dialog…");
                 } else if let Some(e) = &s.error {
-                    error(ui, t, &format!("Not uninstalled: {e}"));
+                    error(ui, t, &format!("Not uninstalled. {e}"));
                 }
             },
             |ui, s| {
@@ -1074,7 +1147,7 @@ impl Setup {
                 },
                 action: match cap {
                     TccStatus::Granted => None,
-                    TccStatus::Denied => Some("Open Settings"),
+                    TccStatus::Denied => Some(OPEN_SETTINGS),
                     TccStatus::Unknown => Some("Allow System Audio Recording"),
                 },
             }
@@ -1098,8 +1171,8 @@ impl Setup {
                     ""
                 },
                 action: match mic {
-                    TccStatus::Unknown if !self.mic_asking => Some("Allow Microphone"),
-                    TccStatus::Denied => Some("Open Settings"),
+                    TccStatus::Unknown if !self.mic_asking => Some("Allow microphone"),
+                    TccStatus::Denied => Some(OPEN_SETTINGS),
                     _ => None,
                 },
             },

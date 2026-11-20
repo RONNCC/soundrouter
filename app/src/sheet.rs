@@ -190,13 +190,13 @@ pub struct Row<'a> {
 pub fn checklist(ui: &mut Ui, t: &Tokens, rows: &[Row]) -> Option<usize> {
     let mut clicked = None;
     let w = ui.available_width();
+    // An inset group by tone alone: no outline, so the rows read as lines, not as boxes.
     Frame::new()
         .fill(t.canvas)
-        .stroke(Stroke::new(1.0, t.hairline))
         .corner_radius(CornerRadius::same(radius::ROW))
-        .inner_margin(Margin::symmetric(12, 0))
+        .inner_margin(Margin::symmetric(14, 0))
         .show(ui, |ui| {
-            ui.set_width(w - 26.0);
+            ui.set_width(w - 28.0);
             ui.spacing_mut().item_spacing.y = 0.0;
             for (i, r) in rows.iter().enumerate() {
                 if i > 0 {
@@ -222,7 +222,7 @@ fn row(ui: &mut Ui, t: &Tokens, r: &Row) -> bool {
         Status::Running => (t.accent, t.accent_ink, true),
         Status::Fail => (t.bad, t.bad_ink, false),
     };
-    ui.add_space(10.0);
+    ui.add_space(12.0);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         let (g, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
@@ -234,7 +234,7 @@ fn row(ui: &mut Ui, t: &Tokens, r: &Row) -> bool {
         ui.vertical(|ui| {
             ui.set_width(w - 30.0);
             ui.spacing_mut().item_spacing.y = 2.0;
-            let (line, resp) = ui.allocate_exact_size(vec2(w - 30.0, 20.0), Sense::hover());
+            let (line, resp) = ui.allocate_exact_size(vec2(w - 30.0, 22.0), Sense::hover());
             let label = format!("{}: {}", r.title, r.status);
             resp.widget_info(|| WidgetInfo::labeled(Role::Label, true, &label));
             let p = ui.painter();
@@ -242,7 +242,7 @@ fn row(ui: &mut Ui, t: &Tokens, r: &Row) -> bool {
                 line.left_center(),
                 Align2::LEFT_CENTER,
                 r.title,
-                theme::label(),
+                theme::strong(),
                 t.ink,
             );
             let g = p.layout_no_wrap(r.status.to_string(), theme::label(), ink);
@@ -260,8 +260,8 @@ fn row(ui: &mut Ui, t: &Tokens, r: &Row) -> bool {
                 ui.add(
                     Label::new(
                         RichText::new(r.detail)
-                            .size(12.0)
-                            .line_height(Some(16.0))
+                            .size(13.0)
+                            .line_height(Some(18.0))
                             .color(t.muted),
                     )
                     .wrap(),
@@ -274,7 +274,7 @@ fn row(ui: &mut Ui, t: &Tokens, r: &Row) -> bool {
             }
         });
     });
-    ui.add_space(10.0);
+    ui.add_space(12.0);
     clicked
 }
 
