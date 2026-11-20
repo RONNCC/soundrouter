@@ -56,10 +56,13 @@ pub struct GraphState {
     pub show_background: bool,
 }
 
+/// A row per hardware output channel, and for every wired channel past them (a headset that
+/// dropped to one channel in a call), so a wire the engine warns about can be seen and removed.
 fn mon_rows(m: &Monitor, hw: &[HwDevice]) -> u16 {
+    let wired = m.wires.iter().map(|w| w.dst_ch + 1).max().unwrap_or(0);
     match hw.iter().find(|h| h.uid == m.device_uid) {
-        Some(h) => h.out_ch.clamp(1, MAX_ROWS),
-        None => (m.wires.iter().map(|w| w.dst_ch + 1).max().unwrap_or(0)).clamp(2, MAX_ROWS),
+        Some(h) => h.out_ch.max(wired).clamp(1, MAX_ROWS),
+        None => wired.clamp(2, MAX_ROWS),
     }
 }
 
@@ -743,7 +746,8 @@ fn card(
         );
         name_button(&x, &format!("{label} {title}"));
         xmark(&painter, at, if x.hovered() { t.danger } else { t.text2 });
-        if x.clicked() {
+        // A double-click's second click would remove the card that moved up under the pointer.
+        if x.clicked() && !x.double_clicked() {
             edits.push(edit);
         }
         x.on_hover_text(format!("{label} {title}"));
@@ -956,7 +960,7 @@ fn card(
             t.danger.gamma_multiply(0.75)
         },
     );
-    if resp.clicked() {
+    if resp.clicked() && !resp.double_clicked() {
         edits.push(edit);
     }
 }

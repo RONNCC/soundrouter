@@ -2129,3 +2129,410 @@ mod model_based {
         }
     }
 }
+
+/// Device names, in order.
+fn names(h: &Harness<App>) -> Vec<String> {
+    h.state()
+        .cfg
+        .devices
+        .iter()
+        .map(|d| d.name.clone())
+        .collect()
+}
+
+/// Start a sidebar rename of `name` and type `to` without committing it.
+fn start_rename(h: &mut Harness<App>, name: &str, to: &str) {
+    double_click(h, &format!("Rename {name}"));
+    select_all(h);
+    h.get_by_label("Rename device").type_text(to);
+    settle(h);
+}
+
+#[test]
+fn return_in_the_permissions_sheet_answers_the_footer_not_a_row_button() {
+    let (a, calls) = asker(TccStatus::Granted);
+    let mut h = with_asker(
+        EngineStatus {
+            mic: TccStatus::Unknown,
+            tcc: TccStatus::Unknown,
+            ..installed()
+        },
+        a,
+    );
+    h.get_by_label("Allow All");
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    // "Allow All" asks for System Audio Recording once the Microphone is answered; the
+    // Microphone row's own button would not.
+    until(&mut h, "System Audio Recording asked", |h| {
+        h.state().worker.shared.lock().unwrap().status.mic = TccStatus::Granted;
+        *calls.lock().unwrap() == 1
+    });
+}
+
+#[test]
+fn a_driver_that_blinks_while_test_setup_is_open_returns_to_the_permissions() {
+    let mut h = setup_run(installed(), flowing());
+    h.get_by_label("Continue");
+    let set = |h: &mut Harness<App>, v: Option<&str>| {
+        h.state()
+            .worker
+            .shared
+            .lock()
+            .unwrap()
+            .status
+            .driver_version = v.map(Into::into);
+        settle(h);
+    };
+    set(&mut h, None);
+    h.get_by_label("Install Driver…");
+    set(&mut h, Some("1"));
+    assert!(!has(&h, "Install Driver…"), "a stale 'not installed' sheet");
+    h.get_by_label("Continue");
+}
+
+#[test]
+fn typing_never_reaches_the_window_behind_a_sheet() {
+    // The title field has the keyboard when the driver goes away and the sheet comes up.
+    let mut h = with_runner(installed(), never_run());
+    h.get_by_label("Device name").click();
+    settle(&mut h);
+    h.event(egui::Event::Text("Q".into()));
+    settle(&mut h);
+    let typed = h.state().cfg.devices[0].name.clone();
+    assert!(typed.contains('Q'), "the field has the keyboard: {typed}");
+    h.state()
+        .worker
+        .shared
+        .lock()
+        .unwrap()
+        .status
+        .driver_version = None;
+    settle(&mut h);
+    h.get_by_label("Install Driver…");
+    h.event(egui::Event::Text("xyz".into()));
+    settle(&mut h);
+    assert_eq!(h.state().cfg.devices[0].name, typed);
+
+    // Same for a sidebar rename, which holds on to the keyboard while it lasts.
+    let mut h = with_runner(installed(), never_run());
+    start_rename(&mut h, "Stream Mix", "Pod");
+    h.get_by_label("Rename device");
+    h.state()
+        .worker
+        .shared
+        .lock()
+        .unwrap()
+        .status
+        .driver_version = None;
+    settle(&mut h);
+    h.event(egui::Event::Text("xyz".into()));
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert!(
+        names(&h).iter().all(|n| !n.contains("xyz")),
+        "{:?}",
+        names(&h)
+    );
+}
+
+#[test]
+fn a_new_device_in_a_long_list_is_scrolled_into_view() {
+    let mut cfg = demo_config();
+    while cfg.devices.len() < 15 {
+        crate::model::new_device(&mut cfg);
+    }
+    let mut h = open(cfg);
+    h.set_size(vec2(1000.0, 520.0)); // the window's minimum size
+    settle(&mut h);
+    click(&mut h, "New Virtual Device");
+    assert_eq!(h.state().selected, 15);
+    let row = h.get_by_label("Select Loopback Audio 16").rect();
+    let new = h.get_by_label("New Virtual Device").rect();
+    assert!(
+        row.bottom() <= new.top() && row.top() >= TITLEBAR_H,
+        "{row:?} hidden"
+    );
+}
+
+#[test]
+fn the_latency_menu_stays_inside_the_window_and_picks_a_size() {
+    let mut h = open(demo_config());
+    let label = latency_label(h.state().cfg.buffer_frames);
+    click(&mut h, &label);
+    let win = h.ctx.content_rect();
+    let other = *BUFFER_FRAMES
+        .iter()
+        .find(|n| **n != h.state().cfg.buffer_frames)
+        .unwrap();
+    for n in BUFFER_FRAMES {
+        let r = h.get_all_by_label(&latency_label(n)).last().unwrap().rect();
+        assert!(win.contains_rect(r), "{n}: {r:?} leaves {win:?}");
+    }
+    h.get_all_by_label(&latency_label(other))
+        .last()
+        .unwrap()
+        .click();
+    settle(&mut h);
+    assert_eq!(h.state().cfg.buffer_frames, other);
+    assert_eq!(h.get_all_by_label_contains("Latency:").count(), 1, "closed");
+}
+
+#[test]
+fn switches_and_buttons_work_from_the_keyboard() {
+    let mut h = open(demo_config());
+    for (label, key) in [
+        ("Enable Loopback Audio", egui::Key::Space),
+        ("Mute Loopback Audio", egui::Key::Enter),
+    ] {
+        let before = h.state().cfg.clone();
+        h.get_by_label(label).focus();
+        settle(&mut h);
+        h.key_press(key);
+        settle(&mut h);
+        assert_ne!(h.state().cfg, before, "{label}");
+    }
+    h.get_by_label("Add channel pair").focus();
+    settle(&mut h);
+    h.key_press(egui::Key::Space);
+    settle(&mut h);
+    assert_eq!(h.state().cfg.devices[0].channels, 4);
+}
+
+/// The fake backend, recording which device each self-test ran on.
+struct Tested(FakeBackend, Arc<Mutex<Vec<String>>>);
+
+impl Backend for Tested {
+    fn apply(&mut self, cfg: &Config) -> anyhow::Result<()> {
+        self.0.apply(cfg)
+    }
+    fn hardware(&self) -> Vec<HwDevice> {
+        self.0.hardware()
+    }
+    fn apps(&self) -> Vec<AppInfo> {
+        self.0.apps()
+    }
+    fn meters(&self, id: &str) -> Option<MeterReading> {
+        self.0.meters(id)
+    }
+    fn status(&self) -> EngineStatus {
+        self.0.status()
+    }
+    fn self_test(&mut self, id: &str) -> anyhow::Result<SelfTest> {
+        self.1.lock().unwrap().push(id.to_string());
+        self.0.self_test(id)
+    }
+}
+
+#[test]
+fn test_setup_tests_an_enabled_device_not_a_disabled_selection() {
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let mut b = FakeBackend::frozen(1.5);
+    b.status = installed();
+    b.self_test = flowing();
+    let mut h = window(
+        demo_config(),
+        Box::new(Tested(b, ids.clone())),
+        None,
+        Theme::Dark,
+        false,
+    );
+    click(&mut h, "Enable Loopback Audio"); // the selected device, now off
+    click(&mut h, "Test Setup…");
+    click(&mut h, "Continue");
+    until(&mut h, "self-test", |h| {
+        has(h, "Audio flows (-6 dBFS, 0 dropouts)")
+    });
+    assert_eq!(*ids.lock().unwrap(), ["v2"]);
+    click(&mut h, "Continue");
+    h.get_by_label_contains("choose “Stream Mix”");
+
+    // Nothing enabled (Zoom Out starts off): nothing to test, and the sheet says so instead of
+    // testing a dead device.
+    click(&mut h, "Done");
+    click(&mut h, "Enable Stream Mix");
+    assert!(h.state().cfg.devices.iter().all(|d| !d.enabled));
+    click(&mut h, "Test Setup…");
+    click(&mut h, "Continue");
+    until(&mut h, "self-test", |h| has(h, "Copy diagnostics"));
+    h.get_by_label_contains("no enabled virtual device");
+    assert_eq!(*ids.lock().unwrap(), ["v2"], "no second test ran");
+}
+
+#[test]
+fn a_standing_warning_never_hides_the_undo() {
+    let mut h = with_status(EngineStatus {
+        warnings: vec!["wire A".into()],
+        ..demo_status()
+    });
+    click(&mut h, "Remove Safari");
+    h.get_by_label("Removed Safari");
+    click(&mut h, "Undo");
+    h.get_by_label("Safari enabled");
+    h.get_by_label("wire A");
+}
+
+#[test]
+fn a_monitor_wire_past_the_hardware_channels_stays_visible_and_removable() {
+    // Bluetooth headphones drop to one output channel in a call; the second wire is not lost.
+    let mut cfg = demo_config();
+    let m = &mut cfg.devices[0].monitors[0];
+    assert_eq!(m.device_uid, "BuiltInSpeakerDevice");
+    m.wires.push(sr_core::config::MonitorWire {
+        out_ch: 0,
+        dst_ch: 3,
+    });
+    let mut h = open(cfg);
+    click(&mut h, "MacBook Pro Speakers channel 4 input");
+    let m = &h.state().cfg.devices[0].monitors[0];
+    assert!(m.wires.iter().all(|w| w.dst_ch < 2), "{:?}", m.wires);
+}
+
+#[test]
+fn choose_app_stays_inside_a_minimum_size_window() {
+    let mut h = open(demo_config());
+    h.set_size(vec2(1000.0, 520.0));
+    let apps = (0..80)
+        .map(|i| AppInfo {
+            bundle_id: format!("com.example.{i:02}"),
+            name: format!("App {i:02}"),
+            running_output: false,
+            regular: true,
+        })
+        .collect();
+    h.state_mut().graph.installed.set(apps).unwrap();
+    settle(&mut h);
+    click(&mut h, "Add source");
+    click(&mut h, "Choose App…");
+    let win = h.ctx.content_rect();
+    let first = h.get_by_label("App 00").rect();
+    assert!(win.contains_rect(first), "{first:?} leaves {win:?}");
+    h.get_by_label("App 79").scroll_to_me();
+    settle(&mut h);
+    let last = h.get_by_label("App 79").rect();
+    assert!(win.contains_rect(last), "{last:?} leaves {win:?}");
+    click(&mut h, "App 79");
+    assert_eq!(
+        h.state().cfg.devices[0].sources.last().unwrap().kind,
+        SourceKind::App {
+            bundle_id: "com.example.79".into()
+        }
+    );
+    assert!(!has(&h, "Choose App…"), "both menus closed");
+}
+
+/// Two quick clicks at one spot (a double-click), a frame apart, as a mouse delivers them.
+fn two_clicks(h: &mut Harness<App>, label: &str) {
+    let at = center(h, label);
+    h.hover_at(at);
+    h.step();
+    for _ in 0..2 {
+        h.drag_at(at);
+        h.step();
+        h.drop_at(at);
+        h.step();
+    }
+    settle(h);
+}
+
+#[test]
+fn a_double_click_on_a_remove_button_removes_one_thing_only() {
+    // The second click would land on whatever moved up under the pointer, and only the last
+    // removal can be undone: the first one would be lost for good.
+    for (label, gone) in [
+        ("Remove Loopback Audio", "Loopback Audio"),
+        ("Delete", "Loopback Audio"),
+    ] {
+        let mut h = open(demo_config());
+        two_clicks(&mut h, label);
+        assert_eq!(names(&h), ["Stream Mix", "Zoom Out"], "{label}");
+        h.get_by_label(&format!("Removed {gone}"));
+    }
+    let mut h = open(demo_config());
+    let sources = h.state().cfg.devices[0].sources.len();
+    two_clicks(&mut h, "Remove Safari");
+    assert_eq!(h.state().cfg.devices[0].sources.len(), sources - 1);
+    h.get_by_label("Spotify enabled");
+    // Same for the Remove Source link of two open Options panes.
+    let mut h = open(demo_config());
+    click(&mut h, "Safari options");
+    click(&mut h, "Spotify options");
+    two_clicks(&mut h, "Remove Source Safari");
+    assert_eq!(h.state().cfg.devices[0].sources.len(), sources - 1);
+    h.get_by_label("Remove Source Spotify");
+}
+
+#[test]
+fn an_idle_sheet_asks_for_no_more_frames() {
+    let idle = |h: &mut Harness<App>, what: &str| {
+        h.run_steps(60);
+        assert!(
+            !h.ctx.has_requested_repaint(),
+            "{what}: {:?}",
+            h.ctx.repaint_causes()
+        );
+    };
+    let mut h = setup_run(installed(), flowing());
+    idle(&mut h, "permissions");
+    click(&mut h, "Continue");
+    until(&mut h, "self-test", |h| {
+        has(h, "Audio flows (-6 dBFS, 0 dropouts)")
+    });
+    idle(&mut h, "verify passed");
+    click(&mut h, "Continue");
+    idle(&mut h, "done");
+    click(&mut h, "Done");
+    click(&mut h, "Uninstall…");
+    idle(&mut h, "uninstall dialog");
+    let mut h = with_runner(no_driver(), never_run());
+    idle(&mut h, "welcome");
+    click(&mut h, "Install Driver…");
+    until(&mut h, "runner result", |h| has(h, "Driver not installed"));
+    idle(&mut h, "install failed");
+}
+
+#[test]
+fn a_click_that_closes_a_menu_only_closes_it() {
+    // As on macOS: dismissing a menu by clicking elsewhere never also presses what is there.
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    click(&mut h, "Add monitor");
+    h.get_by_label("Output Devices");
+    click(&mut h, "Remove Spotify");
+    assert!(!has(&h, "Output Devices"), "the menu closed");
+    assert_eq!(h.state().cfg, before);
+    // The same click once the menu is gone does remove it.
+    click(&mut h, "Remove Spotify");
+    assert_ne!(h.state().cfg, before);
+
+    // A click on a wire, which removes it, while the latency menu is open.
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    let (a, b) = (
+        center(&h, "Output channel 2 output"),
+        center(&h, "MacBook Pro Speakers channel 2 input"),
+    );
+    let [p0, p1, p2, p3] = crate::layout::wire_points(a, b);
+    let mid =
+        ((p0.to_vec2() + 3.0 * p1.to_vec2() + 3.0 * p2.to_vec2() + p3.to_vec2()) / 8.0).to_pos2();
+    let l = latency_label(before.buffer_frames);
+    click(&mut h, &l);
+    for _ in 0..2 {
+        h.hover_at(mid);
+        h.step();
+        h.drag_at(mid);
+        h.step();
+        h.drop_at(mid);
+        settle(&mut h);
+        if h.state().cfg == before {
+            assert_eq!(h.get_all_by_label_contains("Latency:").count(), 1, "closed");
+        }
+    }
+    let wires = |c: &Config| c.devices[0].monitors[0].wires.len();
+    assert_eq!(
+        wires(&h.state().cfg),
+        wires(&before) - 1,
+        "second click only"
+    );
+}

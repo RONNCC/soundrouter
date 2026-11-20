@@ -567,7 +567,8 @@ impl Setup {
                 );
             }
         } else if matches!(self.step, Step::Welcome | Step::Driver) {
-            if self.deadline.take().is_some() || v.missing {
+            // `open`: the driver blinked (a coreaudiod restart) while the sheet was up.
+            if self.deadline.take().is_some() || v.missing || self.open {
                 self.step = Step::Permissions;
                 self.open = true;
             } else {

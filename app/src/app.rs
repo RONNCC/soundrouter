@@ -47,6 +47,8 @@ pub struct App {
     graph: GraphState,
     icon_tex: IconTextures,
     renaming: Option<(usize, String)>,
+    /// Scroll the sidebar to the selected row on the next frame (it was created or restored).
+    reveal: bool,
     toast: Option<String>,
     save_pending: bool,
     vibrancy: bool,
@@ -94,6 +96,7 @@ impl App {
             graph: GraphState::default(),
             icon_tex: IconTextures::default(),
             renaming: None,
+            reveal: false,
             toast,
             save_pending: false,
             vibrancy,
@@ -239,11 +242,14 @@ impl App {
             )
         };
         let missing = setup::should_show_setup(&self.needs(&status));
+        // The driver only publishes enabled devices: a disabled one can never pass the test.
+        let enabled = |d: &&sr_core::config::VirtualDevice| d.enabled;
         let dev = self
             .cfg
             .devices
             .get(self.selected)
-            .or(self.cfg.devices.first());
+            .filter(enabled)
+            .or_else(|| self.cfg.devices.iter().find(enabled));
         let name = dev.map_or("Loopback Audio", |d| d.name.as_str());
         let source = self.setup.source().map(std::path::Path::to_path_buf);
         let diagnostics = || {
@@ -278,7 +284,7 @@ impl App {
                     Some(id) => self.worker.self_test(&id),
                     None => self
                         .worker
-                        .fail_self_test("There is no virtual device to test."),
+                        .fail_self_test("There is no enabled virtual device to test."),
                 }
             }
             Some(SetupAction::Demo) => {
@@ -362,6 +368,7 @@ impl App {
         }
         if select_new {
             self.selected = self.cfg.devices.len() - 1;
+            self.reveal = true;
         }
         // Removing a device above the selected one shifts the selection's index down with it.
         let removed_above = removed_dev.is_some_and(|d| d < self.selected);
@@ -383,6 +390,7 @@ impl App {
         let Some(u) = self.undo.take() else { return };
         self.cfg = u.prev;
         self.selected = u.selected.min(self.cfg.devices.len().saturating_sub(1));
+        self.reveal = true;
         if self.applied {
             self.worker.apply(&self.cfg);
         }
@@ -464,6 +472,9 @@ impl App {
         name_button(&resp, &format!("Select {}", dev.name));
         if resp.clicked() {
             self.selected = i;
+        }
+        if i == self.selected && std::mem::take(&mut self.reveal) {
+            resp.scroll_to_me(None);
         }
         let inner = row.shrink2(vec2(8.0, 4.0));
         if i == self.selected {
@@ -569,7 +580,8 @@ impl App {
             x_at,
             if x.hovered() { t.danger } else { t.text2 },
         );
-        if x.clicked() {
+        // A double-click's second click would remove the row that moved up under the pointer.
+        if x.clicked() && !x.double_clicked() {
             edits.push(Edit::RemoveDevice(i));
         }
         x.on_hover_text(format!("Remove {}", dev.name));
@@ -662,7 +674,7 @@ impl App {
                     FontId::proportional(12.5),
                     t.text.gamma_multiply(a),
                 );
-                if has && resp.clicked() {
+                if has && resp.clicked() && !resp.double_clicked() {
                     edits.push(Edit::RemoveDevice(self.selected));
                 }
                 let real_driver = self
@@ -713,7 +725,8 @@ impl App {
                     .or(apply_error)
                     .or(es.background_error)
                     .or(warn);
-                if status.is_none()
+                // A standing error or warning waits out the few seconds the undo is offered.
+                if self.toast.is_none()
                     && let Some(u) = &self.undo
                 {
                     let x = btn.right() + 18.0;
@@ -969,12 +982,23 @@ impl eframe::App for App {
             crate::model::learn_names(&mut self.cfg, &s.hardware, &s.apps, installed)
         };
         self.save_pending |= learned;
+        // A click outside an open menu only closes the menu, as on macOS: without this it would
+        // also remove the card or wire it landed on. Menus live on the Foreground layer.
+        let dismissing = egui::Popup::is_any_open(&ctx)
+            && ctx.input(|i| i.pointer.any_click())
+            && ctx
+                .input(|i| i.pointer.interact_pos())
+                .and_then(|p| ctx.layer_id_at(p))
+                .is_none_or(|l| l.order != egui::Order::Foreground);
         let mut edits = Vec::new();
         self.sidebar(ui, &t, &mut edits);
         self.main_pane(ui, &t, &mut edits);
         if self.selected != prev_selected {
             self.graph.peaks.clear();
             self.graph.drag = None;
+        }
+        if dismissing {
+            edits.clear();
         }
         self.commit(edits);
         self.drive_setup(&ctx);
