@@ -5,7 +5,7 @@ use crate::props::*;
 use crate::state::*;
 use coreaudio_sys::*;
 use objc2_core_foundation::{CFNumber, CFRetained, CFString, CFType};
-use sr_core::driver_proto::{DriverDevice, MAX_DEVICES, STORAGE_KEY};
+use sr_core::driver_proto::{DriverDevice, MAX_DEVICES, PROP_READ_AHEAD, STORAGE_KEY};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::NonNull;
@@ -370,7 +370,11 @@ pub unsafe extern "C" fn set_data(
         return UNKNOWN_PROP;
     }
     if obj == PLUGIN {
-        return set_devices(sz, data);
+        return if sel == PROP_READ_AHEAD {
+            set_read_ahead_prop(sz, data)
+        } else {
+            set_devices(sz, data)
+        };
     }
     let Some((slot, s, side, part)) = lookup(obj) else {
         return BAD_OBJECT;
@@ -440,6 +444,23 @@ fn set_control(level: &Level, obj: u32, sel: u32, sz: u32, data: *const c_void) 
     };
     notify(obj, changed);
     0
+}
+
+/// Switch the loop read-ahead on (any nonzero integer) or off (0). Takes effect on the next I/O cycle.
+fn set_read_ahead_prop(sz: u32, data: *const c_void) -> OSStatus {
+    if sz as usize != size_of::<CFTypeRef>() {
+        return BAD_SIZE;
+    }
+    let on = unsafe { borrow(*(data as *const CFTypeRef)) }
+        .and_then(|n| n.downcast_ref::<CFNumber>())
+        .and_then(|n| n.as_i64());
+    match on {
+        Some(v) => {
+            set_read_ahead(v != 0);
+            0
+        }
+        None => ILLEGAL,
+    }
 }
 
 /// Replace the device list: validate, persist, then wake the reconcile worker

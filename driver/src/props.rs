@@ -2,7 +2,8 @@
 use crate::state::*;
 use coreaudio_sys::*;
 use sr_core::driver_proto::{
-    MANUFACTURER, PROP_DEVICES, PROP_OVERLOADS, PROP_VERSION, SAMPLE_RATES, companion_uid,
+    MANUFACTURER, PROP_DEVICES, PROP_OVERLOADS, PROP_READ_AHEAD, PROP_VERSION, SAMPLE_RATES,
+    companion_uid,
 };
 use std::mem::size_of;
 use std::sync::atomic::Ordering::{Acquire, Relaxed};
@@ -102,9 +103,15 @@ pub fn prop(obj: u32, a: &AudioObjectPropertyAddress) -> Option<V> {
                     mPropertyDataType: kAudioServerPlugInCustomPropertyDataTypeCFString,
                     mQualifierDataType: kAudioServerPlugInCustomPropertyDataTypeNone,
                 },
+                AudioServerPlugInCustomPropertyInfo {
+                    mSelector: PROP_READ_AHEAD,
+                    mPropertyDataType: kAudioServerPlugInCustomPropertyDataTypeCFPropertyList,
+                    mQualifierDataType: kAudioServerPlugInCustomPropertyDataTypeNone,
+                },
             ]),
             PROP_DEVICES => DeviceList,
             PROP_VERSION => Str(PROTOCOL_VERSION.into()),
+            PROP_READ_AHEAD => Count(read_ahead_on() as u64),
             _ => return None,
         });
     }
@@ -281,7 +288,7 @@ fn rate_ranges() -> Vec<AudioValueRange> {
 
 pub fn settable(obj: u32, sel: u32) -> bool {
     if obj == PLUGIN {
-        return sel == PROP_DEVICES;
+        return sel == PROP_DEVICES || sel == PROP_READ_AHEAD;
     }
     match decode(obj) {
         Some((_, _, Part::Device)) => sel == kAudioDevicePropertyNominalSampleRate,
@@ -340,9 +347,15 @@ mod tests {
         };
         assert_eq!(
             c.iter().map(|i| i.mSelector).collect::<Vec<_>>(),
-            [PROP_DEVICES, PROP_VERSION]
+            [PROP_DEVICES, PROP_VERSION, PROP_READ_AHEAD]
         );
         assert!(settable(PLUGIN, PROP_DEVICES) && !settable(PLUGIN, PROP_VERSION));
+        assert!(settable(PLUGIN, PROP_READ_AHEAD));
+        // The switch is process-global and other tests flip it: only the shape of the value is stable.
+        assert!(matches!(
+            prop(PLUGIN, &a(PROP_READ_AHEAD, 0)),
+            Some(V::Count(0 | 1))
+        ));
         assert!(prop(PLUGIN, &a(kAudioDevicePropertyDeviceUID, 0)).is_none());
         // Nothing alive in a fresh process: no device objects resolve.
         assert!(prop(16, &a(kAudioObjectPropertyName, 0)).is_none());

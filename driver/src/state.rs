@@ -1,6 +1,6 @@
 //! Global driver state: object-id layout, the fixed slot pool, host handle, clock.
 use crate::config::MAX_CHANNELS;
-use crate::ring::Ring;
+use crate::ring::{ReadAhead, Ring};
 use coreaudio_sys::*;
 use sr_core::driver_proto::{DEFAULT_RATE, DriverDevice, MAX_DEVICES, SAMPLE_RATES};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering::*};
@@ -11,6 +11,19 @@ pub const PLUGIN: u32 = kAudioObjectPlugInObject;
 pub const RING_FRAMES: u32 = 16384;
 /// Fallback switch: `false` makes the engine companion visible (it still can never be a default device).
 pub const COMPANION_HIDDEN: bool = true;
+/// Whether readers of a loopback ring read ahead of the writer's frames (latency saving, see
+/// `ring::ReadAhead`). Runtime switch: custom plug-in property `'srla'`. Off until it has run in a real
+/// coreaudiod: only the HAL model in the unit tests and fakehost has exercised it.
+pub const READ_AHEAD_DEFAULT: bool = false;
+static READ_AHEAD: AtomicBool = AtomicBool::new(READ_AHEAD_DEFAULT);
+pub fn read_ahead_on() -> bool {
+    READ_AHEAD.load(Relaxed)
+}
+/// Flip the switch and make every reader calibrate afresh when it turns on again.
+pub fn set_read_ahead(on: bool) {
+    READ_AHEAD.store(on, Relaxed);
+    SLOTS.iter().for_each(Slot::restart_read_ahead);
+}
 
 // Object ids per slot s: base = 16 + 8s. Visible device V at +0 (streams +1 in, +2 out),
 // engine companion C at +4 (streams +5 in, +6 out). V's four controls live after all slot blocks:
@@ -193,7 +206,12 @@ pub struct Slot {
     pub seed: AtomicU64,
     /// Volume/mute on V, applied when reading: [input scope, output scope]. C has none.
     pub levels: [Level; 2],
-    /// WriteMix calls that arrived late or were too big for the ring, per side. Read-only property `srov`.
+    /// Read-ahead calibration per reading side (index = `Side as usize`), and the epoch that restarts it
+    /// (bumped when I/O starts or stops on either side).
+    pub read_ahead: [ReadAhead; 2],
+    pub ra_epoch: AtomicU32,
+    /// WriteMix calls that arrived late or were too big for the ring, and read-ahead reads that came up
+    /// short, per side. Read-only property `srov`.
     pub overloads: [AtomicU64; 2],
     /// V.out -> C.in
     pub ring_a: OnceLock<Ring>,
@@ -216,6 +234,8 @@ impl Slot {
             seed: AtomicU64::new(0),
             levels: [const { Level::new() }; 2],
             overloads: [AtomicU64::new(0), AtomicU64::new(0)],
+            read_ahead: [const { ReadAhead::new() }; 2],
+            ra_epoch: AtomicU32::new(0),
             ring_a: OnceLock::new(),
             ring_b: OnceLock::new(),
         }
@@ -290,6 +310,9 @@ impl Slot {
             self.ring_b.get()
         }
     }
+    pub fn restart_read_ahead(&self) {
+        self.ra_epoch.fetch_add(1, Relaxed);
+    }
     pub fn reset_rings(&self) {
         for r in [&self.ring_a, &self.ring_b] {
             if let Some(r) = r.get() {
@@ -320,6 +343,7 @@ impl Slot {
         }
         self.ch_want.store(d.channels as u32, Release);
         self.rate_want.store(default, Release);
+        self.restart_read_ahead();
         for c in &self.clients {
             c.store(0, Release);
         }

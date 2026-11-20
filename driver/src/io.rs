@@ -38,6 +38,7 @@ pub unsafe extern "C" fn stop_io(
         .fetch_update(AcqRel, Acquire, |n| n.checked_sub(1))
         .map_or(0, |n| n - 1);
     if left == 0 {
+        slot.restart_read_ahead();
         // The ring this side writes goes silent: V writes ring A, C writes ring B.
         if let Some(r) = slot.ring(side == Side::Visible) {
             r.reset();
@@ -164,7 +165,17 @@ pub unsafe extern "C" fn do_io(
         ring.write(ch, t, buf);
         return 0;
     }
-    ring.read(ch, t, buf);
+    // Read ahead of the timeline by what the writer leaves unused (calibrated per reader, see ring::ReadAhead).
+    let mut at = t;
+    if read_ahead_on() {
+        let epoch = slot.ra_epoch.load(Relaxed);
+        let (ahead, short) = slot.read_ahead[side as usize].plan(ring, epoch, t, frames as usize);
+        if short {
+            slot.overloads[side as usize].fetch_add(1, Relaxed);
+        }
+        at = t.saturating_add(ahead);
+    }
+    ring.read(ch, at, buf);
     // V's levels are applied on the read side, so both consumers of what apps play (the engine on C.in and
     // V.in's direct loop) and what apps record from V honour them. C itself has no controls.
     let out = || slot.levels[1].effective();
@@ -557,6 +568,104 @@ mod tests {
         SLOTS[8].levels[1].set_muted(false);
         run(c, READ, 3000.0, &mut buf, n);
         assert!(buf[0].is_nan(), "unmuted unity passes data through");
+    }
+
+    /// V.out -> C.in under the HAL's call pattern (read at now-F, then write at now+F): after the calibration
+    /// C.in gets the frames F-guard sooner, bit-exact; a stream restart or switching it off goes back to the
+    /// exact timeline.
+    #[test]
+    fn read_ahead_delivers_frames_sooner_after_calibrating() {
+        const F: usize = FRAMES;
+        let (v, c) = activate(2, 2);
+        let val = |t: i64| t as f32 + 1.0;
+        let frame_data =
+            |t: i64| -> Vec<f32> { (0..F as i64).flat_map(|i| [val(t + i); 2]).collect() };
+        // One HAL cycle; returns what C.in read and the sample time of the cycle's input.
+        let cycle = |now: f64| {
+            let mut rd = vec![];
+            assert_eq!(run_at(c, READ, now - F as f64, now, &mut rd, F * 2), 0);
+            let mut wr = frame_data(now as i64 + F as i64);
+            assert_eq!(run_at(v, WRITE, now + F as f64, now, &mut wr, F * 2), 0);
+            rd.truncate(F * 2);
+            (rd, now as i64 - F as i64)
+        };
+        let start = |dev| unsafe { start_io(std::ptr::null_mut(), dev, 0) };
+        let stop = |dev| unsafe { stop_io(std::ptr::null_mut(), dev, 0) };
+        let ra = &SLOTS[2].read_ahead[Side::Engine as usize];
+        let mut now = 10_000.0;
+        set_read_ahead(true);
+        assert_eq!((start(v), start(c)), (0, 0));
+        for k in 0..101 {
+            let (rd, t) = cycle(now);
+            now += F as f64;
+            if k >= 3 {
+                assert_eq!(rd, frame_data(t), "exact timeline while calibrating");
+            }
+        }
+        let guard = (F as i64 / 8).max(16);
+        assert_eq!(ra.ahead(), F as i64 - guard);
+        for _ in 0..20 {
+            let (rd, t) = cycle(now);
+            now += F as f64;
+            assert_eq!(
+                rd,
+                frame_data(t + F as i64 - guard),
+                "frames arrive F - guard sooner"
+            );
+        }
+        assert_eq!(SLOTS[2].overloads[Side::Engine as usize].load(Relaxed), 0);
+        // The engine stops and starts again: back to the exact timeline until it has calibrated.
+        assert_eq!((stop(c), start(c)), (0, 0));
+        let (rd, t) = cycle(now);
+        now += F as f64;
+        assert_eq!(rd, frame_data(t));
+        for _ in 0..101 {
+            cycle(now);
+            now += F as f64;
+        }
+        assert!(ra.ahead() > 0);
+        // Switched off: exact again, and switching on again recalibrates from scratch.
+        set_read_ahead(false);
+        let (rd, t) = cycle(now);
+        now += F as f64;
+        assert_eq!(rd, frame_data(t), "off means off");
+        set_read_ahead(true);
+        cycle(now);
+        now += F as f64;
+        assert_eq!(ra.ahead(), 0, "calibration restarted");
+        for _ in 0..101 {
+            cycle(now);
+            now += F as f64;
+        }
+        assert_eq!(ra.ahead(), F as i64 - guard);
+        // A rate change resets the rings (perform_change): calibration restarts without a stop.
+        SLOTS[2].want(&Change::Rate(0));
+        change(v, Change::Rate(0));
+        change(c, Change::Rate(0));
+        cycle(now);
+        now += F as f64;
+        assert_eq!(ra.ahead(), 0, "rate change recalibrates");
+        for _ in 0..101 {
+            cycle(now);
+            now += F as f64;
+        }
+        assert_eq!(ra.ahead(), F as i64 - guard);
+        // A writer that stalls (its cycle never comes) costs one counted shortfall: a silent tail, never
+        // frames from past the written ones.
+        let mut rd = vec![];
+        let read = |now: f64, rd: &mut Vec<f32>| run_at(c, READ, now - F as f64, now, rd, F * 2);
+        assert_eq!(read(now, &mut rd), 0); // this cycle's write is skipped
+        assert_eq!(SLOTS[2].overloads[Side::Engine as usize].load(Relaxed), 0);
+        assert_eq!(read(now + F as f64, &mut rd), 0);
+        assert_eq!(SLOTS[2].overloads[Side::Engine as usize].load(Relaxed), 1);
+        let real = guard as usize; // frames still written: [now + F - guard, now + F)
+        assert_eq!(
+            &rd[..real * 2],
+            &frame_data(now as i64 + F as i64 - guard)[..real * 2]
+        );
+        assert!(rd[real * 2..F * 2].iter().all(|&x| x == 0.0), "silent tail");
+        set_read_ahead(false);
+        assert_eq!((stop(c), stop(v)), (0, 0));
     }
 
     #[test]

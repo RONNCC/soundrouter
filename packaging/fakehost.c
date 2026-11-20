@@ -206,6 +206,50 @@ static SInt64 overloads(AudioObjectID d) {
 static Float32 gainOf(Float32 db) { return db <= -64.0f ? 0.0f : (Float32)pow(10.0, (double)db / 20.0); }
 static void fill(float* b, int ch, float base) { for (int i = 0; i < FR * ch; i++) b[i] = base + (float)i; }
 
+// Loop read-ahead ('srla' on the plug-in object) and a HAL model to measure it with an impulse.
+static void setReadAhead(SInt64 v) {
+    AudioObjectPropertyAddress a = addr('srla', kAudioObjectPropertyScopeGlobal); CFNumberRef n = CFNumberCreate(0, kCFNumberSInt64Type, &v);
+    CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &a, 0, NULL, sizeof n, &n) == 0); CFRelease(n);
+}
+static SInt64 readAhead(void) {
+    AudioObjectPropertyAddress a = addr('srla', kAudioObjectPropertyScopeGlobal); CFNumberRef n = NULL; UInt32 sz = sizeof n; SInt64 v = -1;
+    CHECK(D->GetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &a, 0, NULL, sz, &sz, &n) == 0 && n && CFGetTypeID(n) == CFNumberGetTypeID());
+    CFNumberGetValue(n, kCFNumberSInt64Type, &v); CFRelease(n);
+    return v;
+}
+static OSStatus ioAt(AudioObjectID d, int op, double now, double tin, double tout, UInt32 frames, float* buf) {
+    gCi.mCurrentTime.mSampleTime = now; gCi.mInputTime.mSampleTime = tin; gCi.mOutputTime.mSampleTime = tout;
+    OSStatus s = D->DoIOOperation(gDrv, d, 0, 1, op, frames, &gCi, buf, NULL);
+    gCi.mCurrentTime.mSampleTime = 0;
+    return s;
+}
+// HAL model, buffer B, on a fresh start of V (and C when `engine`): cycle k has current time now = base + k*B; ReadInput reads at now-B,
+// WriteMix writes at now+B, and within a cycle the calls run V.in, [C.in, C.out: a pass-through engine], V.out. With `race` (xorshift
+// seed) V.out runs before C.in in about a third of the cycles, as when the two threads wake together. An impulse is played into V.out
+// in cycle KW at frame IW. Returns the loop latency an app measures in frames, (cycles back - KW) * B + (frame back - IW), or -1.
+enum { KW = 250, IW = 5, NCYC = 400 };
+static long loopLatency(AudioObjectID V, AudioObjectID C, int engine, UInt32 B, uint32_t race) {
+    float* out = calloc(B * 2, sizeof(float)); float* in = calloc(B * 2, sizeof(float)); float* mid = calloc(B * 2, sizeof(float));
+    long lat = -1;
+    CHECK(D->StartIO(gDrv, V, 1) == 0 && (!engine || D->StartIO(gDrv, C, 7) == 0));
+    for (int k = 0; k < NCYC; k++) {
+        double now = 100000.0 + (double)k * B;
+        memset(out, 0, B * 2 * sizeof(float)); if (k == KW) out[IW * 2] = 1.0f;
+        CHECK(ioAt(V, kAudioServerPlugInIOOperationReadInput, now, now - B, now - B, B, in) == 0);
+        for (UInt32 j = 0; j < B; j++) if (in[j * 2] == 1.0f) { CHECK(lat == -1); lat = (long)(k - KW) * B + ((long)j - IW); }
+        int flip = 0; if (race) { race ^= race << 13; race ^= race >> 17; race ^= race << 5; flip = race % 3 == 0; }
+        if (flip) CHECK(ioAt(V, kAudioServerPlugInIOOperationWriteMix, now, now + B, now + B, B, out) == 0);
+        if (engine) {
+            CHECK(ioAt(C, kAudioServerPlugInIOOperationReadInput, now, now - B, now - B, B, mid) == 0);
+            CHECK(ioAt(C, kAudioServerPlugInIOOperationWriteMix, now, now + B, now + B, B, mid) == 0);
+        }
+        if (!flip) CHECK(ioAt(V, kAudioServerPlugInIOOperationWriteMix, now, now + B, now + B, B, out) == 0);
+    }
+    CHECK((!engine || D->StopIO(gDrv, C, 7) == 0) && D->StopIO(gDrv, V, 1) == 0);
+    free(out); free(in); free(mid);
+    return lat;
+}
+
 // 6c: 2-channel ReadInput on the ids of a removed slot (as a HAL that has not torn them down yet would do).
 // Returns 1 when the guard words behind the 2-channel region stayed untouched.
 enum { GUARD = 4096 };
@@ -578,14 +622,14 @@ static void stepSleep(void) {
 static volatile int gReading;
 static int isCF(UInt32 s) {
     return s == kAudioObjectPropertyName || s == kAudioObjectPropertyManufacturer || s == kAudioDevicePropertyDeviceUID || s == kAudioDevicePropertyModelUID
-        || s == kAudioPlugInPropertyResourceBundle || s == 'srcf' || s == 'srvr' || s == 'srov';
+        || s == kAudioPlugInPropertyResourceBundle || s == 'srcf' || s == 'srvr' || s == 'srov' || s == 'srla';
 }
 static void* reader(void* arg) {
     uint64_t r = (uint64_t)(uintptr_t)arg * 2654435761u + 1;
     static const UInt32 sels[] = {
         kAudioObjectPropertyBaseClass, kAudioObjectPropertyClass, kAudioObjectPropertyOwner, kAudioObjectPropertyName, kAudioObjectPropertyManufacturer,
         kAudioObjectPropertyOwnedObjects, kAudioPlugInPropertyDeviceList, kAudioPlugInPropertyBoxList, kAudioPlugInPropertyResourceBundle,
-        kAudioObjectPropertyCustomPropertyInfoList, 'srcf', 'srvr', 'srov', kAudioDevicePropertyDeviceUID, kAudioDevicePropertyModelUID,
+        kAudioObjectPropertyCustomPropertyInfoList, 'srcf', 'srvr', 'srov', 'srla', kAudioDevicePropertyDeviceUID, kAudioDevicePropertyModelUID,
         kAudioDevicePropertyTransportType, kAudioDevicePropertyRelatedDevices, kAudioDevicePropertyClockDomain, kAudioDevicePropertyDeviceIsAlive,
         kAudioDevicePropertyDeviceIsRunning, kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyAvailableNominalSampleRates,
         kAudioDevicePropertyIsHidden, kAudioDevicePropertyZeroTimeStampPeriod, kAudioDevicePropertyPreferredChannelsForStereo,
@@ -629,6 +673,7 @@ static int fuzz(unsigned long long seed, int steps) {
     gSeed = seed; gRng = seed * 0x9E3779B97F4A7C15ull + 0x632BE59BD9B4E019ull; if (!gRng) gRng = 1;
     mach_timebase_info_data_t tb; mach_timebase_info(&tb); gTps = 1e9 * tb.denom / tb.numer;
     gFuzz = 1; gDefer = 1; gQn = 0;
+    setReadAhead(1); // random I/O runs the read-ahead path too: sizes, times and stream restarts are all arbitrary
     gEn = 1; strcpy(gE[0].uid, "soundrouter:v1"); strcpy(gE[0].name, "Loopback Audio"); gE[0].ch = 2; // empty storage: the default
     gReading = 1; pthread_t th; FCHECK(pthread_create(&th, NULL, reader, (void*)(uintptr_t)seed) == 0);
     int counts[8] = {0};
@@ -1017,6 +1062,34 @@ int main(int argc, char** argv) {
         CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 3000, memset(i2, 0xAA, sizeof i2)) == 0 && !memcmp(i2, o, sizeof i2)); // direct loop again
         CHECK(D->StopIO(gDrv, V, 1) == 0);
         printf("ok V loops to itself while C is idle, engine path while C runs\n");
+    }
+
+    // 5b2. Loop read-ahead: off by default; on, each ring traversal returns about one buffer sooner. Loop latency measured with an
+    // impulse through a HAL model: V.out -> V.in (C idle, 2 buffers) and V.out -> C.in -> C.out -> V.in (the engine path, 4 buffers).
+    {
+        AudioObjectPropertyAddress pa = addr('srla', kAudioObjectPropertyScopeGlobal); Boolean st = 0;
+        CHECK(D->IsPropertySettable(gDrv, kAudioObjectPlugInObject, 0, &pa, &st) == 0 && st);
+        CHECK(readAhead() == 0);
+        CFNumberRef bad = (CFNumberRef)CFSTR("on"); CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &pa, 0, NULL, sizeof bad, &bad) != 0);
+        UInt8 tiny = 1; CHECK(D->SetPropertyData(gDrv, kAudioObjectPlugInObject, 0, &pa, 0, NULL, 1, &tiny) != 0);
+        CHECK(readAhead() == 0);
+        setReadAhead(1); CHECK(readAhead() == 1); setReadAhead(0); CHECK(readAhead() == 0);
+        const UInt32 sizes[] = { 64, 256, 1024 };
+        for (unsigned i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+            long B = sizes[i], g = B / 8 > 16 ? B / 8 : 16;
+            SInt64 ov0 = overloads(V) + overloads(C);
+            long direct0 = loopLatency(V, C, 0, B, 0), engine0 = loopLatency(V, C, 1, B, 0);
+            CHECK(direct0 == 2 * B && engine0 == 4 * B);
+            setReadAhead(1);
+            long direct1 = loopLatency(V, C, 0, B, 0), engine1 = loopLatency(V, C, 1, B, 0);
+            long engine2 = loopLatency(V, C, 1, B, 12345u + (uint32_t)B); // the engine's read lands after V's write in a third of the cycles
+            printf("  B=%ld: V loop %ld -> %ld frames, engine loop %ld -> %ld (racing %ld), guard %ld\n", B, direct0, direct1, engine0, engine1, engine2, g);
+            CHECK(direct1 == B + g && engine1 == 2 * B + 2 * g && engine2 == engine1);
+            CHECK(overloads(V) + overloads(C) == ov0); // no read came up short, no write was late
+            setReadAhead(0);
+            CHECK(loopLatency(V, C, 1, B, 0) == 4 * B); // off again: the full loop
+        }
+        printf("ok loop read-ahead ('srla', default off): V loop 2B -> B+guard, engine loop 4B -> 2B+2*guard (also with racing calls), no shortfalls\n");
     }
 
 

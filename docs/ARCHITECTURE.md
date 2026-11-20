@@ -33,7 +33,34 @@ Unity (0 dB, unmuted) skips the multiply, so the default path stays bit-exact; m
 
 ### Overload counter
 
-`WriteMix` calls that arrive late (scheduled before the device's current sample time) or larger than half the ring are counted per device in a relaxed atomic (no logging on the real-time path). The count is exposed read-only as custom property `'srov'` (CFNumber, 64-bit) on V and on C and resets when the slot is reused. Late writes are still written.
+`WriteMix` calls that arrive late (scheduled before the device's current sample time) or larger than half the ring are counted per device in a relaxed atomic (no logging on the real-time path). A `ReadInput` whose read-ahead (next section) reached past the written frames is counted on the reading device too. The count is exposed read-only as custom property `'srov'` (CFNumber, 64-bit) on V and on C and resets when the slot is reused. Late writes are still written.
+
+### Loop read-ahead (`'srla'`, off by default)
+
+Through a ring a frame waits about two buffers: the writer stores it at output time ~now+B and the reader asks for it at input time ~now-B on the same sample timeline, so the frame has been sitting in the ring for up to two buffers when it is read. With read-ahead the reader reads `ahead` frames later on the timeline (`ring.read(ch, t + ahead, buf)`) and the app or engine gets each frame `ahead` frames sooner. Every ring traversal is shortened by `ahead`; the engine path (V.out -> C.in, C.out -> V.in) has two, the direct V loop one. Blackhole, BGM and eqMac read at `mInputTime` with no read-ahead.
+
+How it stays safe (`ring::ReadAhead`, one per reading device; `do_io` calls `plan` once per `ReadInput`):
+
+- **Measure.** `Ring::slack(t, frames)` = `end - (t + frames)`: written frames past the end of this read. Over the first 100 read cycles of a stream (more when writer and reader buffers differ: `writer_frames / gcd(writer_frames, frames)`, the cycles after which the two positions repeat; beats over 1024 cycles get no read-ahead) the reader reads at `t` (no read-ahead) and keeps the smallest slack. The writer's buffer size is the `frames` of its last `write`, stored in the ring.
+- **Freeze.** `ahead = clamp(min_slack - guard, 0, 4 * max(frames, writer_frames))` with `guard = max(16, frames / 8)`, then it never changes: a moving `ahead` replays or drops audio.
+- **Shortfall.** A read whose `t + ahead + frames` is past `end` gets silence for the frames beyond it (the ring only ever returns frames below its release-stored `end`) and is counted in `'srov'`. A second shortfall without 65536 clean cycles in between halves `ahead` (the one back-off step); a lone one, such as a writer thread stalled once, changes nothing.
+- **Restart.** Calibration starts over (`ahead` back to 0) when I/O stops on either side of the slot, when the reader's or writer's buffer size changes, when `t` jumps (not 0..4 cycles forward), when the ring is empty or was reset (format changes and slot reuse reset it), and when the switch is flipped.
+- **Order of calls.** The ring is only read below `end`, so reading ahead cannot return data that was never written. What the writer's phase can change is slack: when V's and C's threads wake together, the reader sometimes runs before and sometimes after the writer's cycle lands (slack differs by one writer buffer). Calibration normally sees the lower of the two (reader first) within 100 cycles and sizes `ahead` for it. If the order flips only rarely, calibration can miss the lower slack: then the first flip is a shortfall (a silent tail of up to `ahead - slack` frames, counted), the second halves `ahead` below the lower slack and the stream is clean afterwards (never more than two in the model, `ring.rs` tests).
+- **Real-time rules.** `plan` and `do_io` use relaxed atomics only: no allocation, locks or logging.
+
+The switch is the custom property `'srla'` on the plug-in object (`'plst'` CFNumber, settable, nonzero = on; `READ_AHEAD_DEFAULT` = off, not persisted, so whoever wants it writes it after every driver start). Flipping it restarts every calibration. It is off because it has only run against the HAL model in the unit tests and `packaging/fakehost.c`, not in a real coreaudiod: turn the default on after a live run shows `'srov'` staying put.
+
+Frames saved per traversal with equal reader and writer buffers `B`: `B - guard` (fakehost, impulse through the HAL model: V loop 2B -> B + guard, engine loop 4B -> 2B + 2 * guard, the same with the engine's read racing V's write):
+
+| B (frames) | per traversal | engine loop (2 traversals) | engine loop at 48 kHz, before -> after |
+|---|---|---|---|
+| 64 | 48 (1.0 ms) | 96 (2.0 ms) | 5.33 -> 3.33 ms |
+| 128 | 112 (2.3 ms) | 224 (4.7 ms) | 10.67 -> 6.00 ms |
+| 256 | 224 (4.7 ms) | 448 (9.3 ms) | 21.33 -> 12.00 ms |
+| 512 | 448 (9.3 ms) | 896 (18.7 ms) | 42.67 -> 24.00 ms |
+| 1024 | 896 (18.7 ms) | 1792 (37.3 ms) | 85.33 -> 48.00 ms |
+
+Different reader and writer buffers (V's size is the client app's, the engine's the Audio delay setting) save whatever the measured slack leaves; the model above assumes equal ones. Read-ahead does not touch the aggregate's own offsets (process-tap safety offset, drift compensation). The driver must be reinstalled to get any of this.
 
 ### Clock and zero timestamps
 

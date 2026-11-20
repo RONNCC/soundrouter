@@ -3,7 +3,7 @@
 //! One writer (a device's WriteMix), any number of readers. Reads never consume, so every reader
 //! sees the same frames. Memory is allocated once and never freed. Everything on the I/O path is
 //! wait-free: relaxed atomic stores of sample bits plus one release store of the write head.
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::*};
 
 const EMPTY: i64 = i64::MIN;
 
@@ -15,6 +15,8 @@ pub struct Ring {
     end: AtomicI64,
     /// First frame of the contiguous run ending at `end` (a gap in writes restarts the run).
     start: AtomicI64,
+    /// Frames in the last `write` call: the writer's IO buffer size, for read-ahead calibration.
+    last_frames: AtomicU32,
 }
 
 impl Ring {
@@ -29,12 +31,25 @@ impl Ring {
             max_ch,
             end: AtomicI64::new(EMPTY),
             start: AtomicI64::new(0),
+            last_frames: AtomicU32::new(0),
         }
     }
 
     /// Forget all content: reads return silence until the next write. Safe from any thread.
     pub fn reset(&self) {
         self.end.store(EMPTY, Release);
+    }
+
+    /// Frames the writer stored per call, or 0 before the first write.
+    pub fn writer_frames(&self) -> usize {
+        self.last_frames.load(Relaxed) as usize
+    }
+
+    /// Written frames past the end of a read of `frames` frames at `t`: how far that read could move
+    /// later in time and still find data. `None` while the ring is empty.
+    pub fn slack(&self, t: i64, frames: usize) -> Option<i64> {
+        let end = self.end.load(Acquire);
+        (end != EMPTY).then(|| end.saturating_sub(t.saturating_add(frames as i64)))
     }
 
     /// Store `src` (interleaved, `ch` channels) at sample time `t`. Single writer only.
@@ -44,6 +59,7 @@ impl Ring {
         }
         let frames = (src.len() / ch).min(self.cap as usize);
         let src = &src[..frames * ch];
+        self.last_frames.store(frames as u32, Relaxed);
         let end = self.end.load(Relaxed);
         if end == EMPTY || t > end {
             self.start.store(t, Relaxed); // first write or a gap: older ring content is stale
@@ -91,6 +107,140 @@ impl Ring {
                 k += 1;
             }
         }
+    }
+}
+
+/// Read cycles observed before the read-ahead is frozen (more when the buffer sizes beat slowly, see `plan`).
+const CAL_CYCLES: u32 = 100;
+/// Longest beat, in reader cycles, between two buffer sizes that calibration still covers.
+const MAX_BEAT: usize = 1024;
+/// Clean cycles after which earlier shortfalls no longer count as "repeated" (~90 s at 64 frames, 48 kHz):
+/// long enough that a rare writer/reader order flip, which keeps coming, is caught by its second hit.
+const CLEAN_CYCLES: u32 = 1 << 16;
+
+/// Per-reader read-ahead for a loopback ring.
+///
+/// The writer stores `frames` at output time ~now+B and the reader reads at input time ~now-B, so a
+/// frame sits in the ring about two buffers before anyone asks for it. Reading `ahead` frames later in
+/// time (`ring.read(ch, t + ahead, ..)`) delivers it that much sooner. `ahead` is the smallest slack
+/// (written frames past the end of the read, `Ring::slack`) seen over the first cycles of a stream,
+/// minus a guard, and then stays fixed: a changing `ahead` replays or drops audio. Only repeated
+/// shortfalls (a read that reaches past the written frames and gets silence there) halve it.
+///
+/// All state is atomics owned by the reader's real-time thread; other threads only bump the epoch
+/// they pass in. No allocation, locks or logging.
+pub struct ReadAhead {
+    epoch: AtomicU32,
+    frames: AtomicU32,
+    writer_frames: AtomicU32,
+    prev_t: AtomicI64,
+    cycles: AtomicU32,
+    frozen: AtomicBool,
+    min_slack: AtomicI64,
+    ahead: AtomicI64,
+    misses: AtomicU32,
+    clean: AtomicU32,
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+impl ReadAhead {
+    pub const fn new() -> Self {
+        Self {
+            epoch: AtomicU32::new(0),
+            frames: AtomicU32::new(0),
+            writer_frames: AtomicU32::new(0),
+            prev_t: AtomicI64::new(EMPTY),
+            cycles: AtomicU32::new(0),
+            frozen: AtomicBool::new(false),
+            min_slack: AtomicI64::new(i64::MAX),
+            ahead: AtomicI64::new(0),
+            misses: AtomicU32::new(0),
+            clean: AtomicU32::new(0),
+        }
+    }
+
+    /// Frames the reader currently reads ahead (0 while calibrating).
+    #[cfg(test)]
+    pub fn ahead(&self) -> i64 {
+        self.ahead.load(Relaxed)
+    }
+
+    fn restart(&self, epoch: u32, frames: usize, writer_frames: usize) {
+        self.epoch.store(epoch, Relaxed);
+        self.frames.store(frames as u32, Relaxed);
+        self.writer_frames.store(writer_frames as u32, Relaxed);
+        self.cycles.store(0, Relaxed);
+        self.frozen.store(false, Relaxed);
+        self.min_slack.store(i64::MAX, Relaxed);
+        self.ahead.store(0, Relaxed);
+        self.misses.store(0, Relaxed);
+        self.clean.store(0, Relaxed);
+    }
+
+    /// Decide where this read of `frames` frames at `t` goes: returns `(ahead, shortfall)`. The caller
+    /// reads `ring` at `t + ahead` and counts a shortfall. `epoch` changes when a stream stops. A new
+    /// epoch, a different `frames` or writer buffer size, a jump of `t` (not one cycle later) or an empty
+    /// ring restarts calibration.
+    pub fn plan(&self, ring: &Ring, epoch: u32, t: i64, frames: usize) -> (i64, bool) {
+        let fw = ring.writer_frames();
+        let jump = {
+            let d = t.saturating_sub(self.prev_t.swap(t, Relaxed));
+            !(0..=4 * frames as i64).contains(&d)
+        };
+        let Some(slack) = ring.slack(t, frames) else {
+            self.restart(epoch, frames, fw);
+            return (0, false);
+        };
+        if jump
+            || epoch != self.epoch.load(Relaxed)
+            || frames != self.frames.load(Relaxed) as usize
+            || fw != self.writer_frames.load(Relaxed) as usize
+        {
+            self.restart(epoch, frames, fw);
+        }
+        if !self.frozen.load(Relaxed) {
+            let min = self.min_slack.load(Relaxed).min(slack);
+            self.min_slack.store(min, Relaxed);
+            let n = self.cycles.load(Relaxed) + 1;
+            self.cycles.store(n, Relaxed);
+            // Reader and writer positions repeat every fw / gcd(fw, frames) reader cycles; the minimum
+            // over a shorter run could miss the tightest phase.
+            let beat = fw / gcd(fw, frames).max(1);
+            if n as usize >= beat.max(CAL_CYCLES as usize) || beat > MAX_BEAT {
+                let guard = (frames as i64 / 8).max(16);
+                let cap = 4 * frames.max(fw) as i64;
+                let ahead = if beat > MAX_BEAT {
+                    0
+                } else {
+                    (min - guard).clamp(0, cap)
+                };
+                self.ahead.store(ahead, Relaxed);
+                self.frozen.store(true, Relaxed);
+            }
+            return (0, false);
+        }
+        let ahead = self.ahead.load(Relaxed);
+        if ahead == 0 {
+            return (0, false); // today's behaviour: nothing to protect
+        }
+        if slack >= ahead {
+            if self.clean.fetch_add(1, Relaxed) >= CLEAN_CYCLES {
+                self.misses.store(0, Relaxed);
+            }
+            return (ahead, false);
+        }
+        self.clean.store(0, Relaxed);
+        let misses = self.misses.load(Relaxed) + 1;
+        if misses < 2 {
+            self.misses.store(misses, Relaxed);
+            return (ahead, true);
+        }
+        self.misses.store(0, Relaxed);
+        self.ahead.store(ahead / 2, Relaxed);
+        (ahead / 2, true)
     }
 }
 
@@ -235,5 +385,347 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- read-ahead: a model of the HAL driving one writer and one reader of a ring ----
+
+    /// Cycle k of a device with buffer `b` has current time k*b; WriteMix targets now+b, ReadInput reads
+    /// at now-b. Calls run in real-time order: nominal time + `phase` (reader only) + a wake error of
+    /// up to `jitter` frames each. A cycle's data is the sample time + 1, so a frame is real iff it matches.
+    #[derive(Clone)]
+    struct Model {
+        fw: usize,
+        fr: usize,
+        phase: i64,
+        jitter: i64,
+        seed: u64,
+        cycles: usize,
+        tie_writer_first: bool,
+    }
+    #[derive(Default)]
+    struct Outcome {
+        /// Reader cycles that reported a shortfall.
+        shortfalls: Vec<usize>,
+        /// `ahead` after each reader cycle.
+        ahead: Vec<i64>,
+        /// Frames that are not exactly what was written for their sample time, or non-silent past the end.
+        bad_frames: usize,
+        /// Reads that ran past the written frames (silent tail) without reporting a shortfall, while ahead > 0.
+        unflagged: usize,
+    }
+    fn val(t: i64) -> f32 {
+        t as f32 + 1.0
+    }
+    fn simulate(m: &Model) -> Outcome {
+        let ring = Ring::new(1 << 15, 1);
+        let ra = ReadAhead::new();
+        let mut rng = m.seed | 1;
+        let mut wake = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            if m.jitter == 0 {
+                0
+            } else {
+                (rng >> 33) as i64 % (2 * m.jitter + 1) - m.jitter
+            }
+        };
+        let writes = m.cycles * m.fr / m.fw + 4;
+        // (real time, 0 = writer / 1 = reader, cycle)
+        let mut ev: Vec<(i64, u8, usize)> = vec![];
+        // One thread per device: its calls never overtake each other.
+        let (mut last_w, mut last_r) = (i64::MIN, i64::MIN);
+        for k in 0..writes {
+            last_w = ((k * m.fw) as i64 + wake()).max(last_w.saturating_add(1));
+            ev.push((last_w, 0, k));
+        }
+        for k in 0..m.cycles {
+            last_r = ((k * m.fr) as i64 + m.phase + wake()).max(last_r.saturating_add(1));
+            ev.push((last_r, 1, k));
+        }
+        ev.sort_by_key(|&(t, who, _)| (t, (who == 1) == m.tie_writer_first));
+        let first = m.fw as i64; // sample time of the first write
+        let mut out = Outcome::default();
+        for (_, who, k) in ev {
+            if who == 0 {
+                let t = (k * m.fw) as i64 + m.fw as i64;
+                let data: Vec<f32> = (t..t + m.fw as i64).map(val).collect();
+                ring.write(1, t, &data);
+                continue;
+            }
+            let t = (k * m.fr) as i64 - m.fr as i64;
+            let end = ring.slack(t, m.fr).map(|s| s + t + m.fr as i64);
+            let (ahead, short) = ra.plan(&ring, 0, t, m.fr);
+            let mut buf = vec![f32::NAN; m.fr];
+            ring.read(1, t + ahead, &mut buf);
+            let end = end.unwrap_or(i64::MIN);
+            for (i, &x) in buf.iter().enumerate() {
+                let ts = t + ahead + i as i64;
+                let want = if ts >= first && ts < end {
+                    val(ts)
+                } else {
+                    0.0
+                };
+                out.bad_frames += (x != want) as usize;
+            }
+            out.unflagged += (ahead > 0 && t + ahead + m.fr as i64 > end && !short) as usize;
+            if short {
+                out.shortfalls.push(k);
+            }
+            out.ahead.push(ahead);
+        }
+        out
+    }
+    fn model(fw: usize, fr: usize, phase: i64, jitter: i64) -> Model {
+        Model {
+            fw,
+            fr,
+            phase,
+            jitter,
+            seed: 1,
+            cycles: 3000,
+            tie_writer_first: true,
+        }
+    }
+    fn guard(b: usize) -> i64 {
+        (b as i64 / 8).max(16)
+    }
+
+    /// Equal buffers, a stable call order (jitter well below the distance between the two calls): no
+    /// shortfall at all, and `ahead` is exactly what the order leaves free minus the guard: one buffer
+    /// when the reader runs first, two when the writer's current cycle has already landed.
+    #[test]
+    fn stable_order_never_falls_short_and_reads_ahead_by_the_free_slack() {
+        for b in [64usize, 128, 256, 512, 1024, 2048] {
+            let j = guard(b) / 2;
+            for (phase, free) in [(b as i64 / 2, 2 * b as i64), (-(b as i64) / 2, b as i64)] {
+                let o = simulate(&model(b, b, phase, j));
+                assert!(o.shortfalls.is_empty(), "b={b} phase={phase}");
+                assert_eq!((o.bad_frames, o.unflagged), (0, 0), "b={b} phase={phase}");
+                assert_eq!(
+                    *o.ahead.last().unwrap(),
+                    free - guard(b),
+                    "b={b} phase={phase}"
+                );
+            }
+        }
+    }
+
+    /// Different writer and reader buffers beat against each other; calibration spans the whole beat.
+    #[test]
+    fn unequal_buffers_calibrate_over_the_whole_beat() {
+        for (fw, fr) in [
+            (512, 64),
+            (64, 512),
+            (480, 512),
+            (441, 512),
+            (128, 96),
+            (1024, 256),
+            (1000, 64),
+            (511, 512),
+            (1023, 512),
+        ] {
+            for phase in [0, 7, 33] {
+                let o = simulate(&model(fw, fr, phase, 0));
+                assert!(o.shortfalls.is_empty(), "fw={fw} fr={fr} phase={phase}");
+                assert_eq!((o.bad_frames, o.unflagged), (0, 0), "fw={fw} fr={fr}");
+            }
+        }
+        // A beat longer than the calibration can cover: no read-ahead rather than a guess.
+        let o = simulate(&model(1031, 64, 0, 0));
+        assert!(o.ahead.iter().all(|&a| a == 0) && o.shortfalls.is_empty());
+    }
+
+    /// A writer far ahead of the reader (a stale or foreign timeline) never lets `ahead` run away.
+    #[test]
+    fn ahead_is_capped() {
+        let b = 64;
+        let ring = Ring::new(1 << 15, 1);
+        let ra = ReadAhead::new();
+        for k in 0..101 {
+            ring.write(1, 10_000 + k * b as i64, &vec![1.0; b]);
+            ra.plan(&ring, 0, k * b as i64, b);
+        }
+        assert_eq!(ra.ahead(), 4 * b as i64);
+    }
+
+    /// Shortfalls far apart are separate hiccups and leave `ahead` alone; two close together halve it.
+    #[test]
+    fn only_repeated_shortfalls_back_off() {
+        let b = 64usize;
+        let ring = Ring::new(1 << 15, 1);
+        let ra = ReadAhead::new();
+        let data = vec![1.0; b];
+        let mut t = 0i64;
+        // One HAL cycle: the writer's call lands first unless it stalls.
+        let mut step = |stall: bool| {
+            if !stall {
+                ring.write(1, t + 2 * b as i64, &data);
+            }
+            let r = ra.plan(&ring, 0, t, b);
+            t += b as i64;
+            r
+        };
+        for _ in 0..101 {
+            step(false);
+        }
+        let a = ra.ahead();
+        assert_eq!(a, 2 * b as i64 - guard(b));
+        assert_eq!(step(true), (a, true), "a stalled writer falls short");
+        for _ in 0..CLEAN_CYCLES + 2 {
+            assert_eq!(step(false), (a, false));
+        }
+        assert_eq!(step(true), (a, true));
+        assert_eq!(ra.ahead(), a, "far from the first: not repeated");
+        step(false);
+        assert_eq!(step(true), (a / 2, true));
+        assert_eq!(ra.ahead(), a / 2, "close to the last: repeated");
+    }
+
+    /// The two calls land in a random order (writer and reader wake together): `ahead` is sized for
+    /// the reader-first order, so neither order falls short.
+    #[test]
+    fn calls_racing_each_other_do_not_fall_short() {
+        for b in [64usize, 256, 1024] {
+            for seed in 1..40 {
+                let m = Model {
+                    seed,
+                    ..model(b, b, 0, b as i64 / 4)
+                };
+                let o = simulate(&m);
+                assert!(o.shortfalls.is_empty(), "b={b} seed={seed}");
+                assert_eq!(
+                    *o.ahead.last().unwrap(),
+                    b as i64 - guard(b),
+                    "b={b} seed={seed}"
+                );
+            }
+        }
+    }
+
+    /// A rare order flip that calibration missed falls short, but the second shortfall halves `ahead`
+    /// below what the slow order leaves, so there are never more than two and the stream is clean after.
+    #[test]
+    fn a_rarely_flipping_order_backs_off_and_converges() {
+        let mut falls_short = 0;
+        for b in [64usize, 512] {
+            let j = guard(b) / 2;
+            for seed in 1..40 {
+                // The reader runs a hair behind the writer: it only sees the writer-first slack unless a
+                // wake error swaps them, which is rare.
+                let m = Model {
+                    seed,
+                    cycles: 12_000,
+                    ..model(b, b, 2 * j - 1, j)
+                };
+                let o = simulate(&m);
+                assert_eq!((o.bad_frames, o.unflagged), (0, 0), "b={b} seed={seed}");
+                assert!(
+                    o.shortfalls.len() <= 2,
+                    "b={b} seed={seed}: {:?}",
+                    o.shortfalls
+                );
+                falls_short += (o.shortfalls.len() == 2) as usize;
+                if let Some(&k) = o.shortfalls.first() {
+                    assert_eq!(o.ahead[k], o.ahead[k - 1], "one shortfall is not repeated");
+                }
+                if let Some(&k) = o.shortfalls.get(1) {
+                    assert!(o.ahead[k] < 2 * b as i64 - guard(b), "backed off");
+                }
+            }
+        }
+        assert!(falls_short > 0, "the model never exercised the back-off");
+    }
+
+    /// Wake errors larger than the guard and the call distance together, any buffers: reads stay
+    /// inside what was written (never beyond `end`), every silent tail is reported, and the number of
+    /// shortfalls stays bounded because only back-off ever changes `ahead`.
+    #[test]
+    fn heavy_jitter_stays_safe_and_bounded() {
+        for fr in [64usize, 256, 1024] {
+            for fw in [fr, fr * 2, fr / 2] {
+                for seed in 1..30 {
+                    let m = Model {
+                        seed,
+                        cycles: 6000,
+                        ..model(fw, fr, seed as i64 % 7, fr as i64)
+                    };
+                    let o = simulate(&m);
+                    assert_eq!(
+                        (o.bad_frames, o.unflagged),
+                        (0, 0),
+                        "fw={fw} fr={fr} seed={seed}"
+                    );
+                    let frozen = o.ahead.iter().skip_while(|&&a| a == 0).collect::<Vec<_>>();
+                    assert!(
+                        frozen.windows(2).all(|w| w[1] <= w[0]),
+                        "ahead only ever shrinks"
+                    );
+                    assert!(
+                        o.shortfalls.len() <= 40,
+                        "fw={fw} fr={fr} seed={seed}: {}",
+                        o.shortfalls.len()
+                    );
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn read_ahead_never_reads_past_the_written_frames(
+            fw in 16usize..1200, fr in 16usize..1200, phase in -2000i64..2000,
+            jitter in 0i64..1500, seed in 1u64..u64::MAX, first in proptest::bool::ANY,
+        ) {
+            let m = Model { fw, fr, phase, jitter, seed, cycles: 1500, tie_writer_first: first };
+            let o = simulate(&m);
+            proptest::prop_assert_eq!((o.bad_frames, o.unflagged), (0, 0));
+            proptest::prop_assert!(o.shortfalls.len() <= 60, "{}", o.shortfalls.len());
+        }
+    }
+
+    /// Calibration restarts, and `ahead` drops to 0, on anything that changes the relation between
+    /// reader and writer: a new epoch, another reader buffer, a different writer buffer, a time jump,
+    /// an empty ring.
+    #[test]
+    fn calibration_restarts_when_the_stream_changes() {
+        let b = 256usize;
+        let ring = Ring::new(1 << 15, 1);
+        let ra = ReadAhead::new();
+        let mut t = 0i64;
+        let run = |ring: &Ring, epoch: u32, fr: usize, t: &mut i64, n: usize| {
+            let mut a = 0;
+            for _ in 0..n {
+                ring.write(1, *t + 2 * b as i64, &vec![1.0; b]);
+                a = ra.plan(ring, epoch, *t, fr).0;
+                *t += b as i64;
+            }
+            a
+        };
+        ring.write(1, 0, &vec![1.0; 3 * b]);
+        assert_eq!(
+            run(&ring, 0, b, &mut t, 100),
+            0,
+            "calibrating for 100 cycles"
+        );
+        let a = run(&ring, 0, b, &mut t, 1);
+        assert!(a > 0, "frozen after 100 cycles");
+        assert_eq!(run(&ring, 0, b, &mut t, 50), a, "ahead does not drift");
+        assert_eq!(run(&ring, 1, b, &mut t, 1), 0, "epoch");
+        assert_eq!(run(&ring, 1, b, &mut t, 100), a, "same stream, same value");
+        assert_eq!(run(&ring, 1, b / 2, &mut t, 1), 0, "reader buffer");
+        assert_eq!(run(&ring, 1, b, &mut t, 1), 0, "reader buffer back");
+        assert_eq!(run(&ring, 1, b, &mut t, 100), a);
+        t += 100 * b as i64;
+        assert_eq!(run(&ring, 1, b, &mut t, 1), 0, "time jump");
+        assert_eq!(run(&ring, 1, b, &mut t, 100), a);
+        ring.write(1, t + 2 * b as i64, &vec![1.0; b / 2]); // the writer's buffer size changed
+        assert_eq!(ra.plan(&ring, 1, t, b).0, 0, "writer buffer");
+        assert_eq!(ra.ahead(), 0);
+        assert_eq!(run(&ring, 1, b, &mut t, 101), a);
+        ring.reset();
+        let next = t + b as i64;
+        assert_eq!(ra.plan(&ring, 1, next, b), (0, false), "empty ring");
+        assert_eq!(ra.ahead(), 0);
     }
 }
