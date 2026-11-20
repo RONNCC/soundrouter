@@ -310,6 +310,7 @@ pub fn dropout_dot(
     at: egui::Pos2,
     ring: egui::Color32,
     t: &Tokens,
+    id: &str,
     name: &str,
     count: u64,
 ) {
@@ -318,7 +319,7 @@ pub fn dropout_dot(
     let tip = dropout_tip(count);
     let hit = ui.interact(
         Rect::from_center_size(at, vec2(14.0, 14.0)),
-        Id::unique("dropouts"),
+        Id::unique(("dropouts", id)),
         Sense::hover(),
     );
     let label = format!("{name}: {tip}");

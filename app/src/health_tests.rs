@@ -143,6 +143,24 @@ fn dropouts_grew_to(h: &mut Harness<App>, n: u64) {
 }
 
 #[test]
+fn two_devices_with_dropouts_each_show_their_own_dot() {
+    let cfg = demo_config();
+    let (a, b) = (&cfg.devices[0], &cfg.devices[1]);
+    let mut backend = FakeBackend::frozen(1.5);
+    backend.status.xruns = vec![(a.id.clone(), 3), (b.id.clone(), 5)];
+    let mut h = window(cfg.clone(), Box::new(backend), None, Theme::Dark, false);
+    let now = h.state().now;
+    // The engine's counters then grew past these: both rows draw a dot in the same frame, and with one
+    // shared widget id the second would replace the first.
+    h.state_mut()
+        .dropouts
+        .observe(&[(a.id.clone(), 1), (b.id.clone(), 2)], now);
+    h.run_steps(2);
+    h.get_by_label(&format!("{}: 3 dropouts since start", a.name));
+    h.get_by_label(&format!("{}: 5 dropouts since start", b.name));
+}
+
+#[test]
 fn a_device_row_shows_an_amber_dot_only_while_dropouts_grow() {
     let mut b = FakeBackend::frozen(1.5);
     b.status.xruns = vec![("v1".into(), 12)];

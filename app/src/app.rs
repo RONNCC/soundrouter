@@ -835,6 +835,7 @@ impl App {
                 icon.right_top() + vec2(-1.0, 1.0),
                 ring,
                 t,
+                &dev.id,
                 &dev.name,
                 n,
             );
