@@ -1172,6 +1172,12 @@ fn used_device_uids(cfg: &Config) -> Vec<String> {
     uids
 }
 
+/// One device used by several vdevs: the widest output any of them was built with, and whether any
+/// of them reads its input. `None` when no vdev uses it. Independent of the vdev order.
+fn combine_builds(builds: impl Iterator<Item = (u32, bool)>) -> Option<(u32, bool)> {
+    builds.reduce(|(out, open), (o, i)| (out.max(o), open || i))
+}
+
 /// Devices of the config held in hog mode by another process, and Bluetooth devices that look switched
 /// to the headset profile. Read from the HAL on each call (both are cheap property reads).
 fn device_trouble(g: &Inner) -> (Vec<HogInfo>, Vec<String>) {
@@ -1182,22 +1188,27 @@ fn device_trouble(g: &Inner) -> (Vec<HogInfo>, Vec<String>) {
         };
         let name = hal::device_name(dev);
         hogged.extend(health::hog_info(dev));
-        let built = g
+        let builds = g
             .vdevs
             .values()
             .flat_map(|v| v.subs.iter().map(move |s| (v, s)))
-            .find(|(_, s)| s.uid == uid);
-        if let Some((v, s)) = built {
-            let built_out: u32 = s.out_bufs.iter().map(|&c| u32::from(c)).sum();
-            if health::looks_hfp(
+            .filter(|(_, s)| s.uid == uid)
+            .map(|(v, s)| {
+                (
+                    s.out_bufs.iter().map(|&c| u32::from(c)).sum(),
+                    !s.in_bufs.is_empty() && v.spec.readers.contains(&uid),
+                )
+            });
+        if let Some((built_out, input_open)) = combine_builds(builds)
+            && health::looks_hfp(
                 health::is_bluetooth(health::transport_type(dev)),
                 hal::nominal_rate(dev),
                 u32::from(hal::total_channels(dev, kAudioObjectPropertyScopeOutput)),
                 built_out,
-                !s.in_bufs.is_empty() && v.spec.readers.contains(&uid),
-            ) {
-                hfp.push(name);
-            }
+                input_open,
+            )
+        {
+            hfp.push(name);
         }
     }
     hfp.sort();

@@ -1703,3 +1703,13 @@ fn taps_run_only_when_the_main_and_the_tap_aggregate_both_run() {
     assert!(!taps_running(Running, Some(Failed(-1))));
     assert!(!taps_running(Starting, None));
 }
+
+#[test]
+fn a_device_shared_by_two_vdevs_combines_their_builds_in_any_order() {
+    // vdev A only plays to a headset (2 out, input unread), vdev B reads its microphone (0 out).
+    let (a, b) = ((2, false), (0, true));
+    assert_eq!(combine_builds([a, b].into_iter()), Some((2, true)));
+    assert_eq!(combine_builds([b, a].into_iter()), Some((2, true)));
+    assert_eq!(combine_builds([a].into_iter()), Some((2, false)));
+    assert_eq!(combine_builds(std::iter::empty()), None);
+}
