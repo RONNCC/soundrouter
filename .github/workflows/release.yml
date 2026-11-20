@@ -18,17 +18,15 @@ jobs:
   release:
     runs-on: macos-15
     env:
-      CERT_P12: ${{ secrets.CERT_P12 }}
-      CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
-      SIGN_ID: ${{ secrets.SIGN_ID }}
-      INSTALLER_ID: ${{ secrets.INSTALLER_ID }}
-      NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
-      NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
-      NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+      # Only these booleans are job-wide; each secret goes to the step that needs it, never to cargo (build scripts
+      # of every dependency run there) before the signing key is in a keychain.
+      HAVE_CERT: ${{ secrets.CERT_P12 != '' && secrets.SIGN_ID != '' }}
+      NOTARIZED: ${{ secrets.NOTARY_APPLE_ID != '' && secrets.NOTARY_TEAM_ID != '' && secrets.NOTARY_PASSWORD != '' && secrets.SIGN_ID != '' && secrets.INSTALLER_ID != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # CFBundleVersion = commit count
+          persist-credentials: false # this job's token can write the repo; build scripts must not find it in .git
       - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-about
@@ -37,8 +35,15 @@ jobs:
         run: |
           version=$(awk -F'"' '/^\[/ { ws = ($0 == "[workspace.package]") } ws && /^version[ ]*=/ { print $2; exit }' Cargo.toml)
           [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "tag $GITHUB_REF_NAME != workspace version v$version (Cargo.toml)" >&2; exit 1; }
+      - name: Build (no signing key or secret present yet)
+        run: |
+          cargo build --release -p soundrouter-app -p sr-cli
+          cargo build --release -p soundrouter-driver
       - name: Import signing certificates
-        if: env.CERT_P12 != '' && env.SIGN_ID != ''
+        if: env.HAVE_CERT == 'true'
+        env:
+          CERT_P12: ${{ secrets.CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
         run: |
           echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p ci "$RUNNER_TEMP/ci.keychain"
@@ -48,14 +53,23 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k ci "$RUNNER_TEMP/ci.keychain"
           security list-keychains -d user -s "$RUNNER_TEMP/ci.keychain" login.keychain
           rm -f "$RUNNER_TEMP/cert.p12"
-      - name: Bundle app (builds the driver, generates ThirdPartyLicenses)
+      - name: Bundle app (reuses the build above, generates ThirdPartyLicenses)
+        env:
+          SIGN_ID: ${{ secrets.SIGN_ID }}
         run: REQUIRE_NOTICES=1 packaging/bundle-app.sh
       - name: Build pkg and dmg
+        env:
+          SIGN_ID: ${{ secrets.SIGN_ID }}
+          INSTALLER_ID: ${{ secrets.INSTALLER_ID }}
         run: |
           packaging/make-pkg.sh
           packaging/make-dmg.sh
       - name: Notarize
-        if: env.NOTARY_APPLE_ID != '' && env.NOTARY_TEAM_ID != '' && env.NOTARY_PASSWORD != '' && env.SIGN_ID != '' && env.INSTALLER_ID != ''
+        if: env.NOTARIZED == 'true'
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
         run: |
           xcrun notarytool store-credentials sr-ci --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" --password "$NOTARY_PASSWORD"
           export NOTARY_PROFILE=sr-ci
@@ -77,10 +91,9 @@ jobs:
             target/SoundRouter.driver.zip
             target/SHA256SUMS.txt
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' # a dispatch, even on a tag, is a dry run
         env:
           GH_TOKEN: ${{ github.token }}
-          NOTARIZED: ${{ env.NOTARY_APPLE_ID != '' && env.NOTARY_TEAM_ID != '' && env.NOTARY_PASSWORD != '' && env.SIGN_ID != '' && env.INSTALLER_ID != '' }}
         run: |
           if [ "$NOTARIZED" = true ]; then
             notes="Developer ID signed and notarized."
