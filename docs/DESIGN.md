@@ -2,7 +2,7 @@
 
 SoundRouter patches audio between apps, microphones and virtual devices. The people using it record podcasts, stream, play music or sit on calls, and the one thing the window has to make obvious is who hears what. The visual language comes from the studio: patch bays, console strips, patch cables ending in jacks, LED level ladders, faders, tape.
 
-Status: the tokens, fonts and egui style below are in place, and every screen reads them. The sidebar, footer, sheets, welcome, copy and the graph (source cables, jacks, LED ladders, empty states) are done.
+Status: the tokens, fonts and egui style below are in place, and every screen reads them. The sidebar, footer, sheets, welcome, copy, the graph (source cables, jacks, LED ladders, empty states), the health banner and the permissions sheet are done.
 
 ## The one memorable thing
 
@@ -109,7 +109,18 @@ Motion only answers an action: a short plug-in pop when a wire connects, eased s
 
 ### Footer
 
-The sidebar footer and the window footer are both 44 px, so their hairlines are one line. Left to right in the sidebar: "New device", the one primary action, in `accent_ink` with a ⊕ and a `selected` pill on hover. In the window footer: "Remove device" (same word as the row's remove button, the toast and Undo), the status text, then "Audio delay: Balanced" (a chip that opens the delay menu), "Test setup" and a quiet "…" button. "Uninstall…" is inside that menu: it is destructive and used once, so it must not sit next to the buttons people press.
+The sidebar footer and the window footer are both 44 px, so their hairlines are one line. Left to right in the sidebar: "New device", the one primary action, in `accent_ink` with a ⊕ and a `selected` pill on hover. In the window footer: "Remove device" (same word as the row's remove button, the toast and Undo), the status text, then "Audio delay: Balanced" (a chip that opens the delay menu), "Test setup" and a quiet "…" button. "Uninstall…" is inside that menu, under "Permissions" (the sheet below): it is destructive and used once, so it must not sit next to the buttons people press.
+
+### Health banner and dropout dot
+
+What the engine says about its own health (`EngineStatus::tap_silent`, `hogged`, `bluetooth_hfp`, `xruns`; the decisions are pure functions in `app/src/health.rs`) shows in two places and never blocks the window.
+
+- **Banner.** One row above the footer, the width of the main pane: a `warn` dot, one sentence in body ink that wraps to a second line instead of clipping (so it holds at the 1000 px minimum window), an optional secondary pill, a quiet "+N" badge when more notices wait behind it ("N more notices" to a screen reader) and a close x ("Dismiss notice"). It sits on `raised` with a hairline on top, like the footer's hairline, no shadow: it is part of the frame, not a floating layer. One banner at a time, most important first: System Audio Recording denied while an app is captured, silent app captures, a device another app holds in exclusive use, Bluetooth in phone-call mode. A denied permission replaces the silent-capture notices it explains. Closing a banner hides it until the app quits; the next one takes its place. The capture notices carry **Open Privacy settings**, which opens the System Audio Recording pane directly; this is the one place that says "Privacy settings" rather than "System Settings" because the button lands on one pane, and the setup sheets keep "Open System Settings". The demo never shows banners (its audio is synthetic).
+- **Dropout dot.** A 9 px `warn` dot on the corner of a device's icon tile, ringed in the row's own surface, with the tooltip "N dropouts since start". It shows while the engine's counter for that device grew in the last 10 s, and clears itself (at the next status refresh, so up to 2 s late). A counter seen for the first time is a baseline, not news. The delay menu ends with an "Audio health" line (total dropouts since start) and, while they grow, "Dropouts: choose a larger delay" in `warn_ink` (at the largest delay: "close busy apps or turn off devices you do not use").
+
+### Permissions sheet
+
+"Permissions" in the footer's "…" menu and in the menu-bar item opens a review sheet: System Audio Recording (apps), Microphone (inputs), Audio driver and Start at login, each with a status chip, a one-line why and, where something can be done, a secondary button ("Allow microphone", "Open System Settings", "Turn on", "Turn off"). The first two rows are the setup walkthrough's own rows, so their words and buttons are identical; the sheet has one primary button, "Done", and closing it does not count as finishing setup.
 
 ### Sheets and welcome
 

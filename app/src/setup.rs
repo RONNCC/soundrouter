@@ -314,6 +314,9 @@ pub enum Step {
     Done,
     /// "Measure delay": one click timed through a virtual device.
     Delay,
+    /// "Permissions": every permission and setting the app needs, at a glance, from the footer or
+    /// the menu-bar item. Not a walkthrough: it changes nothing until a row button is pressed.
+    Access,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -334,6 +337,8 @@ pub enum Action {
     Demo,
     /// The uninstall deleted the settings folder.
     SettingsDeleted,
+    /// Turn Start at login on or off (the Permissions sheet's row).
+    Login(bool),
 }
 
 /// What the app tells the sheet each frame.
@@ -349,6 +354,8 @@ pub struct View<'a> {
     pub first_apply_pending: bool,
     /// `should_show_setup` said yes.
     pub missing: bool,
+    /// Start at login is on; only read while the Permissions sheet is open (`Setup::wants_login`).
+    pub login: bool,
     pub now: f64,
     pub diagnostics: &'a dyn Fn() -> String,
 }
@@ -472,6 +479,17 @@ impl Setup {
     pub fn open_measure(&mut self) {
         self.step = Step::Delay;
         self.open = true;
+    }
+
+    /// "Permissions" in the footer menu or the menu-bar item.
+    pub fn open_access(&mut self) {
+        self.step = Step::Access;
+        self.open = true;
+    }
+
+    /// The Permissions sheet is up and needs to know whether Start at login is on.
+    pub fn wants_login(&self) -> bool {
+        self.open && self.step == Step::Access
     }
 
     pub fn ask_uninstall(&mut self) {
@@ -716,8 +734,9 @@ impl Setup {
         }
     }
 
-    /// Closing the measurement leaves the setup's "seen" mark alone: it says nothing about setup.
-    fn close_measure(&mut self) {
+    /// Closing the measurement or the permissions list leaves the setup's "seen" mark alone: neither
+    /// says anything about the walkthrough.
+    fn close_quiet(&mut self) {
         self.open = false;
         self.step = Step::Welcome;
     }
@@ -1124,11 +1143,11 @@ impl Setup {
                             |ui, s| {
                                 if running {
                                     if button(ui, t, "Cancel", Kind::Secondary) {
-                                        s.close_measure();
+                                        s.close_quiet();
                                     }
                                 } else {
                                     if button(ui, t, "Done", Kind::Primary) {
-                                        s.close_measure();
+                                        s.close_quiet();
                                     }
                                     if button(ui, t, "Measure again", Kind::Secondary) {
                                         action = Some(Action::Measure);
@@ -1139,6 +1158,39 @@ impl Setup {
                     },
                 )
             }
+            Step::Access => modal(
+                ctx,
+                t,
+                &Sheet {
+                    id: "setup_access",
+                    buttons: true,
+                    glyph: Glyph::App,
+                    title: "Permissions",
+                    intro: "What SoundRouter needs from macOS, and whether it has it.",
+                },
+                self,
+                |ui, s| {
+                    let rows = s.access_rows(v);
+                    match checklist(ui, t, &rows) {
+                        Some(0) => s.capture_action(ctx, v),
+                        Some(1) => s.mic_action(v),
+                        Some(3) => action = Some(Action::Login(!v.login)),
+                        _ => {}
+                    }
+                },
+                |ui, s| {
+                    buttons(
+                        ui,
+                        s,
+                        |_, _| {},
+                        |ui, s| {
+                            if button(ui, t, "Done", Kind::Primary) {
+                                s.close_quiet();
+                            }
+                        },
+                    );
+                },
+            ),
             Step::Done => modal(
                 ctx,
                 t,
@@ -1232,6 +1284,37 @@ impl Setup {
 }
 
 impl Setup {
+    /// The Permissions sheet: System Audio Recording (apps), Microphone (inputs), the driver, and
+    /// Start at login. The first two are the walkthrough's own rows, so their words and buttons match.
+    fn access_rows<'a>(&self, v: &View) -> [Row<'a>; 4] {
+        let [mic, cap] = self.permission_rows(v, true);
+        let driver = if v.status.driver_version.is_some() {
+            Row {
+                state: Status::Ok,
+                title: "Audio driver",
+                status: "Installed",
+                detail: "Adds the virtual devices to macOS.",
+                action: None,
+            }
+        } else {
+            Row {
+                state: Status::Fail,
+                title: "Audio driver",
+                status: "Not installed",
+                detail: "Adds the virtual devices to macOS.",
+                action: None,
+            }
+        };
+        let login = Row {
+            state: if v.login { Status::Ok } else { Status::Pending },
+            title: "Start at login",
+            status: if v.login { "On" } else { "Off" },
+            detail: "Opens SoundRouter in the menu bar when you log in, so your routes are ready.",
+            action: Some(if v.login { "Turn off" } else { "Turn on" }),
+        };
+        [cap, mic, driver, login]
+    }
+
     /// Microphone and System Audio Recording as checklist rows (a row's button asks macOS, or opens
     /// its Settings pane once it said no). `explain` adds the why.
     fn permission_rows<'a>(&self, v: &View, explain: bool) -> [Row<'a>; 2] {
@@ -1311,7 +1394,7 @@ fn tcc_word(s: TccStatus) -> &'static str {
     }
 }
 
-fn open_url(url: &str) {
+pub fn open_url(url: &str) {
     let _ = Command::new("/usr/bin/open").arg(url).spawn();
 }
 

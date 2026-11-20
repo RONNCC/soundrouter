@@ -95,6 +95,8 @@ pub enum Cmd {
     Preset(String),
     /// "Save current as…" in the Presets submenu.
     SavePreset,
+    /// "Permissions": open the window on its permissions sheet.
+    Permissions,
 }
 
 pub struct Tray {
@@ -106,6 +108,7 @@ pub struct Tray {
     presets: Submenu,
     preset_rows: Vec<(MenuItem, String)>,
     save_preset_id: MenuId,
+    permissions_id: MenuId,
     preset_names: Vec<String>,
     open_id: MenuId,
     quit_id: MenuId,
@@ -169,6 +172,7 @@ impl Tray {
         let open = MenuItem::new("Open SoundRouter", true, None);
         let login = CheckMenuItem::new("Start at Login", true, login_enabled, None);
         let quit = MenuItem::new("Quit SoundRouter", true, None);
+        let permissions = MenuItem::new("Permissions", true, None);
         let presets = Submenu::new("Presets", true);
         let save_preset = MenuItem::new("Save current as…", true, None);
         presets.append(&save_preset).map_err(|e| e.to_string())?;
@@ -178,6 +182,7 @@ impl Tray {
             &status,
             &PredefinedMenuItem::separator(),
             &presets,
+            &permissions,
             &login,
             &PredefinedMenuItem::separator(),
             &quit,
@@ -205,6 +210,7 @@ impl Tray {
             presets,
             preset_rows: Vec::new(),
             save_preset_id: save_preset.id().clone(),
+            permissions_id: permissions.id().clone(),
             preset_names: Vec::new(),
             open_id: open.id().clone(),
             quit_id: quit.id().clone(),
@@ -230,6 +236,8 @@ impl Tray {
                     Some(Cmd::Login(self.login.is_checked()))
                 } else if id == self.save_preset_id {
                     Some(Cmd::SavePreset)
+                } else if id == self.permissions_id {
+                    Some(Cmd::Permissions)
                 } else {
                     self.preset_rows
                         .iter()

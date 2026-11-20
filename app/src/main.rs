@@ -3,6 +3,7 @@ mod app;
 mod deeplink;
 mod fake;
 mod graph;
+mod health;
 mod icons;
 mod instance;
 mod layout;

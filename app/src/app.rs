@@ -1,5 +1,6 @@
 //! Application state, sidebar and the window frame.
 use crate::graph::{self, GraphCtx, GraphState};
+use crate::health;
 use crate::icons::IconTextures;
 use crate::login;
 use crate::model::{
@@ -25,6 +26,7 @@ use eframe::egui::{
 use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
 use sr_core::config::{BUFFER_FRAMES, Config, MAX_NAME_CHARS, SourceKind};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 const SIDEBAR_W: f32 = 250.0;
@@ -85,6 +87,29 @@ pub struct App {
     now: f64,
     /// Why the real audio engine did not start; the app then only edits and saves the config.
     engine_error: Option<String>,
+    /// Health banners the user closed, and when each device's dropout counter last grew.
+    dismissed: health::Dismissed,
+    dropouts: health::Dropouts,
+    os: Os,
+}
+
+/// What the window asks of the machine outside the audio engine: Start at login and System Settings
+/// links. A field of `App`, so tests never touch `~/Library/LaunchAgents` or open System Settings.
+#[derive(Clone)]
+struct Os {
+    login_is_on: Arc<dyn Fn() -> bool + Send + Sync>,
+    set_login: Arc<dyn Fn(bool) -> std::io::Result<()> + Send + Sync>,
+    open_url: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl Os {
+    fn system() -> Self {
+        Self {
+            login_is_on: Arc::new(login::is_enabled),
+            set_login: Arc::new(login::set_enabled),
+            open_url: Arc::new(setup::open_url),
+        }
+    }
 }
 
 /// Label and dot color for a device state; idle devices show no dot.
@@ -98,14 +123,24 @@ fn state_look(s: &DeviceState, t: &Tokens) -> Option<(String, egui::Color32)> {
     })
 }
 
+/// What the delay menu says about the machine, besides the setting itself.
+struct DelayFacts {
+    /// macOS Low Power Mode is on.
+    low_power: bool,
+    /// An enabled device exists to measure through.
+    can_measure: bool,
+    /// Dropouts since start, and whether they grew in the last few seconds.
+    dropouts: u64,
+    growing: bool,
+}
+
 /// The "Audio delay" popup: one plain sentence, then a radio-style row per buffer size, and the
 /// action that measures the delay for real (`measure` is set when it is clicked).
 fn delay_menu(
     ui: &mut egui::Ui,
     t: &Tokens,
     current: u32,
-    low_power: bool,
-    can_measure: bool,
+    facts: &DelayFacts,
     edits: &mut Vec<Edit>,
     measure: &mut bool,
 ) {
@@ -131,7 +166,7 @@ fn delay_menu(
             .wrap(),
         );
     });
-    if low_power_hint_due(low_power, current) {
+    if low_power_hint_due(facts.low_power, current) {
         ui.add_space(4.0);
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.add(
@@ -195,7 +230,18 @@ fn delay_menu(
         }
     }
     ui.separator();
-    let btn = ui.add_enabled(can_measure, egui::Button::new("Measure delay…"));
+    let larger = BUFFER_FRAMES.iter().any(|&n| n > current);
+    let (line, hint) = health::health_line(facts.dropouts, facts.growing, larger);
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.label(egui::RichText::new(line).font(body()).color(t.muted));
+        if let Some(hint) = hint {
+            ui.add(
+                egui::Label::new(egui::RichText::new(hint).font(body()).color(t.warn_ink)).wrap(),
+            );
+        }
+    });
+    ui.separator();
+    let btn = ui.add_enabled(facts.can_measure, egui::Button::new("Measure delay…"));
     let btn = btn
         .on_hover_text("Plays one very quiet click into the virtual device and times how long it takes to come back.")
         .on_disabled_hover_text("Turn a device on first.");
@@ -252,6 +298,9 @@ impl App {
             preset_pick: None,
             now: 0.0,
             engine_error: None,
+            dismissed: health::Dismissed::default(),
+            dropouts: health::Dropouts::default(),
+            os: Os::system(),
         }
     }
 
@@ -273,6 +322,7 @@ impl App {
         let mut events = Vec::new();
         let mut presets_wanted = Vec::new();
         let mut save_wanted = false;
+        let mut access_wanted = false;
         if self.hide_in > 0 {
             self.hide_in -= 1;
             if self.hide_in == 0 {
@@ -301,6 +351,7 @@ impl App {
                     tray::Cmd::Quit => events.push(Event::Quit),
                     tray::Cmd::Preset(name) => presets_wanted.push(name),
                     tray::Cmd::SavePreset => save_wanted = true,
+                    tray::Cmd::Permissions => access_wanted = true,
                     tray::Cmd::Login(on) => {
                         if let Err(e) = login::set_enabled(on) {
                             t.set_login_checked(!on);
@@ -344,6 +395,10 @@ impl App {
         if save_wanted {
             show_window(ctx);
             self.presets.open_save();
+        }
+        if access_wanted {
+            show_window(ctx);
+            self.setup.open_access();
         }
     }
 
@@ -503,6 +558,7 @@ impl App {
             device_name: name,
             first_apply_pending: pending,
             missing,
+            login: self.setup.wants_login() && (self.os.login_is_on)(),
             now: ctx.input(|i| i.time),
             diagnostics: &diagnostics,
         };
@@ -535,6 +591,14 @@ impl App {
                 self.worker.use_demo();
                 self.worker.apply(&self.cfg);
             }
+            Some(SetupAction::Login(on)) => match (self.os.set_login)(on) {
+                Ok(()) => {
+                    if let Some(t) = &self.tray {
+                        t.set_login_checked(on);
+                    }
+                }
+                Err(e) => self.toast = Some(format!("Start at Login did not change: {e}")),
+            },
             Some(SetupAction::SettingsDeleted) => {
                 // The settings folder is gone: stop writing it back with every edit.
                 self.path = None;
@@ -760,6 +824,21 @@ impl App {
         ui.painter()
             .rect_filled(icon, CornerRadius::same(8), cable.gamma_multiply(dim));
         loops(ui.painter(), icon, Color32::WHITE.gamma_multiply(dim));
+        if let Some(n) = self.dropouts.growing(&dev.id, self.now) {
+            let ring = if i == self.selected {
+                t.selected
+            } else {
+                t.panel
+            };
+            health::dropout_dot(
+                ui,
+                icon.right_top() + vec2(-1.0, 1.0),
+                ring,
+                t,
+                &dev.name,
+                n,
+            );
+        }
         let name_pos = pos2(icon.right() + 10.0, inner.top() + 18.0);
         let name_rect = Rect::from_min_size(
             pos2(name_pos.x, name_pos.y - 10.0),
@@ -1036,6 +1115,10 @@ impl App {
                     resp.clone().on_hover_text("More actions");
                     egui::Popup::menu(&resp).show(|ui| {
                         ui.set_min_width(140.0);
+                        if ui.button("Permissions").clicked() {
+                            self.setup.open_access();
+                        }
+                        ui.separator();
                         if ui
                             .button(egui::RichText::new("Uninstall…").color(t.bad_ink))
                             .clicked()
@@ -1068,18 +1151,15 @@ impl App {
                     .find_map(|d| Some((d.name.as_str(), device_delay_ms(&live, &d.id)?)));
                 resp.clone()
                     .on_hover_text(delay_chip_tip(self.cfg.buffer_frames, reading));
-                let can_measure = self.cfg.devices.iter().any(|d| d.enabled);
+                let facts = DelayFacts {
+                    low_power: live.low_power_mode,
+                    can_measure: self.cfg.devices.iter().any(|d| d.enabled),
+                    dropouts: self.dropouts.total(),
+                    growing: self.dropouts.any_growing(self.now),
+                };
                 let mut measure = false;
                 egui::Popup::menu(&resp).show(|ui| {
-                    delay_menu(
-                        ui,
-                        t,
-                        self.cfg.buffer_frames,
-                        live.low_power_mode,
-                        can_measure,
-                        edits,
-                        &mut measure,
-                    )
+                    delay_menu(ui, t, self.cfg.buffer_frames, &facts, edits, &mut measure)
                 });
                 if measure {
                     self.setup.open_measure();
@@ -1166,6 +1246,37 @@ impl App {
                 status.widget_info(|| WidgetInfo::labeled(Role::Label, true, &msg));
                 status.on_hover_text(msg);
             });
+
+        let status = self.engine_status();
+        let app_source = self
+            .cfg
+            .devices
+            .iter()
+            .filter(|d| d.enabled)
+            .flat_map(|d| &d.sources)
+            .any(|s| matches!(s.kind, SourceKind::App { .. }));
+        let list = health::issues(&status, app_source, |id| {
+            self.cfg
+                .devices
+                .iter()
+                .find(|d| d.id == id)
+                .map_or_else(|| id.to_owned(), health::subject)
+        });
+        if let Some((issue, more)) = self.dismissed.pick(&list)
+            && !self.demo
+        {
+            let clicked = egui::Panel::bottom("health")
+                .resizable(false)
+                .frame(egui::Frame::default().fill(t.raised))
+                .show(ui, |ui| health::banner(ui, t, issue, more))
+                .inner;
+            if clicked.dismiss {
+                self.dismissed.dismiss(&issue.key);
+            }
+            if clicked.fix == Some(health::Fix::Privacy) {
+                (self.os.open_url)(AUDIO_CAPTURE_SETTINGS);
+            }
+        }
 
         let waiting = self
             .engine_status()
@@ -1329,6 +1440,8 @@ impl eframe::App for App {
         if let Some(u) = &self.undo {
             ctx.request_repaint_after(Duration::from_secs_f64(u.until - self.now + 0.05));
         }
+        self.dropouts.observe(&self.engine_status().xruns, self.now);
+        // No repaint is scheduled for the amber dot to clear: the worker's status refresh (2 s) repaints.
 
         let prev_selected = self.selected;
         let learned = {
@@ -1390,3 +1503,7 @@ mod tests;
 #[cfg(test)]
 #[path = "presets_tests.rs"]
 mod preset_tests;
+
+#[cfg(test)]
+#[path = "health_tests.rs"]
+mod health_tests;

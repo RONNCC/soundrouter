@@ -55,7 +55,7 @@ fn until(h: &mut Harness<App>, what: &str, done: impl Fn(&Harness<App>) -> bool)
 /// Block until the worker thread has published what the window needs: its first refresh (status,
 /// hardware, apps) and, unless the setup sheet holds the first apply back, either meters for every
 /// enabled device or the apply error.
-fn wait_published(h: &mut Harness<App>) {
+pub(super) fn wait_published(h: &mut Harness<App>) {
     until(h, "worker publishing", |h| {
         let app = h.state();
         let s = app.worker.shared.lock().unwrap();
