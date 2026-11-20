@@ -372,15 +372,20 @@ struct Rig {
     cb: Cb,
     meters: Arc<Meters>,
     _handle: MixerHandle,
+    tap: TapInHandle,
+    stats: Arc<TapStats>,
 }
 fn rig(dev: &VirtualDevice, lay: &IoLayout, ain: &[u16], aout: &[u16]) -> Rig {
     let meters = Arc::new(Meters::new());
     let (mixer, mut handle) = mixer(meters.clone());
     handle.set_plan(MixPlan::compile(dev, lay));
+    let stats = Arc::new(TapStats::default());
+    let (tap_cb, tap) = tap_in(stats.clone());
     let shared = Arc::new(Shared {
         expected: AtomicU64::new(layout::shape_key_of(ain, aout)),
         state: AtomicU64::new(1),
         delay: AtomicU32::new(NO_DELAY),
+        lead: AtomicU32::new(NO_DELAY),
     });
     Rig {
         cb: Cb {
@@ -390,9 +395,12 @@ fn rig(dev: &VirtualDevice, lay: &IoLayout, ain: &[u16], aout: &[u16]) -> Rig {
             in_planar: Scratch::new(),
             out_planar: Scratch::new(),
             next_t: f64::NAN,
+            tap: tap_cb,
         },
         meters,
         _handle: handle,
+        tap,
+        stats,
     }
 }
 /// Exactly representable in f32, distinct per (frame, channel).
@@ -986,6 +994,7 @@ fn spec(main: &str, subs: &[&str]) -> AggSpec {
         subs: subs.iter().map(|s| (*s).to_owned()).collect(),
         channels: 2,
         buffer_frames: 256,
+        split: true,
     }
 }
 
@@ -996,7 +1005,7 @@ fn keep_in_place_only_for_the_same_aggregate() {
     let live = spec(&comp, &["mic"]);
     let keep = |l: &AggSpec, io, cands: &[String], subs: &[&str]| {
         let subs: Vec<String> = subs.iter().map(|s| (*s).to_owned()).collect();
-        keep_in_place(l, &[], io, cands, &subs, 2, 256)
+        keep_in_place(l, &[], io, cands, &subs, 2, 256, true)
     };
     assert!(keep(&live, IoState::Running, &both, &["mic"]));
     assert!(keep(&live, IoState::Starting, &both, &["mic"]));
@@ -1010,7 +1019,8 @@ fn keep_in_place_only_for_the_same_aggregate() {
         &both,
         &subs,
         4,
-        256
+        256,
+        true
     ));
     assert!(!keep_in_place(
         &live,
@@ -1019,7 +1029,19 @@ fn keep_in_place_only_for_the_same_aggregate() {
         &both,
         &subs,
         2,
-        128
+        128,
+        true
+    ));
+    // Splitting the taps off (or back in) is a different aggregate layout.
+    assert!(!keep_in_place(
+        &live,
+        &[],
+        IoState::Running,
+        &both,
+        &subs,
+        2,
+        256,
+        false
     ));
 }
 
@@ -1035,7 +1057,8 @@ fn a_failed_io_start_is_rebuilt_by_the_next_apply() {
         &["c".into()],
         &[],
         2,
-        256
+        256,
+        true
     ));
 }
 
@@ -1054,11 +1077,12 @@ fn a_fallback_main_moves_to_the_companion_once_present() {
         std::slice::from_ref(&vis),
         &[],
         2,
-        256
+        256,
+        true
     ));
     let both = [comp.clone(), vis.clone()];
-    assert!(!keep_in_place(&live, &[], run, &both, &[], 2, 256));
-    assert!(keep_in_place(&live, &[comp], run, &both, &[], 2, 256));
+    assert!(!keep_in_place(&live, &[], run, &both, &[], 2, 256, true));
+    assert!(keep_in_place(&live, &[comp], run, &both, &[], 2, 256, true));
 }
 
 #[test]
@@ -1144,11 +1168,372 @@ fn the_ioproc_publishes_only_valid_sample_times() {
     let valid = AudioTimeStampFlags::SampleTimeValid;
     let none = AudioTimeStampFlags(0);
     let read = || r.cb.shared.delay.load(Relaxed);
-    assert_eq!(read(), NO_DELAY);
-    r.cb.track_delay(&stamp(10.0, valid), &stamp(20.0, none));
+    let lead = || r.cb.shared.lead.load(Relaxed);
+    assert_eq!((read(), lead()), (NO_DELAY, NO_DELAY));
+    let now = stamp(0.0, valid);
+    r.cb.track_delay(&now, &stamp(10.0, valid), &stamp(20.0, none));
     assert_eq!(read(), NO_DELAY, "output time not valid");
-    r.cb.track_delay(&stamp(10.0, valid), &stamp(522.0, valid));
-    assert_eq!(read(), 512);
-    r.cb.track_delay(&stamp(10.0, valid), &stamp(-5.0, valid));
-    assert_eq!(read(), 512, "a negative gap keeps the last good one");
+    assert_eq!(lead(), NO_DELAY);
+    r.cb.track_delay(&now, &stamp(10.0, valid), &stamp(522.0, valid));
+    assert_eq!((read(), lead()), (512, 522));
+    r.cb.track_delay(&now, &stamp(10.0, valid), &stamp(-5.0, valid));
+    assert_eq!(
+        (read(), lead()),
+        (512, 522),
+        "a negative gap keeps the last good one"
+    );
+}
+
+// ---- split vdev: taps arrive through the ring ----
+
+const SB: usize = 64;
+
+/// Pass-thru (2 main input channels) plus one app tap of 2 channels that is not in the aggregate's
+/// buffers but in the ring; both go to the 2 output channels.
+fn split_dev() -> VirtualDevice {
+    vdev(
+        vec![src("pt", SourceKind::PassThru), app("a", "com.a")],
+        vec![
+            wire("pt", 0, 0),
+            wire("pt", 1, 1),
+            wire("a", 0, 0),
+            wire("a", 1, 1),
+        ],
+        vec![],
+    )
+}
+
+fn split_layout(dev: &VirtualDevice, taps: &[String]) -> IoLayout {
+    let li = layout_inputs(dev, "comp");
+    let spec = LayoutSpec {
+        subs: &[sub("comp", true, &[2], &[2])],
+        passthru: li.passthru.as_deref(),
+        device_sources: &li.device_sources,
+        monitors: &li.monitors,
+        taps,
+    };
+    let ain: Vec<u16> = [2].into_iter().chain(taps.iter().map(|_| 2)).collect();
+    layout::build_layout(&spec, &ain, &[2]).unwrap()
+}
+
+fn split_rig() -> Rig {
+    let dev = split_dev();
+    let lay = split_layout(&dev, &["a".to_owned()]);
+    rig(&dev, &lay, &[2], &[2])
+}
+
+/// `SB` frames of a tap: channel 0 counts up from `start`, channel 1 is its negative.
+fn push_tap(tx: &mut crate::tapring::TapTx, start: usize) {
+    for f in 0..SB {
+        tx.stage()[f * 2] = (start + f) as f32 / 1024.0;
+        tx.stage()[f * 2 + 1] = -((start + f) as f32) / 1024.0;
+    }
+    tx.push(SB);
+}
+
+fn run_split(r: &mut Rig, pt: impl Fn(usize) -> f32) -> Bl {
+    let mut inp = Bl::new(&[2], SB);
+    let mut out = Bl::new(&[2], SB);
+    inp.fill(0, pt);
+    out.fill(0, |_| 9.0);
+    unsafe { run(&mut r.cb, inp.ptr(), out.ptr()) };
+    out
+}
+
+#[test]
+fn split_taps_mix_in_from_the_ring_next_to_the_main_inputs() {
+    let mut r = split_rig();
+    let (mut tx, rx) = crate::tapring::channel(2, SB, r.stats.clone());
+    r.tap.publish(rx);
+    // Prefill: a block plus the cushion, then audio flows in order.
+    push_tap(&mut tx, 0);
+    let out = run_split(&mut r, |_| 0.0);
+    assert!(out.all_zero(), "still prefilling: silent, not a mismatch");
+    push_tap(&mut tx, SB);
+    let out = run_split(&mut r, |i| if i % 2 == 0 { 0.25 } else { 0.0 });
+    for f in 0..SB {
+        assert_eq!(out.data[0][f * 2], 0.25 + f as f32 / 1024.0, "L f{f}");
+        assert_eq!(out.data[0][f * 2 + 1], -(f as f32) / 1024.0, "R f{f}");
+    }
+    push_tap(&mut tx, 2 * SB);
+    let out = run_split(&mut r, |_| 0.0);
+    assert_eq!(out.data[0][0], SB as f32 / 1024.0, "next block follows");
+    assert_eq!(r.meters.mismatch_count(), 0);
+    assert_eq!(r.stats.counters(), crate::tapring::TapCounters::default());
+}
+
+#[test]
+fn split_main_paths_run_without_any_tap_ring() {
+    // The plan wants the tap's channels but no ring was published yet (tap aggregate still starting,
+    // e.g. while the permission prompt is open): pass-thru must not notice.
+    let mut r = split_rig();
+    let out = run_split(&mut r, |i| sample(i / 2, i % 2));
+    for f in 0..SB {
+        assert_eq!(out.data[0][f * 2], sample(f, 0));
+        assert_eq!(out.data[0][f * 2 + 1], sample(f, 1));
+    }
+    assert_eq!(r.meters.mismatch_count(), 0);
+}
+
+#[test]
+fn a_ring_the_plan_does_not_expect_is_silent_not_a_mismatch() {
+    let mut r = split_rig();
+    let (mut tx, rx) = crate::tapring::channel(4, SB, r.stats.clone()); // 2 taps; the plan has 1
+    r.tap.publish(rx);
+    for _ in 0..3 {
+        tx.stage()[..SB * 4].fill(1.0);
+        tx.push(SB);
+    }
+    let out = run_split(&mut r, |i| sample(i / 2, i % 2));
+    assert_eq!(out.data[0][0], sample(0, 0));
+    assert_eq!(out.data[0][3], sample(1, 1));
+    assert_eq!(r.meters.mismatch_count(), 0);
+}
+
+#[test]
+fn plan_and_ring_swap_in_either_order_without_a_mismatch() {
+    let mut r = split_rig();
+    let (mut tx, rx) = crate::tapring::channel(2, SB, r.stats.clone());
+    r.tap.publish(rx);
+    push_tap(&mut tx, 0);
+    push_tap(&mut tx, SB);
+    run_split(&mut r, |_| 0.0);
+    // The app quits: the plan loses the tap's inputs before the (empty) ring replaces the old one.
+    let dev = split_dev();
+    r._handle
+        .set_plan(MixPlan::compile(&dev, &split_layout(&dev, &[])));
+    let out = run_split(&mut r, |i| sample(i / 2, i % 2));
+    assert_eq!(out.data[0][0], sample(0, 0), "main paths unchanged");
+    r.tap.publish(TapRx::none(r.stats.clone()));
+    let out = run_split(&mut r, |i| sample(i / 2, i % 2));
+    assert_eq!(out.data[0][1], sample(0, 1));
+    // It comes back: the ring first, the plan after.
+    let (mut tx, rx) = crate::tapring::channel(2, SB, r.stats.clone());
+    r.tap.publish(rx);
+    push_tap(&mut tx, 0);
+    push_tap(&mut tx, SB);
+    let out = run_split(&mut r, |_| 0.0);
+    assert!(out.all_zero(), "ring without a plan for it is ignored");
+    r._handle.set_plan(MixPlan::compile(
+        &dev,
+        &split_layout(&dev, &["a".to_owned()]),
+    ));
+    let out = run_split(&mut r, |_| 0.0);
+    assert_eq!(out.data[0][2], 1.0 / 1024.0);
+    assert_eq!(r.meters.mismatch_count(), 0);
+}
+
+// ---- the tap IOProc's copy into the ring ----
+
+fn tap_cb(
+    in_bufs: &[u16],
+    out_bufs: &[u16],
+    n_taps: usize,
+) -> (tapagg::TapCb, crate::tapring::TapRx) {
+    let stats = Arc::new(TapStats::default());
+    let ch = in_bufs[in_bufs.len() - n_taps..]
+        .iter()
+        .map(|&c| usize::from(c))
+        .sum();
+    let (tx, rx) = crate::tapring::channel(ch, 32, stats.clone());
+    let shared = Arc::new(Shared {
+        expected: AtomicU64::new(layout::shape_key_of(in_bufs, out_bufs)),
+        state: AtomicU64::new(1),
+        delay: AtomicU32::new(NO_DELAY),
+        lead: AtomicU32::new(NO_DELAY),
+    });
+    (
+        tapagg::TapCb {
+            tx,
+            shared,
+            stats,
+            n_tap_bufs: n_taps,
+        },
+        rx,
+    )
+}
+
+#[test]
+fn the_tap_ioproc_copies_the_tap_buffers_frame_major_and_skips_the_companion_input() {
+    let (ins, outs) = ([2u16, 2, 2], [2u16]);
+    let (mut cb, mut rx) = tap_cb(&ins, &outs, 2);
+    let frames = 40;
+    let mut inp = Bl::new(&ins, frames);
+    let mut out = Bl::new(&outs, frames);
+    inp.fill(0, |_| 7.0); // the companion's own input: not copied
+    inp.fill(1, |i| i as f32); // tap 1: L R interleaved
+    inp.fill(2, |i| 1000.0 + i as f32);
+    for _ in 0..3 {
+        unsafe { tapagg::tap_run(&mut cb, inp.ptr(), out.ptr()) };
+    }
+    assert_eq!(cb.stats.counters(), TapCounters::default());
+    let mut dst = vec![0.0; 4 * MAX_FRAMES];
+    rx.pull(frames, &mut dst, 0);
+    for f in 0..frames {
+        assert_eq!(dst[f], (f * 2) as f32, "tap 1 L f{f}");
+        assert_eq!(dst[MAX_FRAMES + f], (f * 2 + 1) as f32, "tap 1 R f{f}");
+        assert_eq!(
+            dst[2 * MAX_FRAMES + f],
+            1000.0 + (f * 2) as f32,
+            "tap 2 L f{f}"
+        );
+        assert_eq!(
+            dst[3 * MAX_FRAMES + f],
+            1000.0 + (f * 2 + 1) as f32,
+            "tap 2 R f{f}"
+        );
+    }
+}
+
+#[test]
+fn the_tap_ioproc_skips_a_cycle_of_the_wrong_shape_and_counts_it() {
+    let (mut cb, mut rx) = tap_cb(&[2, 2], &[2], 1);
+    let mut out = Bl::new(&[2], 16);
+    let mut wrong = Bl::new(&[2, 2, 2], 16); // a second tap appeared that the key does not know
+    unsafe { tapagg::tap_run(&mut cb, wrong.ptr(), out.ptr()) };
+    assert_eq!(cb.stats.counters().mismatches, 1);
+    let mut dst = vec![9.0; 2 * MAX_FRAMES];
+    rx.pull(16, &mut dst, 0);
+    assert!(dst[..16].iter().all(|&x| x == 0.0), "nothing was pushed");
+    // No input list at all (the HAL passes none while the aggregate has no input streams).
+    unsafe { tapagg::tap_run(&mut cb, std::ptr::null_mut(), out.ptr()) };
+    assert_eq!(cb.stats.counters().mismatches, 1);
+}
+
+#[test]
+fn tap_copy_chunks_cycles_longer_than_max_frames() {
+    let (mut cb, mut rx) = tap_cb(&[2, 2], &[2], 1);
+    let frames = MAX_FRAMES + 100;
+    let mut inp = Bl::new(&[2, 2], frames);
+    let mut out = Bl::new(&[2], frames);
+    inp.fill(1, |i| i as f32);
+    unsafe { tapagg::tap_run(&mut cb, inp.ptr(), out.ptr()) };
+    assert_eq!(cb.stats.counters(), TapCounters::default());
+    let mut dst = vec![0.0; 2 * MAX_FRAMES];
+    rx.pull(MAX_FRAMES, &mut dst, 0);
+    assert_eq!(dst[MAX_FRAMES - 1], ((MAX_FRAMES - 1) * 2) as f32);
+    rx.pull(100, &mut dst, 0);
+    assert_eq!(dst[0], (MAX_FRAMES * 2) as f32, "the second chunk follows");
+}
+
+// ---- split vdev bookkeeping ----
+
+#[test]
+fn split_setting_reads_the_env_value() {
+    use tapagg::split_setting;
+    assert!(!split_setting(Some("0"), true));
+    assert!(split_setting(Some("1"), false));
+    assert!(split_setting(None, true));
+    assert!(!split_setting(None, false));
+    assert!(
+        split_setting(Some("yes"), true),
+        "anything else is the default"
+    );
+}
+
+#[test]
+fn a_failed_tap_start_fails_the_vdev_and_a_waiting_one_only_the_apps() {
+    use DeviceState as D;
+    use IoState::*;
+    assert_eq!(combine_io(Running, Some(Starting)), Running);
+    assert_eq!(combine_io(Running, Some(Failed(-1))), Failed(-1));
+    assert_eq!(combine_io(Failed(-2), Some(Failed(-1))), Failed(-2));
+    assert_eq!(combine_io(Starting, None), Starting);
+    let denied = TccStatus::Denied;
+    // The permission prompt holds the tap aggregate only: a running main aggregate is Waiting for apps.
+    assert_eq!(split_state(Starting, None, denied), D::Starting);
+    assert_eq!(split_state(Running, None, denied), D::Running);
+    assert_eq!(
+        split_state(Running, Some(Starting), denied),
+        D::WaitingForPermission
+    );
+    assert_eq!(
+        split_state(Running, Some(Starting), TccStatus::Granted),
+        D::Starting
+    );
+    assert_eq!(split_state(Running, Some(Running), denied), D::Running);
+    assert!(matches!(
+        split_state(Running, Some(Failed(-1)), denied),
+        D::Failed(_)
+    ));
+    assert!(matches!(
+        split_state(Failed(-1), None, denied),
+        D::Failed(_)
+    ));
+}
+
+// ---- the audio threads never allocate ----
+
+mod no_alloc {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! { static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
+
+    struct Counting;
+    // SAFETY: delegates to System; the counter is a const-initialised thread-local Cell (no allocation).
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.dealloc(p, l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.realloc(p, l, n) }
+        }
+    }
+    #[global_allocator]
+    static A: Counting = Counting;
+
+    #[test]
+    fn tap_copy_and_ring_pop_do_not_allocate() {
+        let mut r = split_rig();
+        let (mut tcb, rx) = tap_cb(&[2, 2], &[2], 1);
+        r.tap.publish(rx);
+        let mut tap_in = Bl::new(&[2, 2], SB);
+        let mut tap_out = Bl::new(&[2], SB);
+        tap_in.fill(1, |i| i as f32 / 1024.0);
+        let mut inp = Bl::new(&[2], SB);
+        let mut out = Bl::new(&[2], SB);
+        inp.fill(0, |i| i as f32);
+        // Warm up (prefill, first plan pick-up), then count: steady state, an underrun, a pile-up
+        // (trim), a ring swap and a long cycle in chunks.
+        for _ in 0..4 {
+            unsafe { tapagg::tap_run(&mut tcb, tap_in.ptr(), tap_out.ptr()) };
+            unsafe { run(&mut r.cb, inp.ptr(), out.ptr()) };
+        }
+        let (fresh_tx, fresh_rx) = crate::tapring::channel(2, 32, r.stats.clone());
+        let mut fresh = tapagg::TapCb {
+            tx: fresh_tx,
+            shared: tcb.shared.clone(),
+            stats: r.stats.clone(),
+            n_tap_bufs: 1,
+        };
+        let big_in = Bl::new(&[2, 2], MAX_FRAMES + 100);
+        let mut big_in = big_in;
+        let mut big_out = Bl::new(&[2], MAX_FRAMES + 100);
+        r.tap.publish(fresh_rx);
+        let before = ALLOCS.with(Cell::get);
+        for i in 0..1000 {
+            unsafe { tapagg::tap_run(&mut fresh, tap_in.ptr(), tap_out.ptr()) };
+            match i % 50 {
+                0 => {} // a cycle without a pop: the ring piles up, then trims
+                1..=5 => unsafe {
+                    tapagg::tap_run(&mut fresh, tap_in.ptr(), tap_out.ptr());
+                    run(&mut r.cb, inp.ptr(), out.ptr());
+                },
+                _ => unsafe { run(&mut r.cb, inp.ptr(), out.ptr()) },
+            }
+        }
+        unsafe { tapagg::tap_run(&mut fresh, big_in.ptr(), big_out.ptr()) };
+        assert_eq!(ALLOCS.with(Cell::get) - before, 0);
+        let c = r.stats.counters();
+        assert!(c.underruns > 0 || c.trims > 0, "the paths ran: {c:?}");
+        r.tap.flush();
+    }
 }

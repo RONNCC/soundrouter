@@ -305,10 +305,19 @@ fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>, force: bool
             };
             if let Some(m) = engine.meters(id) {
                 let ch: Vec<String> = m.channels.iter().map(|&x| db(x)).collect();
-                let delay = engine.delay(id).map_or_else(
-                    || "delay n/a".to_owned(),
-                    |d| format!("delay {:.1} ms", d.ms()),
-                );
+                let ms = |d: Option<sr_core::backend::Delay>| {
+                    d.map_or_else(|| "n/a".to_owned(), |d| format!("{:.1} ms", d.ms()))
+                };
+                // Apps sit in their own aggregate on a split device: say how far behind the rest they are.
+                let delay = match engine.tap_delay(id) {
+                    Some(t) => format!(
+                        "delay {} (apps {}), tap {:?}",
+                        ms(engine.main_delay(id)),
+                        ms(Some(t)),
+                        engine.tap_counters(id).unwrap_or_default()
+                    ),
+                    None => format!("delay {}", ms(engine.delay(id))),
+                };
                 println!(
                     "{id} [{st}] out: {} ({delay}, glitches {}, mismatches {})",
                     ch.join(" "),

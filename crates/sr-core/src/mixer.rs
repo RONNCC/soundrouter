@@ -356,6 +356,12 @@ impl Mixer {
         }
     }
 
+    /// Inputs the current plan expects, after picking up a newly published one; `None` before the first.
+    pub fn in_len(&mut self) -> Option<usize> {
+        self.poll();
+        self.plan.as_ref().map(|p| p.in_len)
+    }
+
     /// Planar; zero outputs first; no plan = silence. Mismatched buffer counts/lengths vs the plan's
     /// layout give silence and bump `Meters::mismatch_count`. More than MAX_FRAMES frames run in chunks.
     pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize) {

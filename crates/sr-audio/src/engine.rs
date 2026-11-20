@@ -38,6 +38,8 @@ use crate::driver;
 use crate::hal::{self, SYSTEM};
 use crate::layout::{self, LayoutSpec, SCRATCH_LEN, SubDesc};
 use crate::power::PowerWatch;
+use crate::tapring::{TapCounters, TapIn, TapInHandle, TapRx, TapStats, tap_in};
+use tapagg::{TapAgg, TapAggSpec, retire_tap, tap_split_enabled};
 
 /// If the hidden companion cannot be found or joined, run on the visible vdev instead.
 /// shortcut: then the Pass-Thru source is off (see `LayoutInputs::passthru`); the companion path is verified live (docs/TESTING.md), this fallback is not.
@@ -71,6 +73,26 @@ fn device_state(io: IoState, tcc: TccStatus) -> DeviceState {
     }
 }
 
+/// The state of a split vdev: the main aggregate never waits on the permission prompt (it has no taps),
+/// the tap aggregate's start does, and only that holds back the tapped apps.
+fn split_state(main: IoState, tap: Option<IoState>, tcc: TccStatus) -> DeviceState {
+    match (main, tap) {
+        (m @ IoState::Failed(_), _) | (_, Some(m @ IoState::Failed(_))) => device_state(m, tcc),
+        (IoState::Starting, _) => DeviceState::Starting,
+        (IoState::Running, Some(IoState::Starting)) => device_state(IoState::Starting, tcc),
+        (IoState::Running, _) => DeviceState::Running,
+    }
+}
+
+fn vdev_state(v: &Vdev, tcc: TccStatus) -> DeviceState {
+    let main = io_state_of(&v.shared);
+    if v.spec.split {
+        split_state(main, v.tapagg.as_ref().map(|t| io_state_of(&t.shared)), tcc)
+    } else {
+        device_state(main, tcc)
+    }
+}
+
 struct Shared {
     /// Expected `layout::shape_key` of the buffer lists; 0 = never matches (silence).
     /// Release-stored after the matching plan is published and Acquire-loaded by the IOProc, so a new key
@@ -80,6 +102,9 @@ struct Shared {
     state: AtomicU64,
     /// In->out distance in frames of the latest cycle; [`NO_DELAY`] before the first.
     delay: AtomicU32,
+    /// Output time minus the current time of the latest cycle: how far ahead of the clock the output
+    /// lies; [`NO_DELAY`] before the first.
+    lead: AtomicU32,
 }
 
 const NO_DELAY: u32 = u32::MAX;
@@ -100,6 +125,8 @@ struct Cb {
     out_planar: Scratch,
     /// Sample time the next cycle should start at; NaN before the first cycle.
     next_t: f64,
+    /// Tapped audio from the tap aggregate (split vdevs); no channels without one.
+    tap: TapIn,
 }
 
 impl Cb {
@@ -112,9 +139,15 @@ impl Cb {
         self.next_t = t + frames as f64;
     }
 
-    /// Publishes this cycle's in->out distance. Audio thread: one relaxed store.
-    fn track_delay(&self, input: &AudioTimeStamp, output: &AudioTimeStamp) {
+    /// Publishes this cycle's in->out distance and the output's lead over the clock. Audio thread: relaxed stores.
+    fn track_delay(&self, now: &AudioTimeStamp, input: &AudioTimeStamp, output: &AudioTimeStamp) {
         let valid = AudioTimeStampFlags::SampleTimeValid;
+        if output.mFlags.contains(valid)
+            && now.mFlags.contains(valid)
+            && let Some(d) = in_out_distance(now.mSampleTime, output.mSampleTime)
+        {
+            self.shared.lead.store(d, Relaxed);
+        }
         if input.mFlags.contains(valid)
             && output.mFlags.contains(valid)
             && let Some(d) = in_out_distance(input.mSampleTime, output.mSampleTime)
@@ -188,6 +221,8 @@ struct AggSpec {
     channels: u16,
     /// Requested IO buffer size (`Config::buffer_frames`); part of the reuse key.
     buffer_frames: u32,
+    /// One aggregate for the process taps and another for everything else; part of the reuse key.
+    split: bool,
 }
 
 struct Vdev {
@@ -204,6 +239,15 @@ struct Vdev {
     layout: sr_core::mixer::IoLayout,
     subs: Vec<SubDesc>,
     taps: Vec<Tap>,
+    /// The tap-only aggregate of a split vdev; `None` without taps (and unsplit, where `taps` sit in `agg`).
+    tapagg: Option<TapAgg>,
+    /// Publishes the tap ring's receiver to the IOProc.
+    tap_in: TapInHandle,
+    /// Tap path counters, cumulative over tap aggregate rebuilds.
+    tap_stats: Arc<TapStats>,
+    /// Where the tap aggregate reports its IOProc start; `None` in tests.
+    events: Option<Sender<Event>>,
+    activity: Arc<Activity>,
     /// Removed taps the aggregate may still reference; destroyed after its tap list is updated (F7).
     zombies: Vec<Tap>,
     /// The aggregate's tap list (or layout) may be out of date: the next sync must redo it (F7).
@@ -226,23 +270,52 @@ struct Vdev {
 unsafe impl Send for Vdev {}
 
 impl Vdev {
-    /// True while the starter thread is still inside `AudioDeviceStart` (TCC prompt open).
+    /// True while a starter thread is still inside `AudioDeviceStart` (TCC prompt open).
     fn starting(&self) -> bool {
         self.starter.as_ref().is_some_and(|h| !h.is_finished())
+            || self.tapagg.as_ref().is_some_and(TapAgg::starting)
+    }
+
+    /// Start state of the vdev: the main aggregate's, or `Failed` when the tap aggregate's start failed.
+    fn io(&self) -> IoState {
+        combine_io(
+            io_state_of(&self.shared),
+            self.tapagg.as_ref().map(|t| io_state_of(&t.shared)),
+        )
     }
 }
 
-/// Teardown first waits for the starter thread: `AudioDeviceStart` may still be running on the
+/// Failed if either start failed; else the main aggregate's state (the tap aggregate may still be
+/// waiting on the permission prompt while everything else routes).
+fn combine_io(main: IoState, tap: Option<IoState>) -> IoState {
+    match tap {
+        Some(f @ IoState::Failed(_)) if !matches!(main, IoState::Failed(_)) => f,
+        _ => main,
+    }
+}
+
+/// Teardown first waits for the starter threads: `AudioDeviceStart` may still be running on the
 /// IOProc/aggregate we are about to destroy (F3). So **dropping a `Vdev` can block for as long as the TCC
 /// prompt is open**; code on a caller's thread uses [`retire`] instead.
+///
+/// Order: tap IOProc stopped, main IOProc stopped, tap aggregate destroyed, main aggregate destroyed, then
+/// the taps (nothing lists them any more).
 impl Drop for Vdev {
     fn drop(&mut self) {
+        if let Some(t) = self.tapagg.as_mut() {
+            t.stop();
+        }
         if let Some(h) = self.starter.take() {
             let _ = h.join();
         }
         unsafe {
             if self.proc_id.is_some() {
                 AudioDeviceStop(self.agg, self.proc_id);
+            }
+        }
+        self.tapagg = None;
+        unsafe {
+            if self.proc_id.is_some() {
                 AudioDeviceDestroyIOProcID(self.agg, self.proc_id);
             }
             AudioHardwareDestroyAggregateDevice(self.agg);
@@ -400,7 +473,24 @@ impl Engine {
     }
 
     pub fn io_state(&self, device_id: &str) -> Option<IoState> {
-        Some(io_state_of(&lock(&self.inner).vdevs.get(device_id)?.shared))
+        Some(lock(&self.inner).vdevs.get(device_id)?.io())
+    }
+
+    /// Start state of a split vdev's tap aggregate; `None` without one (no taps running, or unsplit).
+    pub fn tap_io_state(&self, device_id: &str) -> Option<IoState> {
+        Some(io_state_of(
+            &lock(&self.inner)
+                .vdevs
+                .get(device_id)?
+                .tapagg
+                .as_ref()?
+                .shared,
+        ))
+    }
+
+    /// Counters of a vdev's tap path: underruns, trims, dropped blocks and shape mismatches.
+    pub fn tap_counters(&self, device_id: &str) -> Option<TapCounters> {
+        Some(lock(&self.inner).vdevs.get(device_id)?.tap_stats.counters())
     }
 
     /// Blocks silenced by a buffer-shape mismatch (diagnostic).
@@ -439,20 +529,59 @@ impl Engine {
     }
 }
 
-/// `v`'s measured delay, once its IOProc has run a cycle.
-fn vdev_delay(v: &Vdev) -> Option<Delay> {
-    let frames = v.shared.delay.load(Relaxed);
+/// Nominal rate of `v`'s main device; `None` before it is known.
+fn main_rate(v: &Vdev) -> Option<u32> {
     let rate = v.rates.iter().find(|(u, _)| *u == v.spec.main)?.1;
-    (frames != NO_DELAY && rate >= 1.0).then(|| Delay {
+    (rate >= 1.0).then(|| rate.round() as u32)
+}
+
+/// The distance through `v`'s main aggregate (mic, pass-thru, monitors), once its IOProc has run a cycle.
+/// In an unsplit vdev this is also the tapped apps' delay.
+fn main_delay(v: &Vdev) -> Option<Delay> {
+    let frames = v.shared.delay.load(Relaxed);
+    (frames != NO_DELAY).then_some(Delay {
         frames,
-        rate_hz: rate.round() as u32,
+        rate_hz: main_rate(v)?,
     })
 }
 
+/// The path of a split vdev's tapped apps, from the app's output to the mixer's: how stale the audio is
+/// when the tap IOProc gets it, plus what waits in the ring, plus how far the main output lies ahead.
+/// Measured per cycle; the wait for the main IOProc's phase (up to one buffer) is not in it.
+fn tap_delay(v: &Vdev) -> Option<Delay> {
+    let t = v.tapagg.as_ref()?;
+    let (lag, lead) = (t.shared.delay.load(Relaxed), v.shared.lead.load(Relaxed));
+    (lag != NO_DELAY && lead != NO_DELAY).then_some(Delay {
+        frames: lag
+            .saturating_add(v.tap_stats.level.load(Relaxed))
+            .saturating_add(lead),
+        rate_hz: main_rate(v)?,
+    })
+}
+
+/// The longest path of `v`: what a user hears as the device's delay.
+fn vdev_delay(v: &Vdev) -> Option<Delay> {
+    [main_delay(v), tap_delay(v)]
+        .into_iter()
+        .flatten()
+        .max_by_key(|d| d.frames)
+}
+
 impl Engine {
-    /// The in->out distance `id`'s IOProc last saw; see [`Delay`].
+    /// The longest path through `id`'s engine: its main aggregate's in->out distance (the IOProc's
+    /// `output - input` time) or, when apps are tapped, the app path; see [`Delay`].
     pub fn delay(&self, id: &str) -> Option<Delay> {
         vdev_delay(lock(&self.inner).vdevs.get(id)?)
+    }
+
+    /// The app (tap) path alone; `None` without a running tap aggregate.
+    pub fn tap_delay(&self, id: &str) -> Option<Delay> {
+        tap_delay(lock(&self.inner).vdevs.get(id)?)
+    }
+
+    /// The main aggregate's distance alone: mic, pass-thru and monitor paths.
+    pub fn main_delay(&self, id: &str) -> Option<Delay> {
+        main_delay(lock(&self.inner).vdevs.get(id)?)
     }
 }
 
@@ -764,7 +893,11 @@ fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
     let (mut failed, mut ok) = (Vec::new(), Vec::new());
     for (id, build, good) in p.io.drain(..) {
         // A stale build (already retired) says nothing about the current one.
-        let Some(v) = g.vdevs.get_mut(&id).filter(|v| v.build == build) else {
+        let Some(v) = g
+            .vdevs
+            .get_mut(&id)
+            .filter(|v| v.build == build || v.tapagg.as_ref().is_some_and(|t| t.build == build))
+        else {
             continue;
         };
         if good {
@@ -850,7 +983,7 @@ impl Backend for Engine {
         let mut per_device: Vec<(String, DeviceState)> = g
             .vdevs
             .iter()
-            .map(|(id, v)| (id.clone(), device_state(io_state_of(&v.shared), tcc)))
+            .map(|(id, v)| (id.clone(), vdev_state(v, tcc)))
             .chain(
                 g.recovering
                     .iter()
@@ -864,6 +997,12 @@ impl Backend for Engine {
             .filter_map(|(id, v)| Some((id.clone(), vdev_delay(v)?)))
             .collect();
         delays.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut tap_delays: Vec<(String, Delay)> = g
+            .vdevs
+            .iter()
+            .filter_map(|(id, v)| Some((id.clone(), tap_delay(v)?)))
+            .collect();
+        tap_delays.sort_by(|a, b| a.0.cmp(&b.0));
         drop(g);
         per_device.sort_by(|a, b| a.0.cmp(&b.0));
         EngineStatus {
@@ -874,6 +1013,7 @@ impl Backend for Engine {
             mic,
             driver_version,
             delays,
+            tap_delays,
             low_power_mode: activity::low_power_mode(),
         }
     }
@@ -919,6 +1059,7 @@ impl Backend for Engine {
         // Deliver a plan the full queue refused while the IOProc was not consuming (F5): a stale plan
         // can otherwise outlive the user's newer volume until the next apply.
         v.handle.flush();
+        v.tap_in.flush();
         Some(v.meters.take(&v.layout, &v.dev))
     }
 }
@@ -1158,6 +1299,7 @@ fn apply_locked(g: &mut Inner, cfg: &Config, sync: fn(&Config) -> Result<()>) ->
 /// in place instead of being rebuilt. Not when its IOProc failed to start: only a new build retries that
 /// (`io_retry` bounds the background ones). Not when a better main is present that was not tried at its
 /// build: a fallback built before the companion was published then moves to it.
+#[allow(clippy::too_many_arguments)]
 fn keep_in_place(
     live: &AggSpec,
     passed_over: &[String],
@@ -1166,11 +1308,13 @@ fn keep_in_place(
     subs: &[String],
     channels: u16,
     buffer_frames: u32,
+    split: bool,
 ) -> bool {
     !matches!(io, IoState::Failed(_))
         && live.subs == subs
         && live.channels == channels
         && live.buffer_frames == buffer_frames
+        && live.split == split
         && cands
             .iter()
             .find(|c| **c == live.main || !passed_over.contains(c))
@@ -1191,8 +1335,9 @@ fn apply_vdev(
         );
     }
     let subs = plan_subs(dev, &|u| hal::device_by_uid(u).is_some());
+    let split = tap_split_enabled();
     if let Some(v) = g.vdevs.get_mut(&dev.id) {
-        let io = io_state_of(&v.shared);
+        let io = v.io();
         if keep_in_place(
             &v.spec,
             &v.passed_over,
@@ -1201,6 +1346,7 @@ fn apply_vdev(
             &subs,
             dev.channels,
             buffer_frames,
+            split,
         ) {
             v.dev = dev.clone();
             match sync_taps(v, groups).and_then(|()| refresh_layout(v)) {
@@ -1224,6 +1370,7 @@ fn apply_vdev(
                 subs: subs.clone(),
                 channels: dev.channels,
                 buffer_frames,
+                split,
             },
             groups,
             g.tx.as_ref(),
@@ -1409,6 +1556,11 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
     }
     if changed {
         v.tap_dirty = true;
+        if v.spec.split {
+            rebuild_tap_agg(v)?;
+            v.tap_dirty = false;
+            return Ok(());
+        }
         v.shared.expected.store(0, Release); // silence until the new layout is in
         let uids: Vec<String> = v.taps.iter().map(|t| t.uid.clone()).collect();
         hal::set_object(
@@ -1431,6 +1583,46 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
         refresh_layout(v)?;
         v.tap_dirty = false;
     }
+    Ok(())
+}
+
+/// Replaces a split vdev's tap aggregate with one listing `v.taps` (none: no aggregate), hands its ring
+/// to the main IOProc and republishes the layout. The main aggregate keeps mixing every other path
+/// throughout; the tapped apps are silent from the old aggregate's stop until the new one runs.
+///
+/// Fails without touching what runs when the new aggregate cannot be built or does not fit the mixer;
+/// `v.tap_dirty` makes the next sync try again.
+fn rebuild_tap_agg(v: &mut Vdev) -> Result<()> {
+    let (new, rx) = if v.taps.is_empty() {
+        (None, TapRx::none(v.tap_stats.clone()))
+    } else {
+        let (agg, rx) = tapagg::build(&TapAggSpec {
+            dev_id: &v.dev.id,
+            main: &v.spec.main,
+            taps: &v.taps,
+            buffer_frames: v.spec.buffer_frames,
+            stats: &v.tap_stats,
+            events: v.events.as_ref(),
+            activity: &v.activity,
+        })?;
+        (Some(agg), rx)
+    };
+    let old = std::mem::replace(&mut v.tapagg, new);
+    if let Err(e) = refresh_layout(v) {
+        retire_tap(std::mem::replace(&mut v.tapagg, old));
+        return Err(e);
+    }
+    v.tap_in.publish(rx);
+    // The old aggregate may still list the taps removed since: it destroys them once it is gone.
+    let mut old = old;
+    match old.as_mut() {
+        Some(o) => o.zombies.append(&mut v.zombies),
+        None => v
+            .zombies
+            .drain(..)
+            .for_each(|t| unsafe { _ = AudioHardwareDestroyProcessTap(t.id) }),
+    }
+    retire_tap(old);
     Ok(())
 }
 
@@ -1511,7 +1703,13 @@ fn check_width(lay: &IoLayout) -> Result<()> {
 
 /// Recompute the layout from the aggregate's current streams, compile the plan, publish both.
 fn refresh_layout(v: &mut Vdev) -> Result<()> {
-    let ain = hal::stream_channels(v.agg, kAudioObjectPropertyScopeInput);
+    let main_in = hal::stream_channels(v.agg, kAudioObjectPropertyScopeInput);
+    // A split vdev's tap buffers come from the tap aggregate, behind the main aggregate's own.
+    let ain: Vec<u16> = main_in
+        .iter()
+        .copied()
+        .chain(v.tapagg.iter().flat_map(|t| t.bufs.iter().copied()))
+        .collect();
     let aout = hal::stream_channels(v.agg, kAudioObjectPropertyScopeOutput);
     let li = layout_inputs(&v.dev, &v.spec.main);
     let tap_ids: Vec<String> = v.taps.iter().map(|t| t.source_id.clone()).collect();
@@ -1540,7 +1738,7 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
     v.layout = lay;
     v.shared
         .expected
-        .store(layout::shape_key_of(&ain, &aout), Release);
+        .store(layout::shape_key_of(&main_in, &aout), Release);
     Ok(())
 }
 
@@ -1561,6 +1759,38 @@ fn set_buffer_frames(agg: u32, frames: u32) {
         Ok(()) => log::info!("aggregate {agg}: buffer {frames} frames (now {now})"),
         Err(e) => log::info!("aggregate {agg}: buffer {frames} frames {e}; keeping {now}"),
     }
+}
+
+/// Starts `proc_id` on `agg` off the caller's thread (`AudioDeviceStart` blocks until the TCC prompt is
+/// answered), records the outcome in `sh.state` and reports it as an [`Event::IoStart`] of `build`.
+fn spawn_starter(
+    agg: u32,
+    proc_id: AudioDeviceIOProcID,
+    sh: Arc<Shared>,
+    events: Option<Sender<Event>>,
+    id: String,
+    build: u64,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("sr-audio-start".into())
+        .spawn(move || {
+            let st = unsafe { AudioDeviceStart(agg, proc_id) };
+            sh.state.store(
+                if st == 0 {
+                    1
+                } else {
+                    (1 << 32) | u64::from(st as u32)
+                },
+                Relaxed,
+            );
+            if let Some(tx) = events {
+                let _ = tx.send(Event::IoStart {
+                    id,
+                    build,
+                    ok: st == 0,
+                });
+            }
+        })
 }
 
 fn build_vdev(
@@ -1633,6 +1863,7 @@ fn build_vdev(
         .collect();
     let tap_dicts: Vec<Retained<_>> = taps
         .iter()
+        .filter(|_| !spec.split)
         .map(|t| {
             let (u, d) = (NSString::from_str(&t.uid), hal::bool_obj(true));
             hal::cdict(&[
@@ -1697,10 +1928,14 @@ fn build_vdev(
     }
     let meters = Arc::new(Meters::new());
     let (mx, handle) = mixer(meters.clone());
+    let split = spec.split;
+    let tap_stats = Arc::new(TapStats::default());
+    let (tap_cb, tap_handle) = tap_in(tap_stats.clone());
     let shared = Arc::new(Shared {
         expected: AtomicU64::new(0),
         state: AtomicU64::new(0),
         delay: AtomicU32::new(NO_DELAY),
+        lead: AtomicU32::new(NO_DELAY),
     });
     let cb = Box::into_raw(Box::new(Cb {
         mixer: mx,
@@ -1709,7 +1944,14 @@ fn build_vdev(
         in_planar: Scratch::new(),
         out_planar: Scratch::new(),
         next_t: f64::NAN,
+        tap: tap_cb,
     }));
+    // A split vdev's taps join once the main aggregate runs: until then they only need cleaning up.
+    let (live_taps, parked) = if split {
+        (Vec::new(), taps)
+    } else {
+        (taps, Vec::new())
+    };
     let mut v = Vdev {
         dev: dev.clone(),
         spec,
@@ -1724,13 +1966,18 @@ fn build_vdev(
             outputs: vec![],
         },
         subs: descs,
-        taps,
+        taps: live_taps,
+        tapagg: None,
+        tap_in: tap_handle,
+        tap_stats,
+        events: events.cloned(),
+        activity: activity.clone(),
         starter: None,
         build: seq,
         rates,
         _listeners: listeners,
         _lease: activity.lease(),
-        zombies: Vec::new(),
+        zombies: parked,
         tap_dirty: false,
         warnings: Vec::new(),
         passed_over: Vec::new(),
@@ -1750,38 +1997,32 @@ fn build_vdev(
     };
     hal::check("AudioDeviceCreateIOProcID", st).context("creating IOProc")?;
     let (proc_id, sh) = (v.proc_id, v.shared.clone());
-    let (id, events) = (dev.id.clone(), events.cloned());
     // AudioDeviceStart blocks until the TCC prompt is answered: keep it off the caller's thread.
     // `Drop` joins this thread before stopping or destroying anything it uses (F3).
-    v.starter = Some(
-        std::thread::Builder::new()
-            .name("sr-audio-start".into())
-            .spawn(move || {
-                let st = unsafe { AudioDeviceStart(agg, proc_id) };
-                sh.state.store(
-                    if st == 0 {
-                        1
-                    } else {
-                        (1 << 32) | u64::from(st as u32)
-                    },
-                    Relaxed,
-                );
-                if let Some(tx) = events {
-                    let _ = tx.send(Event::IoStart {
-                        id,
-                        build: seq,
-                        ok: st == 0,
-                    });
-                }
-            })?,
-    );
+    v.starter = Some(spawn_starter(
+        agg,
+        proc_id,
+        sh,
+        events.cloned(),
+        dev.id.clone(),
+        seq,
+    )?);
     v.handle.flush();
+    if split {
+        // The main aggregate is already running every other path: the taps follow, and a failure here
+        // (or a permission prompt holding the tap aggregate's start) never takes them down.
+        v.taps = std::mem::take(&mut v.zombies);
+        if let Err(e) = rebuild_tap_agg(&mut v) {
+            log::warn!("device '{}': tap aggregate failed: {e:#}", dev.id);
+            v.zombies = std::mem::take(&mut v.taps);
+        }
+    }
     Ok(v)
 }
 
 unsafe extern "C-unwind" fn ioproc(
     _dev: AudioObjectID,
-    _now: NonNull<AudioTimeStamp>,
+    now: NonNull<AudioTimeStamp>,
     input: NonNull<AudioBufferList>,
     it: NonNull<AudioTimeStamp>,
     output: NonNull<AudioBufferList>,
@@ -1794,7 +2035,7 @@ unsafe extern "C-unwind" fn ioproc(
             b.mDataByteSize as usize / 4 / (b.mNumberChannels as usize).max(1)
         });
         cb.track_time(ot.as_ref().mSampleTime, frames);
-        cb.track_delay(it.as_ref(), ot.as_ref());
+        cb.track_delay(now.as_ref(), it.as_ref(), ot.as_ref());
         run(cb, input.as_ptr(), output.as_ptr())
     }));
     if r.is_err() {
@@ -1856,8 +2097,16 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
         mixer,
         in_planar,
         out_planar,
+        tap,
         ..
     } = cb;
+    tap.poll();
+    // The plan says how many tap channels follow the aggregate's own inputs: they come from the tap
+    // ring, or are silent while a new ring or plan is still on its way. An unsplit plan wants none.
+    let tap_ch = mixer
+        .in_len()
+        .map_or(0, |p| p.saturating_sub(n_in))
+        .min(MAX_CH - n_in);
     let mut start = 0;
     while start < frames {
         let n = (frames - start).min(MAX_FRAMES);
@@ -1872,8 +2121,11 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
             }
             c0 += ch;
         }
+        if tap_ch > 0 {
+            tap.pull(tap_ch, n, in_planar, n_in);
+        }
         let mut in_refs: [&[f32]; MAX_CH] = [&[]; MAX_CH];
-        for (c, r) in in_refs.iter_mut().enumerate().take(n_in) {
+        for (c, r) in in_refs.iter_mut().enumerate().take(n_in + tap_ch) {
             *r = &in_planar[c * MAX_FRAMES..][..n];
         }
         let mut out_refs: [&mut [f32]; MAX_CH] = std::array::from_fn(|_| &mut [][..]);
@@ -1884,7 +2136,7 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
         {
             *r = &mut row[..n];
         }
-        mixer.process(&in_refs[..n_in], &mut out_refs[..n_out], n);
+        mixer.process(&in_refs[..n_in + tap_ch], &mut out_refs[..n_out], n);
         let mut c0 = 0;
         for b in outs.iter() {
             let ch = b.mNumberChannels as usize;
@@ -1898,6 +2150,8 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
         start += n;
     }
 }
+
+mod tapagg;
 
 #[cfg(test)]
 mod tests;

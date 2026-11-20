@@ -1,6 +1,6 @@
 //! Live memory soak of the engine's rebuild paths against the INSTALLED driver (soundrouter:v1).
 //! Silent: nothing plays. It changes the driver's device list, so run it only when no SoundRouter app
-//! is running. Run with `cargo test -p sr-audio --test churn -- --ignored --nocapture`.
+//! is running. Run with `cargo test -p sr-audio --test churn -- --ignored --nocapture --test-threads=1`.
 use sr_audio::Engine;
 use sr_core::backend::Backend;
 use sr_core::config::*;
@@ -101,5 +101,81 @@ fn rebuild_loops_do_not_leak() {
     }));
     e.apply(&cfg(false, 0.0, false)).unwrap();
     // Allocator noise is a few MiB; a per-cycle leak of even 100 KiB would show as 5+ MiB here.
+    assert!(worst < 8 * 1024, "rss grew by {worst} KiB in one loop");
+}
+
+/// Like `cfg`, plus a second device `v2` that only plays (nothing reads it), and an app source on the
+/// process at `player` (a real executable path) when `with_app`.
+fn tap_cfg(with_app: bool, player: &str) -> Config {
+    let mut c = cfg(true, 0.0, false);
+    if with_app {
+        c.devices[0].sources.push(src(
+            "a",
+            SourceKind::App {
+                bundle_id: format!("path:{player}"),
+            },
+        ));
+        c.devices[0].wires.push(Wire {
+            source: "a".into(),
+            src_ch: 0,
+            out_ch: 1,
+        });
+    }
+    let mut v2 = c.devices[0].clone();
+    (v2.id, v2.name, v2.sources, v2.wires) = ("v2".into(), "Player".into(), vec![], vec![]);
+    c.devices.push(v2);
+    c
+}
+
+/// A real tapped process: `srtone` plays a tone into `soundrouter:v2` while the engine adds and
+/// removes the app source, so the tap aggregate is built, started, swapped and destroyed each time.
+#[test]
+#[ignore = "needs the SoundRouter driver installed; changes the driver device list; needs clang"]
+fn tap_aggregate_loops_do_not_leak() {
+    let dir = std::env::temp_dir().join(format!("sr-churn-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let player = dir.canonicalize().unwrap().join("srtone"); // the tap keys the process by its real path
+    let src_c = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/srtone.c");
+    let built = std::process::Command::new("clang")
+        .args([
+            "-O2",
+            "-framework",
+            "CoreAudio",
+            "-framework",
+            "CoreFoundation",
+            "-o",
+        ])
+        .arg(&player)
+        .arg(src_c)
+        .status()
+        .unwrap();
+    assert!(built.success(), "clang failed");
+    let mut e = Engine::new().unwrap();
+    e.apply(&tap_cfg(false, "")).unwrap();
+    let mut tone = std::process::Command::new(&player)
+        .args(["soundrouter:v2", "600", "0.2", "0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let p = player.to_str().unwrap();
+    let worst = grow("add/remove a real tapped app", 60, |i| {
+        e.apply(&tap_cfg(i % 2 == 0, p)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150)); // the tap aggregate starts
+    });
+    // The last state: tapped and running, with every counter clean.
+    e.apply(&tap_cfg(true, p)).unwrap();
+    let t0 = std::time::Instant::now();
+    while e.tap_delay("v1").is_none() {
+        assert!(t0.elapsed().as_secs() < 10, "the tap aggregate never ran");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert_eq!(e.mismatches("v1"), 0);
+    println!("tap counters {:?}", e.tap_counters("v1"));
+    let _ = tone.kill();
+    let _ = tone.wait();
+    e.apply(&cfg(false, 0.0, false)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(worst < 8 * 1024, "rss grew by {worst} KiB in one loop");
 }
