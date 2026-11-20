@@ -37,7 +37,7 @@ Rebuilds keep asking for permissions: run `packaging/make-dev-identity.sh` once,
 Do not route a virtual device's own output into a monitor that an app records from it, and do not monitor a device to an output that is also tapped. Mute the source or break the cycle in the graph.
 
 ## Uninstall
-`packaging/uninstall.sh` removes the driver, restarts coreaudiod and forgets installer receipts (delete the app by hand); `--purge` also removes `~/Library/Application Support/SoundRouter` (config), logs and the login LaunchAgent. `--dry-run` shows what would be removed.
+`packaging/uninstall.sh` removes the driver, restarts coreaudiod and forgets installer receipts (delete the app by hand); `--purge` also quits a running SoundRouter (it would write its settings back) and removes `~/Library/Application Support/SoundRouter` (config), logs and the login LaunchAgent. `--dry-run` shows what would be removed.
 
 ## Logs
 GUI: `~/Library/Logs/SoundRouter/soundrouter.log`. CLI: stderr; `-v` info, `-vv` debug, `RUST_LOG` overrides.

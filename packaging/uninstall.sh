@@ -16,7 +16,7 @@ Usage: uninstall.sh [--purge] [--dry-run] [--help]
 Removes $DRIVER, restarts coreaudiod and forgets the
 SoundRouter installer receipts. Safe to run repeatedly. Uses sudo unless root.
 
-  --purge     also remove ~/Library/Application Support/SoundRouter,
+  --purge     also quit SoundRouter and remove ~/Library/Application Support/SoundRouter,
               ~/Library/Logs/SoundRouter and the login LaunchAgent
   --dry-run   print the actions without executing them
   --help      show this text
@@ -79,6 +79,8 @@ if [ "$PURGE" = 1 ]; then
     run rm -f "$plist"
     say "removed $plist"
   fi
+  # a running app writes its settings folder back with its next save
+  run pkill -U "$uid" -x SoundRouter || true
   for d in "$TARGET_HOME/Library/Application Support/SoundRouter" "$TARGET_HOME/Library/Logs/SoundRouter"; do
     if [ -e "$d" ]; then
       run rm -rf "$d"
