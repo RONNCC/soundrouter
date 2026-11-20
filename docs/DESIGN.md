@@ -2,7 +2,7 @@
 
 SoundRouter patches audio between apps, microphones and virtual devices. The people using it record podcasts, stream, play music or sit on calls, and the one thing the window has to make obvious is who hears what. The visual language comes from the studio: patch bays, console strips, patch cables ending in jacks, LED level ladders, faders, tape.
 
-Status: the tokens, fonts and egui style below are in place, and every screen reads them. Per-source cable colours (wires are still coloured by left/right channel), sagging cables with jacks, segmented LED meters and the plug-in pop are the next step, as are the remaining `·` strings in the Audio delay menu and the undo toast.
+Status: the tokens, fonts and egui style below are in place, and every screen reads them. The sidebar, footer, sheets, welcome, copy and the graph (source cables, jacks, LED ladders, empty states) are done.
 
 ## The one memorable thing
 
@@ -35,6 +35,10 @@ Assigned per source in order (`cable_color(index)`), stable per source id, the s
 | `#3B6CFF` | `#E8458B` | `#FF8A1F` | `#19B98A` | `#8B5CF6` | `#12AEDB` | `#F2C21B` | `#FF5C5C` |
 
 Coral is deliberately pinker and redder than the terracotta `#D97757` that generated designs default to. App and device tiles without a real icon (`tile_tint`) draw from the same set.
+
+In the graph the colour of a source is the number in its id (`s3` is slot 2, so removing another source never recolours it), used for the jack before its card title and for every wire that carries it. A wire from an output channel takes the colour of the first source feeding that channel, grey when nothing does. A muted source or a disabled device fades its cables into the canvas.
+
+A cable is a cubic bezier whose handles run out of each end and sag in proportion to the horizontal run (`layout::wire_points`, capped at 36 px): 3 px of cable colour over a 1 px darker outline, ending in round jacks (a filled circle, a lighter ring, a dark hole; an empty socket is a raised circle with a muted ring). A hovered wire thickens and shows an x at its middle. Meters are 20-segment LED ladders, one segment per 3 dB from -57 to 0 dBFS: green to -12, amber to -3, red above, unlit segments in `track`, and the segment at the peak holds its light.
 
 ### Status and accent
 
@@ -93,6 +97,29 @@ The brief planned static Regular/Medium/SemiBold/Bold files because egui used to
 ### Motion
 
 Motion only answers an action: a short plug-in pop when a wire connects, eased switches and sliders, meter peak-hold falling back. Nothing animates while idle, and an idle window asks for no repaint (the tests check this).
+
+## Chrome and copy
+
+### Sidebar
+
+- **No vibrancy.** The sidebar is an opaque `panel`, in both themes. The macOS blur showed through a 55 % panel and moved the contrast of every row with the wallpaper behind the window, while the main pane next to it is flat `canvas`; a translucent strip beside a flat one looked like two apps. The window is still created transparent with the blur view under it (`main.rs`), but nothing translucent is painted over it, so it is invisible. Revisit only if the main pane becomes translucent too.
+- **Title and traffic lights.** The window has no title bar and its content runs under the traffic lights, so the sidebar header is a 46 px band: the lights sit at the left, "Devices" starts at x = 84, past them, and a hairline closes the band. Nothing else is drawn in the band.
+- **Rows.** The icon tile takes the device's cable colour (`cable_color(index)`, so a device keeps its colour until a device above it is removed) with a white loop glyph. The selected row is the `selected` fill plus a 3 px bar in the same colour on the straight part of its left edge. The name is the label role, "N channels" is a muted caption, the volume slider has a 14 px knob and the percentage is in the `Num` face. State dot, switch and remove button share the right edge.
+- **No loop glyph next to "Devices".** Tried and dropped, by the mirror test: each row already carries the loop mark in its own colour, and a fourth copy in the header added nothing the tiles do not say.
+
+### Footer
+
+The sidebar footer and the window footer are both 44 px, so their hairlines are one line. Left to right in the sidebar: "New device", the one primary action, in `accent_ink` with a ⊕ and a `selected` pill on hover. In the window footer: "Remove device" (same word as the row's remove button, the toast and Undo), the status text, then "Audio delay: Balanced" (a chip that opens the delay menu), "Test setup" and a quiet "…" button. "Uninstall…" is inside that menu: it is destructive and used once, so it must not sit next to the buttons people press.
+
+### Sheets and welcome
+
+Checklist rows are lighter: the group is an inset `canvas` fill with no outline, the title is the strong role (15), the detail is body size (13). Every primary button is `Kind::Primary`; row actions are secondary, so one button per sheet answers Return.
+
+On a brand-new install (the `.setup-seen` marker file does not exist yet) a welcome sheet comes before anything else: "Route sound between apps, mics and virtual devices.", three plain lines (what a virtual device is, what a source is, where audio goes) and one "Get started" button. It creates the marker as an empty file. The marker still holds the version only once the setup sheet was finished or dismissed, so the permission sheet is not skipped, and an upgrade from a version that already wrote the marker never sees the welcome.
+
+### Copy
+
+Sentence case, active voice, plain verbs. A button says what happens ("Allow microphone", "Install driver", "Run test", "Test again", not "Continue" or "Retry" when something more exact is true). The same action keeps the same name wherever it appears: "Remove" on the row, in the footer, in the toast and in Undo; "Open System Settings" in the banner and in the sheets; "Install driver" on the welcome step and after a failure. An error says what failed and what to do next. Empty states invite an action. No middle dots, no spaced em dashes, no apologies.
 
 ## What we avoided
 

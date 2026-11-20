@@ -1,4 +1,5 @@
 //! Small painted controls: switch, meter, slider knob, icons.
+use crate::meter::FLOOR_DB;
 use crate::theme::Tokens;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Painter, Pos2, Rect, Response, Sense, Stroke,
@@ -34,33 +35,85 @@ pub fn switch(ui: &mut Ui, rect: Rect, id: Id, on: bool, t: &Tokens, label: &str
     new
 }
 
-/// Continuous bar: 0..=1 `level`, 2 px peak tick at `peak`. Colour turns amber from 70 % and red from 90 %.
-pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) {
-    let color = |pos: f32| {
-        if pos > 0.9 {
-            t.bad
-        } else if pos > 0.7 {
-            t.warn
-        } else {
-            t.ok
-        }
-        .gamma_multiply(dim)
-    };
-    let round = CornerRadius::same((r.height() / 2.0) as u8);
-    p.rect_filled(r, round, t.track);
-    let w = r.width() * level.clamp(0.0, 1.0);
-    if w > 0.5 {
-        let fill = Rect::from_min_size(r.min, vec2(w.max(r.height()), r.height()));
-        p.rect_filled(fill, round, color(level));
+/// Segments in an LED ladder: one per 3 dB from -57 to 0 dBFS.
+pub const LED_SEGMENTS: usize = 20;
+const LED_STEP_DB: f32 = 3.0;
+
+/// dBFS at which segment `i` (0 = quietest) lights.
+pub fn led_threshold_db(i: usize) -> f32 {
+    FLOOR_DB + LED_STEP_DB * (i as f32 + 1.0)
+}
+
+/// How many segments light for a 0..=1 bar position (`meter::level`, -60..0 dBFS).
+pub fn led_lit(level: f32) -> usize {
+    let db = FLOOR_DB - FLOOR_DB * level.clamp(0.0, 1.0);
+    // The epsilon absorbs the round trip through `level`'s log and its inverse.
+    (0..LED_SEGMENTS)
+        .take_while(|&i| db + 1e-3 >= led_threshold_db(i))
+        .count()
+}
+
+/// Green up to -12 dBFS, amber up to -3, red above.
+pub fn led_color(i: usize, t: &Tokens) -> Color32 {
+    match led_threshold_db(i) {
+        db if db <= -12.0 => t.ok,
+        db if db <= -3.0 => t.warn,
+        _ => t.bad,
     }
-    if peak > 0.0 {
-        let x =
-            (r.left() + r.width() * peak.clamp(0.0, 1.0)).clamp(r.left() + 1.0, r.right() - 1.0);
-        p.rect_filled(
-            Rect::from_x_y_ranges((x - 1.0)..=(x + 1.0), r.y_range()),
-            CornerRadius::ZERO,
-            color(peak),
+}
+
+/// LED ladder in `r`: the segments up to `level` light, the segment at `peak` holds its light.
+pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) {
+    let n = LED_SEGMENTS as f32;
+    let gap = (r.width() / n * 0.3).clamp(1.0, 2.0);
+    let w = (r.width() - gap * (n - 1.0)) / n;
+    let round = CornerRadius::same((w.min(r.height()) / 3.0).round().max(1.0) as u8);
+    let lit = led_lit(level);
+    let held = if peak > 0.0 {
+        led_lit(peak).checked_sub(1)
+    } else {
+        None
+    };
+    for i in 0..LED_SEGMENTS {
+        let seg = Rect::from_min_size(
+            pos2(r.left() + i as f32 * (w + gap), r.top()),
+            vec2(w, r.height()),
         );
+        let color = if i < lit || held == Some(i) {
+            led_color(i, t).gamma_multiply(dim)
+        } else {
+            t.track
+        };
+        p.rect_filled(seg, round, color);
+    }
+}
+
+/// Opaque darker shade of a cable colour, for outlines and holes.
+pub fn darken(c: Color32) -> Color32 {
+    c.lerp_to_gamma(Color32::BLACK, 0.45)
+}
+
+/// Radius of a jack at rest.
+pub const JACK_R: f32 = 6.0;
+
+/// A round jack. `None` is an empty socket; `Some(color)` a plug in that cable colour. `scale`
+/// grows it for the plug-in pop.
+pub fn jack(p: &Painter, at: Pos2, plug: Option<Color32>, scale: f32, t: &Tokens) {
+    let r = JACK_R * scale;
+    match plug {
+        Some(c) => {
+            p.circle(at, r, c, Stroke::new(1.0, darken(c)));
+            p.circle_stroke(
+                at,
+                r * 0.6,
+                Stroke::new(1.0, c.lerp_to_gamma(Color32::WHITE, 0.55)),
+            );
+            p.circle_filled(at, r * 0.28, Color32::from_black_alpha(170));
+        }
+        None => {
+            p.circle(at, r, t.raised, Stroke::new(1.5, t.muted));
+            p.circle_filled(at, r * 0.34, Color32::from_black_alpha(110));
+        }
     }
 }
 
@@ -225,5 +278,54 @@ pub fn loops(p: &Painter, rect: Rect, color: Color32) {
     let w = Stroke::new(rect.height() * 0.09, color);
     for dx in [-0.17, 0.17] {
         p.circle_stroke(rect.center() + vec2(rect.width() * dx, 0.0), r, w);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meter::level;
+    use crate::theme::tokens;
+
+    fn lin(db: f32) -> f32 {
+        10f32.powf(db / 20.0)
+    }
+
+    #[test]
+    fn ladder_lights_one_segment_per_three_db() {
+        assert_eq!(led_lit(0.0), 0);
+        assert_eq!(led_lit(level(lin(-58.0))), 0);
+        assert_eq!(led_lit(level(lin(-57.0))), 1);
+        assert_eq!(led_lit(level(lin(-30.0))), 10);
+        assert_eq!(led_lit(level(lin(0.0))), LED_SEGMENTS);
+        assert_eq!(led_lit(1.5), LED_SEGMENTS);
+        assert_eq!(led_lit(f32::NAN), 0);
+    }
+
+    #[test]
+    fn ladder_is_monotonic() {
+        let mut last = 0;
+        for i in 0..=600 {
+            let n = led_lit(i as f32 / 600.0);
+            assert!(n >= last);
+            last = n;
+        }
+    }
+
+    #[test]
+    fn ladder_colours_switch_at_minus_12_and_minus_3_dbfs() {
+        let t = tokens(true);
+        let colours: Vec<Color32> = (0..LED_SEGMENTS).map(|i| led_color(i, &t)).collect();
+        // the -12 dBFS segment is the last green, the -3 dBFS one the last amber
+        let at = |db: f32| {
+            (0..LED_SEGMENTS)
+                .find(|&i| led_threshold_db(i) == db)
+                .unwrap()
+        };
+        assert_eq!(colours[at(-12.0)], t.ok);
+        assert_eq!(colours[at(-9.0)], t.warn);
+        assert_eq!(colours[at(-3.0)], t.warn);
+        assert_eq!(colours[at(0.0)], t.bad);
+        assert_eq!(led_threshold_db(LED_SEGMENTS - 1), 0.0);
     }
 }

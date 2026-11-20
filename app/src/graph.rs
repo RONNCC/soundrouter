@@ -2,19 +2,19 @@
 //! Reads the config, emits `Edit`s; never mutates it.
 use crate::icons::{self, IconTextures};
 use crate::layout::{
-    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, PORT_R, TOP, body_height,
-    wire_distance, wire_points,
+    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, TOP, body_height, wire_distance,
+    wire_mid, wire_points,
 };
 use crate::meter::{PeakHold, level};
 use crate::model::{Edit, Link, Port, can_link, ch_label, links};
-use crate::theme::{Tokens, cable_color, caption, label, num, radius, strong, tile_tint};
+use crate::theme::{Tokens, body, cable_color, caption, label, num, radius, section, tile_tint};
 use crate::widgets::{
-    chevron, loops, menu_hint, meter, name_button, name_widget, plus_circle, slider_knob, switch,
-    tile, xmark,
+    chevron, darken, jack, loops, menu_hint, meter, name_button, name_widget, plus_circle,
+    slider_knob, switch, tile, xmark,
 };
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Id, Popup, PopupCloseBehavior, Rect, Response,
-    Sense, Slider, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo,
+    self, Align2, Color32, CornerRadius, FontId, Id, Popup, PopupCloseBehavior, Pos2, Rect,
+    Response, Sense, Shape, Slider, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo,
     epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
 };
 use sr_core::backend::{AppInfo, HwDevice, MeterReading, TccStatus};
@@ -23,6 +23,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 const MAX_ROWS: u16 = 32;
+/// Room kept below the column headers for an empty column's invitation.
+const EMPTY_H: f32 = 190.0;
 
 pub struct GraphCtx<'a> {
     pub dev_idx: usize,
@@ -45,6 +47,10 @@ pub struct GraphCtx<'a> {
 pub struct GraphState {
     pub expanded: HashSet<String>,
     pub peaks: HashMap<(CardId, u16), PeakHold>,
+    /// When each wire of the shown device was plugged in (egui time), for the plug-in pop; a
+    /// wire that was already there when the device came on screen holds `NEG_INFINITY`.
+    pub plugs: HashMap<(Port, Port), f64>,
+    plugs_dev: String,
     pub drag: Option<Port>,
     /// Filled once by a background scan (started on the first frame), see `sr_audio::apps::installed_apps`.
     pub installed: Arc<OnceLock<Vec<AppInfo>>>,
@@ -54,6 +60,8 @@ pub struct GraphState {
     pub filter: String,
     pub focus_search: bool,
     pub show_background: bool,
+    /// Which button's popup the search text belongs to, when more than one can open it.
+    filter_owner: Option<Id>,
 }
 
 /// A row per hardware output channel, and for every wired channel past them (a headset that
@@ -135,16 +143,16 @@ fn sources_summary(dev: &VirtualDevice) -> String {
         .count();
     let mut parts = Vec::new();
     if apps > 0 {
-        parts.push(format!("{apps} App{}", if apps == 1 { "" } else { "s" }));
+        parts.push(format!("{apps} app{}", if apps == 1 { "" } else { "s" }));
     }
     if devs > 0 {
-        parts.push(format!("{devs} Device{}", if devs == 1 { "" } else { "s" }));
+        parts.push(format!("{devs} device{}", if devs == 1 { "" } else { "s" }));
     }
     if dev.sources.iter().any(|s| s.kind == SourceKind::PassThru) {
         parts.push("Pass-Thru".into());
     }
     if parts.is_empty() {
-        "No Sources".into()
+        "No sources".into()
     } else {
         parts.join(", ")
     }
@@ -211,9 +219,18 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
         usize::from(dev.channels / 2),
         &mon_specs,
     );
-    ui.allocate_exact_size(vec2(width, layout.size.y.max(g.min_h)), Sense::hover());
+    let need = if dev.sources.is_empty() || dev.monitors.is_empty() {
+        TOP + EMPTY_H
+    } else {
+        0.0
+    };
+    ui.allocate_exact_size(
+        vec2(width, layout.size.y.max(g.min_h).max(need)),
+        Sense::hover(),
+    );
 
     column_headers(ui, g, st, &layout, edits);
+    empty_columns(ui, g, st, &layout, edits);
     for c in &layout.cards {
         card(ui, g, st, edits, c, dt, &key);
     }
@@ -232,14 +249,14 @@ fn column_headers(
     let base = layout.origin.y + TOP;
     let heads: [(&str, String); 3] = [
         ("Sources", sources_summary(dev)),
-        ("Output Channels", format!("{} Channels", dev.channels)),
+        ("Output channels", format!("{} channels", dev.channels)),
         (
             "Monitors",
-            format!(
-                "{} Device{}",
-                dev.monitors.len(),
-                if dev.monitors.len() == 1 { "" } else { "s" }
-            ),
+            match dev.monitors.len() {
+                0 => "No devices".to_string(),
+                1 => "1 device".to_string(),
+                n => format!("{n} devices"),
+            },
         ),
     ];
     for (i, (title, sub)) in heads.iter().enumerate() {
@@ -247,16 +264,16 @@ fn column_headers(
         text_left(
             ui,
             x + 2.0,
-            base - 38.0,
+            base - 37.0,
             title,
-            strong(),
+            section(),
             t.ink,
             layout.card_w - 50.0,
         );
         text_left(
             ui,
             x + 2.0,
-            base - 20.0,
+            base - 14.0,
             sub,
             caption(),
             t.muted,
@@ -279,13 +296,7 @@ fn column_headers(
                     pos2(right - 4.0, base - 28.0),
                     hint_color(&resp, t),
                 );
-                let shown = Popup::menu(&resp)
-                    .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| source_menu(ui, g, st, edits));
-                if shown.is_none() {
-                    st.filter.clear();
-                    st.focus_search = true;
-                }
+                source_popup(g, st, edits, &resp);
             }
             1 => {
                 let resp = plus_circle(
@@ -337,6 +348,198 @@ fn column_headers(
 
 fn hint_color(resp: &Response, t: &Tokens) -> Color32 {
     if resp.hovered() { t.ink } else { t.muted }
+}
+
+/// The Sources popup under `anchor`. Its search starts empty and focused on every open, whichever
+/// button opened it.
+fn source_popup(g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>, anchor: &Response) {
+    let shown = Popup::menu(anchor)
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| source_menu(ui, g, st, edits));
+    if shown.is_some() {
+        st.filter_owner = Some(anchor.id);
+    } else if st.filter_owner.is_none_or(|o| o == anchor.id) {
+        st.filter_owner = None;
+        st.filter.clear();
+        st.focus_search = true;
+    }
+}
+
+/// Closed outline of a rounded rectangle, to dash.
+fn rounded_path(r: Rect, rad: f32) -> Vec<Pos2> {
+    let corners = [
+        (pos2(r.right() - rad, r.top() + rad), -90.0f32),
+        (pos2(r.right() - rad, r.bottom() - rad), 0.0),
+        (pos2(r.left() + rad, r.bottom() - rad), 90.0),
+        (pos2(r.left() + rad, r.top() + rad), 180.0),
+    ];
+    let mut path = Vec::new();
+    for (c, from) in corners {
+        for k in 0..=6 {
+            let a = (from + 15.0 * k as f32).to_radians();
+            path.push(c + rad * vec2(a.cos(), a.sin()));
+        }
+    }
+    path.push(path[0]);
+    path
+}
+
+/// A dashed slot where a column has no cards: one sentence and the button that fills it.
+#[allow(clippy::too_many_arguments)]
+fn empty_slot(
+    ui: &mut Ui,
+    t: &Tokens,
+    top_left: Pos2,
+    w: f32,
+    id: Id,
+    text: &str,
+    button: &str,
+    name: &str,
+) -> Response {
+    const PAD: f32 = 16.0;
+    let p = ui.painter().clone();
+    let words = p.layout(text.to_string(), body(), t.muted, w - 2.0 * PAD);
+    let btn_w = p
+        .layout_no_wrap(button.to_string(), label(), t.ink)
+        .size()
+        .x
+        + 28.0;
+    let rect = Rect::from_min_size(top_left, vec2(w, PAD + words.size().y + 12.0 + 28.0 + PAD));
+    let dash = Stroke::new(1.0, t.muted.gamma_multiply(0.5));
+    p.extend(Shape::dashed_line(
+        &rounded_path(rect, f32::from(radius::STRIP)),
+        dash,
+        5.0,
+        4.0,
+    ));
+    let btn = Rect::from_min_size(
+        pos2(rect.left() + PAD, rect.top() + PAD + words.size().y + 12.0),
+        vec2(btn_w, 28.0),
+    );
+    p.galley(rect.min + vec2(PAD, PAD), words, t.muted);
+    let resp = ui.interact(btn, id, Sense::click());
+    name_button(&resp, name);
+    let fill = if resp.hovered() { t.selected } else { t.raised };
+    let pill = CornerRadius::same(radius::PILL);
+    p.rect(
+        btn,
+        pill,
+        fill,
+        Stroke::new(1.0, t.hairline),
+        StrokeKind::Inside,
+    );
+    p.text(btn.center(), Align2::CENTER_CENTER, button, label(), t.ink);
+    if resp.has_focus() {
+        p.rect_stroke(btn, pill, Stroke::new(2.0, t.focus), StrokeKind::Outside);
+    }
+    resp
+}
+
+/// The invitation in a column with no cards.
+fn empty_columns(
+    ui: &mut Ui,
+    g: &GraphCtx,
+    st: &mut GraphState,
+    layout: &Layout,
+    edits: &mut Vec<Edit>,
+) {
+    let (dev, t, d) = (g.dev, g.t, g.dev_idx);
+    let top = layout.origin.y + TOP;
+    if dev.sources.is_empty() {
+        let at = pos2(layout.origin.x + layout.col_x[0], top);
+        let resp = empty_slot(
+            ui,
+            t,
+            at,
+            layout.card_w,
+            Id::unique(("empty_src", d)),
+            "Nothing plugged in yet. Add an app or a microphone and drag a cable to an output.",
+            "Add source",
+            "Add source (empty list)",
+        );
+        source_popup(g, st, edits, &resp);
+    }
+    if dev.monitors.is_empty() {
+        let at = pos2(layout.origin.x + layout.col_x[2], top);
+        let resp = empty_slot(
+            ui,
+            t,
+            at,
+            layout.card_w,
+            Id::unique(("empty_mon", d)),
+            "Nobody is listening yet. Add speakers or headphones to hear this device.",
+            "Add monitor",
+            "Add monitor (empty list)",
+        );
+        Popup::menu(&resp).show(|ui| monitor_menu(ui, g, edits));
+    }
+}
+
+/// The window with no devices: two jacks joined by a sagging cable, and the one thing to do.
+/// Returns true when "Create your first device" is clicked.
+pub fn no_devices(ui: &mut Ui, t: &Tokens, area: Rect) -> bool {
+    let p = ui.painter().clone();
+    let mid = area.center();
+    let art = mid.y - 84.0;
+    let (a, b) = (pos2(mid.x - 76.0, art), pos2(mid.x + 76.0, art));
+    let cable = cable_color(0);
+    for end in [a, b] {
+        p.circle(end, 22.0, t.raised, Stroke::new(2.0, t.hairline));
+    }
+    draw_cable(&p, wire_points(a, b), cable, 6.0);
+    for end in [a, b] {
+        jack(&p, end, Some(cable), 2.4, t);
+    }
+    p.text(
+        pos2(mid.x, mid.y - 14.0),
+        Align2::CENTER_CENTER,
+        "No devices yet",
+        section(),
+        t.ink,
+    );
+    let words = p.layout(
+        "A device collects sound from apps and microphones and sends it to speakers or headphones."
+            .to_string(),
+        body(),
+        t.muted,
+        340.0,
+    );
+    let top = mid.y + 10.0;
+    p.galley(
+        pos2(mid.x - words.size().x / 2.0, top),
+        words.clone(),
+        t.muted,
+    );
+    let text = "Create your first device";
+    let btn_w = p
+        .layout_no_wrap(text.to_string(), label(), Color32::WHITE)
+        .size()
+        .x
+        + 36.0;
+    let btn = Rect::from_center_size(
+        pos2(mid.x, top + words.size().y + 16.0 + 16.0),
+        vec2(btn_w, 32.0),
+    );
+    let resp = ui.interact(btn, Id::unique("create_first_device"), Sense::click());
+    name_button(&resp, text);
+    let fill = if resp.hovered() {
+        t.accent.lerp_to_gamma(Color32::BLACK, 0.15)
+    } else {
+        t.accent
+    };
+    let pill = CornerRadius::same(radius::PILL);
+    p.rect_filled(btn, pill, fill);
+    p.text(
+        btn.center(),
+        Align2::CENTER_CENTER,
+        text,
+        label(),
+        Color32::WHITE,
+    );
+    if resp.has_focus() {
+        p.rect_stroke(btn, pill, Stroke::new(2.0, t.focus), StrokeKind::Outside);
+    }
+    resp.clicked()
 }
 
 /// One menu line: icon, label, accent highlight on hover. Returns true when clicked.
@@ -708,8 +911,26 @@ fn card(
             .x
             - 14.0
     });
-    let title_w = r.width()
-        - 28.0
+    // A source wears its cable colour: a small jack before the title.
+    let title_x = r.left()
+        + 14.0
+        + match c.id {
+            CardId::Src(i) => {
+                let at = pos2(r.left() + 14.0 + 5.0, r.top() + HEAD_H / 2.0);
+                jack(
+                    &painter,
+                    at,
+                    Some(source_color(dev, i).gamma_multiply(dim)),
+                    0.85,
+                    t,
+                );
+                16.0
+            }
+            _ => 0.0,
+        };
+    let title_w = r.right()
+        - 14.0
+        - title_x
         - if on.is_some() {
             84.0 + note_w.max(0.0)
         } else {
@@ -717,7 +938,7 @@ fn card(
         };
     text_left(
         ui,
-        r.left() + 14.0,
+        title_x,
         r.top() + HEAD_H / 2.0,
         &title,
         label(),
@@ -725,7 +946,7 @@ fn card(
         title_w,
     );
     if let Some(n) = note {
-        let hit = Rect::from_min_size(pos2(r.left() + 14.0, r.top()), vec2(title_w, HEAD_H));
+        let hit = Rect::from_min_size(pos2(title_x, r.top()), vec2(title_w, HEAD_H));
         ui.interact(hit, Id::unique(("card_note", d, c.id)), Sense::hover())
             .widget_info(|| WidgetInfo::labeled(egui::Role::Label, true, format!("{title}: {n}")));
     }
@@ -817,17 +1038,16 @@ fn card(
             CardId::Out(p) => (p as u16 * 2 + row, 0),
             _ => (row, total_rows),
         };
-        let lbl = match c.id {
-            CardId::Out(_) => format!("Channel {}", ch_label(ch_for_label, lbl_total)),
-            _ => ch_label(ch_for_label, lbl_total),
-        };
-        painter.text(
-            pos2(label_x, y),
-            Align2::LEFT_CENTER,
-            lbl,
-            caption(),
-            t.muted.gamma_multiply(dim),
-        );
+        let lbl = ch_label(ch_for_label, lbl_total);
+        let ink = t.muted.gamma_multiply(dim);
+        let mut x = label_x;
+        if matches!(c.id, CardId::Out(_)) {
+            x += painter
+                .text(pos2(x, y), Align2::LEFT_CENTER, "Channel", caption(), ink)
+                .width()
+                + 5.0;
+        }
+        painter.text(pos2(x, y), Align2::LEFT_CENTER, lbl, num(11.0), ink);
         let lin = if active { row_level(g, c.id, row) } else { 0.0 };
         let lv = level(lin);
         let pk = st.peaks.entry((c.id, row)).or_default().update(lv, dt);
@@ -837,7 +1057,7 @@ fn card(
         }
         meter(
             &painter,
-            Rect::from_x_y_ranges(meter_l..=(r.right() - 18.0), (y - 3.0)..=(y + 3.0)),
+            Rect::from_x_y_ranges(meter_l..=(r.right() - 18.0), (y - 4.0)..=(y + 4.0)),
             lv,
             pk,
             t,
@@ -845,35 +1065,42 @@ fn card(
         );
     }
 
-    // Options disclosure.
+    // Options disclosure: a quiet chevron at the foot of the card while it is hot.
     if !c.options {
         return;
     }
     let y0 = body_top + body_h;
-    painter.hline(r.x_range(), y0, Stroke::new(1.0, t.hairline));
-    let opt = Rect::from_min_size(pos2(r.left(), y0), vec2(r.width(), FOOT_H));
-    let resp = ui.interact(opt, Id::unique(("opt", d, c.id)), Sense::click());
+    let strip = Rect::from_min_max(
+        pos2(r.left() + 14.0, y0 - 6.0),
+        pos2(r.right() - 14.0, y0 + FOOT_H),
+    );
+    let resp = ui.interact(strip, Id::unique(("opt", d, c.id)), Sense::click());
     name_button(&resp, &format!("{title} options"));
-    let col = if resp.hovered() { t.ink } else { t.muted };
-    chevron(
-        &painter,
-        pos2(r.left() + 20.0, opt.center().y),
-        c.expanded,
-        col,
-    );
-    painter.text(
-        pos2(r.left() + 32.0, opt.center().y),
-        Align2::LEFT_CENTER,
-        "Options",
-        caption(),
-        col,
-    );
+    let aimed = resp.hovered() || resp.has_focus();
+    if c.expanded || aimed || ui.rect_contains_pointer(r) {
+        let col = if aimed { t.ink } else { t.muted };
+        chevron(
+            &painter,
+            pos2(r.center().x, y0 + FOOT_H / 2.0),
+            c.expanded,
+            col,
+        );
+    }
+    if resp.has_focus() {
+        painter.rect_stroke(
+            strip,
+            CornerRadius::same(radius::INPUT),
+            Stroke::new(2.0, t.focus),
+            StrokeKind::Inside,
+        );
+    }
     if resp.clicked() && !st.expanded.remove(&opt_key) {
         st.expanded.insert(opt_key.clone());
     }
     if !c.expanded {
         return;
     }
+    painter.hline(r.x_range(), y0, Stroke::new(1.0, t.hairline));
     let vrow = Rect::from_min_size(
         pos2(r.left() + 14.0, y0 + FOOT_H),
         vec2(r.width() - 28.0, 22.0),
@@ -989,16 +1216,40 @@ fn row_level(g: &GraphCtx, id: CardId, row: u16) -> f32 {
     }
 }
 
-fn link_color(l: Link) -> Color32 {
-    let ch = match l.from {
-        Port::Src { ch, .. } | Port::OutOut { ch } => ch,
-        _ => 0,
-    };
-    cable_color(usize::from(ch % 2))
+/// Colour slot of a source: the number in its id (`s3` is slot 2), so adding or removing other
+/// sources never recolours it. An id without a number takes its position.
+pub fn source_slot(id: &str, index: usize) -> usize {
+    id.strip_prefix('s')
+        .and_then(|n| n.parse::<usize>().ok())
+        .map_or(index, |n| n.saturating_sub(1))
 }
 
-fn port_color(p: Port) -> Color32 {
-    link_color(Link { from: p, to: p })
+/// The cable colour of `dev.sources[i]`, on its card, its jacks and every wire from it.
+fn source_color(dev: &VirtualDevice, i: usize) -> Color32 {
+    cable_color(source_slot(&dev.sources[i].id, i))
+}
+
+/// The source whose signal passes through a port: its own for a source port, else whatever feeds
+/// the port first, followed back through the output channels.
+fn feeding_source(all: &[Link], p: Port) -> Option<usize> {
+    match p {
+        Port::Src { src, .. } => Some(src),
+        Port::OutOut { ch } => feeding_source(all, Port::OutIn { ch }),
+        Port::OutIn { .. } | Port::Mon { .. } => all
+            .iter()
+            .find(|l| l.to == p)
+            .and_then(|l| feeding_source(all, l.from)),
+    }
+}
+
+const POP_SECS: f64 = 0.12;
+
+/// Scale of a jack `age` seconds after its wire was plugged in: swells to 1.5x and settles back.
+pub fn pop_scale(age: f64) -> f32 {
+    if !(0.0..POP_SECS).contains(&age) {
+        return 1.0;
+    }
+    1.0 + 0.5 * (std::f64::consts::PI * age / POP_SECS).sin() as f32
 }
 
 /// Accessible name of a port, e.g. "Safari channel 1 output".
@@ -1019,13 +1270,16 @@ fn port_label(g: &GraphCtx, p: Port) -> String {
     }
 }
 
-fn wire_shape(a: egui::Pos2, b: egui::Pos2, color: Color32, w: f32) -> CubicBezierShape {
-    CubicBezierShape::from_points_stroke(
-        wire_points(a, b),
-        false,
-        Color32::TRANSPARENT,
-        Stroke::new(w, color),
-    )
+/// A cable: a darker outline one pixel wider on each side under the cable colour.
+fn draw_cable(p: &egui::Painter, pts: [Pos2; 4], color: Color32, width: f32) {
+    for (w, c) in [(width + 2.0, darken(color)), (width, color)] {
+        p.add(CubicBezierShape::from_points_stroke(
+            pts,
+            false,
+            Color32::TRANSPARENT,
+            Stroke::new(w, c),
+        ));
+    }
 }
 
 fn wires_and_ports(
@@ -1077,9 +1331,45 @@ fn wires_and_ports(
 
     let painter = ui.painter().clone();
     let all = links(dev);
-    let src_active = |p: Port| match p {
-        Port::Src { src, .. } => !dev.sources[src].muted,
-        _ => true,
+    let now = ui.input(|i| i.time);
+    // A wire seen for the first time pops its destination jack. The first frame of a device only
+    // learns the wires it already has.
+    let fresh = if st.plugs_dev == dev.id {
+        now
+    } else {
+        st.plugs.clear();
+        st.plugs_dev.clone_from(&dev.id);
+        f64::NEG_INFINITY
+    };
+    for l in &all {
+        st.plugs.entry((l.from, l.to)).or_insert(fresh);
+    }
+    st.plugs
+        .retain(|k, _| all.iter().any(|l| (l.from, l.to) == *k));
+    if st
+        .plugs
+        .values()
+        .any(|t0| (0.0..POP_SECS).contains(&(now - t0)))
+    {
+        ui.request_repaint();
+    }
+    let pop = |p: Port| {
+        all.iter()
+            .filter(|l| l.to == p)
+            .filter_map(|l| st.plugs.get(&(l.from, l.to)))
+            .map(|t0| pop_scale(now - t0))
+            .fold(1.0, f32::max)
+    };
+    // A cable has the colour of the source it carries; a muted source or a disabled device
+    // fades it into the canvas.
+    let cable = |p: Port| {
+        let src = feeding_source(&all, p);
+        let c = src.map_or(t.muted, |s| source_color(dev, s));
+        if dev.enabled && src.is_none_or(|s| !dev.sources[s].muted) {
+            c
+        } else {
+            c.lerp_to_gamma(t.canvas, 0.65)
+        }
     };
     // Only the graph's own layer: never a wire under an open menu or the setup sheet.
     let on_graph = |pos| ui.ctx().layer_id_at(pos).is_none_or(|l| l == ui.layer_id());
@@ -1104,37 +1394,44 @@ fn wires_and_ports(
             continue;
         };
         let hot = hover == Some(l.from) || hover == Some(l.to) || hovered_wire == Some(n);
-        let mut c = link_color(*l);
-        if !src_active(l.from) || !dev.enabled {
-            c = c.gamma_multiply(0.35);
-        }
-        painter.add(wire_shape(a, b, c, if hot { 3.5 } else { 2.0 }));
+        draw_cable(
+            &painter,
+            wire_points(a, b),
+            cable(l.from),
+            if hot { 4.5 } else { 3.0 },
+        );
     }
     if let (Some(from), Some(pos)) = (st.drag, pointer)
         && let Some(a) = layout.port_pos(from)
     {
         let end = target.and_then(|p| layout.port_pos(p)).unwrap_or(pos);
-        painter.add(wire_shape(
-            a,
-            end,
-            port_color(from).gamma_multiply(0.75),
-            2.0,
-        ));
+        draw_cable(&painter, wire_points(a, end), cable(from), 3.0);
+        if target.is_none() {
+            // The loose end carries its plug until it lands.
+            jack(&painter, end, Some(cable(from)), 1.0, t);
+        }
     }
     for &p in &ports {
         let Some(pos) = layout.port_pos(p) else {
             continue;
         };
-        let c = port_color(p);
         let linked = all.iter().any(|l| l.from == p || l.to == p);
         let hot = hover == Some(p) || target == Some(p);
-        let radius = if hot { PORT_R + 1.5 } else { PORT_R };
-        painter.circle(
-            pos,
-            radius,
-            if linked || hot { c } else { t.raised },
-            Stroke::new(1.5, c),
-        );
+        let plug = match (linked, target == Some(p), st.drag) {
+            (true, _, _) => Some(cable(p)),
+            (false, true, Some(from)) => Some(cable(from)),
+            _ => None,
+        };
+        let grow = if hot { 1.25 } else { 1.0 };
+        jack(&painter, pos, plug, grow * pop(p), t);
+    }
+    // The hovered wire shows where a click takes it out.
+    if let Some(n) = hovered_wire
+        && let (Some(a), Some(b)) = (layout.port_pos(all[n].from), layout.port_pos(all[n].to))
+    {
+        let mid = wire_mid(&wire_points(a, b));
+        painter.circle(mid, 9.0, t.raised, Stroke::new(1.0, t.bad_ink));
+        xmark(&painter, mid, t.bad_ink);
     }
 }
 
@@ -1426,5 +1723,310 @@ mod tests {
         assert!(p.apps.is_empty());
         assert_eq!(names(&p.background), ["assistantd"]);
         assert!(picks(&[], &apps, "nothing like this").apps.is_empty());
+    }
+
+    fn sources(n: usize) -> VirtualDevice {
+        let mut c = bare_config();
+        for i in 0..n {
+            let kind = SourceKind::App {
+                bundle_id: format!("app.n{i}"),
+            };
+            apply(&mut c, Edit::AddSource(0, kind, 2));
+        }
+        c.devices.remove(0)
+    }
+
+    fn colours(dev: &VirtualDevice) -> Vec<(String, Color32)> {
+        (0..dev.sources.len())
+            .map(|i| (dev.sources[i].id.clone(), source_color(dev, i)))
+            .collect()
+    }
+
+    #[test]
+    fn a_source_keeps_its_cable_colour_when_others_come_and_go() {
+        let mut c = bare_config();
+        for i in 0..4 {
+            let kind = SourceKind::App {
+                bundle_id: format!("app.n{i}"),
+            };
+            apply(&mut c, Edit::AddSource(0, kind, 2));
+            let now = colours(&c.devices[0]);
+            // the colour of an earlier source never changes when a later one is added
+            assert_eq!(now.len(), i + 1);
+            assert_eq!(now[i].1, cable_color(i));
+        }
+        let before = colours(&c.devices[0]);
+        apply(&mut c, Edit::RemoveSource(0, 1));
+        let after = colours(&c.devices[0]);
+        assert_eq!(after.len(), 3);
+        for (id, colour) in &after {
+            assert_eq!(before.iter().find(|b| b.0 == *id).unwrap().1, *colour);
+        }
+        // every source of a device with fewer than eight has its own colour
+        let mut distinct: Vec<Color32> = after.iter().map(|a| a.1).collect();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3);
+    }
+
+    #[test]
+    fn colour_slots_follow_the_id_number_else_the_position() {
+        assert_eq!(source_slot("s1", 5), 0);
+        assert_eq!(source_slot("s8", 0), 7);
+        assert_eq!(source_slot("s0", 3), 0);
+        assert_eq!(source_slot("mic", 3), 3);
+        assert_eq!(source_slot("sx", 2), 2);
+        assert_eq!(source_slot("", 1), 1);
+    }
+
+    #[test]
+    fn a_wire_carries_the_colour_of_the_source_behind_it() {
+        let src = |s, ch| Port::Src { src: s, ch };
+        let all = [
+            Link {
+                from: src(1, 0),
+                to: Port::OutIn { ch: 0 },
+            },
+            Link {
+                from: src(0, 0),
+                to: Port::OutIn { ch: 0 },
+            },
+            Link {
+                from: Port::OutOut { ch: 0 },
+                to: Port::Mon { mon: 0, ch: 1 },
+            },
+        ];
+        assert_eq!(feeding_source(&all, src(0, 1)), Some(0));
+        assert_eq!(feeding_source(&all, Port::OutIn { ch: 0 }), Some(1));
+        assert_eq!(feeding_source(&all, Port::OutOut { ch: 0 }), Some(1));
+        assert_eq!(feeding_source(&all, Port::Mon { mon: 0, ch: 1 }), Some(1));
+        // nothing feeds channel 2, nor a monitor channel without a wire
+        assert_eq!(feeding_source(&all, Port::OutOut { ch: 1 }), None);
+        assert_eq!(feeding_source(&all, Port::Mon { mon: 0, ch: 0 }), None);
+    }
+
+    #[test]
+    fn the_plug_in_pop_swells_then_settles_and_only_while_young() {
+        assert_eq!(pop_scale(-1.0), 1.0);
+        assert_eq!(pop_scale(0.0), 1.0);
+        assert!((pop_scale(POP_SECS / 2.0) - 1.5).abs() < 1e-6);
+        assert_eq!(pop_scale(POP_SECS), 1.0);
+        assert_eq!(pop_scale(5.0), 1.0);
+        assert_eq!(pop_scale(f64::INFINITY), 1.0);
+        assert!(pop_scale(POP_SECS * 0.25) > 1.0);
+    }
+
+    #[test]
+    fn a_new_wire_asks_for_frames_only_while_its_jack_pops() {
+        let mut dev = device();
+        dev.wires.clear();
+        let mut h = rig(dev);
+        h.run_steps(10);
+        assert!(
+            !h.ctx.has_requested_repaint(),
+            "{:?}",
+            h.ctx.repaint_causes()
+        );
+        let source = h.state().dev.sources[0].id.clone();
+        h.state_mut().dev.wires.push(sr_core::config::Wire {
+            source,
+            src_ch: 0,
+            out_ch: 0,
+        });
+        h.step();
+        assert!(h.ctx.has_requested_repaint());
+        h.run_steps(6); // 0.3 s
+        assert!(
+            !h.ctx.has_requested_repaint(),
+            "{:?}",
+            h.ctx.repaint_causes()
+        );
+    }
+
+    #[test]
+    fn wires_that_were_already_there_do_not_pop() {
+        let mut h = rig(device());
+        h.run_steps(2);
+        assert!(!h.ctx.has_requested_repaint());
+    }
+
+    #[test]
+    fn an_empty_device_invites_you_to_add_a_source_and_a_monitor() {
+        let mut dev = sources(0);
+        dev.monitors.clear();
+        let mut h = rig(dev);
+        h.get_by_label("Add monitor (empty list)");
+        h.get_by_label("Add source (empty list)").click();
+        h.run_steps(3);
+        h.get_by_label("Search sources");
+    }
+
+    #[test]
+    fn the_invitation_goes_away_with_the_first_source() {
+        let h = rig(device());
+        assert!(h.query_by_label("Add source (empty list)").is_none());
+        assert!(h.query_by_label("Add monitor (empty list)").is_none());
+    }
+
+    #[test]
+    fn options_stay_reachable_without_the_footer_row() {
+        let mut h = rig(device());
+        h.get_by_label("y options").click();
+        h.run_steps(3);
+        h.get_by_label("y volume");
+    }
+
+    /// Snapshots: `cargo test -p soundrouter-app --features snapshots` (`UPDATE_SNAPSHOTS=1` rewrites).
+    #[cfg(feature = "snapshots")]
+    mod snapshots {
+        use super::*;
+        use crate::fake::{FakeBackend, demo_config};
+        use eframe::egui::Theme;
+        use sr_core::backend::Backend;
+
+        struct P {
+            st: GraphState,
+            dev: VirtualDevice,
+            hw: Vec<HwDevice>,
+            reading: Option<MeterReading>,
+            layout: Option<Layout>,
+            dark: bool,
+            none: bool,
+        }
+
+        fn harness(
+            theme: Theme,
+            dev: VirtualDevice,
+            loud: bool,
+            none: bool,
+        ) -> Harness<'static, P> {
+            let reading = loud.then(|| MeterReading {
+                sources: dev
+                    .sources
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let lv = [[0.9, 0.55], [0.12, 0.05], [0.0, 0.0]][i % 3];
+                        (s.id.clone(), lv[..usize::from(s.channels).min(2)].to_vec())
+                    })
+                    .collect(),
+                channels: vec![0.9, 0.55],
+            });
+            Harness::builder()
+                .with_size(vec2(1000.0, 560.0))
+                .with_step_dt(0.05)
+                .with_theme(theme)
+                .with_context_setup(install_fonts)
+                .wgpu()
+                .build_ui_state(
+                    |ui, s: &mut P| {
+                        let tk = tokens(s.dark);
+                        ui.painter()
+                            .rect_filled(ui.max_rect(), CornerRadius::ZERO, tk.canvas);
+                        if s.none {
+                            no_devices(ui, &tk, ui.max_rect());
+                            return;
+                        }
+                        let g = GraphCtx {
+                            dev_idx: 0,
+                            dev: &s.dev,
+                            hw: &s.hw,
+                            apps: &[],
+                            icons: &IconTextures::default(),
+                            installed: &[],
+                            reading: s.reading.as_ref(),
+                            t: &tk,
+                            mic: TccStatus::Granted,
+                            min_h: 520.0,
+                        };
+                        s.layout = Some(show(ui, &g, &mut s.st, &mut Vec::new()));
+                    },
+                    P {
+                        st: GraphState::default(),
+                        dev,
+                        hw: FakeBackend::new().hardware(),
+                        reading,
+                        layout: None,
+                        dark: theme == Theme::Dark,
+                        none,
+                    },
+                )
+        }
+
+        fn populated() -> VirtualDevice {
+            let mut c = demo_config();
+            c.devices.remove(0)
+        }
+
+        #[test]
+        fn populated_device() {
+            let mut results = egui_kittest::SnapshotResults::new();
+            for (theme, name) in [(Theme::Dark, "graph_dark"), (Theme::Light, "graph_light")] {
+                let mut h = harness(theme, populated(), true, false);
+                h.run_steps(30);
+                h.snapshot(name);
+                results.extend_harness(&mut h);
+            }
+        }
+
+        #[test]
+        fn empty_device() {
+            let mut results = egui_kittest::SnapshotResults::new();
+            for (theme, name) in [
+                (Theme::Dark, "graph_empty_dark"),
+                (Theme::Light, "graph_empty_light"),
+            ] {
+                let mut dev = populated();
+                dev.sources.clear();
+                dev.wires.clear();
+                dev.monitors.clear();
+                let mut h = harness(theme, dev, false, false);
+                h.run_steps(3);
+                h.snapshot(name);
+                results.extend_harness(&mut h);
+            }
+        }
+
+        #[test]
+        fn no_devices_at_all() {
+            let mut results = egui_kittest::SnapshotResults::new();
+            for (theme, name) in [
+                (Theme::Dark, "graph_no_devices_dark"),
+                (Theme::Light, "graph_no_devices_light"),
+            ] {
+                let mut h = harness(theme, populated(), false, true);
+                h.run_steps(3);
+                h.snapshot(name);
+                results.extend_harness(&mut h);
+            }
+        }
+
+        #[test]
+        fn cable_in_flight_and_hovered_wire() {
+            let mut results = egui_kittest::SnapshotResults::new();
+            for (theme, name) in [
+                (Theme::Dark, "graph_drag_dark"),
+                (Theme::Light, "graph_drag_light"),
+            ] {
+                let mut dev = populated();
+                dev.wires.clear();
+                let mut h = harness(theme, dev, true, false);
+                h.run_steps(3);
+                let from = h
+                    .state()
+                    .layout
+                    .as_ref()
+                    .unwrap()
+                    .port_pos(Port::Src { src: 1, ch: 0 })
+                    .unwrap();
+                h.hover_at(from);
+                h.step();
+                h.drag_at(from);
+                h.step();
+                h.hover_at(from + vec2(150.0, 90.0));
+                h.run_steps(3);
+                h.snapshot(name);
+                results.extend_harness(&mut h);
+            }
+        }
     }
 }

@@ -6,7 +6,8 @@ pub const HEAD_H: f32 = 34.0;
 /// Minimum body height of a card with a big icon.
 pub const ICON_BODY: f32 = 48.0;
 pub const ROW_H: f32 = 24.0;
-pub const FOOT_H: f32 = 28.0;
+/// Strip under the channel rows that holds the options chevron.
+pub const FOOT_H: f32 = 16.0;
 pub const OPTIONS_H: f32 = 58.0;
 /// Extra height of an expanded app card: the "Mute in original output" row.
 pub const MUTE_H: f32 = 22.0;
@@ -15,7 +16,6 @@ pub const GAP: f32 = 16.0;
 /// Space above the first card for the column headers.
 pub const TOP: f32 = 54.0;
 pub const SIDE: f32 = 24.0;
-pub const PORT_R: f32 = 4.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CardId {
@@ -204,10 +204,24 @@ impl Layout {
     }
 }
 
-/// Cubic bezier control points: control handles run horizontally out of each end.
+/// Longest droop the control points get, in px.
+const SAG_MAX: f32 = 36.0;
+
+/// Cubic bezier control points of a cable: the handles run out of each end and gravity pushes
+/// them down in proportion to the horizontal run (capped), so a long cable hangs lower.
 pub fn wire_points(a: Pos2, b: Pos2) -> [Pos2; 4] {
-    let dx = ((b.x - a.x) * 0.5).max(40.0);
-    [a, a + vec2(dx, 0.0), b - vec2(dx, 0.0), b]
+    let run = (b.x - a.x).abs();
+    let dx = (run * 0.5).max(40.0);
+    let sag = vec2(0.0, (run * 0.16).min(SAG_MAX));
+    [a, a + vec2(dx, 0.0) + sag, b - vec2(dx, 0.0) + sag, b]
+}
+
+/// Midpoint of the curve (t = 0.5).
+pub fn wire_mid(p: &[Pos2; 4]) -> Pos2 {
+    pos2(
+        (p[0].x + 3.0 * p[1].x + 3.0 * p[2].x + p[3].x) / 8.0,
+        (p[0].y + 3.0 * p[1].y + 3.0 * p[2].y + p[3].y) / 8.0,
+    )
 }
 
 /// Approximate distance from `pos` to the curve (polyline of 32 samples).
@@ -343,15 +357,37 @@ mod tests {
     }
 
     #[test]
-    fn wire_passes_through_both_ends_and_midpoint() {
+    fn wire_passes_through_both_ends_and_sagged_midpoint() {
         let (a, b) = (pos2(0.0, 0.0), pos2(200.0, 100.0));
         let p = wire_points(a, b);
-        for on_curve in [a, b, pos2(100.0, 50.0)] {
+        for on_curve in [a, b, wire_mid(&p)] {
             assert!(wire_distance(&p, on_curve) < 1e-3, "{on_curve:?}");
         }
-        // handles stay horizontal
-        assert_eq!(p[1].y, a.y);
-        assert_eq!(p[2].y, b.y);
+        // gravity: the middle hangs below the straight line between the ends
+        assert!(wire_mid(&p).y > 50.0);
+    }
+
+    #[test]
+    fn sag_grows_with_the_run_and_is_capped() {
+        let droop = |run: f32| wire_points(pos2(0.0, 0.0), pos2(run, 0.0))[1].y;
+        assert!(droop(50.0) < droop(150.0));
+        assert_eq!(droop(1000.0), SAG_MAX);
+        assert_eq!(droop(5000.0), SAG_MAX);
+        assert_eq!(droop(0.0), 0.0);
+    }
+
+    #[test]
+    fn sag_is_finite_deterministic_and_mirror_symmetric() {
+        let (a, b) = (pos2(12.5, 80.0), pos2(310.0, -40.0));
+        let p = wire_points(a, b);
+        assert_eq!(p, wire_points(a, b));
+        assert!(p.iter().all(|q| q.x.is_finite() && q.y.is_finite()));
+        // mirrored left to right, the cable is the same curve walked backwards
+        let mirror = |q: Pos2| pos2(-q.x, q.y);
+        let m = wire_points(mirror(b), mirror(a));
+        for i in 0..4 {
+            assert_eq!(m[i], mirror(p[3 - i]));
+        }
     }
 
     #[test]
@@ -363,7 +399,7 @@ mod tests {
     #[test]
     fn wire_distance_is_small_on_curve() {
         let p = wire_points(pos2(0.0, 0.0), pos2(200.0, 100.0));
-        assert!(wire_distance(&p, pos2(100.0, 50.0)) < 0.5);
-        assert!(wire_distance(&p, pos2(100.0, 150.0)) > 50.0);
+        assert!(wire_distance(&p, wire_mid(&p)) < 0.5);
+        assert!(wire_distance(&p, pos2(100.0, 250.0)) > 50.0);
     }
 }
