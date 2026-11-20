@@ -83,7 +83,7 @@ The result is ad-hoc signed and not notarized. Consequences, honestly:
 
 ## Upgrades and installer behaviour
 
-The driver package's `preinstall` removes any existing `/Library/Audio/Plug-Ins/HAL/SoundRouter.driver`, so an upgrade never leaves files of an older build inside the signed bundle. Its `postinstall` clears quarantine, logs a warning if the signature does not verify, and restarts `coreaudiod` (audio drops for 1-2 s). The app package is non-relocatable. `packaging/uninstall.sh` (also copied to `/Library/Application Support/SoundRouter`) removes the driver and forgets the receipts.
+The driver package's `preinstall` removes any existing `/Library/Audio/Plug-Ins/HAL/SoundRouter.driver`, so an upgrade never leaves files of an older build inside the signed bundle. Its `postinstall` clears quarantine, logs a warning if the signature does not verify, and restarts `coreaudiod` (audio drops for 1-2 s). The app package is non-relocatable. Neither bundle is version-checked: an older pkg (or a release over a dev build with a higher `CFBundleVersion`) installs as is, where Installer would otherwise skip the driver after `preinstall` deleted it. `packaging/uninstall.sh` (also copied to `/Library/Application Support/SoundRouter`) removes the driver and forgets the receipts.
 
 ## Not verified
 

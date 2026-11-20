@@ -45,16 +45,24 @@ exit 0
 EOF
 chmod +x "$WORK/scripts/preinstall" "$WORK/scripts/postinstall"
 
+# Not version-checked: Installer skips a bundle older than the one on disk (a downgrade, or a release over a
+# dev build with a higher commit count) and preinstall has already deleted the driver, leaving none.
+pkgbuild --analyze --root "$WORK/hal" "$WORK/driver.plist"
+plutil -replace 0.BundleIsVersionChecked -bool NO "$WORK/driver.plist"
+
 pkgbuild --root "$WORK/hal" \
+  --component-plist "$WORK/driver.plist" \
   --install-location /Library/Audio/Plug-Ins/HAL \
   --identifier com.ronncc.soundrouter.driver.pkg \
   --version "$VERSION" \
   --scripts "$WORK/scripts" \
   "$WORK/driver.pkg"
 
-# non-relocatable: Installer must not "upgrade" a stray SoundRouter.app elsewhere
+# non-relocatable: Installer must not "upgrade" a stray SoundRouter.app elsewhere; not version-checked, so a
+# downgrade replaces the app together with its driver
 pkgbuild --analyze --root "$WORK/apps" "$WORK/app.plist"
 plutil -replace 0.BundleIsRelocatable -bool NO "$WORK/app.plist"
+plutil -replace 0.BundleIsVersionChecked -bool NO "$WORK/app.plist"
 
 pkgbuild --root "$WORK/apps" \
   --component-plist "$WORK/app.plist" \
@@ -62,6 +70,11 @@ pkgbuild --root "$WORK/apps" \
   --identifier com.ronncc.soundrouter.app.pkg \
   --version "$VERSION" \
   "$WORK/app.pkg"
+
+for p in driver app; do
+  pkgutil --expand "$WORK/$p.pkg" "$WORK/check-$p"
+  grep -q '<bundle-version/>' "$WORK/check-$p/PackageInfo" || { echo "$p.pkg: a bundle is version-checked" >&2; exit 1; }
+done
 
 pkgbuild --root "$WORK/support" \
   --install-location "/Library/Application Support/SoundRouter" \

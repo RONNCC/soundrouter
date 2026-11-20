@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency: # a newer push to the same PR supersedes its running checks; every main commit keeps its own run
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
 env:
   MACOSX_DEPLOYMENT_TARGET: "14.2" # same as packaging/lib.sh, so cargo steps and the scripts share build artifacts
 
@@ -31,6 +38,7 @@ jobs:
         run: |
           command -v shellcheck >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install shellcheck
           shellcheck packaging/*.sh
+          packaging/test-uninstall.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Build driver
@@ -44,6 +52,8 @@ jobs:
           for b in target/SoundRouter.app target/SoundRouter.driver; do
             codesign --verify --deep --strict "$b"
           done
+      - name: Build pkg (unsigned; checks its component settings)
+        run: packaging/make-pkg.sh
       - name: Zip bundles
         run: |
           cd target
