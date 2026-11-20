@@ -1,10 +1,10 @@
 //! The routing engine: one private aggregate + IOProc per enabled virtual device.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
 use std::sync::atomic::{
-    AtomicU64,
+    AtomicU32, AtomicU64,
     Ordering::{Acquire, Relaxed, Release},
 };
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -16,12 +16,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use block2::RcBlock;
 use objc2::AnyThread;
 use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
 use objc2_core_audio::*;
-use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp, AudioValueRange};
+use objc2_core_audio_types::{
+    AudioBuffer, AudioBufferList, AudioTimeStamp, AudioTimeStampFlags, AudioValueRange,
+};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSNumber, NSString};
 use sr_core::backend::{
-    AppInfo, Backend, DeviceState, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
+    AppInfo, Backend, Delay, DeviceState, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
 };
 use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice};
 use sr_core::driver_proto::{COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, companion_uid};
@@ -29,6 +32,7 @@ use sr_core::meters::Meters;
 use sr_core::mixer::{IoLayout, MixPlan, Mixer, MixerHandle, mixer};
 use sr_core::selftest;
 
+use crate::activity::{self, Activity, Lease};
 use crate::apps::{self, AppGroup};
 use crate::driver;
 use crate::hal::{self, SYSTEM};
@@ -74,6 +78,17 @@ struct Shared {
     expected: AtomicU64,
     /// 0 starting, 1 running, `1<<32 | status` failed.
     state: AtomicU64,
+    /// In->out distance in frames of the latest cycle; [`NO_DELAY`] before the first.
+    delay: AtomicU32,
+}
+
+const NO_DELAY: u32 = u32::MAX;
+
+/// Frames from an input sample's time to the output sample time of the same cycle; `None` for a
+/// distance that is negative, not finite or too large to be a real one.
+fn in_out_distance(input_t: f64, output_t: f64) -> Option<u32> {
+    let d = output_t - input_t;
+    (d.is_finite() && (0.0..f64::from(NO_DELAY)).contains(&d)).then(|| d.round() as u32)
 }
 
 /// Audio-thread state; owned via raw pointer handed to the IOProc.
@@ -95,6 +110,17 @@ impl Cb {
             self.meters.glitch_count.fetch_add(1, Relaxed);
         }
         self.next_t = t + frames as f64;
+    }
+
+    /// Publishes this cycle's in->out distance. Audio thread: one relaxed store.
+    fn track_delay(&self, input: &AudioTimeStamp, output: &AudioTimeStamp) {
+        let valid = AudioTimeStampFlags::SampleTimeValid;
+        if input.mFlags.contains(valid)
+            && output.mFlags.contains(valid)
+            && let Some(d) = in_out_distance(input.mSampleTime, output.mSampleTime)
+        {
+            self.shared.delay.store(d, Relaxed);
+        }
     }
 }
 
@@ -193,6 +219,8 @@ struct Vdev {
     rates: Vec<(String, f64)>,
     /// Rate listeners on the main and sub devices; removed with the vdev.
     _listeners: Vec<Listener>,
+    /// Keeps the process out of App Nap while this vdev's IOProc exists.
+    _lease: Lease,
 }
 // SAFETY: `cb` is only dereferenced by the IOProc thread; control-side access is limited to the atomics in `Shared`.
 unsafe impl Send for Vdev {}
@@ -242,6 +270,8 @@ struct Inner {
     vdevs: HashMap<String, Vdev>,
     /// [`current_device_set`] as of the last apply; device events that leave it unchanged are echoes.
     dev_set: Vec<String>,
+    /// App Nap insurance shared by all vdevs.
+    activity: Arc<Activity>,
     bg_errors: BTreeMap<Op, String>,
     /// Where vdevs report their IOProc start; `None` in tests that never build one.
     tx: Option<Sender<Event>>,
@@ -406,6 +436,23 @@ impl Engine {
             .collect();
         w.sort();
         w
+    }
+}
+
+/// `v`'s measured delay, once its IOProc has run a cycle.
+fn vdev_delay(v: &Vdev) -> Option<Delay> {
+    let frames = v.shared.delay.load(Relaxed);
+    let rate = v.rates.iter().find(|(u, _)| *u == v.spec.main)?.1;
+    (frames != NO_DELAY && rate >= 1.0).then(|| Delay {
+        frames,
+        rate_hz: rate.round() as u32,
+    })
+}
+
+impl Engine {
+    /// The in->out distance `id`'s IOProc last saw; see [`Delay`].
+    pub fn delay(&self, id: &str) -> Option<Delay> {
+        vdev_delay(lock(&self.inner).vdevs.get(id)?)
     }
 }
 
@@ -811,6 +858,12 @@ impl Backend for Engine {
                     .map(|id| (id.clone(), waiting.clone())),
             )
             .collect();
+        let mut delays: Vec<(String, Delay)> = g
+            .vdevs
+            .iter()
+            .filter_map(|(id, v)| Some((id.clone(), vdev_delay(v)?)))
+            .collect();
+        delays.sort_by(|a, b| a.0.cmp(&b.0));
         drop(g);
         per_device.sort_by(|a, b| a.0.cmp(&b.0));
         EngineStatus {
@@ -820,6 +873,8 @@ impl Backend for Engine {
             tcc,
             mic,
             driver_version,
+            delays,
+            low_power_mode: activity::low_power_mode(),
         }
     }
 
@@ -1155,6 +1210,7 @@ fn apply_vdev(
             },
             groups,
             g.tx.as_ref(),
+            &g.activity,
         ) {
             Ok(mut v) => {
                 log::info!("device '{}': aggregate main device '{main}'", dev.id);
@@ -1495,6 +1551,7 @@ fn build_vdev(
     spec: AggSpec,
     groups: &[AppGroup],
     events: Option<&Sender<Event>>,
+    activity: &Arc<Activity>,
 ) -> Result<Vdev> {
     // Format listeners first, then the baseline, then the aggregate: a rate change at any point after the
     // read has an event that compares unequal, one before it is in both the baseline and the aggregate.
@@ -1541,14 +1598,20 @@ fn build_vdev(
             .for_each(|t| unsafe { _ = AudioHardwareDestroyProcessTap(t.id) })
     };
 
+    // `drift` must be a CFNumber: the HAL reads a CFBoolean (`NSNumber::new_bool`) as 0, i.e. no drift
+    // compensation at all (checked via the aggregate's composition). Low quality then halves the
+    // resampler's fixed delay; the main device is the clock and has none.
+    let low = NSNumber::new_u32(kAudioAggregateDriftCompensationLowQuality);
     let sub_dicts: Vec<Retained<_>> = std::iter::once((&spec.main, false))
         .chain(spec.subs.iter().map(|s| (s, true)))
         .map(|(uid, drift)| {
-            let (u, d) = (NSString::from_str(uid), hal::bool_obj(drift));
-            hal::cdict(&[
+            let (u, d) = (NSString::from_str(uid), NSNumber::new_i32(i32::from(drift)));
+            let pairs: [(&CStr, &AnyObject); 3] = [
                 (kAudioSubDeviceUIDKey, &u),
                 (kAudioSubDeviceDriftCompensationKey, &d),
-            ])
+                (kAudioSubDeviceDriftCompensationQualityKey, &low),
+            ];
+            hal::cdict(&pairs[..if drift { 3 } else { 2 }])
         })
         .collect();
     let tap_dicts: Vec<Retained<_>> = taps
@@ -1620,6 +1683,7 @@ fn build_vdev(
     let shared = Arc::new(Shared {
         expected: AtomicU64::new(0),
         state: AtomicU64::new(0),
+        delay: AtomicU32::new(NO_DELAY),
     });
     let cb = Box::into_raw(Box::new(Cb {
         mixer: mx,
@@ -1648,6 +1712,7 @@ fn build_vdev(
         build: seq,
         rates,
         _listeners: listeners,
+        _lease: activity.lease(),
         zombies: Vec::new(),
         tap_dirty: false,
         warnings: Vec::new(),
@@ -1655,6 +1720,8 @@ fn build_vdev(
     };
     // From here `Drop` cleans up the aggregate, taps and callback state.
     refresh_layout(&mut v)?;
+    // Only the aggregate is asked: a size requested for V or C from this process (no IO of ours on V)
+    // changed neither a client's cycle nor the loop delay when measured; a client's size is its own.
     set_buffer_frames(agg, v.spec.buffer_frames);
     let st = unsafe {
         AudioDeviceCreateIOProcID(
@@ -1699,7 +1766,7 @@ unsafe extern "C-unwind" fn ioproc(
     _dev: AudioObjectID,
     _now: NonNull<AudioTimeStamp>,
     input: NonNull<AudioBufferList>,
-    _it: NonNull<AudioTimeStamp>,
+    it: NonNull<AudioTimeStamp>,
     output: NonNull<AudioBufferList>,
     ot: NonNull<AudioTimeStamp>,
     ud: *mut c_void,
@@ -1710,6 +1777,7 @@ unsafe extern "C-unwind" fn ioproc(
             b.mDataByteSize as usize / 4 / (b.mNumberChannels as usize).max(1)
         });
         cb.track_time(ot.as_ref().mSampleTime, frames);
+        cb.track_delay(it.as_ref(), ot.as_ref());
         run(cb, input.as_ptr(), output.as_ptr())
     }));
     if r.is_err() {

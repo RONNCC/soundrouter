@@ -380,6 +380,7 @@ fn rig(dev: &VirtualDevice, lay: &IoLayout, ain: &[u16], aout: &[u16]) -> Rig {
     let shared = Arc::new(Shared {
         expected: AtomicU64::new(layout::shape_key_of(ain, aout)),
         state: AtomicU64::new(1),
+        delay: AtomicU32::new(NO_DELAY),
     });
     Rig {
         cb: Cb {
@@ -1115,4 +1116,39 @@ fn an_identical_device_list_is_still_pushed_to_the_driver() {
     assert_eq!(removed, vec![format!("{DEVICE_UID_PREFIX}gone")]);
     // A refused set is an error.
     assert!(push_devices(&want, vec![], |_| Err(anyhow::anyhow!("refused"))).is_err());
+}
+
+#[test]
+fn in_out_distance_is_the_frame_gap_or_nothing() {
+    assert_eq!(in_out_distance(1000.0, 1512.0), Some(512));
+    assert_eq!(in_out_distance(1000.0, 1000.4), Some(0));
+    assert_eq!(in_out_distance(1000.0, 999.0), None);
+    assert_eq!(in_out_distance(f64::NAN, 5.0), None);
+    assert_eq!(in_out_distance(0.0, f64::INFINITY), None);
+}
+
+#[test]
+fn the_ioproc_publishes_only_valid_sample_times() {
+    let lay = IoLayout {
+        inputs: vec![],
+        outputs: vec![],
+    };
+    let r = rig(&vdev(vec![], vec![], vec![]), &lay, &[], &[]);
+    let stamp = |t: f64, flags| {
+        // SAFETY: AudioTimeStamp is plain data; all-zero is a valid (empty) stamp.
+        let mut s: AudioTimeStamp = unsafe { std::mem::zeroed() };
+        s.mSampleTime = t;
+        s.mFlags = flags;
+        s
+    };
+    let valid = AudioTimeStampFlags::SampleTimeValid;
+    let none = AudioTimeStampFlags(0);
+    let read = || r.cb.shared.delay.load(Relaxed);
+    assert_eq!(read(), NO_DELAY);
+    r.cb.track_delay(&stamp(10.0, valid), &stamp(20.0, none));
+    assert_eq!(read(), NO_DELAY, "output time not valid");
+    r.cb.track_delay(&stamp(10.0, valid), &stamp(522.0, valid));
+    assert_eq!(read(), 512);
+    r.cb.track_delay(&stamp(10.0, valid), &stamp(-5.0, valid));
+    assert_eq!(read(), 512, "a negative gap keeps the last good one");
 }

@@ -36,6 +36,30 @@ pub enum DeviceState {
     Running,
     Failed(String),
 }
+/// What a running virtual device adds between an input frame arriving and its output frame playing:
+/// the distance the engine's IOProc reports (output sample time minus input sample time). It includes
+/// the aggregate's IO buffers and its safety offsets, so it is the delay as it really is, not a guess
+/// from the buffer setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Delay {
+    pub frames: u32,
+    pub rate_hz: u32,
+}
+
+impl Delay {
+    pub fn ms(self) -> f64 {
+        frames_to_ms(self.frames, self.rate_hz)
+    }
+}
+
+/// `frames` at `rate_hz` in milliseconds; 0 at an unknown (0 Hz) rate.
+pub fn frames_to_ms(frames: u32, rate_hz: u32) -> f64 {
+    if rate_hz == 0 {
+        return 0.0;
+    }
+    f64::from(frames) * 1000.0 / f64::from(rate_hz)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EngineStatus {
     pub per_device: Vec<(String, DeviceState)>,
@@ -47,6 +71,10 @@ pub struct EngineStatus {
     pub mic: TccStatus,
     /// Protocol version of the installed driver plug-in; `None` = driver not installed.
     pub driver_version: Option<String>,
+    /// Measured delay per running device (devices that have not run a cycle yet are absent).
+    pub delays: Vec<(String, Delay)>,
+    /// macOS Low Power Mode is on: clocks drop and small audio delays may glitch.
+    pub low_power_mode: bool,
 }
 /// Result of a loopback self-test: a tone into a virtual device, read back from its input.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,5 +96,23 @@ pub trait Backend {
     /// prompt is open), so callers run it off the UI thread.
     fn self_test(&mut self, _id: &str) -> anyhow::Result<SelfTest> {
         anyhow::bail!("self-test is not supported by this backend")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_convert_to_milliseconds() {
+        assert_eq!(frames_to_ms(48, 48_000), 1.0);
+        assert!((frames_to_ms(512, 48_000) - 10.666_666).abs() < 1e-3);
+        assert_eq!(frames_to_ms(0, 48_000), 0.0);
+        assert_eq!(frames_to_ms(480, 0), 0.0);
+        let d = Delay {
+            frames: 1024,
+            rate_hz: 44_100,
+        };
+        assert!((d.ms() - 23.219).abs() < 1e-3);
     }
 }

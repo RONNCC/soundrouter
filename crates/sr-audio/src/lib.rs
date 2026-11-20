@@ -1,4 +1,5 @@
 //! CoreAudio engine (slice C): process taps + private aggregates + one IOProc per virtual device.
+pub mod activity;
 pub mod apps;
 pub mod driver;
 pub mod engine;

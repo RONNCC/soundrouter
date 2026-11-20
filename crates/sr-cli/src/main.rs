@@ -305,8 +305,12 @@ fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>, force: bool
             };
             if let Some(m) = engine.meters(id) {
                 let ch: Vec<String> = m.channels.iter().map(|&x| db(x)).collect();
+                let delay = engine.delay(id).map_or_else(
+                    || "delay n/a".to_owned(),
+                    |d| format!("delay {:.1} ms", d.ms()),
+                );
                 println!(
-                    "{id} [{st}] out: {} (glitches {}, mismatches {})",
+                    "{id} [{st}] out: {} ({delay}, glitches {}, mismatches {})",
                     ch.join(" "),
                     engine.glitches(id),
                     engine.mismatches(id)
