@@ -183,6 +183,18 @@ static OSStatus io(AudioObjectID d, AudioObjectID st, UInt32 client, int op, dou
     return D->DoIOOperation(gDrv, d, st, client, op, FR, &gCi, buf, NULL);
 }
 
+// A volume or mute change fades over 10 ms (several blocks), so "steady" output is what a read returns once two reads in a row agree.
+static OSStatus ioSteady(AudioObjectID d, AudioObjectID st, UInt32 client, int op, double t, float* buf) {
+    float prev[FR * 8];
+    for (int n = 0; n < 32; n++) {
+        OSStatus r = io(d, st, client, op, t, buf);
+        if (r != 0 || (n && !memcmp(prev, buf, FR * 2 * sizeof(float)))) return r;
+        memcpy(prev, buf, FR * 2 * sizeof(float));
+        memset(buf, 0xAA, FR * 2 * sizeof(float));
+    }
+    return -1;
+}
+
 // Level/mute controls and the overload counter (props on V's control objects).
 static OSStatus getBytes(AudioObjectID o, UInt32 sel, UInt32 scope, void* out, UInt32 size) {
     AudioObjectPropertyAddress a = addr(sel, scope); UInt32 sz = size;
@@ -1140,30 +1152,32 @@ int main(int argc, char** argv) {
         CHECK(D->StartIO(gDrv, V, 1) == 0 && D->StartIO(gDrv, C, 7) == 0);
         CHECK(io(V, Vo, 1, kAudioServerPlugInIOOperationWriteMix, 8000, raw) == 0);
         SCALED(want, raw, g);
-        CHECK(io(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, want, sizeof rd));
+        CHECK(ioSteady(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, want, sizeof rd));
         setMute(mOut, 1);
-        CHECK(io(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
+        // The fade is real: the first block after a mute is neither the old level nor silence (no click), and a muted read ends in exact zeros.
+        CHECK(io(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && memcmp(rd, zr, sizeof rd) && memcmp(rd, want, sizeof rd));
+        CHECK(ioSteady(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
         setMute(mOut, 0); setF32(vOut, kAudioLevelControlPropertyScalarValue, 1.0f);
-        CHECK(io(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, raw, sizeof rd));
+        CHECK(ioSteady(C, Ci, 7, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, raw, sizeof rd));
         // V.in via the engine (ring B) carries the input scope only; the output level does not leak into it, and C.out is stored raw.
         setF32(vOut, kAudioLevelControlPropertyDecibelValue, DB);
         fill(want, 2, 9000.0f);
         CHECK(io(C, Co, 7, kAudioServerPlugInIOOperationWriteMix, 9000, want) == 0);
-        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, want, sizeof rd));
+        CHECK(ioSteady(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, want, sizeof rd));
         setF32(vIn, kAudioLevelControlPropertyDecibelValue, -12.0f); gi = gainOf(-12.0f);
         float w2[FR * 2]; SCALED(w2, want, gi);
-        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, w2, sizeof rd));
+        CHECK(ioSteady(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, w2, sizeof rd));
         setMute(mIn, 1);
-        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
+        CHECK(ioSteady(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 9000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
         setMute(mIn, 0);
         // V -> V loop (C idle): output level times input level, one multiply by their product.
         CHECK(D->StopIO(gDrv, C, 7) == 0);
         gg = gi * g; SCALED(w2, raw, gg);
-        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, w2, sizeof rd));
+        CHECK(ioSteady(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, w2, sizeof rd));
         setMute(mOut, 1);
-        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
+        CHECK(ioSteady(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, zr, sizeof rd));
         setMute(mOut, 0); setF32(vIn, kAudioLevelControlPropertyScalarValue, 1.0f); setF32(vOut, kAudioLevelControlPropertyScalarValue, 1.0f);
-        CHECK(io(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, raw, sizeof rd)); // back to bit-exact unity
+        CHECK(ioSteady(V, Vi, 1, kAudioServerPlugInIOOperationReadInput, 8000, memset(rd, 0xAA, sizeof rd)) == 0 && !memcmp(rd, raw, sizeof rd)); // back to bit-exact unity
 
         // Overload counter: a WriteMix scheduled before the device's current time is counted per device; reads and on-time writes are not.
         CHECK(overloads(V) == 0 && overloads(C) == 0);

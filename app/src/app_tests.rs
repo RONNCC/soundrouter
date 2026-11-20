@@ -986,7 +986,9 @@ mod snapshots {
                 .build_eframe(move |cc| {
                     let backend = Box::new(FakeBackend::frozen(1.5));
                     let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
-                    App::new(demo_config(), None, w, None, false, false)
+                    let mut app = App::new(demo_config(), None, w, None, false, false);
+                    app.setup.skip_intro(); // the real marker may not exist on this machine
+                    app
                 });
             wait_published(&mut h);
             settle(&mut h);
