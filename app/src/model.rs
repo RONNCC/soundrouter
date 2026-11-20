@@ -88,23 +88,30 @@ pub fn delay_name(frames: u32) -> &'static str {
     }
 }
 
-/// Footer button label, e.g. "Delay: Balanced".
+/// Footer chip label, e.g. "Audio delay: Balanced".
 pub fn delay_label(frames: u32) -> String {
-    format!("Delay: {}", delay_name(frames))
+    format!("Audio delay: {}", delay_name(frames))
 }
 
-/// Menu row text: "<name>  ·  +<ms> ms[ · hint]". The menu paints what follows the first "  ·  " muted.
+/// One line under a menu option's name; empty when the name says enough.
+pub fn delay_hint(frames: u32) -> &'static str {
+    match frames {
+        64 => "Uses the most CPU",
+        256 => "Recommended",
+        512 => "Best for recording and streaming, where delay does not matter",
+        _ => "",
+    }
+}
+
+/// A menu row as a screen reader reads it: "Balanced, +10.7 ms. Recommended".
 pub fn delay_option(frames: u32) -> String {
-    let (name, hint) = match frames {
-        64 => ("Lowest", " · uses the most CPU"),
-        256 => ("Balanced (recommended)", ""),
-        512 => (
-            "Safest",
-            " · best for recording/streaming where delay does not matter",
-        ),
-        _ => (delay_name(frames), ""),
-    };
-    format!("{name}  ·  +{:.1} ms{hint}", delay_ms(frames))
+    let hint = delay_hint(frames);
+    let sep = if hint.is_empty() { "" } else { ". " };
+    format!(
+        "{}, +{:.1} ms{sep}{hint}",
+        delay_name(frames),
+        delay_ms(frames)
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -516,17 +523,17 @@ pub(crate) mod tests {
     #[test]
     fn buffer_frames_edit_and_label() {
         let mut c = default_config();
-        assert_eq!(delay_label(c.buffer_frames), "Delay: Balanced");
+        assert_eq!(delay_label(c.buffer_frames), "Audio delay: Balanced");
         apply(&mut c, Edit::BufferFrames(128));
         assert_eq!(c.buffer_frames, 128);
         c.validate().unwrap();
-        assert_eq!(delay_label(128), "Delay: Low");
-        assert_eq!(delay_option(64), "Lowest  ·  +2.7 ms · uses the most CPU");
-        assert_eq!(delay_option(128), "Low  ·  +5.3 ms");
-        assert_eq!(delay_option(256), "Balanced (recommended)  ·  +10.7 ms");
+        assert_eq!(delay_label(128), "Audio delay: Low");
+        assert_eq!(delay_option(64), "Lowest, +2.7 ms. Uses the most CPU");
+        assert_eq!(delay_option(128), "Low, +5.3 ms");
+        assert_eq!(delay_option(256), "Balanced, +10.7 ms. Recommended");
         assert_eq!(
             delay_option(512),
-            "Safest  ·  +21.3 ms · best for recording/streaming where delay does not matter"
+            "Safest, +21.3 ms. Best for recording and streaming, where delay does not matter"
         );
     }
 

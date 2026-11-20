@@ -551,7 +551,13 @@ impl Setup {
                     return Some(Action::SettingsDeleted);
                 }
             }
-            (_, Err(SetupError::Cancelled)) => self.error = Some("Cancelled.".into()),
+            (Some(Busy::Installing), Err(SetupError::Cancelled)) => {
+                self.error =
+                    Some("You cancelled the password dialog, so nothing was installed.".into());
+            }
+            (_, Err(SetupError::Cancelled)) => {
+                self.error = Some("You cancelled the password dialog.".into());
+            }
             (_, Err(SetupError::Failed(m))) => self.error = Some(m),
             (None, Ok(())) => {}
         }
@@ -620,6 +626,12 @@ impl Setup {
     /// Demo and tests start without the welcome.
     pub fn skip_intro(&mut self) {
         self.intro = false;
+    }
+
+    #[cfg(test)]
+    pub fn with_intro(mut self) -> Self {
+        self.intro = true;
+        self
     }
 
     /// The welcome sheet. Its marker is an empty file, so "finished this version" stays false.
@@ -953,7 +965,9 @@ impl Setup {
                             _ => {}
                         }
                         match v.test {
-                            _ if hung => body(ui, t, "Try again, or copy diagnostics for support."),
+                            _ if hung => {
+                                body(ui, t, "Test again, or copy diagnostics for support.")
+                            }
                             SelfTestState::Idle | SelfTestState::Running => {
                                 progress(ui, t, "Playing a quiet tone through the virtual device…");
                             }
@@ -1201,7 +1215,21 @@ fn open_url(url: &str) {
     let _ = Command::new("/usr/bin/open").arg(url).spawn();
 }
 
-/// Footer button in the style of the Delete button.
+/// Width of a footer button for `label`: the text plus room on both sides.
+pub fn footer_width(ui: &egui::Ui, label: &str) -> f32 {
+    let w = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_string(),
+            crate::theme::label(),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x;
+    (w + 28.0).max(64.0)
+}
+
+/// Footer button in the style of the Remove device button.
 pub fn footer_button(
     ui: &mut egui::Ui,
     rect: Rect,

@@ -2,7 +2,9 @@
 use crate::graph::{self, GraphCtx, GraphState};
 use crate::icons::IconTextures;
 use crate::login;
-use crate::model::{Edit, apply, db_to_pct, delay_label, delay_ms, delay_option, pct_to_db};
+use crate::model::{
+    Edit, apply, db_to_pct, delay_hint, delay_label, delay_ms, delay_name, delay_option, pct_to_db,
+};
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, OPEN_SETTINGS, Setup};
 use crate::store;
 use crate::theme::{
@@ -91,45 +93,51 @@ fn state_look(s: &DeviceState, t: &Tokens) -> Option<(String, egui::Color32)> {
 /// The "Audio delay" popup: one plain sentence, then a radio-style row per buffer size.
 fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>) {
     use egui::text::{LayoutJob, TextFormat};
-    const W: f32 = 340.0;
+    const W: f32 = 360.0;
     const CHECK_W: f32 = 24.0;
+    const MS_W: f32 = 64.0;
     ui.set_width(W);
     ui.label(
         egui::RichText::new("Audio delay")
             .font(strong())
             .color(t.ink),
     );
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new("How long audio takes to pass through SoundRouter. Lower is snappier for live monitoring and calls, but uses more CPU and can crackle on a busy Mac. Higher is the most reliable.")
-                .font(body())
-                .line_height(Some(18.0))
-                .color(t.muted),
-        )
-        .wrap(),
-    );
+    // A menu justifies its labels; a paragraph reads better ragged-right.
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("How long audio takes to pass through SoundRouter. Lower is snappier for live monitoring and calls, but uses more CPU and can crackle on a busy Mac. Higher is the most reliable.")
+                    .font(body())
+                    .line_height(Some(18.0))
+                    .color(t.muted),
+            )
+            .wrap(),
+        );
+    });
     ui.add_space(4.0);
     for n in BUFFER_FRAMES {
-        let text = delay_option(n);
-        let (name, rest) = text.split_once("  ·  ").unwrap_or((&text, ""));
         let mut job = LayoutJob::default();
-        job.wrap.max_width = W - CHECK_W - 8.0;
-        job.append(name, 0.0, TextFormat::simple(label(), t.ink));
-        job.append(
-            &format!("  ·  {rest}"),
-            0.0,
-            TextFormat::simple(body(), t.muted),
-        );
+        job.wrap.max_width = W - CHECK_W - MS_W - 8.0;
+        job.append(delay_name(n), 0.0, TextFormat::simple(label(), t.ink));
+        let hint = delay_hint(n);
+        if !hint.is_empty() {
+            job.append(
+                &format!("\n{hint}"),
+                0.0,
+                TextFormat::simple(body(), t.muted),
+            );
+        }
         let galley = ui.painter().layout_job(job);
-        let (rect, resp) = ui.allocate_exact_size(vec2(W, galley.size().y + 10.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(vec2(W, galley.size().y + 12.0), Sense::click());
         let on = n == current;
+        let text = delay_option(n);
         resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, on, &text));
         let p = ui.painter();
         if resp.hovered() {
             p.rect_filled(rect, CornerRadius::same(radius::INPUT), t.hairline);
         }
         if on {
-            let c = pos2(rect.left() + 11.0, rect.top() + 5.0 + 8.0);
+            let c = pos2(rect.left() + 11.0, rect.top() + 6.0 + 8.0);
             p.line(
                 vec![
                     c + vec2(-3.5, 0.5),
@@ -139,9 +147,16 @@ fn delay_menu(ui: &mut egui::Ui, t: &Tokens, current: u32, edits: &mut Vec<Edit>
                 Stroke::new(1.8, t.accent),
             );
         }
-        p.galley(pos2(rect.left() + CHECK_W, rect.top() + 5.0), galley, t.ink);
+        p.galley(pos2(rect.left() + CHECK_W, rect.top() + 6.0), galley, t.ink);
+        p.text(
+            pos2(rect.right() - 8.0, rect.top() + 6.0 + 9.0),
+            Align2::RIGHT_CENTER,
+            format!("+{:.1} ms", delay_ms(n)),
+            num(12.0),
+            t.muted,
+        );
         let tip = format!(
-            "{n} frames per buffer. Added delay = 2 × {n} frames ÷ 48,000 per second = {:.1} ms, assuming 48 kHz.",
+            "{n} frames per buffer. Added delay = 2 buffers × {n} frames ÷ 48,000 frames per second = {:.1} ms, at 48 kHz.",
             delay_ms(n)
         );
         if resp.on_hover_text(tip).clicked() && !on {
@@ -523,9 +538,20 @@ impl App {
                     Id::unique("new_dev"),
                     Sense::click(),
                 );
-                name_button(&new, "New Virtual Device");
-                let c = if new.hovered() { t.ink } else { t.muted };
-                plus_glyph(ui.painter(), pos2(foot.left() + 22.0, cy), c, false);
+                name_button(&new, NEW_DEVICE);
+                if new.hovered() {
+                    ui.painter().rect_filled(
+                        new.rect,
+                        CornerRadius::same(radius::PILL),
+                        t.selected,
+                    );
+                }
+                plus_glyph(
+                    ui.painter(),
+                    pos2(foot.left() + 28.0, cy),
+                    t.accent_ink,
+                    false,
+                );
                 ui.painter().text(
                     pos2(foot.left() + 44.0, cy),
                     Align2::LEFT_CENTER,
@@ -554,6 +580,13 @@ impl App {
         if i == self.selected {
             ui.painter()
                 .rect_filled(inner, CornerRadius::same(radius::ROW), t.selected);
+            // The accent bar sits on the straight part of the rounded edge.
+            let bar = Rect::from_x_y_ranges(
+                inner.left()..=(inner.left() + 3.0),
+                (inner.top() + radius::ROW as f32 + 2.0)
+                    ..=(inner.bottom() - radius::ROW as f32 - 2.0),
+            );
+            ui.painter().rect_filled(bar, CornerRadius::same(2), cable);
         }
         let dim = if dev.enabled { 1.0 } else { 0.55 };
         let icon = Rect::from_min_size(
@@ -659,10 +692,7 @@ impl App {
             edits.push(Edit::RemoveDevice(i));
         }
         x.on_hover_text(format!("Remove {}", dev.name));
-        let sw = Rect::from_center_size(
-            pos2(inner.right() - 16.0 - 9.0 - 8.0 - 16.0, inner.top() + 18.0),
-            vec2(32.0, 18.0),
-        );
+        let sw = Rect::from_center_size(pos2(x_at.x - 9.0 - 10.0 - 16.0, x_at.y), vec2(32.0, 18.0));
         let on = switch(
             ui,
             sw,

@@ -139,6 +139,12 @@ fn click_footer(h: &mut Harness<App>, label: &str) {
     settle(h);
 }
 
+/// Uninstall sits in the footer's "More actions" menu.
+fn uninstall(h: &mut Harness<App>) {
+    click(h, "More actions");
+    click(h, "Uninstall…");
+}
+
 fn click_row(h: &mut Harness<App>, label: &str) {
     h.get_all_by_label(label).next().unwrap().click();
     settle(h);
@@ -194,9 +200,9 @@ fn every_control_of_the_demo_window_has_an_accessible_name() {
     let h = open(demo_config());
     // `window` already ran the check; spot-check the names the other tests rely on.
     for label in [
-        "New Virtual Device",
+        NEW_DEVICE,
         "Remove Loopback Audio",
-        "Delete",
+        REMOVE_DEVICE,
         "Select Loopback Audio",
         "Rename Loopback Audio",
         "Enable Loopback Audio",
@@ -217,7 +223,7 @@ fn every_control_of_the_demo_window_has_an_accessible_name() {
 #[test]
 fn new_device_is_added_and_selected() {
     let mut h = open(demo_config());
-    click(&mut h, "New Virtual Device");
+    click(&mut h, NEW_DEVICE);
     assert_eq!(h.state().cfg.devices.len(), 4);
     assert_eq!(h.state().selected, 3);
     assert_eq!(
@@ -232,7 +238,7 @@ fn deleting_the_last_device_selects_the_new_last_one_and_empties_cleanly() {
     let mut h = open(demo_config());
     click(&mut h, "Select Zoom Out");
     assert_eq!(h.state().selected, 2);
-    click(&mut h, "Delete");
+    click(&mut h, REMOVE_DEVICE);
     assert_eq!(h.state().cfg.devices.len(), 2);
     assert_eq!(h.state().selected, 1);
     assert_eq!(
@@ -245,10 +251,10 @@ fn deleting_the_last_device_selects_the_new_last_one_and_empties_cleanly() {
     assert_eq!(h.state().selected, 0);
     assert!(h.query_by_label("Device name").is_none());
     // nothing left to delete: the button is inert instead of panicking
-    click(&mut h, "Delete");
+    click(&mut h, REMOVE_DEVICE);
     assert!(h.state().cfg.devices.is_empty());
     // and the user can start over
-    click(&mut h, "New Virtual Device");
+    click(&mut h, NEW_DEVICE);
     assert_eq!(h.state().cfg.devices.len(), 1);
     assert_eq!(h.state().selected, 0);
 }
@@ -560,7 +566,7 @@ fn demo_mode_says_so_and_nothing_else_by_default() {
         Theme::Light,
         true,
     );
-    h.get_by_label("Demo mode: synthetic audio, nothing is saved");
+    h.get_by_label("Demo mode: the audio is synthetic and nothing is saved.");
     let h = open(demo_config());
     assert!(h.query_by_label_contains("Demo mode").is_none());
 }
@@ -877,7 +883,9 @@ mod snapshots {
             .build_eframe(move |cc| {
                 let backend = Box::new(FakeBackend::frozen(1.5));
                 let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
-                App::new(cfg, None, w, toast.map(str::to_string), false, false)
+                let mut app = App::new(cfg, None, w, toast.map(str::to_string), false, false);
+                app.setup.skip_intro(); // the real marker may not exist on this machine
+                app
             });
         wait_published(&mut h);
         settle(&mut h);
@@ -1011,7 +1019,9 @@ mod snapshots {
         both(
             "error",
             demo_config,
-            Some("Could not save config: Permission denied (os error 13)"),
+            Some(
+                "Could not save your settings: Permission denied (os error 13). Changes last until you quit.",
+            ),
             |_| {},
         );
     }
@@ -1099,6 +1109,21 @@ mod snapshots {
     }
 
     #[test]
+    fn sheet_welcome() {
+        sheet("welcome", WIDE, no_driver(), None, never_run(), |h| {
+            h.state_mut().setup = Setup::new(never_run(), None).with_intro();
+            settle(h);
+        });
+    }
+
+    #[test]
+    fn sheet_footer_more_menu() {
+        sheet("more_menu", WIDE, installed(), None, never_run(), |h| {
+            click(h, "More actions");
+        });
+    }
+
+    #[test]
     fn sheet_allow_access_granted() {
         sheet(
             "allow_granted",
@@ -1107,7 +1132,7 @@ mod snapshots {
             flowing(),
             never_run(),
             |h| {
-                click(h, "Test Setup…");
+                click(h, "Test setup");
             },
         );
     }
@@ -1152,7 +1177,7 @@ mod snapshots {
             flowing(),
             never_run(),
             |h| {
-                click(h, "Test Setup…");
+                click(h, "Test setup");
             },
         );
     }
@@ -1171,7 +1196,7 @@ mod snapshots {
             flowing(),
             never_run(),
             |h| {
-                click(h, "Test Setup…");
+                click(h, "Test setup");
                 click_footer(h, "Allow System Audio Recording");
                 until(h, "self-test", |h| {
                     h.query_by_label_contains("Audio flows").is_some()
@@ -1189,8 +1214,8 @@ mod snapshots {
             flowing(),
             never_run(),
             |h| {
-                click(h, "Test Setup…");
-                click(h, "Continue");
+                click(h, "Test setup");
+                click(h, "Run test");
                 h.state().worker.shared.lock().unwrap().self_test = SelfTestState::Running;
                 h.run_steps(3);
             },
@@ -1206,8 +1231,8 @@ mod snapshots {
             flowing(),
             never_run(),
             |h| {
-                click(h, "Test Setup…");
-                click(h, "Continue");
+                click(h, "Test setup");
+                click(h, "Run test");
                 until(h, "self-test", |h| {
                     h.query_by_label_contains("Audio flows").is_some()
                 });
@@ -1218,8 +1243,8 @@ mod snapshots {
     #[test]
     fn sheet_self_test_fail() {
         sheet("test_fail", WIDE, installed(), None, never_run(), |h| {
-            click(h, "Test Setup…");
-            click(h, "Continue");
+            click(h, "Test setup");
+            click(h, "Run test");
             until(h, "self-test", |h| has(h, "Copy diagnostics"));
         });
     }
@@ -1227,8 +1252,8 @@ mod snapshots {
     #[test]
     fn sheet_all_done() {
         sheet("done", WIDE, installed(), flowing(), never_run(), |h| {
-            click(h, "Test Setup…");
-            click(h, "Continue");
+            click(h, "Test setup");
+            click(h, "Run test");
             until(h, "self-test", |h| {
                 h.query_by_label_contains("Audio flows").is_some()
             });
@@ -1252,7 +1277,7 @@ mod snapshots {
     fn sheet_driver_install_failed() {
         let runner = recording(Err(SetupError::Cancelled)).0;
         sheet("driver_failed", WIDE, no_driver(), None, runner, |h| {
-            click(h, "Install Driver…");
+            click(h, "Install driver");
             until(h, "runner result", |h| has(h, "Driver not installed"));
         });
     }
@@ -1260,7 +1285,7 @@ mod snapshots {
     #[test]
     fn sheet_uninstall_confirm() {
         sheet("uninstall", WIDE, installed(), None, never_run(), |h| {
-            click(h, "Uninstall…");
+            uninstall(h);
         });
     }
 
@@ -1268,7 +1293,7 @@ mod snapshots {
     fn sheet_uninstall_failed() {
         let runner = recording(Err(SetupError::Failed("Operation not permitted".into()))).0;
         sheet("uninstall_failed", WIDE, installed(), None, runner, |h| {
-            click(h, "Uninstall…");
+            uninstall(h);
             click(h, "Uninstall");
             until(h, "runner result", |h| {
                 h.query_by_label_contains("Not uninstalled").is_some()
@@ -1290,7 +1315,7 @@ mod snapshots {
             None,
             runner,
             |h| {
-                click(h, "Install Driver…");
+                click(h, "Install driver");
                 until(h, "runner result", |h| has(h, "Driver not installed"));
             },
         );
@@ -1364,7 +1389,7 @@ fn device_states_show_as_named_dots_and_permission_banner() {
     let h = with_status(one(DeviceState::WaitingForPermission));
     h.get_by_label("Loopback Audio status: Waiting for permission");
     h.get_by_label(PERMISSION_BANNER);
-    h.get_by_label("Open Settings");
+    h.get_by_label(OPEN_SETTINGS);
     let h = with_status(one(DeviceState::Idle));
     assert!(h.query_by_label_contains("status:").is_none());
 }
@@ -1435,18 +1460,30 @@ fn no_driver() -> EngineStatus {
 }
 
 #[test]
+fn a_brand_new_install_opens_with_a_welcome_before_the_driver_step() {
+    let mut h = with_runner(no_driver(), never_run());
+    h.state_mut().setup = Setup::new(never_run(), None).with_intro();
+    settle(&mut h);
+    h.get_by_label("Welcome to SoundRouter");
+    assert!(!has(&h, "Install driver") && !has(&h, "Try the demo"));
+    click(&mut h, "Get started");
+    assert!(!has(&h, "Get started") && !has(&h, "Welcome to SoundRouter"));
+    h.get_by_label("Install driver");
+}
+
+#[test]
 fn without_a_driver_the_sheet_installs_it_and_a_cancel_says_not_installed() {
     let (runner, calls) = recording(Err(SetupError::Cancelled));
     let mut h = with_runner(no_driver(), runner);
-    h.get_by_label("Try Demo");
+    h.get_by_label("Try the demo");
     assert!(calls.lock().unwrap().is_empty());
-    click(&mut h, "Install Driver…");
+    click(&mut h, "Install driver");
     until(&mut h, "runner result", |h| has(h, "Driver not installed"));
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert!(calls[0].contains("/Library/Audio/Plug-Ins/HAL"));
     assert!(calls[0].contains("'/App/Resources/SoundRouter.driver'"));
-    h.get_by_label("Retry");
+    h.get_by_label("Install driver");
     h.get_by_label("Copy diagnostics");
 }
 
@@ -1457,7 +1494,7 @@ fn a_driver_signed_by_someone_else_is_refused_before_the_admin_prompt() {
     h.state_mut().setup = Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()))
         .with_driver_check(|_| Err(crate::setup::DRIVER_MISMATCH.into()));
     settle(&mut h);
-    click(&mut h, "Install Driver…");
+    click(&mut h, "Install driver");
     until(&mut h, "check result", |h| has(h, "Driver not installed"));
     h.get_by_label_contains("does not match this app");
     assert!(calls.lock().unwrap().is_empty());
@@ -1467,7 +1504,7 @@ fn a_driver_signed_by_someone_else_is_refused_before_the_admin_prompt() {
 fn a_driver_that_never_shows_up_after_a_good_install_times_out() {
     let (runner, _) = recording(Ok(()));
     let mut h = with_runner(no_driver(), runner);
-    click(&mut h, "Install Driver…");
+    click(&mut h, "Install driver");
     until(&mut h, "waiting for the driver", |h| {
         has(h, "Starting the driver…")
     });
@@ -1478,11 +1515,11 @@ fn a_driver_that_never_shows_up_after_a_good_install_times_out() {
 #[test]
 fn a_driver_present_hides_the_sheet_and_the_footer_offers_test_and_uninstall() {
     let h = open(demo_config()); // the demo driver: nothing to test or uninstall
-    assert!(!has(&h, "Install Driver…") && !has(&h, "Test Setup…") && !has(&h, "Uninstall…"));
+    assert!(!has(&h, "Install driver") && !has(&h, "Test setup") && !has(&h, "More actions"));
     let h = with_runner(installed(), never_run());
-    assert!(!has(&h, "Install Driver…"));
-    h.get_by_label("Test Setup…");
-    h.get_by_label("Uninstall…");
+    assert!(!has(&h, "Install driver"));
+    h.get_by_label("Test setup");
+    h.get_by_label("More actions");
 }
 
 fn setup_run(status: EngineStatus, test: Option<SelfTest>) -> Harness<'static, App> {
@@ -1492,7 +1529,7 @@ fn setup_run(status: EngineStatus, test: Option<SelfTest>) -> Harness<'static, A
     let mut h = window(demo_config(), Box::new(b), None, Theme::Dark, false);
     // Something missing opens the sheet by itself; otherwise the footer button does.
     if !h.state().setup.shown() {
-        click(&mut h, "Test Setup…");
+        click(&mut h, "Test setup");
     }
     h
 }
@@ -1510,7 +1547,7 @@ fn flowing() -> Option<SelfTest> {
 fn test_setup_walks_permissions_verify_done_on_a_passing_test() {
     let mut h = setup_run(installed(), flowing());
     h.get_by_label("Microphone: Allowed");
-    click(&mut h, "Continue");
+    click(&mut h, "Run test");
     until(&mut h, "self-test", |h| {
         h.query_by_label_contains("Audio flows").is_some()
     });
@@ -1524,12 +1561,12 @@ fn test_setup_walks_permissions_verify_done_on_a_passing_test() {
 #[test]
 fn a_failed_self_test_offers_diagnostics() {
     let mut h = setup_run(installed(), None);
-    click(&mut h, "Continue");
+    click(&mut h, "Run test");
     until(&mut h, "self-test", |h| has(h, "Copy diagnostics"));
     h.get_by_label_contains("no audio came back");
     click(&mut h, "Copy diagnostics");
     h.get_by_label("Copied to clipboard");
-    h.get_by_label("Retry");
+    h.get_by_label("Test again");
 }
 
 #[test]
@@ -1541,12 +1578,12 @@ fn denied_audio_capture_offers_open_settings() {
         },
         flowing(),
     );
-    h.get_by_label("Open Settings");
+    h.get_by_label(OPEN_SETTINGS);
     h.get_by_label("System Audio Recording: Denied");
     h.get_by_label_contains("System Audio Recording Only");
     assert!(!has(&h, "Allow System Audio Recording"));
     let h = setup_run(installed(), flowing());
-    assert!(!has(&h, "Open Settings") && !has(&h, "Allow System Audio Recording"));
+    assert!(!has(&h, OPEN_SETTINGS) && !has(&h, "Allow System Audio Recording"));
 }
 
 /// An asker that counts its calls and answers `with`.
@@ -1583,13 +1620,13 @@ fn the_capture_row_asks_macos_and_shows_the_answer() {
         };
         let (a, calls) = asker(answer);
         let mut h = with_asker(unasked, a);
-        click(&mut h, "Test Setup…");
+        click(&mut h, "Test setup");
         h.get_by_label("System Audio Recording: Needs permission");
-        assert!(!has(&h, "Open Settings"), "only after Denied");
+        assert!(!has(&h, OPEN_SETTINGS), "only after Denied");
         click_row(&mut h, "Allow System Audio Recording");
         assert_eq!(*calls.lock().unwrap(), 1);
         h.get_by_label(&format!("System Audio Recording: {word}"));
-        assert_eq!(has(&h, "Open Settings"), settings, "{answer:?}");
+        assert_eq!(has(&h, OPEN_SETTINGS), settings, "{answer:?}");
         assert_eq!(
             h.query_all_by_label("Allow System Audio Recording").count() > 0,
             answer == TccStatus::Unknown
@@ -1606,16 +1643,16 @@ fn the_microphone_row_has_its_own_button_and_footer_follows_what_is_missing() {
         },
         asker(TccStatus::Granted).0,
     );
-    click(&mut h, "Test Setup…");
+    click(&mut h, "Test setup");
     h.get_by_label("Microphone: Needs permission");
     assert_eq!(
-        h.get_all_by_label("Allow Microphone").count(),
+        h.get_all_by_label("Allow microphone").count(),
         2,
         "row + footer"
     );
-    click_row(&mut h, "Allow Microphone");
+    click_row(&mut h, "Allow microphone");
     h.get_by_label("Microphone: Asking…");
-    assert!(!has(&h, "Allow Microphone"));
+    assert!(!has(&h, "Allow microphone"));
     // answered: the row loses its button
     h.state().worker.shared.lock().unwrap().status.mic = TccStatus::Granted;
     settle(&mut h);
@@ -1627,8 +1664,8 @@ fn the_microphone_row_has_its_own_button_and_footer_follows_what_is_missing() {
     };
     let h = setup_run(denied, flowing());
     h.get_by_label("Microphone: Denied");
-    h.get_by_label("Open Settings");
-    h.get_by_label("Continue");
+    h.get_by_label(OPEN_SETTINGS);
+    h.get_by_label("Run test");
     assert!(!has(&h, "Open Microphone Settings"));
 }
 
@@ -1643,7 +1680,7 @@ fn continue_asks_for_the_microphone_then_system_audio() {
         },
         a,
     );
-    click(&mut h, "Test Setup…");
+    click(&mut h, "Test setup");
     click_footer(&mut h, "Allow System Audio Recording");
     assert_eq!(*calls.lock().unwrap(), 1);
     h.get_by_label("System Audio Recording: Allowed");
@@ -1658,8 +1695,8 @@ fn continue_asks_for_the_microphone_then_system_audio() {
         },
         a,
     );
-    h.get_by_label("Allow All");
-    click(&mut h, "Allow All");
+    h.get_by_label("Allow both");
+    click(&mut h, "Allow both");
     h.run_steps(3);
     assert_eq!(
         *calls.lock().unwrap(),
@@ -1688,7 +1725,7 @@ fn a_dismissed_sheet_stays_dismissed() {
     click(&mut h, "Close");
     h.run_steps(10);
     assert!(!h.state().setup.shown() && h.state().setup.seen());
-    click(&mut h, "Test Setup…");
+    click(&mut h, "Test setup");
     assert!(h.state().setup.shown(), "Test Setup… always opens it");
 }
 
@@ -1699,10 +1736,10 @@ fn the_microphone_question_is_explained_before_the_first_apply() {
         ..installed()
     };
     let mut h = with_runner(status, never_run());
-    assert_eq!(h.get_all_by_label("Allow Microphone").count(), 2);
+    assert_eq!(h.get_all_by_label("Allow microphone").count(), 2);
     assert!(!has(&h, "Close"), "cannot skip the explanation");
     assert!(h.state().worker.shared.lock().unwrap().meters.is_empty());
-    click_footer(&mut h, "Allow Microphone");
+    click_footer(&mut h, "Allow microphone");
     until(&mut h, "apply and self-test", |h| {
         let s = h.state().worker.shared.lock().unwrap();
         !s.meters.is_empty() && matches!(s.self_test, SelfTestState::Done(_))
@@ -1712,11 +1749,11 @@ fn the_microphone_question_is_explained_before_the_first_apply() {
 #[test]
 fn try_demo_swaps_to_the_synthetic_engine() {
     let mut h = with_runner(no_driver(), never_run());
-    click(&mut h, "Try Demo");
+    click(&mut h, "Try the demo");
     until(&mut h, "demo", |h| {
-        has(h, "Demo mode: synthetic audio, nothing is saved")
+        has(h, "Demo mode: the audio is synthetic and nothing is saved.")
     });
-    assert!(!has(&h, "Install Driver…"));
+    assert!(!has(&h, "Install driver"));
     until(&mut h, "demo meters", |h| {
         !h.state().worker.shared.lock().unwrap().meters.is_empty()
     });
@@ -1726,13 +1763,15 @@ fn try_demo_swaps_to_the_synthetic_engine() {
 fn uninstall_asks_first_and_deletes_settings_only_when_ticked() {
     let (runner, calls) = recording(Err(SetupError::Cancelled));
     let mut h = with_runner(installed(), runner);
-    click(&mut h, "Uninstall…");
+    uninstall(&mut h);
     assert!(calls.lock().unwrap().is_empty());
     click(&mut h, "Cancel");
     assert!(!has(&h, "Uninstall"));
-    click(&mut h, "Uninstall…");
+    uninstall(&mut h);
     click(&mut h, "Uninstall");
-    until(&mut h, "runner", |h| has(h, "Not uninstalled: Cancelled."));
+    until(&mut h, "runner", |h| {
+        has(h, "Not uninstalled. You cancelled the password dialog.")
+    });
     {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -1753,7 +1792,7 @@ fn after_deleting_the_settings_edits_are_not_written_back() {
         let (runner, _) = recording(Ok(()));
         let mut h = with_runner(installed(), runner);
         h.state_mut().path = Some(path.clone());
-        click(&mut h, "Uninstall…");
+        uninstall(&mut h);
         if tick {
             click(&mut h, "Also delete my SoundRouter settings");
         }
@@ -1844,7 +1883,7 @@ fn the_undo_toast_expires_and_the_next_edit_replaces_it() {
 
 #[test]
 fn deleting_a_device_can_be_undone_from_both_delete_buttons() {
-    for button in ["Delete", "Remove Stream Mix"] {
+    for button in [REMOVE_DEVICE, "Remove Stream Mix"] {
         let mut h = open(demo_config());
         click(&mut h, "Select Stream Mix");
         let before = h.state().cfg.clone();
@@ -1895,7 +1934,7 @@ fn a_failed_engine_start_shows_silence_and_a_standing_banner() {
     );
     h.state_mut().engine_error = Some("no CoreAudio".into());
     settle(&mut h);
-    let banner = "Audio engine unavailable: no CoreAudio. Routing is not running.";
+    let banner = "SoundRouter could not start its audio engine (no CoreAudio). Nothing is routed. Quit and reopen SoundRouter to try again.";
     h.get_by_label(banner);
     {
         let s = h.state().worker.shared.lock().unwrap();
@@ -1908,13 +1947,16 @@ fn a_failed_engine_start_shows_silence_and_a_standing_banner() {
     click(&mut h, "Mute Loopback Audio");
     h.run_steps(300); // far longer than any toast
     h.get_by_label(banner);
-    assert!(!has(&h, "Demo mode: synthetic audio, nothing is saved"));
+    assert!(!has(
+        &h,
+        "Demo mode: the audio is synthetic and nothing is saved."
+    ));
 }
 
 #[test]
 fn a_hung_self_test_can_be_cancelled_or_times_out() {
     let hang = |h: &mut Harness<App>| {
-        click(h, "Continue");
+        click(h, "Run test");
         until(h, "self-test", |h| {
             has(h, "Audio flows (-6 dBFS, 0 dropouts)")
         });
@@ -1929,11 +1971,11 @@ fn a_hung_self_test_can_be_cancelled_or_times_out() {
     let mut h = setup_run(installed(), flowing());
     hang(&mut h);
     until(&mut h, "30 s timeout", |h| {
-        has(h, "The test did not finish")
+        has(h, "The test did not finish in 30 seconds.")
     });
     assert!(h.state().now >= 30.0);
     h.get_by_label("Copy diagnostics");
-    click(&mut h, "Retry");
+    click(&mut h, "Test again");
     until(&mut h, "retry result", |h| {
         has(h, "Audio flows (-6 dBFS, 0 dropouts)")
     });
@@ -1997,7 +2039,7 @@ fn try_demo_resets_the_selection_and_the_undo_of_the_replaced_config() {
             until: 1e6,
         });
     }
-    click(&mut h, "Try Demo");
+    click(&mut h, "Try the demo");
     until(&mut h, "demo", |h| h.state().demo);
     let app = h.state();
     assert!(app.selected < app.cfg.devices.len(), "{}", app.selected);
@@ -2167,10 +2209,10 @@ fn return_in_the_permissions_sheet_answers_the_footer_not_a_row_button() {
         },
         a,
     );
-    h.get_by_label("Allow All");
+    h.get_by_label("Allow both");
     h.key_press(egui::Key::Enter);
     settle(&mut h);
-    // "Allow All" asks for System Audio Recording once the Microphone is answered; the
+    // "Allow both" asks for System Audio Recording once the Microphone is answered; the
     // Microphone row's own button would not.
     until(&mut h, "System Audio Recording asked", |h| {
         h.state().worker.shared.lock().unwrap().status.mic = TccStatus::Granted;
@@ -2181,7 +2223,7 @@ fn return_in_the_permissions_sheet_answers_the_footer_not_a_row_button() {
 #[test]
 fn a_driver_that_blinks_while_test_setup_is_open_returns_to_the_permissions() {
     let mut h = setup_run(installed(), flowing());
-    h.get_by_label("Continue");
+    h.get_by_label("Run test");
     let set = |h: &mut Harness<App>, v: Option<&str>| {
         h.state()
             .worker
@@ -2193,10 +2235,10 @@ fn a_driver_that_blinks_while_test_setup_is_open_returns_to_the_permissions() {
         settle(h);
     };
     set(&mut h, None);
-    h.get_by_label("Install Driver…");
+    h.get_by_label("Install driver");
     set(&mut h, Some("1"));
-    assert!(!has(&h, "Install Driver…"), "a stale 'not installed' sheet");
-    h.get_by_label("Continue");
+    assert!(!has(&h, "Install driver"), "a stale 'not installed' sheet");
+    h.get_by_label("Run test");
 }
 
 #[test]
@@ -2217,7 +2259,7 @@ fn typing_never_reaches_the_window_behind_a_sheet() {
         .status
         .driver_version = None;
     settle(&mut h);
-    h.get_by_label("Install Driver…");
+    h.get_by_label("Install driver");
     h.event(egui::Event::Text("xyz".into()));
     settle(&mut h);
     assert_eq!(h.state().cfg.devices[0].name, typed);
@@ -2254,10 +2296,10 @@ fn a_new_device_in_a_long_list_is_scrolled_into_view() {
     let mut h = open(cfg);
     h.set_size(vec2(1000.0, 520.0)); // the window's minimum size
     settle(&mut h);
-    click(&mut h, "New Virtual Device");
+    click(&mut h, NEW_DEVICE);
     assert_eq!(h.state().selected, 15);
     let row = h.get_by_label("Select Loopback Audio 16").rect();
-    let new = h.get_by_label("New Virtual Device").rect();
+    let new = h.get_by_label(NEW_DEVICE).rect();
     assert!(
         row.bottom() <= new.top() && row.top() >= TITLEBAR_H,
         "{row:?} hidden"
@@ -2285,7 +2327,11 @@ fn the_delay_menu_stays_inside_the_window_and_picks_a_size() {
         .click();
     settle(&mut h);
     assert_eq!(h.state().cfg.buffer_frames, other);
-    assert_eq!(h.get_all_by_label_contains("Delay:").count(), 1, "closed");
+    assert_eq!(
+        h.get_all_by_label_contains("Audio delay:").count(),
+        1,
+        "closed"
+    );
     assert!(!has(&h, "Audio delay"), "closed");
 }
 
@@ -2349,8 +2395,8 @@ fn test_setup_tests_an_enabled_device_not_a_disabled_selection() {
         false,
     );
     click(&mut h, "Enable Loopback Audio"); // the selected device, now off
-    click(&mut h, "Test Setup…");
-    click(&mut h, "Continue");
+    click(&mut h, "Test setup");
+    click(&mut h, "Run test");
     until(&mut h, "self-test", |h| {
         has(h, "Audio flows (-6 dBFS, 0 dropouts)")
     });
@@ -2363,10 +2409,10 @@ fn test_setup_tests_an_enabled_device_not_a_disabled_selection() {
     click(&mut h, "Done");
     click(&mut h, "Enable Stream Mix");
     assert!(h.state().cfg.devices.iter().all(|d| !d.enabled));
-    click(&mut h, "Test Setup…");
-    click(&mut h, "Continue");
+    click(&mut h, "Test setup");
+    click(&mut h, "Run test");
     until(&mut h, "self-test", |h| has(h, "Copy diagnostics"));
-    h.get_by_label_contains("no enabled virtual device");
+    h.get_by_label_contains("no enabled device");
     assert_eq!(*ids.lock().unwrap(), ["v2"], "no second test ran");
 }
 
@@ -2452,7 +2498,7 @@ fn a_double_click_on_a_remove_button_removes_one_thing_only() {
     // removal can be undone: the first one would be lost for good.
     for (label, gone) in [
         ("Remove Loopback Audio", "Loopback Audio"),
-        ("Delete", "Loopback Audio"),
+        (REMOVE_DEVICE, "Loopback Audio"),
     ] {
         let mut h = open(demo_config());
         two_clicks(&mut h, label);
@@ -2485,7 +2531,7 @@ fn an_idle_sheet_asks_for_no_more_frames() {
     };
     let mut h = setup_run(installed(), flowing());
     idle(&mut h, "permissions");
-    click(&mut h, "Continue");
+    click(&mut h, "Run test");
     until(&mut h, "self-test", |h| {
         has(h, "Audio flows (-6 dBFS, 0 dropouts)")
     });
@@ -2493,11 +2539,11 @@ fn an_idle_sheet_asks_for_no_more_frames() {
     click(&mut h, "Continue");
     idle(&mut h, "done");
     click(&mut h, "Done");
-    click(&mut h, "Uninstall…");
+    uninstall(&mut h);
     idle(&mut h, "uninstall dialog");
     let mut h = with_runner(no_driver(), never_run());
     idle(&mut h, "welcome");
-    click(&mut h, "Install Driver…");
+    click(&mut h, "Install driver");
     until(&mut h, "runner result", |h| has(h, "Driver not installed"));
     idle(&mut h, "install failed");
 }
@@ -2536,7 +2582,11 @@ fn a_click_that_closes_a_menu_only_closes_it() {
         h.drop_at(mid);
         settle(&mut h);
         if h.state().cfg == before {
-            assert_eq!(h.get_all_by_label_contains("Delay:").count(), 1, "closed");
+            assert_eq!(
+                h.get_all_by_label_contains("Audio delay:").count(),
+                1,
+                "closed"
+            );
         }
     }
     let wires = |c: &Config| c.devices[0].monitors[0].wires.len();
