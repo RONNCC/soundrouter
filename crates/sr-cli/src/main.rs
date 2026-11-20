@@ -292,6 +292,8 @@ fn doctor() -> Result<()> {
                     for d in list {
                         let vis = sr_audio::hal::device_by_uid(&d.uid).is_some();
                         let comp = sr_audio::hal::device_by_uid(&companion_uid(&d.uid)).is_some();
+                        // listed by the driver but not published by coreaudiod: nothing can route through it
+                        healthy &= vis && comp;
                         println!(
                             "  {} ({} ch) visible={vis} companion={comp}",
                             d.uid, d.channels

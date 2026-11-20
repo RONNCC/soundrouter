@@ -103,8 +103,8 @@ pub fn require_plugin() -> Result<u32> {
     match find_plugin() {
         Some(p) => Ok(p),
         None => bail!(
-            "SoundRouter driver not installed ({PLUGIN_BUNDLE_ID} not loaded). Install it (needs sudo): \
-             sudo cp -R target/SoundRouter.driver /Library/Audio/Plug-Ins/HAL/ && sudo killall coreaudiod"
+            "SoundRouter driver not installed ({PLUGIN_BUNDLE_ID} not loaded). Install it from the app's setup \
+             sheet, the SoundRouter .pkg, or a checkout: packaging/driver-dev.sh install"
         ),
     }
 }
