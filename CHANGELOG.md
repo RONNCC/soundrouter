@@ -46,6 +46,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - `sr-cli meter` accepts the uid of any existing device (e.g. `BlackHole16ch_UID`), not only our driver ids.
 - README: how to route the Mac's microphone into a virtual device.
 
+### Fixed
+- Engine: a device another process holds in hog mode when a route is applied made the build fail with "aggregate input shape [2] does not match subdevices [2, 16]", and nothing rebuilt it when the holder let go (the failed vdev had no hog listener). The error now names the device and the holder ("BlackHole 16ch is in exclusive use by hog (pid N); it starts by itself when that is released"), and a hog listener kept on the held device rebuilds the route when it is released. Measured with BlackHole 16ch: the route was running 1.5 s after the release. A device grabbed while the route runs needs no rebuild: the aggregate carries silence while held and resumes about 3 s after the release (one glitch, one trim counted).
+- Example: `soak` prints the glitch, mismatch, tap and xrun counters when it ends.
+
 ### Changed
 - App: jacks and cables are coloured by output channel instead of by source. Each of the 64 output channels has its own accessible colour in both themes, a cable wears the colour of the channel it ends at, output and monitor jacks always show their channel's colour, a source jack shows where its cables go (a split ring for two or more, "+N" past three), and hovering a cable or jack lights it with a tooltip naming both ends. A source keeps its own colour only for the dot beside its title.
 - App: the window footer no longer has a "Remove device" button (it duplicated the × on the sidebar row, which keeps the "Removed <name> · Undo" toast and now has the tooltip "Remove device"); the status text starts at the left content edge.

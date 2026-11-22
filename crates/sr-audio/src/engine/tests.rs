@@ -2217,3 +2217,29 @@ fn a_running_device_missing_from_the_drivers_list_is_still_waited_for() {
     );
     assert_eq!(wait(&[&a], &[], &[&a]), vec![key(&a)], "not running");
 }
+
+#[test]
+fn a_build_that_failed_on_a_held_device_names_the_holder() {
+    assert_eq!(hog_error(&[]), None);
+    let held = HogInfo {
+        device_name: "BlackHole 16ch".into(),
+        pid: Some(42),
+        process_name: Some("hog".into()),
+    };
+    assert_eq!(
+        hog_error(std::slice::from_ref(&held)).as_deref(),
+        Some(
+            "BlackHole 16ch is in exclusive use by hog (pid 42); it starts by itself when that is released"
+        )
+    );
+    let unknown = HogInfo {
+        pid: None,
+        process_name: None,
+        ..held
+    };
+    assert!(
+        hog_error(&[unknown])
+            .unwrap()
+            .contains("by another process;")
+    );
+}

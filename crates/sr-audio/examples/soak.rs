@@ -39,5 +39,14 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(if hidden { 500 } else { 33 }));
     }
     println!("done: {meter_calls} meter reads, {refreshes} refreshes");
+    for id in &ids {
+        println!(
+            "{id}: glitches {}, mismatches {}, tap {:?}",
+            e.glitches(id),
+            e.mismatches(id),
+            e.tap_counters(id).unwrap_or_default()
+        );
+    }
+    println!("xruns {:?}", e.status().xruns);
     Ok(())
 }

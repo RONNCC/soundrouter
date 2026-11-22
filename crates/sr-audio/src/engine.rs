@@ -385,6 +385,9 @@ struct Inner {
     recovering: BTreeSet<String>,
     /// Consecutive failed IOProc starts per vdev id, see [`io_retry`].
     io_fails: HashMap<String, u32>,
+    /// Hog-mode listeners on devices another process holds and that kept a vdev from building: the
+    /// vdev has no listeners of its own, so these are what wake the worker when the holder lets go.
+    hog_watch: Vec<Listener>,
 }
 
 enum Event {
@@ -1773,11 +1776,37 @@ fn apply_locked(g: &mut Inner, cfg: &Config, sync: DriverSync) -> Result<()> {
         groups
     });
     let mut errors = Vec::new();
+    let mut watch = Vec::new();
     for dev in cfg.devices.iter().filter(|d| d.enabled) {
         if let Err(e) = apply_vdev(g, dev, cfg.buffer_frames, &groups) {
-            errors.push(format!("device '{}': {e:#}", dev.id));
+            // A device held in hog mode has no streams, which reads as a shape mismatch: name the holder.
+            let held = hogged_subs(dev);
+            errors.push(
+                match hog_error(&held.iter().map(|h| h.2.clone()).collect::<Vec<_>>()) {
+                    Some(why) => format!("device '{}': {why}", dev.id),
+                    None => format!("device '{}': {e:#}", dev.id),
+                },
+            );
+            watch.extend(held.into_iter().map(|(uid, obj, _)| (uid, obj)));
         }
     }
+    g.hog_watch = match &g.tx {
+        Some(tx) => watch
+            .into_iter()
+            .filter_map(|(uid, obj)| {
+                Listener::new(
+                    obj,
+                    kAudioDevicePropertyHogMode,
+                    kAudioObjectPropertyScopeGlobal,
+                    tx.clone(),
+                    move || Event::Hog(uid.clone()),
+                )
+                .map_err(|e| log::warn!("no hog listener: {e:#}"))
+                .ok()
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     // A device disabled or removed while it was waiting to be rebuilt is not recovering any more.
     g.recovering
         .retain(|id| enabled.contains_key(id.as_str()) && !g.vdevs.contains_key(id));
@@ -1837,6 +1866,37 @@ fn groups_for<'a>(dev: &VirtualDevice, groups: &'a LazyCell<Vec<AppGroup>>) -> &
     } else {
         &[]
     }
+}
+
+/// The devices `dev` routes through that another process holds in hog mode: uid, object id, holder.
+fn hogged_subs(dev: &VirtualDevice) -> Vec<(String, u32, HogInfo)> {
+    plan_subs(dev, &|u| hal::device_by_uid(u).is_some())
+        .into_iter()
+        .filter_map(|uid| {
+            let obj = hal::device_by_uid(&uid)?;
+            Some((uid, obj, health::hog_info(obj)?))
+        })
+        .collect()
+}
+
+/// Why a build failed when the devices in `held` are in another process's exclusive use.
+fn hog_error(held: &[HogInfo]) -> Option<String> {
+    if held.is_empty() {
+        return None;
+    }
+    let by = |h: &HogInfo| match (h.pid, &h.process_name) {
+        (Some(p), Some(n)) => format!("{n} (pid {p})"),
+        (Some(p), None) => format!("pid {p}"),
+        _ => "another process".to_owned(),
+    };
+    let list: Vec<String> = held
+        .iter()
+        .map(|h| format!("{} is in exclusive use by {}", h.device_name, by(h)))
+        .collect();
+    Some(format!(
+        "{}; it starts by itself when that is released",
+        list.join(", ")
+    ))
 }
 
 fn apply_vdev(
