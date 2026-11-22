@@ -224,6 +224,22 @@ fn next(s: &mut u64) -> u64 {
     *s
 }
 
+/// Where in the stream a read starts, checking it is contiguous. The first block after priming fades in
+/// (frame `f` scaled by `(f + 1) / n`), so that one read is checked against the ramp instead; its last
+/// frame is at full level either way. Frame 0 of the stream is 0 on both channels.
+fn read_start(c0: &[f32], c1: &[f32]) -> f32 {
+    let n = c0.len();
+    let first = c0[n - 1] - (n - 1) as f32;
+    let contiguous = c0.iter().enumerate().all(|(f, &a)| a == first + f as f32);
+    let ramped = c0.iter().enumerate().all(|(f, &a)| {
+        let want = (first + f as f32) * (f + 1) as f32 / n as f32;
+        (a - want).abs() <= 1e-4 * want.abs().max(1.0)
+    });
+    assert!(contiguous || ramped, "a gap inside a read: {c0:?}");
+    assert!(c0.iter().zip(c1).all(|(&a, &b)| b == -a));
+    first
+}
+
 /// Any mix of pushes and pulls, with any block, read size and cushion, plays frames in the order they
 /// were pushed: never a repeat, never an earlier frame after a later one, and each read is contiguous.
 /// Underflows in the ring arithmetic would panic here (overflow checks are on in tests).
@@ -246,13 +262,7 @@ fn random_traffic_never_replays_or_reorders_frames() {
                 if c0.iter().all(|&x| x == 0.0) && c1.iter().all(|&x| x == 0.0) {
                     continue;
                 }
-                // frame 0 of the stream is the value 0 on both channels: only a pull that starts at
-                // it is all-zero in its first frame, so look at the whole read for the contiguity.
-                let first = c0[0];
-                for (f, (&a, &b)) in c0.iter().zip(c1).enumerate() {
-                    assert_eq!(a, first + f as f32, "cushion {cushion}: gap inside a read");
-                    assert_eq!(b, -a);
-                }
+                let first = read_start(c0, c1);
                 if let Some(prev) = last {
                     assert!(first > prev, "cushion {cushion}: {first} after {prev}");
                 }
@@ -284,11 +294,7 @@ fn rings_swapped_under_a_running_audio_thread_play_in_order() {
                 if ch != 2 || dst[..100].iter().all(|&x| x == 0.0) {
                     continue;
                 }
-                let first = dst[0] as usize;
-                for f in 0..100 {
-                    assert_eq!(dst[f], (first + f) as f32, "gap inside a read");
-                    assert_eq!(dst[MAX_FRAMES + f], -dst[f]);
-                }
+                let first = read_start(&dst[..100], &dst[MAX_FRAMES..][..100]) as usize;
                 if let Some(prev) = last {
                     assert!(first > prev, "{first} played after {prev}");
                 }
