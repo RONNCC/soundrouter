@@ -245,10 +245,17 @@ proptest! {
         let ins: Vec<Vec<f32>> = data[..w.layout_in.len()].iter().map(|v| v[..n].to_vec()).collect();
         let o = run(&mut m, &ins, w.nch, n);
         let dev_gain = if w.dev.muted { 0.0 } else { lin(w.dev.volume_db) };
+        // a wire listed twice is one wire
+        let mut wires: Vec<&Wire> = Vec::new();
+        for wire in &w.dev.wires {
+            if !wires.contains(&wire) {
+                wires.push(wire);
+            }
+        }
         for (c, got) in o.iter().enumerate() {
             for i in 0..n {
                 let mut want = 0.0f32;
-                for wire in w.dev.wires.iter().filter(|x| usize::from(x.out_ch) == c) {
+                for wire in wires.iter().filter(|x| usize::from(x.out_ch) == c) {
                     let s = w.dev.sources.iter().find(|s| s.id == wire.source).unwrap();
                     let slot = w.layout_in.iter().position(|(id, ch)| *id == wire.source && *ch == wire.src_ch).unwrap();
                     let g = if s.muted { 0.0 } else { lin(s.volume_db) };

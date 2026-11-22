@@ -1,8 +1,8 @@
 use crate::config::{MAX_CH, MAX_DB, MAX_FRAMES, SourceKind, VirtualDevice};
 use crate::meters::{METER_SLOTS, Meters, peak, peak_finite};
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
 use std::sync::atomic::Ordering::{AcqRel, Relaxed};
@@ -188,7 +188,12 @@ impl MixPlan {
             })
             .collect();
         let mut taps = Vec::new();
+        // A wire listed twice would sum twice (+6 dB): hand-edited configs and presets can hold one.
+        let mut seen = HashSet::new();
         for w in &dev.wires {
+            if !seen.insert((&w.source, w.src_ch, w.out_ch)) {
+                continue;
+            }
             let (Some(src), vch) = (
                 dev.sources.iter().position(|s| s.id == w.source),
                 usize::from(w.out_ch),
@@ -225,8 +230,9 @@ impl MixPlan {
             .iter()
             .map(|m| {
                 let mut wires = Vec::new();
+                let mut seen = HashSet::new();
                 for mw in &m.wires {
-                    if usize::from(mw.out_ch) >= nch {
+                    if usize::from(mw.out_ch) >= nch || !seen.insert((mw.out_ch, mw.dst_ch)) {
                         continue;
                     }
                     for (slot, p) in layout.outputs.iter().enumerate() {

@@ -526,3 +526,21 @@ fn system_gain_is_per_source() {
         "back to unity: the app plays elsewhere"
     );
 }
+
+#[test]
+fn a_wire_listed_twice_is_one_wire_not_double_level() {
+    let mut d = dev();
+    d.wires.extend(d.wires.clone());
+    d.monitors.push(mon("spk", true, 0.0));
+    let mw = d.monitors[0].wires.clone();
+    d.monitors[0].wires.extend(mw);
+    let (mut m, _h, _) = setup(&d, &layout());
+    let o = run(&mut m, &ones(16), 4, 16);
+    assert!(o[0].iter().all(|x| *x == 1.0), "{:?}", o[0]);
+    assert!(o[1].iter().all(|x| *x == 0.5), "{:?}", o[1]);
+    assert!(
+        o[2].iter().all(|x| *x == 1.0),
+        "monitor wire counted twice: {:?}",
+        o[2]
+    );
+}
