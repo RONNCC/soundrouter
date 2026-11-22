@@ -65,15 +65,26 @@ pub unsafe extern "C" fn zero_ts(
         return BAD_OBJECT;
     }
     // Shared anchor and seed, but each device's own rate: identical to the peer while the rates agree.
-    let per = ticks_per_second() / slot.rate(side) * RING_FRAMES as f64; // host ticks per period
     let anchor = slot.anchor.load(Acquire);
-    let n = (now_ticks().saturating_sub(anchor) as f64 / per) as u64;
+    let (samples, host_offset) = zero_stamp(
+        now_ticks().saturating_sub(anchor),
+        ticks_per_second(),
+        slot.rate(side),
+    );
     unsafe {
-        *sample_time = (n * RING_FRAMES as u64) as f64;
-        *host_time = anchor + (n as f64 * per) as u64;
+        *sample_time = samples;
+        *host_time = anchor + host_offset;
         *seed = slot.seed.load(Acquire).max(1);
     }
     0
+}
+
+/// The latest zero timestamp `elapsed` host ticks after the anchor, at `rate`: the sample time of a whole period and
+/// the host ticks after the anchor that period began at (never more than `elapsed`).
+fn zero_stamp(elapsed: u64, ticks_per_second: f64, rate: f64) -> (f64, u64) {
+    let per = ticks_per_second / rate * RING_FRAMES as f64; // host ticks per period
+    let n = (elapsed as f64 / per) as u64;
+    ((n * RING_FRAMES as u64) as f64, (n as f64 * per) as u64)
 }
 
 pub unsafe extern "C" fn will_do(
@@ -398,6 +409,25 @@ mod tests {
             "timestamp is the latest boundary"
         );
         assert!(s >= 1, "seed is never 0");
+    }
+
+    proptest::proptest! {
+        /// Whatever the uptime (up to 2^52 ticks: 5 years at 24 MHz, 52 days at 1 GHz), rate and clock: a whole number of
+        /// periods, never ahead of now, never more than one period behind it, and the host time within a tick or two of
+        /// what the sample time says (no drift of the timeline however long the session runs).
+        #[test]
+        fn zero_stamps_are_exact_for_any_uptime(
+            elapsed in 0u64..(1 << 52), rate in 0usize..3, fast in proptest::bool::ANY,
+        ) {
+            let rate = sr_core::driver_proto::SAMPLE_RATES[rate];
+            let tps = if fast { 1e9 } else { 24e6 };
+            let per = tps / rate * RING_FRAMES as f64;
+            let (t, h) = zero_stamp(elapsed, tps, rate);
+            proptest::prop_assert_eq!(t % RING_FRAMES as f64, 0.0);
+            proptest::prop_assert!(h <= elapsed, "host time {} is ahead of now {}", h, elapsed);
+            proptest::prop_assert!((elapsed - h) as f64 <= per + 2.0);
+            proptest::prop_assert!((h as f64 - t / rate * tps).abs() <= 2.0);
+        }
     }
 
     #[test]
