@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   MACOSX_DEPLOYMENT_TARGET: "14.2" # same as packaging/lib.sh
@@ -17,19 +17,23 @@ env:
 jobs:
   release:
     runs-on: macos-15
+    outputs:
+      notarized: ${{ env.NOTARIZED }}
     env:
       # Only these booleans are job-wide; each secret goes to the step that needs it, never to cargo (build scripts
       # of every dependency run there) before the signing key is in a keychain.
       HAVE_CERT: ${{ secrets.CERT_P12 != '' && secrets.SIGN_ID != '' }}
       NOTARIZED: ${{ secrets.NOTARY_APPLE_ID != '' && secrets.NOTARY_TEAM_ID != '' && secrets.NOTARY_PASSWORD != '' && secrets.SIGN_ID != '' && secrets.INSTALLER_ID != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # CFBundleVersion = commit count
-          persist-credentials: false # this job's token can write the repo; build scripts must not find it in .git
-      - uses: dtolnay/rust-toolchain@1.95
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-about
+          persist-credentials: false # build scripts must not find a token in .git
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; pinned by SHA, so the toolchain is explicit
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@b298e4e5434569d3c7ccff7c9592b69de2fe37fe # cargo-about
       - name: Tag matches workspace version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
@@ -81,7 +85,7 @@ jobs:
           ditto -c -k --keepParent SoundRouter.app SoundRouter.app.zip
           ditto -c -k --keepParent SoundRouter.driver SoundRouter.driver.zip
           shasum -a 256 SoundRouter.pkg SoundRouter.dmg SoundRouter.app.zip SoundRouter.driver.zip > SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: SoundRouter
           path: |
@@ -90,16 +94,31 @@ jobs:
             target/SoundRouter.app.zip
             target/SoundRouter.driver.zip
             target/SHA256SUMS.txt
+
+  publish:
+    # The only job with a write token, and it runs no third-party action and no build step: the build above
+    # (cargo build scripts, installed actions, the signing key) only ever sees a read-only token.
+    needs: release
+    if: github.event_name == 'push' # a dispatch, even on a tag, is a dry run
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: SoundRouter
+          path: dist
       - name: Create GitHub Release
-        if: github.event_name == 'push' # a dispatch, even on a tag, is a dry run
         env:
           GH_TOKEN: ${{ github.token }}
+          NOTARIZED: ${{ needs.release.outputs.notarized }}
         run: |
           if [ "$NOTARIZED" = true ]; then
             notes="Developer ID signed and notarized."
           else
             notes="**UNSIGNED build (ad-hoc signed, not notarized).** Gatekeeper blocks the first launch: right-click the app and choose Open, or on macOS 15 use System Settings > Privacy & Security > Open Anyway. See docs/RELEASING.md."
           fi
-          gh release create "$GITHUB_REF_NAME" --generate-notes --notes "$notes" --title "$GITHUB_REF_NAME" \
-            target/SoundRouter.pkg target/SoundRouter.dmg \
-            target/SoundRouter.app.zip target/SoundRouter.driver.zip target/SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --notes "$notes" --title "$GITHUB_REF_NAME" \
+            dist/SoundRouter.pkg dist/SoundRouter.dmg \
+            dist/SoundRouter.app.zip dist/SoundRouter.driver.zip dist/SHA256SUMS.txt

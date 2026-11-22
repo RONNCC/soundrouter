@@ -20,12 +20,13 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30 # a hung test or fakehost must fail, not hold the runner for the 6 h default
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; pinned by SHA, so the toolchain is explicit
         with:
+          toolchain: "1.95"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cargo-deny,cargo-about
       - name: Dependency policy
@@ -34,10 +35,16 @@ jobs:
         run: cargo deny check advisories
         continue-on-error: true
       - run: cargo fmt --all --check
-      - name: Shell lint
+      - name: Shell and workflow lint
         run: |
           command -v shellcheck >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install shellcheck
+          command -v actionlint >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install actionlint
           shellcheck packaging/*.sh
+          actionlint
+          # a tag or branch can be moved to malicious code (tj-actions/changed-files, 2025): third-party actions are pinned by commit SHA
+          if grep -nE "^[[:space:]]*-?[[:space:]]*uses: " .github/workflows/*.yml | grep -vE '@[0-9a-f]{40}( |$)'; then
+            echo "::error::pin these actions by full commit SHA"; exit 1
+          fi
           packaging/test-uninstall.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -59,7 +66,7 @@ jobs:
           cd target
           ditto -c -k --keepParent SoundRouter.app SoundRouter.app.zip
           ditto -c -k --keepParent SoundRouter.driver SoundRouter.driver.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soundrouter-bundles
           if-no-files-found: error
@@ -74,13 +81,16 @@ jobs:
     continue-on-error: true
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; pinned by SHA, so the toolchain is explicit
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build and install driver
         run: |
           packaging/build-driver.sh
           sudo cp -R target/SoundRouter.driver /Library/Audio/Plug-Ins/HAL/
+          sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/SoundRouter.driver # as the installer does: coreaudiod loads root-owned plug-ins
           sudo killall coreaudiod || true
           sleep 5
       - name: Check device is listed
@@ -91,12 +101,13 @@ jobs:
     continue-on-error: true
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; pinned by SHA, so the toolchain is explicit
         with:
+          toolchain: "1.95"
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@41e135bca37b18b5a9cc134855b5b3bccbedbf26 # cargo-llvm-cov
       - name: Collect coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Summary
@@ -106,7 +117,7 @@ jobs:
             cargo llvm-cov report --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lcov
           path: lcov.info
@@ -121,15 +132,17 @@ jobs:
     continue-on-error: true # a runner image update can move the drift; diffs are uploaded below
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; pinned by SHA, so the toolchain is explicit
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Tolerate hosted-GPU anti-aliasing drift
         run: echo 'max_failed_pixels = 800' > kittest.toml
       - run: cargo test -p soundrouter-app --features snapshots
       - name: Upload snapshot diffs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: snapshot-diffs
           if-no-files-found: ignore
@@ -147,9 +160,11 @@ jobs:
     continue-on-error: true
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master; pinned by SHA, so the toolchain is explicit
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install BlackHole (retried) and wait for coreaudiod to list it
         run: |
           for i in 1 2 3; do
@@ -201,7 +216,7 @@ jobs:
           grep -iE 'AudioCapture|Microphone' system.log | tail -40 || true
       - name: Upload e2e logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: blackhole-e2e-logs
           if-no-files-found: ignore

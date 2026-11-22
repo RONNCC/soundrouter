@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 NAME=SoundRouter
 DEST=/Library/Audio/Plug-Ins/HAL/$NAME.driver
 OUT=target/$NAME.driver
-TOOLS=${TMPDIR:-/tmp}/sr-drvtools
+TOOLS=$PWD/target/sr-drvtools # not a fixed /tmp name (TMPDIR may be unset): another user could plant the binaries run later
 
 tools() {
   mkdir -p "$TOOLS"

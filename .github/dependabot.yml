@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Actions are pinned by commit SHA (CI fails on a tag or branch ref); Dependabot bumps the SHA and its "# vN" comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]

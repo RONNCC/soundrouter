@@ -56,7 +56,7 @@ packaging/notarize.sh target/SoundRouter.dmg
 
 ## GitHub release (CI)
 
-Push a tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/release.yml` (macos-15) builds, then attaches `SoundRouter.pkg`, `SoundRouter.dmg`, `SoundRouter.app.zip`, `SoundRouter.driver.zip` and `SHA256SUMS.txt` to a GitHub release. "Run workflow" (manual dispatch) builds and uploads the same files as a workflow artifact without creating a release.
+Push a tag: `git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/release.yml` builds on macos-15 with a read-only token (the `release` job, the only one that sees the signing secrets), then the `publish` job (ubuntu, the only job with `contents: write`, no build and no third-party action) attaches `SoundRouter.pkg`, `SoundRouter.dmg`, `SoundRouter.app.zip`, `SoundRouter.driver.zip` and `SHA256SUMS.txt` to a GitHub release. "Run workflow" (manual dispatch) builds and uploads the same files as a workflow artifact without creating a release. Every action is pinned by commit SHA (CI fails on a tag or branch ref; Dependabot bumps them). A manual dispatch on any branch also reads the signing secrets: restrict who can run it, or move the secrets into a protected environment.
 
 Repository secrets (all optional):
 
