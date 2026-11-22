@@ -154,6 +154,18 @@ fn clean(x: f32) -> f32 {
     }
 }
 
+/// Zeroed scratch whose pages are already mapped. Fresh zero pages fault in on the first write, and that
+/// write would be the audio thread's: up to 64 faults (about 1.5 us each) after every plan swap.
+fn prefaulted(len: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; len];
+    // One write per 4 KiB, the smallest page; volatile so the store of a zero over zeroed memory stays.
+    for x in v.iter_mut().step_by(1024) {
+        // SAFETY: `x` is a valid, aligned `&mut f32`.
+        unsafe { std::ptr::write_volatile(x, 0.0) };
+    }
+    v
+}
+
 fn ramp_add(dst: &mut [f32], src: &[f32], from: f32, to: f32) {
     if from == to {
         if to != 0.0 {
@@ -298,7 +310,7 @@ impl MixPlan {
             dev_out,
             mons,
             meter_in,
-            acc: vec![0.0; nch * MAX_FRAMES],
+            acc: prefaulted(nch * MAX_FRAMES),
             acc_finite,
             route: h.finish(),
         }

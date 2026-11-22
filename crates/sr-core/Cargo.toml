@@ -12,5 +12,6 @@ rtrb.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
+libc = "0.2"
 proptest = "1"
 tempfile = "3"
