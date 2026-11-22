@@ -119,7 +119,7 @@ Regenerate the screenshots: `cargo test -p soundrouter-app --features snapshots 
 
 ## Docs
 
-[Architecture](docs/ARCHITECTURE.md), [Design](docs/DESIGN.md), [Testing](docs/TESTING.md), [Troubleshooting](docs/TROUBLESHOOTING.md), [Releasing](docs/RELEASING.md), [Changelog](CHANGELOG.md), [original plan](docs/PLAN.md) (historical; superseded by the architecture doc).
+[Architecture](docs/ARCHITECTURE.md), [Latency](docs/LATENCY.md), [Design](docs/DESIGN.md), [Testing](docs/TESTING.md), [Troubleshooting](docs/TROUBLESHOOTING.md), [Releasing](docs/RELEASING.md), [Changelog](CHANGELOG.md), [original plan](docs/PLAN.md) (historical; superseded by the architecture doc).
 
 ## Provenance and license
 

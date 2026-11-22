@@ -120,6 +120,8 @@ Measured on an M3 Max (macOS 14.7.1, 48 kHz, installed driver, Pass-Thru route, 
 
 ### Latency model (verified)
 
+Why faster code, SIMD or a GPU cannot shorten it, and what does: [LATENCY.md](LATENCY.md).
+
 What the engine adds to a route is the distance its IOProc reports: `output_time.mSampleTime - input_time.mSampleTime` of the same cycle, stored per cycle in `Shared::delay` (one relaxed store) and exposed as `Engine::delay(id)` (the longer of the main and app paths), `Engine::main_delay(id)` and `EngineStatus::delays` (main path only; the app path is `EngineStatus::tap_delays`) (frames plus the main device's rate, `Delay::ms`). `sr-cli run` prints it ("delay 5.3 ms") and the app can show it from the status; nothing is estimated from the buffer setting. On an M3 Max at 48 kHz with the installed driver, a route from V through the engine and back to V satisfies `loop = B_V + added`, where `B_V` is the buffer the client app asked V for and `added` is the reported distance (Pass-Thru route, engine at 128 / 512 / 64 frames: loop 8.00 / 32.01 / 4.00 ms with `B_V` = 128 / 512 / 64 frames, reported 5.3 / 21.3 / 2.7 ms).
 
 - **Buffers.** Without process taps `added` is two engine buffers (input and output side), as above. A buffer size requested from the engine process for V or C changes neither a client's IO cycle (the HAL keeps one per client: a client that never asks gets 512) nor the loop, so the engine only sets its aggregate's size and `B_V` stays the client app's choice.
