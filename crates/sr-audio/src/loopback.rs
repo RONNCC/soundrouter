@@ -11,6 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use objc2_core_audio::*;
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
 use sr_core::config::MAX_CH;
+use sr_core::meters::peak;
 
 use crate::hal;
 
@@ -119,8 +120,13 @@ impl Tone {
 /// Level of the delay probe's click: one sample, so it is not an audible sound, and it only ever
 /// enters a virtual device (`tone_allowed`).
 pub const CLICK_AMP: f32 = 0.25;
-/// What counts as the click coming back; well under `CLICK_AMP` so a lowered device volume still shows it.
-const CLICK_THRESHOLD: f32 = 0.02;
+/// The least that counts as the click coming back (-80 dBFS). The path is digital, so silence is exact
+/// zeros and the click only has to beat what else is on the input; V's volume control alone can take
+/// `CLICK_AMP` down to 0.00015 (-64 dB).
+const CLICK_MIN: f32 = 1e-4;
+/// The click must exceed the loudest input seen before it was played by this factor: other audio
+/// playing into the device (music, a call) is not the click.
+const FLOOR_FACTOR: f32 = 3.0;
 
 /// Sample times of the delay probe's click, shared by the IO thread and `measure_delay`.
 /// Times are f64 bits; NaN = not happened yet.
@@ -131,6 +137,9 @@ pub struct ImpulseTimes {
     out: AtomicU64,
     /// Input sample time of the first sample over the threshold at or after `out`.
     back: AtomicU64,
+    /// Loudest input sample before the click was played, as f32 bits (non-negative floats order like
+    /// their bits, so `fetch_max` is a float max).
+    floor: AtomicU32,
 }
 
 impl ImpulseTimes {
@@ -139,7 +148,12 @@ impl ImpulseTimes {
             armed: AtomicBool::new(false),
             out: AtomicU64::new(f64::NAN.to_bits()),
             back: AtomicU64::new(f64::NAN.to_bits()),
+            floor: AtomicU32::new(0),
         }
+    }
+
+    fn floor(&self) -> f32 {
+        f32::from_bits(self.floor.load(Relaxed))
     }
 
     fn out(&self) -> f64 {
@@ -163,12 +177,17 @@ impl ImpulseTimes {
     /// Look for the click in one interleaved input block starting at sample time `time`.
     fn scan(&self, data: &[f32], ch: usize, time: f64) {
         let out = self.out();
-        if out.is_nan() || !self.back().is_nan() {
+        if out.is_nan() {
+            self.floor.fetch_max(peak(data).to_bits(), Relaxed);
             return;
         }
+        if !self.back().is_nan() {
+            return;
+        }
+        let threshold = CLICK_MIN.max(FLOOR_FACTOR * self.floor());
         let hit = data.chunks(ch.max(1)).enumerate().find_map(|(i, f)| {
             let t = time + i as f64;
-            (t >= out && f.iter().any(|x| x.abs() > CLICK_THRESHOLD)).then_some(t)
+            (t >= out && f.iter().any(|x| x.abs() > threshold)).then_some(t)
         });
         if let Some(t) = hit {
             self.back.store(t.to_bits(), Relaxed);
@@ -381,6 +400,12 @@ pub fn measure_delay(uid: &str) -> Result<f64> {
             break f;
         }
         if t0.elapsed() > Duration::from_secs(2) {
+            if FLOOR_FACTOR * times.floor() >= CLICK_AMP {
+                bail!(
+                    "Other audio is playing into this device, so the click cannot be told apart from it. \
+                     Pause it and measure again."
+                );
+            }
             bail!("The click did not come back through the device.");
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -398,6 +423,11 @@ mod tests {
     /// Drive an `ImpulseTimes` with fake callbacks over a loop that returns audio `delay` frames
     /// late; the output clock leads the input clock by `lead` frames, like a real device's.
     fn simulate(delay: usize, block: usize, lead: f64) -> Option<f64> {
+        simulate_with(delay, block, lead, 0.0, 1.0)
+    }
+
+    /// `bed`: other audio on the input (a square wave of this peak); `gain`: what V's volume does to the click.
+    fn simulate_with(delay: usize, block: usize, lead: f64, bed: f32, gain: f32) -> Option<f64> {
         let times = ImpulseTimes::new();
         let mut wire = vec![0.0f32; 100 * block + 1000]; // played samples by output sample time
         for k in 0..100usize {
@@ -405,7 +435,8 @@ mod tests {
             let input: Vec<f32> = (0..block)
                 .map(|i| {
                     let t = k * block + i;
-                    t.checked_sub(delay).map_or(0.0, |w| wire[w])
+                    let echo = t.checked_sub(delay).map_or(0.0, |w| wire[w] * gain);
+                    echo + if t % 7 < 3 { bed } else { -bed }
                 })
                 .collect();
             times.scan(&input, 1, in_time);
@@ -437,6 +468,36 @@ mod tests {
     }
 
     #[test]
+    fn other_audio_on_the_input_is_not_the_click() {
+        // Music at 0.05 peak plays into the device: the old fixed threshold (0.02) took its first loud
+        // sample for the click and reported a delay of a few frames.
+        for (delay, block, lead) in [(300, 128, 0.0), (1100, 64, 256.0), (420, 512, 100.0)] {
+            assert_eq!(
+                simulate_with(delay, block, lead, 0.05, 1.0),
+                Some(delay as f64),
+                "{delay} {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_through_a_turned_down_volume_is_still_found() {
+        // V's volume at -50 dB leaves 0.25 * 0.0032 = 0.0008, under the old 0.02 threshold.
+        for gain in [0.1, 0.01, 0.0032] {
+            assert_eq!(
+                simulate_with(300, 128, 0.0, 0.0, gain),
+                Some(300.0),
+                "{gain}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bed_louder_than_the_click_finds_nothing_rather_than_a_wrong_delay() {
+        assert_eq!(simulate_with(300, 128, 0.0, 0.3, 1.0), None);
+    }
+
+    #[test]
     fn no_click_before_arming_and_none_when_nothing_returns() {
         let t = ImpulseTimes::new();
         assert!(!t.fire(10.0));
@@ -444,7 +505,7 @@ mod tests {
         assert!(t.fire(10.0));
         assert!(!t.fire(20.0), "one click only");
         assert_eq!(t.frames(), None);
-        t.scan(&[0.0, 0.01, 0.0], 1, 10.0); // under the threshold
+        t.scan(&[0.0, 0.00005, 0.0], 1, 10.0); // under the threshold
         assert_eq!(t.frames(), None);
         t.scan(&[0.5, 0.0], 1, 0.0); // loud, but before the click was played
         assert_eq!(t.frames(), None);
