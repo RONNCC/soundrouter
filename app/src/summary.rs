@@ -146,7 +146,7 @@ pub fn demo_pill(ui: &mut Ui, t: &Tokens, left_center: Pos2) {
         g,
         ink,
     );
-    let hit = ui.interact(pill, Id::new("demo_pill"), Sense::hover());
+    let hit = ui.interact(pill, Id::unique("demo_pill"), Sense::hover());
     hit.widget_info(|| WidgetInfo::labeled(Role::Label, true, "Demo mode"));
     hit.on_hover_text(DEMO_TIP);
 }
