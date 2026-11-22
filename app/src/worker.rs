@@ -8,7 +8,7 @@ use sr_core::config::{Config, SourceKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -90,11 +90,34 @@ impl Core {
         }
     }
 
-    /// One wake-up; the UI is only asked to repaint when the snapshot changed.
+    /// One wake-up; the UI is only asked to repaint when the snapshot changed. A panic in the
+    /// backend must not end the thread: nothing would apply configs any more and the window would
+    /// look fine. It is logged by the panic hook and shown as the apply error instead.
     fn iterate(&mut self, first: Option<Msg>) {
         let batch = drain_latest(&self.rx, first);
         self.pump.visible = self.visible.load(Relaxed);
-        if self.pump.run(batch, Instant::now(), &self.snap) {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.pump.run(batch, Instant::now(), &self.snap)
+        }));
+        let changed = run.unwrap_or_else(|payload| {
+            let why = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            let msg = format!("The audio engine hit an internal error ({why}). See the log.");
+            let mut s = self.snap.lock().unwrap_or_else(PoisonError::into_inner);
+            s.apply_error = Some(msg.clone());
+            // A test that panicked would otherwise stay "Running" for ever.
+            if s.self_test == SelfTestState::Running {
+                s.self_test = SelfTestState::Done(Err(msg.clone()));
+            }
+            if s.measure == MeasureState::Running {
+                s.measure = MeasureState::Done(Err(msg));
+            }
+            true
+        });
+        if changed {
             self.ctx.request_repaint();
         }
     }
@@ -405,6 +428,8 @@ mod tests {
     struct Log {
         applied: Vec<Config>,
         fail: bool,
+        /// `apply` panics.
+        panic: bool,
         /// Snapshot lock was free during every backend call.
         lock_free: bool,
     }
@@ -425,11 +450,14 @@ mod tests {
     impl Backend for Rec {
         fn apply(&mut self, cfg: &Config) -> anyhow::Result<()> {
             self.probe();
-            let mut l = self.log.lock().unwrap();
-            l.applied.push(cfg.clone());
-            if l.fail {
-                anyhow::bail!("tap denied");
-            }
+            let (fail, boom) = {
+                let mut l = self.log.lock().unwrap();
+                l.applied.push(cfg.clone());
+                (l.fail, l.panic)
+            };
+            // After the guard is gone: a panic under it would poison the log for the test.
+            assert!(!boom, "engine bug");
+            anyhow::ensure!(!fail, "tap denied");
             Ok(())
         }
         fn hardware(&self) -> Vec<HwDevice> {
@@ -526,6 +554,39 @@ mod tests {
         log.lock().unwrap().fail = false;
         pump.tick(Some(default_config()), now, &snap);
         assert!(snap.lock().unwrap().apply_error.is_none());
+    }
+
+    #[test]
+    fn a_panicking_backend_is_reported_and_the_worker_keeps_serving() {
+        // Before, the panic ended the thread: later configs went nowhere and the UI never knew.
+        let log = Arc::new(Mutex::new(Log {
+            lock_free: true,
+            panic: true,
+            ..Log::default()
+        }));
+        let rec_snap = Arc::new(Mutex::new(Snapshot::default()));
+        let backend = Rec {
+            log: log.clone(),
+            snap: rec_snap,
+        };
+        let (tx, snap, mut core) =
+            Worker::core(Box::new(backend), Context::default(), Box::new(|_| None));
+        snap.lock().unwrap().self_test = SelfTestState::Running;
+        tx.send(Msg::Apply(default_config())).unwrap();
+        core.iterate(None);
+        let s = snap.lock().unwrap();
+        let err = s.apply_error.clone().unwrap();
+        assert!(err.contains("engine bug"), "{err}");
+        assert!(
+            matches!(s.self_test, SelfTestState::Done(Err(_))),
+            "not stuck on Running"
+        );
+        drop(s);
+        log.lock().unwrap().panic = false;
+        tx.send(Msg::Apply(default_config())).unwrap();
+        core.iterate(None);
+        assert!(snap.lock().unwrap().apply_error.is_none());
+        assert_eq!(log.lock().unwrap().applied.len(), 2);
     }
 
     #[test]
