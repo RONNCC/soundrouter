@@ -54,22 +54,37 @@ impl Ring {
 
     /// Store `src` (interleaved, `ch` channels) at sample time `t`. Single writer only.
     pub fn write(&self, ch: usize, t: i64, src: &[f32]) {
+        self.write_mid(ch, t, src, || {});
+    }
+
+    /// `write`, running `mid` after the data is stored and before the new end is published: where a
+    /// `reset` from another thread can land (tests drive it from there).
+    fn write_mid(&self, ch: usize, t: i64, src: &[f32], mid: impl FnOnce()) {
         if ch == 0 || ch > self.max_ch {
             return;
         }
         let frames = (src.len() / ch).min(self.cap as usize);
         let src = &src[..frames * ch];
         self.last_frames.store(frames as u32, Relaxed);
-        let end = self.end.load(Relaxed);
+        let mut end = self.end.load(Relaxed);
+        let new_end = t.saturating_add(frames as i64);
+        if end != EMPTY && new_end <= end.saturating_sub(self.cap / 2) {
+            // Older than anything a reader may take, so not a late block: the timeline restarted behind an end
+            // that was never reset. Writing it would also overwrite the frames one lap ahead of it.
+            self.end.store(EMPTY, Release);
+            end = EMPTY;
+        }
         if end == EMPTY || t > end {
             self.start.store(t, Relaxed); // first write or a gap: older ring content is stale
         }
         self.span(ch, t, frames, |i, k| {
             self.data[i].store(src[k].to_bits(), Relaxed)
         });
-        let new_end = t.saturating_add(frames as i64);
+        mid();
         if end == EMPTY || new_end > end {
-            self.end.store(new_end, Release);
+            // Not a store: a `reset` since the load above (StopIO on another thread) must stay in force, or
+            // this block would bring back the run it ended, and the next stream would read its frames.
+            let _ = self.end.compare_exchange(end, new_end, Release, Relaxed);
         }
     }
 
@@ -727,5 +742,102 @@ mod tests {
         let next = t + b as i64;
         assert_eq!(ra.plan(&ring, 1, next, b), (0, false), "empty ring");
         assert_eq!(ra.ahead(), 0);
+    }
+
+    /// A reset that lands while a write is in flight must not be undone by that write: the next stream
+    /// starts on a ring that holds nothing of the old one (here the old run's frames at the new stream's
+    /// sample times).
+    #[test]
+    fn a_reset_during_a_write_is_not_undone_by_it() {
+        let r = Ring::new(1024, 1);
+        for k in 0..10 {
+            r.write(1, k * 64, &[7.0; 64]); // the old stream: frames 0..640
+        }
+        r.write_mid(1, 640, &[7.0; 64], || r.reset()); // its last cycle races the StopIO that resets the ring
+        let mut o = vec![9.0; 64];
+        r.read(1, 200, &mut o); // the new stream starts over at time 0 and reads around here
+        assert!(o.iter().all(|&x| x == 0.0), "stale frames came back: {o:?}");
+        r.write(1, 0, &[1.0; 64]); // the new stream's first write
+        r.read(1, 0, &mut o);
+        assert!(
+            o.iter().all(|&x| x == 1.0),
+            "new stream is readable at once"
+        );
+        r.read(1, 200, &mut o);
+        assert!(o.iter().all(|&x| x == 0.0));
+    }
+
+    /// A timeline that restarts behind a ring that kept its old end (a reset that never came) must not
+    /// silence the new stream until it catches up, and a block from a lap ago must not overwrite the
+    /// frames one lap ahead of it.
+    #[test]
+    fn a_block_older_than_the_window_restarts_the_run_and_never_overwrites_newer_frames() {
+        let r = Ring::new(1024, 1);
+        r.write(1, 1_000_000, &[5.0; 64]);
+        for k in 0..4 {
+            r.write(1, k * 64, &[(k + 1) as f32; 64]); // the timeline starts over
+        }
+        let mut o = vec![0.0; 256];
+        r.read(1, 0, &mut o);
+        for k in 0..4 {
+            assert!(
+                o[k * 64..][..64].iter().all(|&x| x == (k + 1) as f32),
+                "block {k}"
+            );
+        }
+        r.write(1, 5000, &[2.0; 64]);
+        r.write(1, 5000 - 1024, &[3.0; 64]); // a lap behind: the same ring slots
+        r.read(1, 5000, &mut o[..64]);
+        assert!(
+            o[..64].iter().all(|&x| x != 3.0),
+            "a stale block overwrote newer frames"
+        );
+    }
+
+    proptest::proptest! {
+        /// The ring against a map of what was written per sample time, for writes at any offset from the
+        /// end (late, overlapping, gapped, a lap or more behind) and reads anywhere: a read returns exactly
+        /// the frames of the current run inside the readable window and silence elsewhere.
+        #[test]
+        fn ring_matches_a_model_for_any_write_offsets(
+            ops in proptest::collection::vec((-200i64..40, 1usize..16, proptest::bool::ANY, 0i64..90), 1..80),
+        ) {
+            use std::collections::HashMap;
+            const CAP: i64 = 64;
+            let r = Ring::new(CAP as usize, 1);
+            let mut m: HashMap<i64, f32> = HashMap::new();
+            let (mut start, mut end) = (0i64, None::<i64>);
+            let mut n = 0.0f32;
+            for (delta, len, is_read, back) in ops {
+                if is_read {
+                    let t = end.map_or(0, |e| e - back);
+                    let mut o = vec![-7.0; len];
+                    r.read(1, t, &mut o);
+                    for (i, &x) in o.iter().enumerate() {
+                        let f = t + i as i64;
+                        let want = match end {
+                            Some(e) if f >= start.max(e - CAP / 2) && f < e => m[&f],
+                            _ => 0.0,
+                        };
+                        proptest::prop_assert_eq!(x, want, "frame {} (run {}..{:?})", f, start, end);
+                    }
+                } else {
+                    let t = end.map_or(100, |e| e + delta);
+                    let w: Vec<f32> = (0..len).map(|_| { n += 1.0; n }).collect();
+                    r.write(1, t, &w);
+                    let new_end = t + len as i64;
+                    if end.is_some_and(|e| new_end <= e - CAP / 2) {
+                        end = None; // wholly older than the window: the timeline restarted
+                    }
+                    if end.is_none_or(|e| t > e) {
+                        start = t;
+                    }
+                    for (i, &x) in w.iter().enumerate() {
+                        m.insert(t + i as i64, x);
+                    }
+                    end = Some(end.map_or(new_end, |e| e.max(new_end)));
+                }
+            }
+        }
     }
 }
