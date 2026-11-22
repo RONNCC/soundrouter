@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 # shellcheck source=packaging/lib.sh
 . packaging/lib.sh
 OUT=target/SoundRouter.driver
-cargo build --release -p soundrouter-driver
+cargo build --release --locked -p soundrouter-driver # --locked: a shipped build never re-resolves dependencies
 rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS"
 cp driver/Info.plist "$OUT/Contents/Info.plist"

@@ -41,8 +41,8 @@ jobs:
           [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "tag $GITHUB_REF_NAME != workspace version v$version (Cargo.toml)" >&2; exit 1; }
       - name: Build (no signing key or secret present yet)
         run: |
-          cargo build --release -p soundrouter-app -p sr-cli
-          cargo build --release -p soundrouter-driver
+          cargo build --release --locked -p soundrouter-app -p sr-cli
+          cargo build --release --locked -p soundrouter-driver
       - name: Import signing certificates
         if: env.HAVE_CERT == 'true'
         env:

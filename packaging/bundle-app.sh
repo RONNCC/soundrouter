@@ -12,7 +12,7 @@ DRV=$APP/Contents/Resources/SoundRouter.driver
 # rustup shims first so rust-toolchain.toml selects the pinned toolchain
 export PATH="$HOME/.cargo/bin:$PATH"
 
-cargo build --release -p soundrouter-app -p sr-cli
+cargo build --release --locked -p soundrouter-app -p sr-cli
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
