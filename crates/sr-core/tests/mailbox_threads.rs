@@ -45,9 +45,9 @@ fn plans_published_while_the_audio_thread_runs_are_applied_without_heap_use() {
             m.process(&ins, &mut refs, 64);
             HEAP_OPS.with(|c| c.set(0));
             let mut blocks = 0u32;
-            // After `done`, the newest plan is published: two more blocks apply it completely.
+            // After `done`, the newest plan is published: enough blocks to finish the 10 ms fade apply it.
             let mut after = 0;
-            while after < 2 {
+            while after < 100 {
                 after += u32::from(done.load(Relaxed));
                 m.process(&ins, &mut refs, 64);
                 assert!(

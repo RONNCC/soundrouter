@@ -87,8 +87,8 @@ proptest! {
                     }
                 }
             }
-            // Whatever order that was, two more blocks apply the newest plan completely.
-            for _ in 0..2 {
+            // Whatever order that was, enough blocks to finish the 10 ms fade apply the newest plan completely.
+            for _ in 0..100 {
                 let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(Vec::as_mut_slice).collect();
                 m.process(&ins, &mut refs, 64);
             }

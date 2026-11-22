@@ -5,6 +5,7 @@
 | Layer | Covers | Command |
 |-------|--------|---------|
 | Unit + property | sr-core config/mixer/meters (incl. no-alloc test), driver slot pool, rings, parsing, engine layout planning, tap ring accounting (cushion, underrun, trim, drop), plan/ring swap order, tap IOProc copy, no-alloc test of the tap copy and ring pop, CLI exit codes | `cargo test --workspace` |
+| Sanitizers (nightly, optional) | ThreadSanitizer over the real-thread mailbox and tap ring tests (acquire/release of the plan and ring mailboxes, the SPSC ring) and the sr-core / sr-audio unit tests | `rustup component add rust-src --toolchain nightly`, then `RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std --target aarch64-apple-darwin -p sr-core --test mailbox_threads` and `-p sr-audio --lib tapring` |
 | Fake host | Driver loaded through CFPlugIn and driven through its vtable, no sudo; then 8 seeds of the randomized scenario fuzz | `packaging/driver-dev.sh fakehost` |
 | Fake host fuzz | Seeded random lists (valid, invalid, repeated), rates, volumes, I/O start/stop, Performs and Aborts in any order, I/O on removed ids, concurrent property reads; guard words behind every buffer, slot quarantine, convergence to the last list | `packaging/driver-dev.sh fuzz` (`SEEDS=50 STEPS=1000` default; one seed: `fakehost <driver> fuzz <seed> [steps]`) |
 | GUI | egui kittest interaction tests; GPU (Metal) snapshot baselines | `cargo test -p soundrouter-app --features snapshots` (`UPDATE_SNAPSHOTS=1` rewrites baselines) |
