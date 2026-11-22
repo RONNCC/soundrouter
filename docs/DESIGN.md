@@ -6,7 +6,7 @@ Status: the tokens, fonts and egui style below are in place, and every screen re
 
 ## The one memorable thing
 
-Colour-coded patch cables and segmented LED meters. Every output channel gets its own colour, a cable wears the colour of the channel it ends at, cables sag like real cables and end in round jacks. Everything around them is quiet, flat and disciplined, so the cables carry the picture.
+Colour-coded patch cables and segmented LED meters. Every cable gets its own colour, so cables that meet look different, cables sag like real cables and end in round jacks. Everything around them is quiet, flat and disciplined, so the cables carry the picture.
 
 ## Tokens
 
@@ -26,20 +26,20 @@ All colours, radii and type roles live in `app/src/theme.rs` (`Tokens`, `radius`
 
 Elevation is tonal: a raised surface is one step lighter (dark) or whiter (light) than what it sits on, outlined by a hairline. There are no gradients.
 
-### Cables and channel colours
+### Cables and cable colours
 
-Colour names a channel, not a source. The colour of output channel `n` (1-based in the UI) is `Tokens::channel(n - 1)`: eight hues from the Okabe-Ito set (the black swapped for violet and reordered so neighbours differ), one value per theme, each at least 3:1 against `raised` and `canvas` of its theme (`theme::tests::channel_palette` computes it). From channel 9 on the same eight hues come back mixed toward white (dark) or black (light) by 0, 30, 15 and 45 % per group of eight, so neighbouring channels never match up to 64.
+Colour names a cable, not a source or a channel. The palette is `Tokens::channel(slot)`: eight hues from the Okabe-Ito set (the black swapped for violet and reordered so neighbours differ), one value per theme, each at least 3:1 against `raised` and `canvas` of its theme (`theme::tests::channel_palette` computes it). Slots 8 to 31 are the same eight hues mixed toward white (dark) or black (light) by 30, 15 and 45 % per group of eight; they are used only when every hue is taken among the cables that meet. An open output-channel or monitor jack keeps the thin ring of its own channel's colour (`Tokens::channel(n - 1)` for channel or row `n`).
 
-| Channel | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+| Slot | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
 |---|---|---|---|---|---|---|---|---|
 | Light | `#0072B2` | `#C26A00` | `#00875F` | `#B5568C` | `#9A7B00` | `#2B8FCB` | `#D0480A` | `#7550D8` |
 | Dark | `#3D9BE0` | `#E69F00` | `#1FBF8F` | `#E08BBA` | `#F0E442` | `#56B4E9` | `#F0733A` | `#A58BFF` |
 
-- **Cable.** Solid, in the colour of the channel it ends at: a stereo source into channels 1 and 2 shows two colours, a mono mic into L and R shows two. A cable into a monitor takes the monitor channel's own colour (its row number).
-- **Output-side jacks** (output channels, monitors) wear their own channel's colour at all times: an open one is a thin ring in that colour on the card, a wired one is solid with a heavier ring and a soft halo.
-- **Source jacks** follow their cables. With none the jack is a neutral grey ring; with one it is solid in the colour of the channel that cable ends at; with two or more it is a larger ring in equal arcs, one per destination in channel order, up to three, and from a fourth cable on a "+N" badge counts the rest. The ring stays honest about where the signal goes.
+- **Cable.** Solid, in a colour of its own (`cables::assign`, one slot per cable). Cables that share a jack, a card (a source, an output-channel pair, a monitor) or an output channel (the cables into it and the cables out of it) avoid the same hue: the eight hues go first, and a lightness tier only appears when a card has more than eight cables. Among free hues, ones that read alike (blue and sky, orange and yellow or vermillion, blue and violet, pink and violet) come last, and the cables of neighbouring rows of one card avoid both. Three sources into Channel 1 draw in three colours, and the output-to-monitor cables never wear the colour of a source cable into the same channel.
+- **Stable.** A cable's slot comes from its key (source id or monitor device, the channel at each end), hashed to a preferred hue; the cables are walked in key order and each takes the cheapest slot against the cables of that order that meet it, ties going to its preferred hue. Repaints, reordered sources, and wires that meet no cable of it change nothing. The colours are recomputed only when the wire set changes (`cables::Cables`).
+- **Jacks** wear their cables. With none, a source jack is a neutral grey ring and an output or monitor jack a thin ring in its channel's colour; with one it is solid in that cable's colour, with a heavier ring and a soft halo; with two or more it is a larger ring in equal arcs, one per cable in cable order, up to three, and from a fourth cable on a "+N" badge counts the rest.
 - **Source identity** (`theme::CABLES`, in order: Signal Blue `#3B6CFF`, Cable Magenta `#E8458B`, Tangerine `#FF8A1F`, Mint Tape `#19B98A`, Violet `#8B5CF6`, Cyan `#12AEDB`, Sun `#F2C21B`, Coral `#FF5C5C`; the same on both themes) is only the small dot before the card title (`cable_color(id number)`, stable when other sources come and go) and the icon tile. Device rows in the sidebar keep `cable_color(index)` too.
-- **Never colour alone.** Row labels keep the channel number and side ("1 (L)"), and wired is also a heavier ring. Hovering a cable or a jack thickens every cable it touches, enlarges both jacks of each and shows a tooltip such as "Safari, channel 1 (L) to Channel 3 (L)", one line per cable.
+- **Never colour alone.** Row labels keep the channel number and side ("1 (L)"), and wired is also a heavier ring. Hovering a cable or a jack thickens every cable it touches, draws them on top, enlarges both jacks of each, dims everything else a little and shows a tooltip such as "Safari, channel 1 (L) to Channel 3 (L)", one line per cable.
 - A muted source or a disabled device fades its cables and jacks into the canvas.
 
 A cable is a cubic bezier whose handles run out of each end and sag in proportion to the horizontal run (`layout::wire_points`, capped at 36 px): 3 px of cable colour over a 1 px darker outline, ending in round jacks (a filled circle, a lighter ring, a dark hole; an empty socket is a raised circle with a ring). A hovered wire thickens and shows an x at its middle. Meters are 20-segment LED ladders, one segment per 3 dB from -57 to 0 dBFS: green to -12, amber to -3, red above, unlit segments in `track`, and the segment at the peak holds its light.

@@ -1,6 +1,7 @@
 //! The three-column graph (Sources | Output Channels | Monitors): painting and interaction.
 //! Reads the config, emits `Edit`s; never mutates it.
 use crate::app_icons::{LOOK_AHEAD, Look, PickerIcons, visible_rows, wanted};
+use crate::cables::{Cables, assign};
 use crate::icons::{self, IconTextures};
 use crate::layout::{
     CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, ROW_H as ROW_PITCH, TOP,
@@ -52,6 +53,8 @@ pub struct GraphState {
     /// wire that was already there when the device came on screen holds `NEG_INFINITY`.
     pub plugs: HashMap<(Port, Port), f64>,
     plugs_dev: String,
+    /// Palette slot of every cable of the shown device, kept until its wires change.
+    cables: Cables,
     pub drag: Option<Port>,
     /// Filled once by a background scan (started on the first frame), see `sr_audio::apps::installed_apps`.
     pub installed: Arc<OnceLock<Vec<AppInfo>>>,
@@ -1315,7 +1318,7 @@ pub fn source_slot(id: &str, index: usize) -> usize {
 }
 
 /// The identity colour of `dev.sources[i]`: the dot before its card title. Cables and jacks
-/// take output-channel colours instead.
+/// take per-cable colours instead (`cables::assign`).
 fn source_color(dev: &VirtualDevice, i: usize) -> Color32 {
     cable_color(source_slot(&dev.sources[i].id, i))
 }
@@ -1333,8 +1336,8 @@ fn feeding_source(all: &[Link], p: Port) -> Option<usize> {
     }
 }
 
-/// The output channel a port stands for, which names its colour: a device channel's own number,
-/// a monitor row's own number. A source port has none; its jack follows its cables.
+/// The output channel a port stands for, which colours its ring while it is open: a device
+/// channel's own number, a monitor row's own number. A source port has none and stays neutral.
 fn port_channel(p: Port) -> Option<u16> {
     match p {
         Port::Src { .. } => None,
@@ -1342,39 +1345,27 @@ fn port_channel(p: Port) -> Option<u16> {
     }
 }
 
-/// Colour of the cable `l`: that of the channel it ends at.
-fn cable_color_of(l: Link, t: &Tokens) -> Color32 {
-    port_channel(l.to).map_or(t.muted, |ch| t.channel(usize::from(ch)))
-}
-
-/// Look of the jack at `p`. Output-side and monitor jacks always wear their own channel's
-/// colour (a ring when open, solid when wired). A source jack is grey with no cable, takes the
-/// colour of the channel its cable ends at, and with more cables shows the lowest three
-/// destination channels as equal arcs (Plug::Split counts the rest).
-fn jack_plug(all: &[Link], p: Port, t: &Tokens) -> Plug {
-    if let Some(ch) = port_channel(p) {
-        let c = t.channel(usize::from(ch));
-        return if all.iter().any(|l| l.to == p || l.from == p) {
-            Plug::One(c)
-        } else {
-            Plug::Open(Some(c))
-        };
-    }
-    let dests = || {
-        all.iter()
-            .filter(|l| l.from == p)
-            .filter_map(|l| port_channel(l.to))
-    };
+/// Look of the jack at `p`, from the cables that touch it (`slots[n]` is the palette slot of
+/// `all[n]`). One cable: solid in its colour. Two or more: equal arcs of the first three, in
+/// cable order, with the true count for the "+N". None: a neutral ring for a source jack, the
+/// channel's own colour for an output or monitor jack.
+fn jack_plug(all: &[Link], slots: &[u8], p: Port, t: &Tokens) -> Plug {
     let mut first = [t.muted; 3];
-    let mut last = None;
-    for slot in &mut first {
-        let Some(ch) = dests().filter(|&c| last.is_none_or(|x| c > x)).min() else {
-            break;
-        };
-        *slot = t.channel(usize::from(ch));
-        last = Some(ch);
+    let mut n = 0;
+    for (_, &s) in all
+        .iter()
+        .zip(slots)
+        .filter(|(l, _)| l.from == p || l.to == p)
+    {
+        if let Some(c) = first.get_mut(n) {
+            *c = t.channel(usize::from(s));
+        }
+        n += 1;
     }
-    Plug::of(first, dests().count())
+    if n == 0 {
+        return Plug::Open(port_channel(p).map(|ch| t.channel(usize::from(ch))));
+    }
+    Plug::of(first, n)
 }
 
 /// "Safari, channel 1 (L) to Channel 3 (L)": what a cable joins, for its tooltip.
@@ -1496,6 +1487,7 @@ fn wires_and_ports(
 
     let painter = ui.painter().clone();
     let all = links(dev);
+    let slots = st.cables.slots(dev, &all);
     let now = ui.input(|i| i.time);
     // A wire seen for the first time pops its destination jack. The first frame of a device only
     // learns the wires it already has.
@@ -1525,8 +1517,7 @@ fn wires_and_ports(
             .map(|t0| pop_scale(now - t0))
             .fold(1.0, f32::max)
     };
-    // A cable has the colour of the channel it ends at; a muted source or a disabled device
-    // fades it into the canvas.
+    // A muted source or a disabled device fades its cables and jacks into the canvas.
     let fade = |c: Color32, src: Option<usize>| {
         if dev.enabled && src.is_none_or(|s| !dev.sources[s].muted) {
             c
@@ -1552,30 +1543,59 @@ fn wires_and_ports(
     {
         edits.push(Edit::Unlink(d, all[n]));
     }
-    // A hovered jack or cable lights every cable it touches and the jacks at their ends.
+    // A hovered jack or cable lights every cable it touches and the jacks at their ends, and
+    // the rest step back a little.
     let lit = |l: &Link, n: usize| {
         hovered_wire == Some(n) || hover.is_some_and(|h| h == l.from || h == l.to)
     };
-    for (n, l) in all.iter().enumerate() {
-        let (Some(a), Some(b)) = (layout.port_pos(l.from), layout.port_pos(l.to)) else {
-            continue;
-        };
-        let c = fade(cable_color_of(*l, t), feeding_source(&all, l.from));
-        draw_cable(
-            &painter,
-            wire_points(a, b),
-            c,
-            if lit(l, n) { 4.5 } else { 3.0 },
-        );
+    let any_lit = st.drag.is_none() && all.iter().enumerate().any(|(n, l)| lit(l, n));
+    let step_back = |c: Color32, on: bool| {
+        if on || !any_lit {
+            c
+        } else {
+            c.lerp_to_gamma(t.canvas, 0.4)
+        }
+    };
+    // The lit cables go on top of the others.
+    for top in [false, true] {
+        for (n, l) in all.iter().enumerate() {
+            let (Some(a), Some(b)) = (layout.port_pos(l.from), layout.port_pos(l.to)) else {
+                continue;
+            };
+            if lit(l, n) != top {
+                continue;
+            }
+            let c = fade(
+                t.channel(usize::from(slots[n])),
+                feeding_source(&all, l.from),
+            );
+            draw_cable(
+                &painter,
+                wire_points(a, b),
+                step_back(c, top),
+                if top { 4.5 } else { 3.0 },
+            );
+        }
     }
+    // The cable in flight shows the colour it will take where it lands: the slot of the cable
+    // that is already there, else the one the colouring would give the new cable.
+    let landing = st.drag.zip(target).map(|(from, to)| {
+        let new = Link { from, to };
+        let slot = all.iter().position(|l| *l == new).map_or_else(
+            || {
+                let mut with = all.clone();
+                with.push(new);
+                assign(dev, &with).last().copied().unwrap_or(0)
+            },
+            |n| slots[n],
+        );
+        t.channel(usize::from(slot))
+    });
     if let (Some(from), Some(pos)) = (st.drag, pointer)
         && let Some(a) = layout.port_pos(from)
     {
         let end = target.and_then(|p| layout.port_pos(p)).unwrap_or(pos);
-        // The cable in flight shows the colour it will take where it lands.
-        let c = target
-            .and_then(port_channel)
-            .map_or(t.muted, |ch| t.channel(usize::from(ch)));
+        let c = landing.unwrap_or(t.muted);
         draw_cable(&painter, wire_points(a, end), c, 3.0);
         if target.is_none() {
             // The loose end carries its plug until it lands.
@@ -1586,16 +1606,18 @@ fn wires_and_ports(
         let Some(pos) = layout.port_pos(p) else {
             continue;
         };
-        let mut plug = jack_plug(&all, p, t);
-        if target == Some(p) {
-            plug = plug.solid();
+        let mut plug = jack_plug(&all, slots, p, t);
+        if target == Some(p)
+            && let Some(c) = landing
+        {
+            plug = Plug::One(c);
         }
-        let plug = plug.map(|c| fade(c, feeding_source(&all, p)));
         let lights = all
             .iter()
             .enumerate()
             .any(|(n, l)| (l.from == p || l.to == p) && lit(l, n));
         let hot = lights || hover == Some(p) || target == Some(p) || st.drag == Some(p);
+        let plug = plug.map(|c| step_back(fade(c, feeding_source(&all, p)), hot));
         let grow = if hot { 1.25 } else { 1.0 };
         jack(&painter, pos, plug, grow * pop(p), hot, t);
     }
@@ -2003,58 +2025,88 @@ mod tests {
     }
 
     #[test]
-    fn a_cable_wears_the_colour_of_the_channel_it_ends_at() {
-        for dark in [false, true] {
-            let t = tokens(dark);
-            let src = |src, ch| Port::Src { src, ch };
-            // a stereo source into channels 1 and 2: two cables, two colours
-            let a = cable_color_of(link(src(0, 0), Port::OutIn { ch: 0 }), &t);
-            let b = cable_color_of(link(src(0, 1), Port::OutIn { ch: 1 }), &t);
-            assert_eq!((a, b), (t.channel(0), t.channel(1)));
-            assert_ne!(a, b);
-            // the source does not matter, only where the cable lands
-            let c = cable_color_of(link(src(2, 0), Port::OutIn { ch: 1 }), &t);
-            assert_eq!(c, b);
-            // a monitor cable takes its monitor channel's colour
-            let m = link(Port::OutOut { ch: 3 }, Port::Mon { mon: 1, ch: 0 });
-            assert_eq!(cable_color_of(m, &t), t.channel(0));
-        }
-    }
-
-    #[test]
-    fn a_source_jack_shows_where_its_cables_go_and_an_output_jack_its_own_channel() {
+    fn a_jack_wears_its_cables_and_an_open_one_its_channel_or_grey() {
         let t = tokens(true);
         let src = Port::Src { src: 0, ch: 0 };
         let out = |ch| Port::OutIn { ch };
-        let ch = |n: usize| t.channel(n);
-        // nothing wired: a source jack is neutral, an output jack still wears its colour
-        assert_eq!(jack_plug(&[], src, &t), Plug::Open(None));
-        assert_eq!(jack_plug(&[], out(2), &t), Plug::Open(Some(ch(2))));
-        // one cable: the colour of the channel it ends at
+        let c = |s: u8| t.channel(usize::from(s));
+        // nothing wired: a source jack is neutral, an output jack still wears its channel
+        assert_eq!(jack_plug(&[], &[], src, &t), Plug::Open(None));
+        assert_eq!(jack_plug(&[], &[], out(2), &t), Plug::Open(Some(c(2))));
+        // one cable: its slot, at both of its ends
         let one = [link(src, out(2))];
-        assert_eq!(jack_plug(&one, src, &t), Plug::One(ch(2)));
-        assert_eq!(jack_plug(&one, out(2), &t), Plug::One(ch(2)));
-        assert_eq!(jack_plug(&one, out(1), &t), Plug::Open(Some(ch(1))));
-        // two cables: both colours, lowest channel first whatever the wire order
+        assert_eq!(jack_plug(&one, &[5], src, &t), Plug::One(c(5)));
+        assert_eq!(jack_plug(&one, &[5], out(2), &t), Plug::One(c(5)));
+        assert_eq!(jack_plug(&one, &[5], out(1), &t), Plug::Open(Some(c(1))));
+        // two cables: equal arcs in cable order
         let two = [link(src, out(3)), link(src, out(1))];
         assert_eq!(
-            jack_plug(&two, src, &t),
-            Plug::Split([ch(1), ch(3), t.muted], 2)
+            jack_plug(&two, &[4, 2], src, &t),
+            Plug::Split([c(4), c(2), t.muted], 2)
         );
-        // many: the three lowest channels and the true count, which is what "+N" counts from
-        let many: Vec<Link> = [5, 2, 0, 7, 4].map(|c| link(src, out(c))).to_vec();
+        // an output jack fed by two sources splits too
+        let fed = [link(src, out(0)), link(Port::Src { src: 1, ch: 0 }, out(0))];
         assert_eq!(
-            jack_plug(&many, src, &t),
-            Plug::Split([ch(0), ch(2), ch(4)], 5)
+            jack_plug(&fed, &[1, 6], out(0), &t),
+            Plug::Split([c(1), c(6), t.muted], 2)
+        );
+        // many: the first three and the true count, which is what "+N" counts from
+        let many: Vec<Link> = [5, 2, 0, 7, 4].map(|n| link(src, out(n))).to_vec();
+        assert_eq!(
+            jack_plug(&many, &[3, 1, 2, 0, 7], src, &t),
+            Plug::Split([c(3), c(1), c(2)], 5)
         );
         // another source's cables do not colour this jack
         let other = [link(Port::Src { src: 1, ch: 0 }, out(0))];
-        assert_eq!(jack_plug(&other, src, &t), Plug::Open(None));
+        assert_eq!(jack_plug(&other, &[1], src, &t), Plug::Open(None));
         // a monitor jack follows the same rule with its own row
         let mon = Port::Mon { mon: 0, ch: 1 };
-        assert_eq!(jack_plug(&[], mon, &t), Plug::Open(Some(ch(1))));
+        assert_eq!(jack_plug(&[], &[], mon, &t), Plug::Open(Some(c(1))));
         let wired = [link(Port::OutOut { ch: 1 }, mon)];
-        assert_eq!(jack_plug(&wired, mon, &t), Plug::One(ch(1)));
+        assert_eq!(jack_plug(&wired, &[6], mon, &t), Plug::One(c(6)));
+    }
+
+    #[test]
+    fn cables_into_one_channel_wear_different_colours() {
+        // three sources into channel 1, each cable its own colour, and the two cables of a
+        // stereo source differ as well
+        let mut c = bare_config();
+        for n in 0..3 {
+            apply(
+                &mut c,
+                Edit::AddSource(
+                    0,
+                    SourceKind::App {
+                        bundle_id: format!("x.{n}"),
+                    },
+                    2,
+                ),
+            );
+        }
+        let mut dev = c.devices.remove(0);
+        dev.wires.clear();
+        for s in 0..3 {
+            dev.wires.push(sr_core::config::Wire {
+                source: dev.sources[s].id.clone(),
+                src_ch: 0,
+                out_ch: 0,
+            });
+        }
+        dev.wires.push(sr_core::config::Wire {
+            source: dev.sources[0].id.clone(),
+            src_ch: 1,
+            out_ch: 1,
+        });
+        let all = links(&dev);
+        let slots = crate::cables::assign(&dev, &all);
+        let distinct: HashSet<u8> = slots.iter().copied().collect();
+        assert_eq!(distinct.len(), 4);
+        for dark in [false, true] {
+            let t = tokens(dark);
+            let colours: HashSet<Color32> =
+                slots.iter().map(|&s| t.channel(usize::from(s))).collect();
+            assert_eq!(colours.len(), 4);
+        }
     }
 
     #[test]
@@ -2266,7 +2318,7 @@ mod tests {
         }
 
         /// A 4-channel device fed by three sources: Safari's left channel leaves by two cables
-        /// (a split jack), Pass-Thru's by four (a split jack with "+1"), every cable wears the colour of the channel it ends at.
+        /// (a split jack), Pass-Thru's by four (a split jack with "+1"), every cable its own colour.
         fn four_channel() -> VirtualDevice {
             let mut c = demo_config();
             apply(&mut c, Edit::GrowChannels(0));
@@ -2290,6 +2342,33 @@ mod tests {
             })
             .to_vec();
             c.devices.remove(0)
+        }
+
+        /// Three stereo sources into the same two channels, which play on two monitors: ten
+        /// cables, none sharing a colour with a cable it meets.
+        #[test]
+        fn three_sources_into_two_channels_and_two_monitors() {
+            let mut results = egui_kittest::SnapshotResults::new();
+            for (theme, name) in [
+                (Theme::Dark, "graph_three_into_two_dark"),
+                (Theme::Light, "graph_three_into_two_light"),
+            ] {
+                let mut c = demo_config();
+                apply(&mut c, Edit::AddMonitor(0, "USBHeadset".into(), 2));
+                let dev = &mut c.devices[0];
+                dev.wires = (0..3)
+                    .flat_map(|s| (0..2).map(move |ch| (s, ch)))
+                    .map(|(s, ch)| sr_core::config::Wire {
+                        source: dev.sources[s].id.clone(),
+                        src_ch: ch,
+                        out_ch: ch,
+                    })
+                    .collect();
+                let mut h = harness(theme, c.devices.remove(0), true, false);
+                h.run_steps(30);
+                h.snapshot(name);
+                results.extend_harness(&mut h);
+            }
         }
 
         #[test]

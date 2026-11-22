@@ -1,6 +1,7 @@
 //! SoundRouter: Loopback-style virtual audio device router.
 mod app;
 mod app_icons;
+mod cables;
 mod deeplink;
 mod fake;
 mod graph;

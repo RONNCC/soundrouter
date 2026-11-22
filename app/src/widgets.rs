@@ -185,14 +185,6 @@ impl Plug {
             Plug::Split(cols, n) => Plug::Split(cols.map(f), n),
         }
     }
-
-    /// An open ring as the solid plug of its colour (the preview of a drop); others unchanged.
-    pub fn solid(self) -> Plug {
-        match self {
-            Plug::Open(Some(c)) => Plug::One(c),
-            other => other,
-        }
-    }
 }
 
 /// Arc `i` of `k` equal arcs of a ring, from the top, clockwise: a polyline.
