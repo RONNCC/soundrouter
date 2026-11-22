@@ -22,6 +22,8 @@ pub unsafe extern "C" fn start_io(
         slot.seed.fetch_add(1, AcqRel);
     }
     slot.clients[side as usize].fetch_add(1, AcqRel);
+    // V.in changes from ring A to ring B when C starts: what its read-ahead measured no longer holds.
+    slot.restart_read_ahead();
     0
 }
 
@@ -665,6 +667,9 @@ mod tests {
     #[test]
     fn read_ahead_delivers_frames_sooner_after_calibrating() {
         const F: usize = FRAMES;
+        let _g = RA_SWITCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (v, c) = activate(2, 2);
         let val = |t: i64| t as f32 + 1.0;
         let frame_data =
@@ -755,6 +760,55 @@ mod tests {
         assert!(rd[real * 2..F * 2].iter().all(|&x| x == 0.0), "silent tail");
         set_read_ahead(false);
         assert_eq!((stop(c), stop(v)), (0, 0));
+    }
+
+    /// The process-wide read-ahead switch is flipped by two tests.
+    static RA_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// V.in reads ring A (V's own output) while the engine is idle, ring B once C runs. That switch changes what
+    /// the calibrated read-ahead was measured on, so it restarts it: ring B's slack is another writer's.
+    #[test]
+    fn the_engine_starting_restarts_the_read_ahead_of_the_input_it_takes_over() {
+        const F: usize = FRAMES;
+        let _g = RA_SWITCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (v, c) = activate(1, 2);
+        let frame = |t: i64| -> Vec<f32> {
+            (0..F as i64)
+                .flat_map(|i| [(t + i) as f32 + 1.0; 2])
+                .collect()
+        };
+        let start = |dev| unsafe { start_io(std::ptr::null_mut(), dev, 0) };
+        let ahead = || SLOTS[1].read_ahead[Side::Visible as usize].ahead();
+        let shortfalls = || SLOTS[1].overloads[Side::Visible as usize].load(Relaxed);
+        // One cycle: C.out (when `engine`) writes ring B too late to be read ahead, V.in reads, V.out writes ring A.
+        let cycle = |now: f64, engine: bool| {
+            let mut rd = vec![];
+            if engine {
+                let mut w = frame(now as i64 - F as i64);
+                assert_eq!(run_at(c, WRITE, now - F as f64, now, &mut w, F * 2), 0);
+            }
+            assert_eq!(run_at(v, READ, now - F as f64, now, &mut rd, F * 2), 0);
+            let mut w = frame(now as i64 + F as i64);
+            assert_eq!(run_at(v, WRITE, now + F as f64, now, &mut w, F * 2), 0);
+        };
+        set_read_ahead(true);
+        assert_eq!(start(v), 0);
+        let mut now = 10_000.0;
+        for _ in 0..102 {
+            cycle(now, false);
+            now += F as f64;
+        }
+        assert!(ahead() > 0, "the direct loop calibrated");
+        assert_eq!((shortfalls(), start(c)), (0, 0));
+        cycle(now, true);
+        assert_eq!(
+            (ahead(), shortfalls()),
+            (0, 0),
+            "calibration restarted for the other ring, no read past its frames"
+        );
+        set_read_ahead(false);
     }
 
     #[test]
