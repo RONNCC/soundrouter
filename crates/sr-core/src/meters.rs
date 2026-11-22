@@ -21,6 +21,9 @@ pub struct Meters {
     /// IOProc cycles whose sample time did not follow the previous one: the HAL skipped audio (CPU
     /// overload or a stalled thread). Written by the audio thread.
     pub glitch_count: AtomicU64,
+    /// Mixed blocks in which a virtual-device output sample went past full scale (|x| > 1.0). The
+    /// output is not limited, so the HAL's converter hard-clips those samples. Written by the audio thread.
+    pub clipped_blocks: AtomicU64,
 }
 
 impl Default for Meters {
@@ -32,6 +35,7 @@ impl Default for Meters {
             outputs: slots(),
             mismatch_count: AtomicU64::new(0),
             glitch_count: AtomicU64::new(0),
+            clipped_blocks: AtomicU64::new(0),
         }
     }
 }
@@ -107,6 +111,10 @@ impl Meters {
 
     pub fn glitch_count(&self) -> u64 {
         self.glitch_count.load(Relaxed)
+    }
+
+    pub fn clipped_blocks(&self) -> u64 {
+        self.clipped_blocks.load(Relaxed)
     }
 
     /// Swaps peaks to 0 and maps indices to names via the layout.

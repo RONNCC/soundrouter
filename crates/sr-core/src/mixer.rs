@@ -113,7 +113,9 @@ impl AppSys {
 }
 struct MonPlan {
     gain: Gain,
-    wires: Vec<(usize, usize)>, // (vdev ch, output slot)
+    /// (vdev ch, output slot, scale). The scale is 1/n when n vdev channels feed the same output slot, so
+    /// a downmix (two channels onto a mono output) averages instead of adding 6 dB; 1.0 otherwise.
+    wires: Vec<(usize, usize, f32)>,
 }
 
 /// Precomputed sparse taps (input slot -> vdev channel via source gain) + per-output gains.
@@ -272,9 +274,16 @@ impl MixPlan {
                             && *uid == m.device_uid
                             && *ch == mw.dst_ch
                         {
-                            wires.push((usize::from(mw.out_ch), slot));
+                            wires.push((usize::from(mw.out_ch), slot, 1.0));
                         }
                     }
+                }
+                let fan_in: Vec<usize> = wires
+                    .iter()
+                    .map(|w| wires.iter().filter(|o| o.1 == w.1).count())
+                    .collect();
+                for (w, n) in wires.iter_mut().zip(fan_in) {
+                    w.2 = 1.0 / n as f32;
                 }
                 MonPlan {
                     gain: Gain::new(&m.device_uid, m.volume_db, !m.enabled),
@@ -297,7 +306,10 @@ impl MixPlan {
         }
         dev_out.hash(&mut h);
         for m in &mons {
-            (m.gain.key, &m.wires).hash(&mut h);
+            m.gain.key.hash(&mut h);
+            for w in &m.wires {
+                (w.0, w.1).hash(&mut h);
+            }
         }
         MixPlan {
             in_len: layout.inputs.len(),
@@ -333,6 +345,7 @@ impl MixPlan {
     }
 
     /// One block of `n <= MAX_FRAMES` frames at `off`. Caller checked lengths. Outputs already zeroed.
+    /// Returns whether a vdev output sample exceeded full scale in this block.
     fn run(
         &mut self,
         inputs: &[&[f32]],
@@ -340,7 +353,7 @@ impl MixPlan {
         off: usize,
         n: usize,
         meters: &Meters,
-    ) {
+    ) -> bool {
         let end = off + n;
         for g in &mut self.srcs {
             g.next = slew(g.cur, g.target, n);
@@ -376,6 +389,7 @@ impl MixPlan {
         for &i in &self.meter_in {
             meters.update_input(i, peak(&inputs[i][off..end]));
         }
+        let mut clipped = false;
         for c in 0..self.nch {
             let ch = &mut self.acc[c * MAX_FRAMES..][..n];
             ramp_scale(ch, self.dev_gain.cur, self.dev_gain.next);
@@ -384,6 +398,7 @@ impl MixPlan {
             } else {
                 peak(ch)
             };
+            clipped |= p > 1.0;
             meters.update_output(c, p);
         }
         self.dev_gain.cur = self.dev_gain.next;
@@ -396,16 +411,17 @@ impl MixPlan {
             );
         }
         for m in &mut self.mons {
-            for &(c, slot) in &m.wires {
+            for &(c, slot, scale) in &m.wires {
                 ramp_add(
                     &mut outputs[slot][off..end],
                     &self.acc[c * MAX_FRAMES..][..n],
-                    m.gain.cur,
-                    m.gain.next,
+                    m.gain.cur * scale,
+                    m.gain.next * scale,
                 );
             }
             m.gain.cur = m.gain.next;
         }
+        clipped
     }
 }
 
@@ -559,7 +575,9 @@ impl Mixer {
         let mut off = 0;
         while off < frames {
             let n = (frames - off).min(MAX_FRAMES);
-            plan.run(inputs, outputs, off, n, meters);
+            if plan.run(inputs, outputs, off, n, meters) {
+                meters.clipped_blocks.fetch_add(1, Relaxed);
+            }
             if let Some(mut old) = fade.take() {
                 crossfade(&mut old, fade_buf, inputs, outputs, n, meters);
                 let _ = ret.push(old); // back to the control side, never freed on the audio thread

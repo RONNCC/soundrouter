@@ -655,3 +655,72 @@ fn after_any_number_of_gain_changes_a_settled_block_is_bit_exact() {
         }
     }
 }
+
+/// `dev()` with the speaker's wires replaced.
+fn dev_with_monitor_wires(pairs: &[(u16, u16)]) -> VirtualDevice {
+    let mut d = dev();
+    let mut m = mon("spk", true, 0.0);
+    m.wires = pairs
+        .iter()
+        .map(|&(out_ch, dst_ch)| MonitorWire { out_ch, dst_ch })
+        .collect();
+    d.monitors.push(m);
+    d
+}
+
+#[test]
+fn monitor_at_unity_is_bit_exact_for_stereo_and_mono_to_stereo() {
+    // stereo -> stereo
+    let (mut m, _h, _) = setup(&dev_with_monitor_wires(&[(0, 0), (1, 1)]), &layout());
+    let ins = vec![vec![0.3; 16], vec![-0.7; 16]];
+    let o = run(&mut m, &ins, 4, 16);
+    assert!(o[2].iter().all(|x| *x == 0.3));
+    assert!(o[3].iter().all(|x| *x == -0.7));
+    // mono source fanned to both vdev channels -> stereo monitor
+    let mut d = dev_with_monitor_wires(&[(0, 0), (1, 1)]);
+    d.sources[0].channels = 1;
+    d.wires[1].src_ch = 0;
+    let mut l = layout();
+    l.inputs.truncate(1);
+    let (mut m, _h, _) = setup(&d, &l);
+    let o = run(&mut m, &[vec![0.3; 16]], 4, 16);
+    assert!(o[2].iter().chain(&o[3]).all(|x| *x == 0.3));
+}
+
+#[test]
+fn two_vdev_channels_onto_one_monitor_channel_average() {
+    // A mono output fed by L and R: a duplicated mono source stays at its own level (not +6 dB).
+    let d = dev_with_monitor_wires(&[(0, 0), (1, 0)]);
+    let (mut m, _h, _) = setup(&d, &layout());
+    let o = run(&mut m, &[vec![0.5; 16], vec![0.5; 16]], 4, 16);
+    assert!(o[2].iter().all(|x| *x == 0.5), "{:?}", o[2]);
+    assert!(o[3].iter().all(|x| *x == 0.0), "dst 1 has no wire");
+    // Different levels: the mean.
+    let (mut m, _h, _) = setup(&d, &layout());
+    let o = run(&mut m, &ones(16), 4, 16);
+    assert!(o[2].iter().all(|x| close(*x, 0.75)), "{:?}", o[2]);
+    // The vdev's own outputs are not scaled.
+    assert!(o[0].iter().all(|x| *x == 1.0) && o[1].iter().all(|x| *x == 0.5));
+}
+
+#[test]
+fn clipped_blocks_count_blocks_with_a_vdev_sample_over_full_scale() {
+    let (mut m, mut h, meters) = setup(&dev(), &layout());
+    // Exactly full scale and non-finite input (silence to the mixer) are not clipping.
+    run(&mut m, &[vec![1.0; 16], vec![f32::INFINITY; 16]], 4, 16);
+    assert_eq!(meters.clipped_blocks(), 0);
+    run(&mut m, &[vec![0.2; 16], vec![-1.5; 16]], 4, 16);
+    assert_eq!(meters.clipped_blocks(), 1, "negative overshoot counts");
+    run(&mut m, &[vec![0.2; 16], vec![0.2; 16]], 4, 16);
+    assert_eq!(meters.clipped_blocks(), 1, "a quiet block adds nothing");
+    // One call longer than MAX_FRAMES runs as two blocks.
+    let n = MAX_FRAMES + 1;
+    run(&mut m, &[vec![1.5; n], vec![0.0; n]], 4, n);
+    assert_eq!(meters.clipped_blocks(), 3);
+    // A routing change runs the old plan once more for the crossfade: still one count per block.
+    let mut d = dev();
+    d.wires.pop();
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    run(&mut m, &[vec![1.5; 16], vec![1.5; 16]], 4, 16);
+    assert_eq!(meters.clipped_blocks(), 4);
+}

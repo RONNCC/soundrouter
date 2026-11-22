@@ -99,8 +99,9 @@ fn lin(db: f32, off: bool) -> f64 {
     }
 }
 
-/// Steady-state output per slot for constant inputs `x`, summed naively in f64.
-fn oracle(c: &Cfg, x: &[f64]) -> Vec<f64> {
+/// Steady-state output per slot for constant inputs `x`, summed naively in f64. Monitor wires that share
+/// a destination average when `avg` (what the mixer does); without it they add, an upper bound for `x >= 0`.
+fn oracle(c: &Cfg, x: &[f64], avg: bool) -> Vec<f64> {
     let mut acc = [0.0f64; NCH];
     for k in 0..SRCS * 2 * NCH {
         if c.wires[k] {
@@ -112,9 +113,11 @@ fn oracle(c: &Cfg, x: &[f64]) -> Vec<f64> {
     let mut out: Vec<f64> = acc.iter().map(|a| a * dev).collect();
     let mut mon = [0.0f64; 2];
     if let Some((db, w)) = &c.mon {
-        for k in 0..NCH * 2 {
-            if w[k] {
-                mon[k % 2] += out[k / 2] * lin(*db, false);
+        for d in 0..2 {
+            let n = (0..NCH).filter(|o| w[o * 2 + d]).count();
+            let div = if avg { n.max(1) as f64 } else { 1.0 };
+            for o in (0..NCH).filter(|o| w[o * 2 + d]) {
+                mon[d] += out[o] * lin(*db, false) / div;
             }
         }
     }
@@ -157,9 +160,9 @@ fn reach(a: &Cfg, b: &Cfg, x: &[f64], flat: bool) -> Vec<f64> {
         u.src_db = vec![(6.0, false); SRCS];
         u.dev_db = 0.0;
         u.mon = u.mon.map(|(_, w)| (0.0, w));
-        return oracle(&u, x);
+        return oracle(&u, x, false);
     }
-    oracle(&u, x)
+    oracle(&u, x, false)
 }
 
 fn block(m: &mut Mixer, x: &[f64], n: usize) -> Vec<Vec<f32>> {
@@ -181,11 +184,11 @@ proptest! {
         let (mut m, mut h) = mixer(Arc::new(Meters::new()));
         h.set_plan(MixPlan::compile(&device(&seq[0].0), &layout6()));
         block(&mut m, &x, seq[0].1);
-        let mut last = oracle(&seq[0].0, &x);
+        let mut last = oracle(&seq[0].0, &x, true);
         let mut prevc = seq[0].0.clone();
         for (c, n) in &seq[1..] {
             h.set_plan(MixPlan::compile(&device(c), &layout6()));
-            let want = oracle(c, &x);
+            let want = oracle(c, &x, true);
             let top = reach(&prevc, c, &x, false);
             let flat = reach(&prevc, c, &x, true);
             // The swap block, then blocks until the gains have settled (+24 dB to silence is 1800 frames).

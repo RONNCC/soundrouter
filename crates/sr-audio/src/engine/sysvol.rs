@@ -68,24 +68,36 @@ impl State {
 
     /// A volume or mute change: the apps keep their follow decision.
     fn read_gain(&self) {
-        let scalar = self
-            .vol
-            .and_then(|c| hal::get_global::<f32>(c, kAudioLevelControlPropertyScalarValue).ok())
-            .unwrap_or(1.0);
-        let muted = self
-            .mute
-            .and_then(|c| hal::get_global::<u32>(c, kAudioBooleanControlPropertyValue).ok())
-            .is_some_and(|m| m != 0);
+        self.update_gain(|| {
+            let scalar = self
+                .vol
+                .and_then(|c| hal::get_global::<f32>(c, kAudioLevelControlPropertyScalarValue).ok())
+                .unwrap_or(1.0);
+            let muted = self
+                .mute
+                .and_then(|c| hal::get_global::<u32>(c, kAudioBooleanControlPropertyValue).ok())
+                .is_some_and(|m| m != 0);
+            (scalar, muted)
+        });
+    }
+
+    /// Reads V's `(scalar, muted)` and publishes it in one critical section. Volume and mute listeners
+    /// can fire on different HAL threads: with the read outside the lock, the thread holding the older
+    /// read could publish last and leave a stale gain until the next change. Serialized, the last
+    /// publish always carries the latest read, so no generation counter is needed.
+    fn update_gain(&self, read: impl FnOnce() -> (f32, bool)) {
         let mut g = self.lock();
+        let (scalar, muted) = read();
         g.gain = volume_gain(scalar, muted);
         self.publish(&g);
     }
 
     /// An app started or stopped playing to V, or the system default output moved.
     fn read_follow(&self) {
+        // Read under the lock like `update_gain`: a stale default must not be published after a newer one.
+        let mut g = self.lock();
         let default =
             hal::get_global::<u32>(hal::SYSTEM, kAudioHardwarePropertyDefaultOutputDevice).ok();
-        let mut g = self.lock();
         for a in &mut g.apps {
             let devices: Vec<Option<Vec<u32>>> = a
                 .objs
@@ -224,6 +236,41 @@ impl SysVol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state() -> State {
+        State {
+            v: 7,
+            vol: None,
+            mute: None,
+            out: Arc::new(SysGain::default()),
+            inner: Mutex::new(Inner {
+                gain: 1.0,
+                apps: vec![App {
+                    source: "a".into(),
+                    objs: vec![],
+                    follow: true,
+                }],
+            }),
+        }
+    }
+
+    /// The read must happen inside the critical section that publishes it: a read taken before the lock
+    /// can be overtaken by a newer read from another listener thread and then published last (stale gain).
+    #[test]
+    fn the_gain_is_read_under_the_lock_that_publishes_it() {
+        let s = state();
+        let mut reads = 0;
+        s.update_gain(|| {
+            reads += 1;
+            assert!(
+                matches!(s.inner.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                "read outside the critical section"
+            );
+            (0.5, false)
+        });
+        assert_eq!(reads, 1);
+        assert_eq!(s.lock().gain, volume_gain(0.5, false));
+    }
 
     #[test]
     fn the_aggregate_main_being_v_does_not_follow_v_twice() {

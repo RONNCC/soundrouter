@@ -543,3 +543,47 @@ proptest! {
         prop_assert!(r.channels.iter().chain(r.sources.iter().flat_map(|(_, c)| c)).all(|x| x.is_finite()));
     }
 }
+
+/// Speaker output ch 0 (slot 2) of `dev()` with its monitor wired as `pairs`, for L and R input.
+fn speaker_ch0(pairs: &[(u16, u16)], vol_db: f32, l: &[f32], r: &[f32]) -> Vec<f32> {
+    let mut d = dev();
+    let mut m = mon("spk", true, vol_db);
+    m.wires = pairs
+        .iter()
+        .map(|&(out_ch, dst_ch)| MonitorWire { out_ch, dst_ch })
+        .collect();
+    d.monitors.push(m);
+    let (mut mx, mut h) = mixer(Arc::new(Meters::new()));
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    run(&mut mx, &[l.to_vec(), r.to_vec()], 4, l.len()).swap_remove(2)
+}
+
+proptest! {
+    /// A mono monitor output (both vdev channels wired to dst 0) carries the stereo output's average.
+    #[test]
+    fn mono_monitor_is_the_average_of_the_stereo_monitor(
+        db in -24.0f32..=6.0,
+        lr in prop::collection::vec((-1.0f32..=1.0, -1.0f32..=1.0), 1..48),
+    ) {
+        let (l, r): (Vec<f32>, Vec<f32>) = lr.into_iter().unzip();
+        let mono = speaker_ch0(&[(0, 0), (1, 0)], db, &l, &r);
+        let left = speaker_ch0(&[(0, 0)], db, &l, &r);
+        let right = speaker_ch0(&[(1, 0)], db, &l, &r);
+        for k in 0..l.len() {
+            prop_assert!((mono[k] - (left[k] + right[k]) / 2.0).abs() <= 1e-6, "frame {k}");
+        }
+    }
+
+    /// A mono source duplicated to L and R reaches a mono monitor at the level it reaches a stereo one.
+    #[test]
+    fn duplicated_mono_has_the_same_level_on_a_mono_monitor(
+        db in -24.0f32..=6.0,
+        x in prop::collection::vec(-1.0f32..=1.0, 1..48),
+    ) {
+        let mono = speaker_ch0(&[(0, 0), (1, 0)], db, &x, &x);
+        let stereo = speaker_ch0(&[(0, 0), (1, 1)], db, &x, &x);
+        for k in 0..x.len() {
+            prop_assert!((mono[k] - stereo[k]).abs() <= 1e-6, "frame {k}");
+        }
+    }
+}

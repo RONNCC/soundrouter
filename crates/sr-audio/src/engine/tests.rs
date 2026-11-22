@@ -1,6 +1,6 @@
 use super::*;
 use sr_core::config::{Monitor, MonitorWire, Source, Wire};
-use sr_core::mixer::OutPort;
+use sr_core::mixer::{IoLayout, OutPort};
 
 fn src(id: &str, kind: SourceKind) -> Source {
     Source {
@@ -109,7 +109,7 @@ fn main_candidates_override_wins_and_never_falls_back() {
     assert_eq!(main_candidates_in(&dev, Some(""), &|_| true).len(), 2);
 }
 
-// ---- layout_inputs / check_width ----
+// ---- layout_inputs / clamp_width ----
 
 #[test]
 fn layout_inputs_collects_roles() {
@@ -152,19 +152,82 @@ fn layout_of(n_in: usize, n_out: usize) -> IoLayout {
     }
 }
 
+/// A device with more than MAX_CH channels keeps its first MAX_CH and silences the rest, as the
+/// vdev runs through `refresh_layout` (clamp) and the IOProc (`run`).
 #[test]
-fn check_width_names_limit_and_counts() {
-    assert!(check_width(&layout_of(MAX_CH, MAX_CH)).is_ok());
-    // Bug 2: a 64-channel device plus one app tap (2 more inputs) is over the limit.
-    let e = check_width(&layout_of(MAX_CH + 2, MAX_CH))
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("66 input / 64 output"), "{e}");
-    assert!(e.contains("at most 64"), "{e}");
-    let e = check_width(&layout_of(2, MAX_CH + 8))
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("2 input / 72 output"), "{e}");
+fn run_wide_monitor_routes_the_first_max_ch_outputs() {
+    let mut dev = vdev(
+        vec![src("pt", SourceKind::PassThru)],
+        vec![wire("pt", 0, 0), wire("pt", 1, 1)],
+        vec![mon("spk", true)],
+    );
+    // Output channel 61 of the 70-channel monitor is the last one routed (slot 2 + 61 = 63).
+    dev.monitors[0].wires = [(0, 0), (1, 61), (0, 66), (1, 69)]
+        .map(|(out_ch, dst_ch)| MonitorWire { out_ch, dst_ch })
+        .to_vec();
+    let subs = [sub("comp", true, &[2], &[2]), sub("spk", false, &[], &[70])];
+    let (ain, aout) = ([2], [2, 70]);
+    let li = layout_inputs(&dev, "comp");
+    let spec = LayoutSpec {
+        subs: &subs,
+        passthru: li.passthru.as_deref(),
+        device_sources: &li.device_sources,
+        monitors: &li.monitors,
+        taps: &[],
+    };
+    let (lay, note) = layout::clamp_width(layout::build_layout(&spec, &ain, &aout).unwrap());
+    assert_eq!(lay.outputs.len(), MAX_CH);
+    assert!(note.is_some_and(|n| n.contains("2 input / 72 output")));
+    let mut r = rig(&dev, &lay, &ain, &aout);
+    let frames = 32;
+    let mut inp = Bl::new(&ain, frames);
+    let mut out = Bl::new(&aout, frames);
+    inp.fill(0, |i| sample(i / 2, i % 2));
+    (0..2).for_each(|b| out.fill(b, |_| 9.0));
+    unsafe { run(&mut r.cb, inp.ptr(), out.ptr()) };
+    for f in 0..frames {
+        assert_eq!(out.data[0][f * 2], sample(f, 0), "main L f{f}");
+        assert_eq!(out.data[1][f * 70], sample(f, 0), "mon ch0 f{f}");
+        assert_eq!(out.data[1][f * 70 + 61], sample(f, 1), "mon ch61 f{f}");
+        for c in [62, 66, 69] {
+            assert_eq!(out.data[1][f * 70 + c], 0.0, "mon ch{c} past the cut f{f}");
+        }
+    }
+    assert_eq!(r.meters.mismatch_count(), 0);
+}
+
+#[test]
+fn run_wide_input_device_routes_its_first_channels() {
+    let dev = vdev(
+        vec![src("mic", SourceKind::Device { uid: "mic".into() })],
+        vec![wire("mic", 61, 0), wire("mic", 63, 1)],
+        vec![],
+    );
+    // main (2 in) + a 64-channel mic: mic channels 62 and 63 fall past the cut.
+    let subs = [sub("comp", true, &[2], &[2]), sub("mic", false, &[64], &[])];
+    let (ain, aout) = ([2, 64], [2]);
+    let li = layout_inputs(&dev, "comp");
+    let spec = LayoutSpec {
+        subs: &subs,
+        passthru: li.passthru.as_deref(),
+        device_sources: &li.device_sources,
+        monitors: &li.monitors,
+        taps: &[],
+    };
+    let (lay, note) = layout::clamp_width(layout::build_layout(&spec, &ain, &aout).unwrap());
+    assert!(note.is_some_and(|n| n.contains("66 input / 2 output")));
+    let mut r = rig(&dev, &lay, &ain, &aout);
+    let frames = 32;
+    let mut inp = Bl::new(&ain, frames);
+    let mut out = Bl::new(&aout, frames);
+    inp.fill(1, |i| sample(i / 64, i % 64));
+    out.fill(0, |_| 9.0);
+    unsafe { run(&mut r.cb, inp.ptr(), out.ptr()) };
+    for f in 0..frames {
+        assert_eq!(out.data[0][f * 2], sample(f, 61), "mic ch61 -> L f{f}");
+        assert_eq!(out.data[0][f * 2 + 1], 0.0, "mic ch63 is past the cut f{f}");
+    }
+    assert_eq!(r.meters.mismatch_count(), 0);
 }
 
 // ---- tap_plan ----
@@ -672,24 +735,57 @@ fn unsettled_waits_until_removed_devices_are_gone() {
 
 // ---- device-event filter and backoff (F4) ----
 
+fn dev(uid: &str, id: u32) -> (String, u32) {
+    (uid.to_owned(), id)
+}
+
 #[test]
-fn uid_set_ignores_own_aggregates_and_order() {
-    let a = |u: &str| u.to_owned();
-    let before = uid_set([a("mic"), a("spk"), a("soundrouter.agg.v1.0")]);
-    let echo = uid_set([
-        a("spk"),
-        a("soundrouter.agg.v1.0"),
-        a("soundrouter.agg.v1.1"),
-        a("mic"),
-        a("mic"),
+fn device_set_ignores_own_aggregates_and_order() {
+    let before = device_set([
+        dev("mic", 10),
+        dev("spk", 11),
+        dev("soundrouter.agg.v1.0", 90),
     ]);
-    assert_eq!(before, ["mic", "spk"]);
+    let echo = device_set([
+        dev("spk", 11),
+        dev("soundrouter.agg.v1.0", 90),
+        dev("soundrouter.agg.v1.1", 91),
+        dev("mic", 10),
+        dev("mic", 10),
+    ]);
+    assert_eq!(before, [dev("mic", 10), dev("spk", 11)]);
     assert_eq!(
         before, echo,
         "creating/destroying our aggregates is not a hot-plug"
     );
-    let plugged = uid_set([a("mic"), a("spk"), a("usb")]);
+    let plugged = device_set([dev("mic", 10), dev("spk", 11), dev("usb", 12)]);
     assert_ne!(before, plugged);
+    // Unplugged and plugged back under the same uid: same uids, new object id.
+    let replugged = device_set([dev("mic", 20), dev("spk", 11)]);
+    assert_ne!(before, replugged, "a same-uid replug is a device change");
+}
+
+#[test]
+fn a_replugged_device_rebuilds_only_the_vdevs_built_on_its_old_object() {
+    let (a, b) = (
+        [dev("c1", 1), dev("mic", 10)].to_vec(),
+        [dev("c2", 2), dev("spk", 11)].to_vec(),
+    );
+    let vdevs: Vec<(&str, &[(String, u32)])> = vec![("v1", &a), ("v2", &b)];
+    let ids = |m: &'static [(&'static str, u32)]| {
+        move |u: &str| m.iter().find(|(k, _)| *k == u).map(|&(_, id)| id)
+    };
+    // Nothing changed: no rebuild.
+    let same = ids(&[("c1", 1), ("mic", 10), ("c2", 2), ("spk", 11)]);
+    assert!(replugged_targets(&vdevs, &same).is_empty());
+    // mic came back as object 20 (alive, same uid, same rate): only v1 holds the stale one.
+    let after = ids(&[("c1", 1), ("mic", 20), ("c2", 2), ("spk", 11)]);
+    assert_eq!(replugged_targets(&vdevs, &after), set(&["v1"]));
+    assert!(replugged(&a, &after) && !replugged(&b, &after));
+    // A device that is gone is the dead path's business, not a replug.
+    let gone = ids(&[("c1", 1), ("c2", 2), ("spk", 11)]);
+    assert!(replugged_targets(&vdevs, &gone).is_empty());
+    assert!(replugged_targets(&[], &after).is_empty());
 }
 
 #[test]
@@ -1232,19 +1328,45 @@ fn apply_keeps_the_newest_config_when_the_driver_does_not_settle() {
     assert_eq!(g.cfg.unwrap().devices[0].channels, 8);
 }
 
+fn time_stamp(t: f64, valid: bool) -> AudioTimeStamp {
+    // SAFETY: AudioTimeStamp is plain data; all-zero is a valid (empty) stamp.
+    let mut s: AudioTimeStamp = unsafe { std::mem::zeroed() };
+    s.mSampleTime = t;
+    if valid {
+        s.mFlags = AudioTimeStampFlags::SampleTimeValid;
+    }
+    s
+}
+
 #[test]
 fn track_time_counts_only_skipped_audio() {
     let mut r = passthru_rig();
     // First cycle never counts, contiguous cycles (even with sub-frame jitter) do not either.
     for (t, frames) in [(1000.0, 512), (1512.0, 512), (2024.3, 512), (2536.3, 256)] {
-        r.cb.track_time(t, frames);
+        r.cb.track_time(&time_stamp(t, true), frames);
     }
     assert_eq!(r.meters.glitch_count(), 0);
     // One buffer was skipped, then a restart that rewinds the clock.
-    r.cb.track_time(2792.3 + 512.0, 512);
+    r.cb.track_time(&time_stamp(2792.3 + 512.0, true), 512);
     assert_eq!(r.meters.glitch_count(), 1);
-    r.cb.track_time(0.0, 512);
+    r.cb.track_time(&time_stamp(0.0, true), 512);
     assert_eq!(r.meters.glitch_count(), 2);
+}
+
+#[test]
+fn track_time_ignores_a_stamp_without_a_valid_sample_time() {
+    let mut r = passthru_rig();
+    r.cb.track_time(&time_stamp(1000.0, true), 512);
+    // A zeroed stamp (SampleTimeValid clear) would read as a rewind to 0: not a glitch, not a baseline.
+    r.cb.track_time(&time_stamp(0.0, false), 512);
+    assert_eq!(r.meters.glitch_count(), 0);
+    // The next valid cycle is far from the old end (1512) yet is not compared with it.
+    r.cb.track_time(&time_stamp(9000.0, true), 512);
+    assert_eq!(r.meters.glitch_count(), 0);
+    // From there on contiguity is checked again.
+    r.cb.track_time(&time_stamp(9512.0, true), 512);
+    r.cb.track_time(&time_stamp(11000.0, true), 512);
+    assert_eq!(r.meters.glitch_count(), 1);
 }
 
 // ---- in-place reuse vs rebuild ----

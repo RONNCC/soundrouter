@@ -29,7 +29,7 @@ use sr_core::backend::{
 use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice};
 use sr_core::driver_proto::{COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, companion_uid};
 use sr_core::meters::Meters;
-use sr_core::mixer::{IoLayout, MixPlan, Mixer, MixerHandle, mixer};
+use sr_core::mixer::{MixPlan, Mixer, MixerHandle, mixer};
 use sr_core::selftest;
 
 use crate::activity::{self, Activity, Lease};
@@ -133,8 +133,15 @@ struct Cb {
 
 impl Cb {
     /// A cycle starting more than half a buffer away from where the last one ended means the HAL
-    /// skipped (or repeated) audio. The first cycle (NaN) compares false. Audio thread: no allocation.
-    fn track_time(&mut self, t: f64, frames: usize) {
+    /// skipped (or repeated) audio. The first cycle (NaN) compares false. A stamp without a valid sample
+    /// time says nothing: no glitch is counted and the baseline is forgotten like at the first cycle, so
+    /// the next valid cycle is not compared with a stale end. Audio thread: no allocation.
+    fn track_time(&mut self, ot: &AudioTimeStamp, frames: usize) {
+        if !ot.mFlags.contains(AudioTimeStampFlags::SampleTimeValid) {
+            self.next_t = f64::NAN;
+            return;
+        }
+        let t = ot.mSampleTime;
         if (t - self.next_t).abs() > frames as f64 / 2.0 {
             self.meters.glitch_count.fetch_add(1, Relaxed);
         }
@@ -266,6 +273,8 @@ struct Vdev {
     /// Nominal rate of the main and sub devices at build / start; a rate event that leaves these
     /// unchanged is an echo of our own aggregate.
     rates: Vec<(String, f64)>,
+    /// Object ids of the main and sub devices at build ([`replugged`]).
+    dev_objs: Vec<(String, u32)>,
     /// Rate listeners on the main and sub devices; removed with the vdev.
     _listeners: Vec<Listener>,
     /// V's volume and mute (and whether each app plays to V) feeding the mixer's per-source `SysGain`.
@@ -360,7 +369,7 @@ struct Inner {
     cfg: Option<Config>,
     vdevs: HashMap<String, Vdev>,
     /// [`current_device_set`] as of the last apply; device events that leave it unchanged are echoes.
-    dev_set: Vec<String>,
+    dev_set: Vec<(String, u32)>,
     /// App Nap insurance shared by all vdevs.
     activity: Arc<Activity>,
     bg_errors: BTreeMap<Op, String>,
@@ -779,21 +788,55 @@ fn backoff(fails: u32) -> Duration {
     (EVENT_DEBOUNCE * 2u32.saturating_pow(fails.min(8))).min(MAX_BACKOFF)
 }
 
-/// Sorted uids of the devices that are not our own private aggregates. Creating or destroying an
-/// aggregate fires `kAudioHardwarePropertyDevices` in our own process; comparing this set tells such
-/// echoes from real hot-plugs (F4).
-fn uid_set(uids: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut v: Vec<String> = uids
+/// Sorted `(uid, object id)` of the devices that are not our own private aggregates. Creating or
+/// destroying an aggregate fires `kAudioHardwarePropertyDevices` in our own process; comparing this set
+/// tells such echoes from real hot-plugs (F4). The object id is part of it: a device unplugged and
+/// plugged back under the same uid between two passes keeps its uid but gets a new id.
+fn device_set(devs: impl IntoIterator<Item = (String, u32)>) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = devs
         .into_iter()
-        .filter(|u| !u.starts_with(AGG_UID_PREFIX))
+        .filter(|(u, _)| !u.starts_with(AGG_UID_PREFIX))
         .collect();
     v.sort();
     v.dedup();
     v
 }
 
-fn current_device_set() -> Vec<String> {
-    uid_set(hal::all_devices().into_iter().map(hal::device_uid))
+fn current_device_set() -> Vec<(String, u32)> {
+    device_set(
+        hal::all_devices()
+            .into_iter()
+            .map(|d| (hal::device_uid(d), d)),
+    )
+}
+
+/// The object ids of the main and sub devices of `spec` as the HAL resolves their uids now.
+fn read_objs(spec: &AggSpec) -> Vec<(String, u32)> {
+    std::iter::once(&spec.main)
+        .chain(&spec.subs)
+        .filter_map(|u| Some((u.clone(), hal::device_by_uid(u)?)))
+        .collect()
+}
+
+/// Whether a device of `built` (uid, object id at build) now resolves to another object id: unplugged
+/// and plugged back under the same uid. Listeners and aggregate sub-device handles still point at the
+/// old object, so the vdev must be rebuilt. A device that is gone (`None`) is the dead path's business.
+fn replugged(built: &[(String, u32)], now: &dyn Fn(&str) -> Option<u32>) -> bool {
+    built
+        .iter()
+        .any(|(uid, was)| now(uid).is_some_and(|id| id != *was))
+}
+
+/// Vdev ids (`(id, object ids at build)`) with a [`replugged`] device.
+fn replugged_targets(
+    vdevs: &[(&str, &[(String, u32)])],
+    now: &dyn Fn(&str) -> Option<u32>,
+) -> BTreeSet<String> {
+    vdevs
+        .iter()
+        .filter(|(_, built)| replugged(built, now))
+        .map(|(id, _)| (*id).to_owned())
+        .collect()
 }
 
 /// Background retries after a failure before the error is surfaced.
@@ -1209,6 +1252,16 @@ fn recovery_targets(g: &mut Inner, p: &mut Pending) -> BTreeSet<String> {
     forced.extend(dead_targets(&p.dead, &watched, &|uid| {
         hal::device_by_uid(uid).is_some_and(hal::is_alive)
     }));
+    // A device unplugged and plugged back under the same uid is alive and keeps its rate, yet the vdev
+    // still holds the old object: only its changed id gives it away.
+    if p.devs || !p.dead.is_empty() {
+        let objs: Vec<(&str, &[(String, u32)])> = g
+            .vdevs
+            .iter()
+            .map(|(id, v)| (id.as_str(), v.dev_objs.as_slice()))
+            .collect();
+        forced.extend(replugged_targets(&objs, &hal::device_by_uid));
+    }
     let targets = rebuild_targets(p.wake, &p.rates, &forced, &watched, &|uid| {
         hal::device_by_uid(uid).map_or(0.0, hal::nominal_rate)
     });
@@ -1700,6 +1753,7 @@ fn apply_vdev(
     if let Some(v) = g.vdevs.get_mut(&dev.id) {
         let io = v.io();
         if v.spec.readers == input_readers(dev, &v.spec.main)
+            && !replugged(&v.dev_objs, &hal::device_by_uid)
             && keep_in_place(
                 &v.spec,
                 &v.passed_over,
@@ -2099,21 +2153,6 @@ fn without_feedback(
     (out, warnings)
 }
 
-/// The mixer handles at most `MAX_CH` channels per direction. Fail loudly rather than drop channels:
-/// the aggregate's inputs are the device's own channels + hardware sources + 2 per app tap, its
-/// outputs the device's channels + enabled monitors' channels.
-fn check_width(lay: &IoLayout) -> Result<()> {
-    let (n_in, n_out) = (lay.inputs.len(), lay.outputs.len());
-    if n_in > MAX_CH || n_out > MAX_CH {
-        bail!(
-            "aggregate needs {n_in} input / {n_out} output channels but the engine mixes at most {MAX_CH} per direction \
-             (inputs = device channels + hardware sources + 2 per app source; outputs = device channels + monitor channels); \
-             reduce the device's channel count or remove sources/monitors"
-        );
-    }
-    Ok(())
-}
-
 /// Recompute the layout from the aggregate's current streams, compile the plan, publish both.
 fn refresh_layout(v: &mut Vdev) -> Result<()> {
     let main_in = hal::stream_channels(v.agg, kAudioObjectPropertyScopeInput);
@@ -2133,15 +2172,9 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
         monitors: &li.monitors,
         taps: &tap_ids,
     };
-    let lay = layout::build_layout(&spec, &ain, &aout)?;
-    check_width(&lay).with_context(|| {
-        format!(
-            "device '{}' ({} channels, {} app taps)",
-            v.dev.id,
-            v.dev.channels,
-            v.taps.len()
-        )
-    })?;
+    // A device wider than the mixer (more than MAX_CH channels) degrades to its first MAX_CH channels
+    // with a warning rather than failing every route of the vdev.
+    let (lay, width) = layout::clamp_width(layout::build_layout(&spec, &ain, &aout)?);
     let (dev, loops) = without_feedback(&v.dev, &|uid| {
         hal::device_by_uid(uid).is_some_and(|d| {
             hal::get_global::<u32>(d, kAudioDevicePropertyTransportType).ok()
@@ -2150,6 +2183,7 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
     });
     let mut warnings = monitor_warnings(&v.dev, &v.subs);
     warnings.extend(loops);
+    warnings.extend(width.map(|w| format!("device '{}': {w}", v.dev.id)));
     for w in warnings.iter().filter(|w| !v.warnings.contains(w)) {
         log::warn!("{w}");
     }
@@ -2224,10 +2258,12 @@ fn build_vdev(
     // read has an event that compares unequal, one before it is in both the baseline and the aggregate.
     // A stream layout change (an interface switched to another channel mode) reuses the rate event.
     let xruns = Arc::new(AtomicU64::new(0));
+    // The object ids the listeners attach to; a same-uid replug gives the device a new one ([`replugged`]).
+    let dev_objs = read_objs(&spec);
     let mut listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
-        std::iter::once(&spec.main)
-            .chain(&spec.subs)
-            .filter_map(|uid| Some((uid, hal::device_by_uid(uid)?)))
+        dev_objs
+            .iter()
+            .map(|(uid, obj)| (uid, *obj))
             .flat_map(|(uid, obj)| {
                 let (u1, u2) = (uid.clone(), uid.clone());
                 [
@@ -2448,6 +2484,7 @@ fn build_vdev(
         starter: None,
         build: seq,
         rates,
+        dev_objs,
         _listeners: listeners,
         sysvol,
         _lease: activity.lease(),
@@ -2536,7 +2573,7 @@ unsafe extern "C-unwind" fn ioproc(
         let frames = bufs(output.as_ptr()).first().map_or(0, |b| {
             b.mDataByteSize as usize / 4 / (b.mNumberChannels as usize).max(1)
         });
-        cb.track_time(ot.as_ref().mSampleTime, frames);
+        cb.track_time(ot.as_ref(), frames);
         cb.track_delay(now.as_ref(), it.as_ref(), ot.as_ref());
         run(cb, input.as_ptr(), output.as_ptr())
     }));
@@ -2577,12 +2614,16 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
     let frames_of =
         |b: &AudioBuffer| b.mDataByteSize as usize / 4 / (b.mNumberChannels as usize).max(1);
     let frames = outs.first().map_or(0, frames_of);
-    let n_in: usize = ins.iter().map(|b| b.mNumberChannels as usize).sum();
-    let n_out: usize = outs.iter().map(|b| b.mNumberChannels as usize).sum();
+    // Channels past MAX_CH are not routed (see `layout::clamp_width`): inputs are skipped, outputs silent.
+    let n_in: usize = ins
+        .iter()
+        .map(|b| b.mNumberChannels as usize)
+        .sum::<usize>()
+        .min(MAX_CH);
+    let n_out_all: usize = outs.iter().map(|b| b.mNumberChannels as usize).sum();
+    let n_out = n_out_all.min(MAX_CH);
     let expected = cb.shared.expected.load(Acquire);
     let ok = key == expected
-        && n_in <= MAX_CH
-        && n_out <= MAX_CH
         && ins
             .iter()
             .chain(outs.iter())
@@ -2594,6 +2635,9 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
         }
         unsafe { zero_buffers(outs) };
         return;
+    }
+    if n_out_all > n_out {
+        unsafe { zero_buffers(outs) }; // interleave writes only the routed channels
     }
     let Cb {
         mixer,
@@ -2615,11 +2659,14 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
         let mut c0 = 0;
         for b in ins.iter() {
             let ch = b.mNumberChannels as usize;
-            if b.mData.is_null() {
-                in_planar[c0 * MAX_FRAMES..(c0 + ch) * MAX_FRAMES].fill(0.0);
+            let take = layout::routed(c0, ch);
+            if take == 0 {
+                // wholly past MAX_CH: not routed
+            } else if b.mData.is_null() {
+                in_planar[c0 * MAX_FRAMES..(c0 + take) * MAX_FRAMES].fill(0.0);
             } else {
                 let src = unsafe { std::slice::from_raw_parts(b.mData as *const f32, frames * ch) };
-                layout::deinterleave(src, ch, start, n, in_planar, c0);
+                layout::deinterleave(src, ch, take, start, n, in_planar, c0);
             }
             c0 += ch;
         }
@@ -2642,10 +2689,11 @@ unsafe fn run(cb: &mut Cb, input: *mut AudioBufferList, output: *mut AudioBuffer
         let mut c0 = 0;
         for b in outs.iter() {
             let ch = b.mNumberChannels as usize;
-            if !b.mData.is_null() {
+            let take = layout::routed(c0, ch);
+            if !b.mData.is_null() && take > 0 {
                 let dst =
                     unsafe { std::slice::from_raw_parts_mut(b.mData as *mut f32, frames * ch) };
-                layout::interleave(out_planar, c0, start, n, dst, ch);
+                layout::interleave(out_planar, c0, start, n, dst, ch, take);
             }
             c0 += ch;
         }

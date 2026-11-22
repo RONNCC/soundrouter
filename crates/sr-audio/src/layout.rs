@@ -103,16 +103,42 @@ pub fn shape_key_of(ins: &[u16], outs: &[u16]) -> u64 {
     )
 }
 
-/// Interleaved `src` (frames x ch) -> planar scratch rows `dst_ch0..dst_ch0+ch` (row stride MAX_FRAMES).
+/// How many of a buffer's `ch` channels, starting at planar row `c0`, are routed: only the first `MAX_CH`
+/// channels of an aggregate are (the same cut as [`clamp_width`]), the rest are skipped by the IOProc.
+pub fn routed(c0: usize, ch: usize) -> usize {
+    ch.min(MAX_CH.saturating_sub(c0))
+}
+
+/// `lay` cut to its first `MAX_CH` channels per direction, with a note when something was dropped: a
+/// device wider than the mixer still routes its first channels and the rest stay silent. Wires to a
+/// dropped channel are dropped by `MixPlan::compile`.
+/// shortcut: flat cut in aggregate order (main, then sub-devices, then taps), so a later sub-device or
+/// app tap behind a very wide one is lost; upgrade to per-device quotas if such setups matter.
+pub fn clamp_width(mut lay: IoLayout) -> (IoLayout, Option<String>) {
+    let (n_in, n_out) = (lay.inputs.len(), lay.outputs.len());
+    lay.inputs.truncate(MAX_CH);
+    lay.outputs.truncate(MAX_CH);
+    let note = (n_in > MAX_CH || n_out > MAX_CH).then(|| {
+        format!(
+            "needs {n_in} input / {n_out} output channels but the engine mixes at most {MAX_CH} per direction: \
+             only the first {MAX_CH} of each are routed, the rest (sub-device channels, then app taps) stay silent"
+        )
+    });
+    (lay, note)
+}
+
+/// Interleaved `src` (frames x ch) -> planar scratch rows `dst_ch0..dst_ch0+take` (row stride MAX_FRAMES);
+/// the buffer's channels from `take` on are skipped.
 pub fn deinterleave(
     src: &[f32],
     ch: usize,
+    take: usize,
     frame0: usize,
     n: usize,
     dst: &mut [f32],
     dst_ch0: usize,
 ) {
-    for c in 0..ch {
+    for c in 0..take {
         let row = &mut dst[(dst_ch0 + c) * MAX_FRAMES..][..n];
         for (f, d) in row.iter_mut().enumerate() {
             *d = src[(frame0 + f) * ch + c];
@@ -120,7 +146,7 @@ pub fn deinterleave(
     }
 }
 
-/// Inverse of [`deinterleave`].
+/// Inverse of [`deinterleave`]; the channels of `dst` from `take` on are left as they are.
 pub fn interleave(
     src: &[f32],
     src_ch0: usize,
@@ -128,8 +154,9 @@ pub fn interleave(
     n: usize,
     dst: &mut [f32],
     ch: usize,
+    take: usize,
 ) {
-    for c in 0..ch {
+    for c in 0..take {
         let row = &src[(src_ch0 + c) * MAX_FRAMES..][..n];
         for (f, &s) in row.iter().enumerate() {
             dst[(frame0 + f) * ch + c] = s;
@@ -156,7 +183,7 @@ mod tests {
     fn roundtrip() {
         let src: Vec<f32> = (0..12).map(|x| x as f32).collect(); // 4 frames x 3 ch
         let mut planar = vec![0.0; SCRATCH_LEN];
-        deinterleave(&src, 3, 0, 4, &mut planar, 2);
+        deinterleave(&src, 3, 3, 0, 4, &mut planar, 2);
         assert_eq!(
             &planar[2 * MAX_FRAMES..2 * MAX_FRAMES + 4],
             &[0.0, 3.0, 6.0, 9.0]
@@ -166,7 +193,7 @@ mod tests {
             &[2.0, 5.0, 8.0, 11.0]
         );
         let mut out = vec![-1.0; 12];
-        interleave(&planar, 2, 0, 4, &mut out, 3);
+        interleave(&planar, 2, 0, 4, &mut out, 3, 3);
         assert_eq!(out, src);
     }
 
@@ -176,10 +203,69 @@ mod tests {
         let mut planar = vec![0.0; SCRATCH_LEN];
         let mut out = vec![0.0; 10];
         for (f0, n) in [(0, 3), (3, 2)] {
-            deinterleave(&src, 2, f0, n, &mut planar, 0);
-            interleave(&planar, 0, f0, n, &mut out, 2);
+            deinterleave(&src, 2, 2, f0, n, &mut planar, 0);
+            interleave(&planar, 0, f0, n, &mut out, 2, 2);
         }
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn a_partial_take_skips_the_trailing_channels() {
+        let src: Vec<f32> = (0..12).map(|x| x as f32).collect(); // 4 frames x 3 ch
+        let mut planar = vec![0.0; SCRATCH_LEN];
+        deinterleave(&src, 3, 2, 0, 4, &mut planar, 0);
+        assert_eq!(&planar[..4], &[0.0, 3.0, 6.0, 9.0]);
+        assert_eq!(&planar[MAX_FRAMES..MAX_FRAMES + 4], &[1.0, 4.0, 7.0, 10.0]);
+        assert!(
+            planar[2 * MAX_FRAMES..3 * MAX_FRAMES]
+                .iter()
+                .all(|&s| s == 0.0)
+        );
+        let mut out = vec![-1.0; 12];
+        interleave(&planar, 0, 0, 4, &mut out, 3, 2);
+        assert_eq!(out[..3], [0.0, 1.0, -1.0]);
+        assert_eq!(out[9..], [9.0, 10.0, -1.0]);
+    }
+
+    #[test]
+    fn routed_channels_stop_at_max_ch() {
+        assert_eq!(routed(0, 2), 2);
+        assert_eq!(routed(MAX_CH - 2, 2), 2);
+        assert_eq!(routed(MAX_CH - 1, 4), 1, "a buffer straddling the cut");
+        assert_eq!(routed(MAX_CH, 4), 0);
+        assert_eq!(routed(MAX_CH + 10, 4), 0);
+        assert_eq!(routed(0, 70), MAX_CH);
+    }
+
+    fn layout_of(n_in: usize, n_out: usize) -> IoLayout {
+        IoLayout {
+            inputs: vec![None; n_in],
+            outputs: (0..n_out as u16)
+                .map(|c| Some(OutPort::Device(c)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn clamp_width_degrades_instead_of_failing() {
+        let (l, note) = clamp_width(layout_of(MAX_CH, MAX_CH));
+        assert_eq!(
+            (l.inputs.len(), l.outputs.len(), note),
+            (MAX_CH, MAX_CH, None)
+        );
+        // Outputs over: the first MAX_CH keep their ports, inputs untouched.
+        let (l, note) = clamp_width(layout_of(2, MAX_CH + 8));
+        assert_eq!((l.inputs.len(), l.outputs.len()), (2, MAX_CH));
+        assert!(
+            matches!(l.outputs[MAX_CH - 1], Some(OutPort::Device(c)) if usize::from(c) == MAX_CH - 1)
+        );
+        let note = note.unwrap();
+        assert!(note.contains("2 input / 72 output"), "{note}");
+        assert!(note.contains(&format!("at most {MAX_CH}")), "{note}");
+        // Inputs over (64 device channels + one app tap).
+        let (l, note) = clamp_width(layout_of(MAX_CH + 2, 2));
+        assert_eq!((l.inputs.len(), l.outputs.len()), (MAX_CH, 2));
+        assert!(note.unwrap().contains("66 input / 2 output"));
     }
 
     #[test]
