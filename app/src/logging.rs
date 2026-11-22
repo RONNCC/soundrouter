@@ -3,7 +3,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -48,7 +47,7 @@ pub fn init() -> Option<PathBuf> {
         .format(|out, msg, rec| {
             out.finish(format_args!(
                 "{} {:5} {} {}",
-                humantime::format_rfc3339_seconds(SystemTime::now()),
+                jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 rec.level(),
                 rec.target(),
                 msg
