@@ -529,7 +529,6 @@ fn taps_running(main: IoState, tap: Option<IoState>) -> bool {
 /// One observation of every vdev's taps: is a tapped app playing, and did the taps deliver any signal
 /// since the last pass (the mixer's input meters, drained apart from the window's).
 fn health_pass(g: &mut Inner, now: Duration) {
-    let tcc = crate::tcc::audio_capture_status().into();
     for (id, v) in g.vdevs.iter_mut() {
         let signal = v
             .taps
@@ -544,9 +543,13 @@ fn health_pass(g: &mut Inner, now: Duration) {
             .taps
             .iter()
             .any(|t| t.objs.iter().any(|&o| health::process_running_output(o)));
-        let silent = v
-            .silence
-            .observe(now, health::watch_taps(running && playing, tcc), signal);
+        let silent = v.silence.observe(
+            now,
+            health::watch_taps(running && playing, || {
+                crate::tcc::audio_capture_status().into()
+            }),
+            signal,
+        );
         if silent != v.tap_silent {
             log::warn!(
                 "device '{id}': tapped apps {} (zero-filled taps look like a denied System Audio Recording permission)",

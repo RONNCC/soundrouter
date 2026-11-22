@@ -39,8 +39,10 @@ impl SilenceWatch {
 /// legitimate once System Audio Recording is granted, so only a permission that is not granted counts.
 /// `Unknown` is watched too: an ad-hoc signed build can read as `Unknown` while the permission is in fact
 /// denied, and the silence is then the only sign of it.
-pub fn watch_taps(active: bool, tcc: TccStatus) -> bool {
-    active && tcc != TccStatus::Granted
+/// `tcc` is only asked when `active`: the answer is a ~10 ms round trip to tccd, and the health thread
+/// asks twice a second whatever the engine does.
+pub fn watch_taps(active: bool, tcc: impl FnOnce() -> TccStatus) -> bool {
+    active && tcc() != TccStatus::Granted
 }
 
 /// `kAudioDevicePropertyHogMode` value: the pid holding the device, `-1` when nobody does.
@@ -172,21 +174,25 @@ mod tests {
             (TccStatus::Denied, true),
             (TccStatus::Unknown, true),
         ] {
-            assert_eq!(watch_taps(true, tcc), watched, "{tcc:?}");
-            assert!(!watch_taps(false, tcc), "an idle tap is never watched");
+            assert_eq!(watch_taps(true, || tcc), watched, "{tcc:?}");
+            assert!(!watch_taps(false, || tcc), "an idle tap is never watched");
         }
+        assert!(
+            !watch_taps(false, || panic!("an idle tap must not ask the TCC daemon")),
+            "the permission is read only for a tap that plays"
+        );
         // Granted: a playing app with a zero peak never reaches the 3 s mark, because the watch is fed
         // `active = false` and resets.
         let mut w = SilenceWatch::default();
         for t in 0..20 {
-            assert!(!w.observe(secs(t), watch_taps(true, TccStatus::Granted), false));
+            assert!(!w.observe(secs(t), watch_taps(true, || TccStatus::Granted), false));
         }
         for t in 20..24 {
-            w.observe(secs(t), watch_taps(true, TccStatus::Denied), false);
+            w.observe(secs(t), watch_taps(true, || TccStatus::Denied), false);
         }
-        assert!(w.observe(secs(24), watch_taps(true, TccStatus::Denied), false));
+        assert!(w.observe(secs(24), watch_taps(true, || TccStatus::Denied), false));
         assert!(
-            !w.observe(secs(25), watch_taps(true, TccStatus::Granted), false),
+            !w.observe(secs(25), watch_taps(true, || TccStatus::Granted), false),
             "granted in the meantime clears the flag"
         );
     }

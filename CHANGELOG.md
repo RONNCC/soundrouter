@@ -119,6 +119,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - App: the Monitors popup scrolls inside the window when there are many output devices; before, the devices below the window edge could not be reached.
 - App: after "Uninstall… > Also delete my SoundRouter settings" the app no longer writes the settings folder back on the next edit or window close.
 - App: the log file is rotated while the app runs (2 MB, one `.1` kept), not only at launch: a menu-bar app lives for weeks, and a flapping device or a repeating warning grew one file without bound.
+- Engine: the health thread no longer asks the TCC daemon about System Audio Recording twice a second forever (a ~10 ms round trip each, measured); it asks only while a tapped app is playing.
 
 ## [0.1.0]
 
