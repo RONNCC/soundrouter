@@ -118,6 +118,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - App: clicking a highlighted wire removes it; before, hovering highlighted it but clicking did nothing.
 - App: the Monitors popup scrolls inside the window when there are many output devices; before, the devices below the window edge could not be reached.
 - App: after "Uninstall… > Also delete my SoundRouter settings" the app no longer writes the settings folder back on the next edit or window close.
+- App: the log file is rotated while the app runs (2 MB, one `.1` kept), not only at launch: a menu-bar app lives for weeks, and a flapping device or a repeating warning grew one file without bound.
 
 ## [0.1.0]
 

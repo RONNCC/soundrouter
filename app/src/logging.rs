@@ -1,7 +1,7 @@
 //! File logger for the GUI: Finder-launched apps have no visible stderr.
 //! Writes `~/Library/Logs/SoundRouter/soundrouter.log`, mirrors to stderr on a TTY.
 use std::fs::{self, OpenOptions};
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -25,11 +25,54 @@ fn rotate(path: &Path, max: u64) -> io::Result<()> {
     }
 }
 
-/// Open the log file, rotating first.
-fn open_log(path: &Path) -> io::Result<fs::File> {
-    fs::create_dir_all(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-    rotate(path, MAX_BYTES)?;
-    OpenOptions::new().create(true).append(true).open(path)
+/// The log file, rotated again while the app runs: a menu-bar app lives for weeks, and a flapping
+/// device or a repeating warning would otherwise grow one file without bound (rotation at launch
+/// alone only bounds what earlier sessions wrote).
+struct Rotating {
+    path: PathBuf,
+    file: fs::File,
+    written: u64,
+    max: u64,
+}
+
+impl Rotating {
+    /// Rotates an oversized file left by an earlier session, then appends.
+    fn open(path: &Path, max: u64) -> io::Result<Rotating> {
+        fs::create_dir_all(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+        rotate(path, max)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let written = file.metadata()?.len();
+        Ok(Rotating {
+            path: path.to_owned(),
+            file,
+            written,
+            max,
+        })
+    }
+}
+
+impl Write for Rotating {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.written > self.max {
+            // A failed rotation keeps the old file and tries again after another `max` bytes.
+            self.written = 0;
+            if rotate(&self.path, 0).is_ok()
+                && let Ok(f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+            {
+                self.file = f;
+            }
+        }
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 /// Install the logger and panic hook. Returns the log file path on success;
@@ -58,10 +101,10 @@ pub fn init() -> Option<PathBuf> {
     if io::stderr().is_terminal() {
         dispatch = dispatch.chain(io::stderr());
     }
-    let file = log_path().map(|p| open_log(&p).map(|f| (p, f)));
+    let file = log_path().map(|p| Rotating::open(&p, MAX_BYTES).map(|f| (p, f)));
     let (path, file_err) = match file {
         Some(Ok((p, f))) => {
-            dispatch = dispatch.chain(f);
+            dispatch = dispatch.chain(Box::new(f) as Box<dyn Write + Send>);
             (Some(p), None)
         }
         Some(Err(e)) => (None, Some(e)),
@@ -108,6 +151,49 @@ pub fn banner(log_file: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_log_stays_bounded_and_keeps_the_newest_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.log");
+        let mut log = Rotating::open(&p, 100).unwrap();
+        for i in 0..1000 {
+            writeln!(log, "line {i:04}").unwrap(); // 10 bytes
+        }
+        let size = |p: &Path| fs::metadata(p).unwrap().len();
+        let old = dir.path().join("a.log.1");
+        assert!(size(&p) <= 100 + 10, "live file grew to {}", size(&p));
+        assert!(size(&old) <= 100 + 10, "old file grew to {}", size(&old));
+        assert!(
+            fs::read_to_string(&p).unwrap().ends_with("line 0999\n"),
+            "newest line is in the live file"
+        );
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "only a.log and a.log.1"
+        );
+    }
+
+    #[test]
+    fn a_launch_appends_to_a_small_log_and_rotates_a_big_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.log");
+        fs::write(&p, "0123456789").unwrap();
+        writeln!(Rotating::open(&p, 10).unwrap(), "x").unwrap();
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "0123456789x\n",
+            "at the limit: appended"
+        );
+        fs::write(&p, "0123456789ab").unwrap();
+        writeln!(Rotating::open(&p, 10).unwrap(), "x").unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "x\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.log.1")).unwrap(),
+            "0123456789ab"
+        );
+    }
 
     #[test]
     fn rotates_only_when_over_limit() {
