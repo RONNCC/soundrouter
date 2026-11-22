@@ -98,6 +98,8 @@ The brief planned static Regular/Medium/SemiBold/Bold files because egui used to
 
 Motion only answers an action: a short plug-in pop when a wire connects, eased switches and sliders, meter peak-hold falling back. Nothing animates while idle, and an idle window asks for no repaint (the tests check this).
 
+With macOS "Reduce motion" on, egui's animation time is 0 (`theme::apply_style`): the switch knob jumps and sheets appear without a fade. The setting is read every frame through `Os::reduce_motion`; tests never read the machine's.
+
 ## Chrome and copy
 
 ### Sidebar

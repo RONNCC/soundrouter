@@ -326,3 +326,64 @@ fn a_preset_that_needs_asking_does_not_replace_a_sheet_being_filled_in() {
     h.get_by_label("Finish what you are doing first.");
     h.get_by_label("Delete \"Three\"?");
 }
+
+fn esc(h: &mut Harness<App>) {
+    h.key_press(eframe::egui::Key::Escape);
+    settle(h);
+}
+
+#[test]
+fn esc_closes_the_menu_first_and_then_cancels_the_save_sheet_without_saving() {
+    let mut h = open(demo_config());
+    open_menu(&mut h);
+    h.get_by_label(presets::SAVE_AS);
+    esc(&mut h);
+    assert!(!has(&h, presets::SAVE_AS), "the menu is closed");
+    assert!(!has(&h, "Save preset"), "and nothing else opened");
+
+    open_menu(&mut h);
+    click(&mut h, presets::SAVE_AS);
+    h.get_by_label("Preset name").type_text("Streaming");
+    settle(&mut h);
+    esc(&mut h);
+    assert!(!has(&h, "Save preset"), "the sheet is closed");
+    assert!(h.state().presets.names().is_empty(), "nothing was saved");
+}
+
+#[test]
+fn esc_backs_out_of_delete_and_rename_and_closes_the_manage_sheet() {
+    let mut h = open(demo_config());
+    save_as(&mut h, "Streaming");
+    open_menu(&mut h);
+    click(&mut h, presets::MANAGE);
+    click(&mut h, "Delete Streaming");
+    h.get_by_label("Delete \"Streaming\"?");
+    esc(&mut h);
+    assert_eq!(h.state().presets.names(), ["Streaming"], "not deleted");
+    h.get_by_label("Done"); // back in the manage sheet
+
+    click(&mut h, "Rename Streaming");
+    h.get_by_label("Rename preset");
+    esc(&mut h);
+    assert!(!has(&h, "Rename preset"));
+    assert_eq!(h.state().presets.names(), ["Streaming"], "not renamed");
+    h.get_by_label("Done");
+
+    esc(&mut h);
+    assert!(!has(&h, "Done"), "the manage sheet is closed");
+    assert_eq!(h.state().presets.names(), ["Streaming"]);
+}
+
+#[test]
+fn esc_declines_adding_the_devices_a_preset_needs() {
+    let mut h = open(demo_config());
+    save_as(&mut h, "Three");
+    h.state_mut().cfg.devices.remove(1);
+    let two = h.state().cfg.clone();
+    open_menu(&mut h);
+    click(&mut h, "Three");
+    h.get_by_label("Add virtual devices?");
+    esc(&mut h);
+    assert!(!has(&h, "Add virtual devices?"));
+    assert_eq!(h.state().cfg, two, "the preset was not applied");
+}

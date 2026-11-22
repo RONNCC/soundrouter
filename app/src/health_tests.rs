@@ -54,6 +54,7 @@ fn machine(h: &mut Harness<App>, login_on: bool) -> Machine {
             Ok(())
         }),
         open_url: Arc::new(move |u| opened.lock().unwrap().push(u.to_owned())),
+        reduce_motion: Arc::new(|| false),
     };
     m
 }
@@ -447,4 +448,19 @@ mod snapshots {
             settle(h);
         });
     }
+}
+
+#[test]
+fn esc_closes_the_permissions_sheet_and_changes_nothing() {
+    let (mut h, m) = permissions(installed(), true);
+    h.get_by_label("Start at login: On");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(!has(&h, "Start at login: On"), "closed");
+    assert!(*m.login.lock().unwrap(), "Start at login is still on");
+    assert!(m.opened.lock().unwrap().is_empty());
+    assert!(
+        !h.state().setup.seen(),
+        "looking at permissions is not finishing setup"
+    );
 }

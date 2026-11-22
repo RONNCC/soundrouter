@@ -235,9 +235,15 @@ pub fn soft_shadow(t: &Tokens) -> Shadow {
     }
 }
 
+/// egui's own animation time: how long a switch knob slides and a sheet fades in. Kept, so only
+/// "Reduce motion" changes it.
+const ANIMATION_SECS: f32 = 0.2;
+
 /// Maps the tokens onto egui's style so stock widgets (menus, checkboxes, sliders, tooltips,
-/// scroll bars, text fields) match the painted ones.
-pub fn apply_style(s: &mut egui::Style, t: &Tokens) {
+/// scroll bars, text fields) match the painted ones. `reduce_motion` (the macOS setting) makes
+/// egui's animations instant: the switch knob jumps and sheets appear without a fade.
+pub fn apply_style(s: &mut egui::Style, t: &Tokens, reduce_motion: bool) {
+    s.animation_time = if reduce_motion { 0.0 } else { ANIMATION_SECS };
     s.text_styles = [
         (TextStyle::Small, caption()),
         (TextStyle::Body, body()),
@@ -365,5 +371,31 @@ mod tests {
             // The focus ring is a non-text indicator: 3:1.
             assert!(contrast(t.focus, t.canvas) >= 3.0);
         }
+    }
+
+    #[test]
+    fn reduce_motion_turns_every_egui_animation_off_and_only_that() {
+        let t = tokens(false);
+        let mut s = egui::Style::default();
+        apply_style(&mut s, &t, false);
+        assert_eq!(s.animation_time, ANIMATION_SECS);
+        assert!(s.animation_time > 0.0);
+        apply_style(&mut s, &t, true);
+        assert_eq!(s.animation_time, 0.0);
+        apply_style(&mut s, &t, false); // switched off again in System Settings
+        assert_eq!(s.animation_time, ANIMATION_SECS);
+        // The rest of the style does not depend on it. `b` is cloned from `a`: two separate
+        // `Style::default()`s never compare equal (their number formatters are compared by pointer).
+        let mut a = egui::Style::default();
+        apply_style(&mut a, &t, false);
+        let mut b = a.clone();
+        apply_style(&mut b, &t, true);
+        b.animation_time = a.animation_time;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_motion_time_is_eguis_own() {
+        assert_eq!(ANIMATION_SECS, egui::Style::default().animation_time);
     }
 }

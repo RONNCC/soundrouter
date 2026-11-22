@@ -17,6 +17,66 @@ const METER_PERIOD: Duration = Duration::from_millis(33);
 /// messages and refreshes.
 const HIDDEN_PERIOD: Duration = Duration::from_millis(500);
 const REFRESH_PERIOD: Duration = Duration::from_secs(2);
+/// How long Cmd-Q waits for the worker thread; a HAL call that never returns must not keep the
+/// app from quitting.
+const STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// Starts the real engine; the worker calls it again while the first start failed.
+pub type EngineStart = Box<dyn FnMut() -> anyhow::Result<Box<dyn Backend + Send>> + Send>;
+
+/// The worker's time source, so tests step through the retry schedule without waiting.
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// Wait before the next start attempt after `failures` failed ones (the first start included):
+/// 1 s, 2 s, 4 s, then every 10 s. At login coreaudiod may not be ready yet; it usually is within
+/// seconds, and an engine that never comes back costs one cheap attempt every 10 s.
+fn retry_delay(failures: u32) -> Duration {
+    match failures {
+        0 | 1 => Duration::from_secs(1),
+        2 => Duration::from_secs(2),
+        3 => Duration::from_secs(4),
+        _ => Duration::from_secs(10),
+    }
+}
+
+/// An engine that has not started yet.
+struct Retry {
+    start: EngineStart,
+    failures: u32,
+    next: Instant,
+}
+
+/// A thread that can be waited for with a limit: `JoinHandle::join` has no timeout, so the thread's
+/// closure holds a sender that nothing uses, and its drop (return or panic) ends the wait.
+struct Joinable {
+    handle: JoinHandle<()>,
+    finished: Receiver<()>,
+}
+
+impl Joinable {
+    fn spawn(body: impl FnOnce() + Send + 'static) -> Self {
+        let (alive, finished) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _alive = alive;
+            body();
+        });
+        Self { handle, finished }
+    }
+
+    /// Joins the thread if it ends within `wait`. A thread still running then is dropped, not
+    /// killed: process exit ends it. Returns whether it ended.
+    fn join_within(self, wait: Duration) -> bool {
+        if self.finished.recv_timeout(wait) == Err(RecvTimeoutError::Timeout) {
+            log::warn!(
+                "the audio worker did not stop within {} s (a CoreAudio call may be hung); quitting anyway",
+                wait.as_secs_f32()
+            );
+            return false;
+        }
+        let _ = self.handle.join();
+        true
+    }
+}
 
 /// Progress of the loopback self-test the setup sheet asks for.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -50,6 +110,8 @@ pub struct Snapshot {
     pub status_ready: bool,
     pub self_test: SelfTestState,
     pub measure: MeasureState,
+    /// Why the real engine is not running while the worker retries starting it; `None` once it runs.
+    pub engine_error: Option<String>,
 }
 
 enum Msg {
@@ -64,7 +126,7 @@ enum Msg {
 
 pub struct Worker {
     tx: Option<Sender<Msg>>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<Joinable>,
     pub shared: Arc<Mutex<Snapshot>>,
     visible: Arc<AtomicBool>,
     /// Tests: no thread. The loop body runs on the caller's thread as soon as a message is sent,
@@ -80,6 +142,7 @@ struct Core {
     snap: Arc<Mutex<Snapshot>>,
     ctx: Context,
     visible: Arc<AtomicBool>,
+    clock: Clock,
 }
 
 impl Core {
@@ -99,7 +162,7 @@ impl Core {
         let batch = drain_latest(&self.rx, first);
         self.pump.visible = self.visible.load(Relaxed);
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.pump.run(batch, Instant::now(), &self.snap)
+            self.pump.run(batch, (self.clock)(), &self.snap)
         }));
         let changed = run.unwrap_or_else(|payload| {
             let why = payload
@@ -176,6 +239,10 @@ struct Pump {
     icon_clock: u64,
     /// The window can be seen: only then are meters read.
     visible: bool,
+    /// The engine is still to be started again (see [`Retry`]).
+    retry: Option<Retry>,
+    /// A config reached the backend: only then is there one to give an engine that starts late.
+    applied: bool,
 }
 
 impl Pump {
@@ -185,6 +252,8 @@ impl Pump {
         if b.demo {
             self.backend = Box::new(FakeBackend::new());
             self.next_refresh = now;
+            self.retry = None;
+            snap.lock().unwrap().engine_error = None;
         }
         let mut changed = self.tick(b.cfg, now, snap) || b.demo;
         for id in b.tests {
@@ -208,6 +277,11 @@ impl Pump {
     /// Returns whether the snapshot changed. Meters are read only while visible; the hidden
     /// snapshot keeps the last ones until the window is shown again.
     fn tick(&mut self, newest: Option<Config>, now: Instant, snap: &Mutex<Snapshot>) -> bool {
+        let engine = self.retry_engine(now);
+        let newest = match newest {
+            None if matches!(engine, Some(None)) && self.applied => Some(self.cfg.clone()),
+            n => n,
+        };
         let mut apply_result = None;
         if let Some(c) = newest {
             let r = self.backend.apply(&c);
@@ -218,6 +292,7 @@ impl Pump {
                 msg
             }));
             self.cfg = c;
+            self.applied = true;
         }
         let meters: Option<HashMap<String, MeterReading>> = self.visible.then(|| {
             self.cfg
@@ -238,6 +313,12 @@ impl Pump {
         if let Some(r) = apply_result {
             s.apply_error = r;
         }
+        if let Some(e) = engine
+            && s.engine_error != e
+        {
+            s.engine_error = e;
+            changed = true;
+        }
         if let Some(m) = meters
             && s.meters != m
         {
@@ -253,6 +334,32 @@ impl Pump {
             self.trim_icons(&mut s.icons);
         }
         changed
+    }
+
+    /// Starts the engine again when a retry is due. `Some(None)`: it runs now (the stand-in is
+    /// replaced and the next refresh is due at once); `Some(Some(why))`: it failed again.
+    fn retry_engine(&mut self, now: Instant) -> Option<Option<String>> {
+        let r = self.retry.as_mut().filter(|r| now >= r.next)?;
+        // Scheduled before the attempt: a start that panics must not be retried at every wake-up.
+        r.failures = r.failures.saturating_add(1);
+        r.next = now + retry_delay(r.failures);
+        match (r.start)() {
+            Ok(engine) => {
+                log::info!(
+                    "audio engine started after {} failed attempt(s)",
+                    r.failures
+                );
+                self.retry = None;
+                self.backend = engine;
+                self.next_refresh = now;
+                Some(None)
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                log::warn!("audio engine still not ready: {why}");
+                Some(Some(why))
+            }
+        }
     }
 
     /// Icons for running apps and configured App sources not looked up before.
@@ -303,21 +410,49 @@ impl Worker {
         Self::spawn_with(backend, ctx, Box::new(icons::resolve))
     }
 
+    /// The first start failed (`failed` says why): the worker runs on a silent stand-in, and calls
+    /// `start` after 1 s, 2 s, 4 s, then every 10 s until the engine runs. The window's banner
+    /// follows `Snapshot::engine_error`.
+    pub fn spawn_retrying(failed: String, start: EngineStart, ctx: Context) -> Worker {
+        log::warn!("audio engine did not start: {failed}");
+        let retry = (failed, start);
+        let clock: Clock = Arc::new(Instant::now);
+        Self::spawn_on(
+            Box::new(FakeBackend::silent()),
+            ctx,
+            Box::new(icons::resolve),
+            Some(retry),
+            clock,
+        )
+    }
+
     fn core(
         backend: Box<dyn Backend + Send>,
         ctx: Context,
         resolve_icon: IconResolver,
+        retry: Option<(String, EngineStart)>,
+        clock: Clock,
     ) -> (Sender<Msg>, Arc<Mutex<Snapshot>>, Core) {
         let (tx, rx) = mpsc::channel::<Msg>();
-        let snap = Arc::new(Mutex::new(Snapshot::default()));
+        let now = clock();
+        let snap = Arc::new(Mutex::new(Snapshot {
+            engine_error: retry.as_ref().map(|(why, _)| why.clone()),
+            ..Snapshot::default()
+        }));
         let pump = Pump {
             backend,
             cfg: Config::default(),
-            next_refresh: Instant::now(),
+            next_refresh: now,
             resolve_icon,
             icon_used: HashMap::new(),
             icon_clock: 0,
             visible: true,
+            retry: retry.map(|(_, start)| Retry {
+                start,
+                failures: 1,
+                next: now + retry_delay(1),
+            }),
+            applied: false,
         };
         let core = Core {
             pump,
@@ -325,6 +460,7 @@ impl Worker {
             snap: snap.clone(),
             ctx,
             visible: Arc::new(AtomicBool::new(true)),
+            clock,
         };
         (tx, snap, core)
     }
@@ -335,9 +471,19 @@ impl Worker {
         ctx: Context,
         resolve_icon: IconResolver,
     ) -> Worker {
-        let (tx, shared, mut core) = Self::core(backend, ctx, resolve_icon);
+        Self::spawn_on(backend, ctx, resolve_icon, None, Arc::new(Instant::now))
+    }
+
+    fn spawn_on(
+        backend: Box<dyn Backend + Send>,
+        ctx: Context,
+        resolve_icon: IconResolver,
+        retry: Option<(String, EngineStart)>,
+        clock: Clock,
+    ) -> Worker {
+        let (tx, shared, mut core) = Self::core(backend, ctx, resolve_icon, retry, clock);
         let visible = core.visible.clone();
-        let handle = std::thread::spawn(move || {
+        let handle = Joinable::spawn(move || {
             loop {
                 let first = match core.rx.recv_timeout(core.period()) {
                     Ok(c) => Some(c),
@@ -365,7 +511,36 @@ impl Worker {
         ctx: Context,
         resolve_icon: IconResolver,
     ) -> Worker {
-        let (tx, shared, mut core) = Self::core(backend, ctx, resolve_icon);
+        Self::inline_on(backend, ctx, resolve_icon, None, Arc::new(Instant::now))
+    }
+
+    /// `spawn_retrying` without the thread and with the clock the test moves.
+    #[cfg(test)]
+    pub fn spawn_inline_retrying(
+        failed: String,
+        start: EngineStart,
+        ctx: Context,
+        clock: Clock,
+    ) -> Worker {
+        let backend = Box::new(FakeBackend::silent());
+        Self::inline_on(
+            backend,
+            ctx,
+            Box::new(|_| None),
+            Some((failed, start)),
+            clock,
+        )
+    }
+
+    #[cfg(test)]
+    fn inline_on(
+        backend: Box<dyn Backend + Send>,
+        ctx: Context,
+        resolve_icon: IconResolver,
+        retry: Option<(String, EngineStart)>,
+        clock: Clock,
+    ) -> Worker {
+        let (tx, shared, mut core) = Self::core(backend, ctx, resolve_icon, retry, clock);
         core.iterate(None);
         Worker {
             tx: Some(tx),
@@ -374,6 +549,12 @@ impl Worker {
             visible: core.visible.clone(),
             inline: Some(std::cell::RefCell::new(core)),
         }
+    }
+
+    /// Tests: one worker wake-up now, as the thread's timeout would do.
+    #[cfg(test)]
+    pub fn wake(&self) {
+        self.send(Msg::Wake);
     }
 
     pub fn apply(&self, cfg: &Config) {
@@ -425,16 +606,17 @@ impl Worker {
         self.send(Msg::Demo);
     }
 
-    /// Stop the thread and wait for it, so the backend (and its CoreAudio devices) is dropped
-    /// before the process exits. Cmd-Q never drops `App`, so this is also called from `on_exit`.
+    /// Stop the thread and wait for it (at most [`STOP_WAIT`]), so the backend (and its CoreAudio
+    /// devices) is dropped before the process exits. Cmd-Q never drops `App`, so this is also
+    /// called from `on_exit`.
     pub fn stop(&mut self) {
         self.tx = None;
         #[cfg(test)]
         {
             self.inline = None;
         }
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        if let Some(j) = self.handle.take() {
+            j.join_within(STOP_WAIT);
         }
     }
 }
@@ -540,6 +722,8 @@ mod tests {
             icon_used: HashMap::new(),
             icon_clock: 0,
             visible: true,
+            retry: None,
+            applied: false,
         };
         (pump, log, snap)
     }
@@ -598,8 +782,13 @@ mod tests {
             log: log.clone(),
             snap: rec_snap,
         };
-        let (tx, snap, mut core) =
-            Worker::core(Box::new(backend), Context::default(), Box::new(|_| None));
+        let (tx, snap, mut core) = Worker::core(
+            Box::new(backend),
+            Context::default(),
+            Box::new(|_| None),
+            None,
+            Arc::new(Instant::now),
+        );
         snap.lock().unwrap().self_test = SelfTestState::Running;
         tx.send(Msg::Apply(default_config())).unwrap();
         core.iterate(None);
@@ -656,6 +845,8 @@ mod tests {
             Box::new(FakeBackend::new()),
             Context::default(),
             Box::new(|_| None),
+            None,
+            Arc::new(Instant::now),
         );
         assert_eq!(core.period(), HIDDEN_PERIOD, "no device: nothing to meter");
         core.pump.cfg = default_config();
@@ -871,5 +1062,249 @@ mod tests {
         assert!(s.status_ready);
         assert_eq!(s.meters.len(), 2); // the demo config's two enabled devices
         assert!(matches!(s.self_test, SelfTestState::Done(Ok(_))));
+    }
+
+    /// `Rec` for an engine that starts on attempt `n + 1`, and how many times it was asked.
+    fn fails_then_starts(n: u32, engine: Rec) -> (EngineStart, Arc<Mutex<u32>>) {
+        let tries = Arc::new(Mutex::new(0));
+        let count = tries.clone();
+        let mut engine = Some(engine);
+        let start: EngineStart = Box::new(move || {
+            let mut c = count.lock().unwrap();
+            *c += 1;
+            anyhow::ensure!(*c > n, "coreaudiod not ready ({c})");
+            Ok(Box::new(engine.take().expect("started twice")) as Box<dyn Backend + Send>)
+        });
+        (start, tries)
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn start_attempts_wait_1_2_4_then_10_seconds() {
+        let waits: Vec<_> = (0..8).map(retry_delay).collect();
+        assert_eq!(
+            waits,
+            [
+                secs(1),
+                secs(1),
+                secs(2),
+                secs(4),
+                secs(10),
+                secs(10),
+                secs(10),
+                secs(10)
+            ]
+        );
+        assert_eq!(retry_delay(u32::MAX), secs(10));
+    }
+
+    #[test]
+    fn a_late_engine_is_retried_on_the_schedule_and_gets_the_config() {
+        let (mut pump, first, snap) = setup();
+        let second = Arc::new(Mutex::new(Log {
+            lock_free: true,
+            ..Log::default()
+        }));
+        let engine = Rec {
+            log: second.clone(),
+            snap: snap.clone(),
+        };
+        let (start, tries) = fails_then_starts(3, engine);
+        let t0 = Instant::now();
+        pump.retry = Some(Retry {
+            start,
+            failures: 1,
+            next: t0 + secs(1),
+        });
+        snap.lock().unwrap().engine_error = Some("no CoreAudio".into());
+        // The window's first config lands on the stand-in (the first `setup` backend).
+        pump.tick(Some(default_config()), t0, &snap);
+        assert_eq!(first.lock().unwrap().applied.len(), 1);
+
+        // (time of the tick, attempts made so far, banner afterwards)
+        let steps = [
+            (900, 0, Some("no CoreAudio")),
+            (1000, 1, Some("coreaudiod not ready (1)")), // next in 2 s
+            (2999, 1, Some("coreaudiod not ready (1)")),
+            (3000, 2, Some("coreaudiod not ready (2)")), // next in 4 s
+            (6999, 2, Some("coreaudiod not ready (2)")),
+            (7000, 3, Some("coreaudiod not ready (3)")), // next in 10 s
+            (16_999, 3, Some("coreaudiod not ready (3)")),
+            (17_000, 4, None),
+            (60_000, 4, None), // running: never asked again
+        ];
+        for (ms, attempts, banner) in steps {
+            pump.tick(None, t0 + Duration::from_millis(ms), &snap);
+            assert_eq!(*tries.lock().unwrap(), attempts, "at {ms} ms");
+            assert_eq!(
+                snap.lock().unwrap().engine_error.as_deref(),
+                banner,
+                "at {ms} ms"
+            );
+        }
+        assert!(pump.retry.is_none());
+        // The new engine got the last config at once; the stand-in saw no more.
+        assert_eq!(second.lock().unwrap().applied, [default_config()]);
+        assert_eq!(first.lock().unwrap().applied.len(), 1);
+        assert!(snap.lock().unwrap().apply_error.is_none());
+    }
+
+    #[test]
+    fn a_failed_retry_with_the_same_reason_does_not_wake_the_ui_but_a_start_does() {
+        let (mut pump, _log, snap) = setup();
+        let engine = Rec {
+            log: Arc::default(),
+            snap: snap.clone(),
+        };
+        let (start, _) = fails_then_starts(1, engine);
+        let t0 = Instant::now();
+        pump.retry = Some(Retry {
+            start,
+            failures: 1,
+            next: t0 + secs(1),
+        });
+        snap.lock().unwrap().engine_error = Some("coreaudiod not ready (1)".into());
+        pump.visible = false; // no meters, so only the retry can change anything
+        assert!(pump.tick(None, t0, &snap)); // first refresh
+        pump.next_refresh = t0 + secs(3600); // refreshes always count; keep them out of this
+        assert!(
+            !pump.tick(None, t0 + secs(1), &snap),
+            "same reason as the banner"
+        );
+        assert!(pump.tick(None, t0 + secs(3), &snap), "the engine started");
+        assert!(snap.lock().unwrap().engine_error.is_none());
+    }
+
+    #[test]
+    fn an_engine_that_starts_before_any_config_is_not_given_the_empty_default() {
+        let (mut pump, _log, snap) = setup();
+        let log = Arc::new(Mutex::new(Log::default()));
+        let engine = Rec {
+            log: log.clone(),
+            snap: snap.clone(),
+        };
+        let (start, _) = fails_then_starts(0, engine);
+        let t0 = Instant::now();
+        pump.retry = Some(Retry {
+            start,
+            failures: 1,
+            next: t0,
+        });
+        pump.tick(None, t0, &snap);
+        assert!(pump.retry.is_none());
+        assert!(log.lock().unwrap().applied.is_empty());
+    }
+
+    #[test]
+    fn the_demo_ends_the_retries_and_the_banner() {
+        let (mut pump, _log, snap) = setup();
+        let (start, tries) = fails_then_starts(
+            u32::MAX,
+            Rec {
+                log: Arc::default(),
+                snap: snap.clone(),
+            },
+        );
+        let t0 = Instant::now();
+        pump.retry = Some(Retry {
+            start,
+            failures: 1,
+            next: t0 + secs(1),
+        });
+        snap.lock().unwrap().engine_error = Some("no CoreAudio".into());
+        let demo = Batch {
+            demo: true,
+            ..Batch::default()
+        };
+        pump.run(demo, t0, &snap);
+        assert!(snap.lock().unwrap().engine_error.is_none());
+        pump.tick(None, t0 + secs(60), &snap);
+        assert_eq!(*tries.lock().unwrap(), 0, "the fake engine is not replaced");
+    }
+
+    #[test]
+    fn the_worker_retries_on_its_own_clock_and_clears_the_banner() {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock: Clock = {
+            let now = now.clone();
+            Arc::new(move || *now.lock().unwrap())
+        };
+        let engine = Rec {
+            log: Arc::default(),
+            snap: Arc::default(),
+        };
+        let (start, tries) = fails_then_starts(1, engine);
+        let (_tx, snap, mut core) = Worker::core(
+            Box::new(FakeBackend::silent()),
+            Context::default(),
+            Box::new(|_| None),
+            Some(("no CoreAudio".into(), start)),
+            clock,
+        );
+        assert_eq!(
+            snap.lock().unwrap().engine_error.as_deref(),
+            Some("no CoreAudio")
+        );
+        core.iterate(None);
+        assert_eq!(*tries.lock().unwrap(), 0, "not due at once");
+        for (advance, attempts, running) in [(1, 1, false), (1, 1, false), (1, 2, true)] {
+            *now.lock().unwrap() += secs(advance);
+            core.iterate(None);
+            assert_eq!(*tries.lock().unwrap(), attempts);
+            assert_eq!(snap.lock().unwrap().engine_error.is_none(), running);
+        }
+    }
+
+    #[test]
+    fn a_start_that_panics_is_not_retried_at_every_wake_up() {
+        let t0 = Instant::now();
+        let calls = Arc::new(Mutex::new(0));
+        let count = calls.clone();
+        let start: EngineStart = Box::new(move || {
+            *count.lock().unwrap() += 1;
+            panic!("HAL aborted");
+        });
+        let (mut pump, _log, snap) = setup();
+        pump.retry = Some(Retry {
+            start,
+            failures: 1,
+            next: t0,
+        });
+        let run = |pump: &mut Pump, at: Instant| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pump.tick(None, at, &snap);
+            }))
+        };
+        assert!(run(&mut pump, t0).is_err());
+        assert!(
+            run(&mut pump, t0 + Duration::from_millis(33)).is_ok(),
+            "waits"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_worker_that_ends_is_joined() {
+        assert!(Joinable::spawn(|| {}).join_within(secs(3600)));
+        // A panic ends the thread as well; it is not mistaken for a hang.
+        assert!(Joinable::spawn(|| panic!("worker bug")).join_within(secs(3600)));
+    }
+
+    #[test]
+    fn a_worker_stuck_in_a_call_does_not_hold_up_quitting() {
+        let (release, blocked) = mpsc::channel::<()>();
+        let (ended, ended_rx) = mpsc::channel::<()>();
+        let j = Joinable::spawn(move || {
+            let _ = blocked.recv(); // the hung HAL call
+            let _ = ended.send(());
+        });
+        // Zero wait: the thread cannot have ended, so this is the timeout path, with no sleeping.
+        assert!(!j.join_within(Duration::ZERO));
+        // Let it go: the thread was only detached, and still finishes.
+        release.send(()).unwrap();
+        ended_rx.recv().unwrap();
     }
 }

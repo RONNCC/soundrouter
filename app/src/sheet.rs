@@ -3,10 +3,11 @@
 use crate::theme::{self, Tokens, radius};
 use crate::widgets::{loops, name_button};
 use eframe::egui::{
-    self, Align, Align2, Color32, Context, CornerRadius, Frame, Id, Key, Label, Layout, Margin,
-    Modal, Modifiers, Rect, RichText, ScrollArea, Sense, Spinner, Stroke, StrokeKind, Ui,
-    WidgetInfo, accesskit::Role, pos2, vec2,
+    self, Align, Align2, Color32, Context, CornerRadius, Frame, Id, Key, Label, LayerId, Layout,
+    Margin, Modal, Modifiers, Order, Popup, Rect, RichText, ScrollArea, Sense, Spinner, Stroke,
+    StrokeKind, Ui, WidgetInfo, accesskit::Role, pos2, vec2,
 };
+use std::time::Duration;
 
 /// Card content width; the card is this plus its padding.
 const INNER_W: f32 = 420.0;
@@ -37,6 +38,67 @@ pub struct Sheet<'a> {
     pub buttons: bool,
 }
 
+/// Esc dismisses a sheet by pressing its own Cancel, Close or Done button, the first of those the
+/// sheet has. What dismissing means stays in the sheet's handler for that button, and Esc can never
+/// run the primary action. A sheet with none of them (the welcome, the driver install, a wait)
+/// ignores Esc.
+const DISMISS: [&str; 3] = ["Cancel", "Close", "Done"];
+
+/// 20 fps for the indeterminate bar.
+const PROGRESS_FRAME: Duration = Duration::from_millis(50);
+
+/// One sheet's Esc state, in egui memory under the sheet's id.
+#[derive(Clone, Default)]
+struct Dismiss {
+    /// Esc is pressed in this frame and aimed at this sheet.
+    esc: bool,
+    /// The best dismiss button drawn in the last frame: the one Esc presses. The buttons come after
+    /// the frame's start, where Esc has to be decided.
+    pick: Option<usize>,
+    /// The best dismiss button drawn so far in this frame.
+    seen: Option<usize>,
+}
+
+/// Which sheet's buttons are being drawn.
+fn drawing() -> Id {
+    Id::unique("sheet_being_drawn")
+}
+
+/// Decides whether Esc is for this sheet: only the topmost modal, and not while a menu is open
+/// (Esc closes the menu first).
+fn begin_dismiss(ctx: &Context, sheet: Id) {
+    let layer = LayerId::new(Order::Foreground, sheet);
+    let top = ctx
+        .memory(|m| m.top_modal_layer())
+        .is_none_or(|l| l == layer);
+    let pressed = top && !Popup::is_any_open(ctx) && ctx.input(|i| i.key_pressed(Key::Escape));
+    let esc = ctx.data_mut(|d| {
+        d.insert_temp(drawing(), sheet);
+        let s = d.get_temp_mut_or_default::<Dismiss>(sheet);
+        s.pick = s.seen.take();
+        s.esc = pressed && s.pick.is_some();
+        s.esc
+    });
+    if esc {
+        // Not also the rename field's or anything underneath.
+        let _ = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+    }
+}
+
+/// Registers `label` as a dismiss button of the sheet being drawn; true when Esc presses it.
+fn esc_presses(ctx: &Context, label: &str) -> bool {
+    let Some(rank) = DISMISS.iter().position(|d| *d == label) else {
+        return false;
+    };
+    ctx.data_mut(|d| {
+        let sheet = d.get_temp::<Id>(drawing())?;
+        let s = d.get_temp_mut_or_default::<Dismiss>(sheet);
+        s.seen = Some(s.seen.map_or(rank, |best| best.min(rank)));
+        Some(s.esc && s.pick == Some(rank))
+    })
+    .unwrap_or(false)
+}
+
 /// Shows `sheet` over the window. The backdrop swallows clicks and never dismisses the sheet.
 /// `content` scrolls when the window is too small; `footer` stays pinned at the bottom.
 pub fn modal<S>(
@@ -58,7 +120,9 @@ pub fn modal<S>(
         .min(screen.width() - 2.0 * (MARGIN + PAD))
         .max(200.0);
     let max_inner_h = screen.height() - 2.0 * (MARGIN + PAD);
-    Modal::new(Id::unique(sheet.id))
+    let id = Id::unique(sheet.id);
+    begin_dismiss(ctx, id);
+    Modal::new(id)
         .backdrop_color(t.scrim)
         .frame(frame)
         .show(ctx, |ui| {
@@ -85,6 +149,7 @@ pub fn modal<S>(
                 );
             }
         });
+    ctx.data_mut(|d| d.remove::<Id>(drawing()));
 }
 
 fn header(ui: &mut Ui, t: &Tokens, sheet: &Sheet, inner_w: f32) {
@@ -309,7 +374,8 @@ pub fn progress(ui: &mut Ui, t: &Tokens, label: &str) {
     let x = egui::lerp((r.left() - seg)..=r.right(), phase);
     let bar = Rect::from_x_y_ranges(x.max(r.left())..=(x + seg).min(r.right()), r.y_range());
     p.rect_filled(bar, round, t.accent);
-    ui.request_repaint();
+    // 20 fps is smooth enough for a thin bar; an immediate repaint would run at the display's rate.
+    ui.request_repaint_after(PROGRESS_FRAME);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -384,7 +450,8 @@ pub fn button_named(ui: &mut Ui, t: &Tokens, label: &str, name: &str, kind: Kind
     let enter = kind == Kind::Primary
         && ui.memory(|m| m.focused().is_none())
         && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-    resp.clicked() || enter
+    let esc = esc_presses(ui.ctx(), label);
+    resp.clicked() || enter || esc
 }
 
 /// Button row: `left` is left-aligned; `right` is laid out right to left, so add the primary button
@@ -398,4 +465,135 @@ pub fn buttons<S>(
     ui.spacing_mut().item_spacing.x = 8.0;
     left(ui, state);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| right(ui, state));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::Harness;
+
+    type Footer = &'static [(&'static str, Kind)];
+    /// Sheets drawn in order, each `(id, has a button row, buttons)`; a later one is on top.
+    type Sheets = Vec<(&'static str, bool, Footer)>;
+
+    const SAVE_CANCEL: Footer = &[("Save", Kind::Primary), ("Cancel", Kind::Secondary)];
+
+    /// The state collects "sheet/label" for every button pressed.
+    fn window(sheets: Sheets) -> Harness<'static, Vec<String>> {
+        Harness::builder()
+            .with_context_setup(theme::install_fonts)
+            .build_ui_state(
+                move |ui, pressed: &mut Vec<String>| {
+                    let t = theme::tokens(false);
+                    for &(id, with_buttons, footer) in &sheets {
+                        let sheet = Sheet {
+                            id,
+                            glyph: Glyph::App,
+                            title: "Title",
+                            intro: "",
+                            buttons: with_buttons,
+                        };
+                        modal(
+                            ui.ctx(),
+                            &t,
+                            &sheet,
+                            pressed,
+                            |_, _| {},
+                            |ui, pressed| {
+                                buttons(
+                                    ui,
+                                    pressed,
+                                    |_, _| {},
+                                    |ui, pressed| {
+                                        for &(label, kind) in footer {
+                                            if button(ui, &t, label, kind) {
+                                                pressed.push(format!("{id}/{label}"));
+                                            }
+                                        }
+                                    },
+                                );
+                            },
+                        );
+                    }
+                },
+                Vec::new(),
+            )
+    }
+
+    /// What was pressed by one Esc, after the sheets have been on screen for a few frames.
+    fn esc(sheets: Sheets) -> Vec<String> {
+        let mut h = window(sheets);
+        h.run_steps(3);
+        assert!(h.state().is_empty(), "nothing is pressed by itself");
+        h.key_press(Key::Escape);
+        h.run_steps(3);
+        h.state().clone()
+    }
+
+    #[test]
+    fn esc_presses_cancel_and_never_the_primary_button() {
+        assert_eq!(esc(vec![("s", true, SAVE_CANCEL)]), ["s/Cancel"]);
+    }
+
+    #[test]
+    fn cancel_beats_close_and_done_whatever_the_drawing_order() {
+        let done_first: Footer = &[("Done", Kind::Primary), ("Cancel", Kind::Secondary)];
+        let cancel_first: Footer = &[("Cancel", Kind::Secondary), ("Done", Kind::Primary)];
+        let three: Footer = &[
+            ("Done", Kind::Primary),
+            ("Close", Kind::Secondary),
+            ("Cancel", Kind::Secondary),
+        ];
+        for (n, footer) in [done_first, cancel_first, three].into_iter().enumerate() {
+            let pressed = esc(vec![("s", true, footer)]);
+            assert_eq!(pressed, ["s/Cancel"], "footer {n}");
+        }
+        let close: Footer = &[("Run test", Kind::Primary), ("Close", Kind::Secondary)];
+        assert_eq!(esc(vec![("s", true, close)]), ["s/Close"]);
+    }
+
+    #[test]
+    fn a_sheet_with_only_done_is_closed_by_esc() {
+        let done: Footer = &[("Done", Kind::Primary)];
+        assert_eq!(esc(vec![("s", true, done)]), ["s/Done"]);
+    }
+
+    #[test]
+    fn a_sheet_with_nothing_to_cancel_ignores_esc() {
+        let install: Footer = &[
+            ("Try the demo", Kind::Secondary),
+            ("Install driver", Kind::Primary),
+        ];
+        assert!(esc(vec![("s", true, install)]).is_empty());
+        // A wait has no button row at all.
+        assert!(esc(vec![("s", false, SAVE_CANCEL)]).is_empty());
+    }
+
+    #[test]
+    fn esc_goes_to_the_topmost_sheet_only() {
+        let cancel: Footer = &[("Cancel", Kind::Secondary)];
+        let pressed = esc(vec![("under", true, cancel), ("over", true, cancel)]);
+        assert_eq!(pressed, ["over/Cancel"]);
+    }
+
+    #[test]
+    fn a_waiting_sheet_repaints_at_20_fps_not_at_every_frame() {
+        let ctx = Context::default();
+        let t = theme::tokens(false);
+        for n in 0..5 {
+            let input = egui::RawInput {
+                time: Some(f64::from(n) * 0.05),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| {
+                progress(ui, &t, "Waiting for the password dialog…");
+            });
+            let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            out.drop_without_applying_deltas();
+            if n >= 3 {
+                // Past the first frames: the bar's own request is the only one left.
+                assert_eq!(delay, Duration::from_millis(50), "frame {n}");
+            }
+        }
+    }
 }

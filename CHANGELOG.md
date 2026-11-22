@@ -63,6 +63,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 - Mixer: vdev channels wired to the same monitor channel (e.g. a stereo device onto a mono output) are averaged instead of summed, so a mono source no longer plays 6 dB louder on a mono output; one wire per channel stays bit-exact. `Meters::clipped_blocks` counts blocks with a vdev output sample over full scale (the output is still unlimited; see ARCHITECTURE "Clipping and monitor downmix").
+- App: an audio engine that fails to start at login (coreaudiod not ready yet) is started again by the worker after 1 s, 2 s, 4 s, then every 10 s, until it runs; the standing banner reads "Audio engine not ready yet. Retrying" meanwhile and goes away on success, with the last config applied to the new engine (was: "Quit and reopen SoundRouter").
+- App: Cmd-Q waits at most 2 s for the worker thread (a HAL call that never returns used to keep the app from quitting); a thread still running then is logged and left to process exit.
+- App: Esc closes the topmost sheet like its Cancel (else Close, else Done) button, never its primary action; the welcome, driver install and waiting sheets have nothing to cancel and ignore it, and a menu open over a sheet takes the Esc first.
+- App: the indeterminate progress bar of a waiting sheet repaints at 20 fps (`request_repaint_after(50 ms)`), not at the display rate.
+- App: with macOS "Reduce motion" on (read through `NSWorkspace`, behind the `Os` seam), the switch knob jumps and sheets appear without a fade (egui's animation time is 0).
 - Engine: a split vdev whose first tap aggregate failed to build left its taps parked with no retry until the next process event; it now schedules a retap at once, which goes through the capped backoff and surfaces the error once.
 - Engine: a device another app held in hog mode and later released never made a failed vdev rebuild; the per-device listeners now include `kAudioDevicePropertyHogMode` and a release triggers a rebuild pass (start-failure counts reset).
 - App: the snapshot's app icons (one 16 KB image per executable ever seen) are capped at 64, least recently seen dropped; the UI frees the textures of dropped ones.

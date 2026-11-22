@@ -135,34 +135,29 @@ fn main() -> eframe::Result {
             #[cfg(not(target_os = "macos"))]
             let vibrancy = false;
 
-            let (cfg, path, toast, backend, unavailable): (_, _, _, Box<dyn Backend + Send>, _) =
+            let (cfg, path, toast, engine): (_, _, _, Result<Box<dyn Backend + Send>, String>) =
                 if demo {
                     (
                         fake::demo_config(),
                         None,
                         None,
-                        Box::new(fake::FakeBackend::new()),
-                        None,
+                        Ok(Box::new(fake::FakeBackend::new())),
                     )
                 } else {
                     let path = store::default_path();
                     let (cfg, msg) = path
                         .as_deref()
                         .map_or_else(|| (model::default_config(), None), store::load);
-                    match real_backend() {
-                        Ok(b) => (cfg, path, msg, b, None),
-                        // The config is still loaded and saved, but nothing routes: silent
-                        // meters and a standing banner, never the demo's fake levels.
-                        Err(e) => (
-                            cfg,
-                            path,
-                            msg,
-                            Box::new(fake::FakeBackend::silent()),
-                            Some(format!("{e:#}")),
-                        ),
-                    }
+                    (cfg, path, msg, real_backend().map_err(|e| format!("{e:#}")))
                 };
-            let worker = worker::Worker::spawn(backend, cc.egui_ctx.clone());
+            let ctx = cc.egui_ctx.clone();
+            let worker = match engine {
+                Ok(backend) => worker::Worker::spawn(backend, ctx),
+                // The config is still loaded and saved, but nothing routes until the engine
+                // starts (at login coreaudiod may not be ready yet; the worker retries): silent
+                // meters and a standing banner, never the demo's fake levels.
+                Err(why) => worker::Worker::spawn_retrying(why, Box::new(real_backend), ctx),
+            };
             if login::is_enabled() {
                 // The agent plist points at the executable that enabled it; follow the app if it moved.
                 let _ = login::set_enabled(true);
@@ -178,9 +173,11 @@ fn main() -> eframe::Result {
                 quitting: false,
             };
             Ok(Box::new(
-                app::App::new(cfg, path, worker, toast, vibrancy, demo)
-                    .engine_unavailable(unavailable)
-                    .background(tray, win, args.background),
+                app::App::new(cfg, path, worker, toast, vibrancy, demo).background(
+                    tray,
+                    win,
+                    args.background,
+                ),
             ))
         }),
     )

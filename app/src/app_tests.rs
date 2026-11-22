@@ -96,6 +96,20 @@ fn window_with(
     demo: bool,
     runner: Runner,
 ) -> Harness<'static, App> {
+    let worker =
+        move |ctx: &egui::Context| Worker::spawn_inline(backend, ctx.clone(), Box::new(|_| None));
+    window_on(cfg, worker, toast, theme, demo, runner)
+}
+
+/// `window_with` for a worker the test builds itself.
+fn window_on(
+    cfg: Config,
+    worker: impl FnOnce(&egui::Context) -> Worker + 'static,
+    toast: Option<&str>,
+    theme: Theme,
+    demo: bool,
+    runner: Runner,
+) -> Harness<'static, App> {
     let toast = toast.map(str::to_string);
     let mut h = Harness::builder()
         .with_size(vec2(1180.0, 700.0))
@@ -103,7 +117,7 @@ fn window_with(
         .with_theme(theme)
         .with_context_setup(crate::theme::install_fonts)
         .build_eframe(move |cc| {
-            let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
+            let w = worker(&cc.egui_ctx);
             let mut app = App::new(cfg, None, w, toast, false, demo);
             app.setup = Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()))
                 .with_driver_check(|_| Ok("ab12".into()));
@@ -2051,7 +2065,10 @@ fn deleting_a_device_can_be_undone() {
     let mut h = open(demo_config());
     click(&mut h, "Select Stream Mix");
     let before = h.state().cfg.clone();
-    assert!(h.query_by_label("Remove device").is_none(), "no footer button");
+    assert!(
+        h.query_by_label("Remove device").is_none(),
+        "no footer button"
+    );
     click(&mut h, "Remove Stream Mix");
     assert_eq!(h.state().cfg.devices.len(), before.devices.len() - 1);
     h.get_by_label("Removed Stream Mix");
@@ -2088,18 +2105,35 @@ fn row_x_removes_that_device_keeps_the_selection_on_its_device_and_undoes() {
 }
 
 #[test]
-fn a_failed_engine_start_shows_silence_and_a_standing_banner() {
-    let mut h = window(
+fn a_failed_engine_start_shows_silence_and_a_standing_banner_until_the_engine_starts() {
+    let now = Arc::new(Mutex::new(std::time::Instant::now()));
+    let tries = Arc::new(Mutex::new(0u32));
+    let (clock, count) = (now.clone(), tries.clone());
+    let mut h = window_on(
         demo_config(),
-        Box::new(FakeBackend::silent()),
+        move |ctx| {
+            // Fails twice, as coreaudiod does for the first seconds of a login.
+            let start: crate::worker::EngineStart = Box::new(move || {
+                let mut n = count.lock().unwrap();
+                *n += 1;
+                anyhow::ensure!(*n > 2, "no CoreAudio");
+                Ok(Box::new(FakeBackend::frozen(1.5)) as Box<dyn Backend + Send>)
+            });
+            let clock = Arc::new(move || *clock.lock().unwrap());
+            Worker::spawn_inline_retrying("no CoreAudio".into(), start, ctx.clone(), clock)
+        },
         None,
         Theme::Dark,
         false,
+        never_run(),
     );
-    h.state_mut().engine_error = Some("no CoreAudio".into());
-    settle(&mut h);
-    let banner = "SoundRouter could not start its audio engine (no CoreAudio). Nothing is routed. Quit and reopen SoundRouter to try again.";
-    h.get_by_label(banner);
+    let banner = engine_banner("no CoreAudio");
+    assert_eq!(
+        banner,
+        "Audio engine not ready yet. Retrying (no CoreAudio). Nothing is routed until it starts."
+    );
+    h.get_by_label(&banner);
+    assert!(!has(&h, "Quit and reopen SoundRouter to try again."));
     {
         let s = h.state().worker.shared.lock().unwrap();
         assert!(!s.meters.is_empty());
@@ -2110,11 +2144,42 @@ fn a_failed_engine_start_shows_silence_and_a_standing_banner() {
     }
     click(&mut h, "Mute Loopback Audio");
     h.run_steps(300); // far longer than any toast
-    h.get_by_label(banner);
+    h.get_by_label(&banner);
     assert!(!has(
         &h,
         "Demo mode: the audio is synthetic and nothing is saved."
     ));
+    assert_eq!(
+        *tries.lock().unwrap(),
+        0,
+        "the first retry is due after 1 s"
+    );
+
+    // Retries at 1 s, 3 s (2 s later) and 7 s (4 s later); the third finds the engine.
+    let wake = |h: &mut Harness<App>, secs: u64| {
+        *now.lock().unwrap() += std::time::Duration::from_secs(secs);
+        h.state().worker.wake();
+        settle(h);
+    };
+    for (secs, attempts) in [(1, 1), (1, 1), (1, 2), (4, 3)] {
+        wake(&mut h, secs);
+        assert_eq!(*tries.lock().unwrap(), attempts);
+        if attempts < 3 {
+            h.get_by_label(&banner);
+        }
+    }
+    assert!(!has(&h, &banner));
+    assert!(
+        h.query_by_label_contains("Audio engine not ready")
+            .is_none()
+    );
+    let s = h.state().worker.shared.lock().unwrap();
+    assert!(s.engine_error.is_none() && s.apply_error.is_none());
+    let plays = s
+        .meters
+        .values()
+        .any(|m| m.channels.iter().any(|c| *c > 0.0));
+    assert!(plays, "the new engine got the config and runs it");
 }
 
 #[test]
@@ -3027,4 +3092,170 @@ fn a_click_that_closes_a_menu_only_closes_it() {
         wires(&before) - 1,
         "second click only"
     );
+}
+
+fn esc(h: &mut Harness<App>) {
+    h.key_press(egui::Key::Escape);
+    settle(h);
+}
+
+#[test]
+fn esc_leaves_the_welcome_and_the_driver_step_alone() {
+    // Neither has anything to cancel, and Esc must not choose for the user.
+    let (runner, calls) = recording(Ok(()));
+    let mut h = with_runner(no_driver(), runner.clone());
+    h.state_mut().setup = Setup::new(runner, None).with_intro();
+    settle(&mut h);
+    h.get_by_label("Welcome to SoundRouter");
+    esc(&mut h);
+    h.get_by_label("Welcome to SoundRouter");
+    click(&mut h, "Get started");
+    h.get_by_label("Install driver");
+    esc(&mut h);
+    h.get_by_label("Install driver");
+    h.get_by_label("Try the demo");
+    assert!(calls.lock().unwrap().is_empty(), "no install was started");
+    assert!(!h.state().demo, "no demo was chosen");
+}
+
+#[test]
+fn esc_closes_the_permissions_step_like_close_and_runs_no_test() {
+    let status = EngineStatus {
+        mic: TccStatus::Denied,
+        ..installed()
+    };
+    let mut h = with_runner(status, never_run());
+    assert!(h.state().setup.shown());
+    esc(&mut h);
+    assert!(!h.state().setup.shown() && h.state().setup.seen());
+    assert_eq!(
+        h.state().worker.shared.lock().unwrap().self_test,
+        SelfTestState::Idle
+    );
+}
+
+#[test]
+fn esc_cancels_a_running_test_and_closes_a_finished_one_without_testing_again() {
+    let mut h = setup_run(installed(), flowing());
+    click(&mut h, "Run test");
+    until(&mut h, "self-test", |h| {
+        has(h, "Audio flows (-6 dBFS, 0 dropouts)")
+    });
+    // Passed: the only button is Continue, so Esc leaves the sheet where it is.
+    esc(&mut h);
+    h.get_by_label("Continue");
+    // Running: Esc is the Cancel button.
+    h.state().worker.shared.lock().unwrap().self_test = SelfTestState::Running;
+    settle(&mut h);
+    h.get_by_label("Cancel");
+    esc(&mut h);
+    assert!(!has(&h, "Cancel") && !has(&h, "Loopback test"));
+
+    // Failed: Esc is Close, not "Test again".
+    let mut h = setup_run(installed(), None);
+    click(&mut h, "Run test");
+    until(&mut h, "self-test", |h| has(h, "Copy diagnostics"));
+    h.get_by_label("Test again");
+    esc(&mut h);
+    assert!(!has(&h, "Test again") && !has(&h, "Copy diagnostics"));
+    assert!(matches!(
+        h.state().worker.shared.lock().unwrap().self_test,
+        SelfTestState::Done(Err(_))
+    ));
+}
+
+#[test]
+fn esc_closes_the_all_set_sheet() {
+    let mut h = setup_run(installed(), flowing());
+    click(&mut h, "Run test");
+    until(&mut h, "self-test", |h| {
+        has(h, "Audio flows (-6 dBFS, 0 dropouts)")
+    });
+    click(&mut h, "Continue");
+    h.get_by_label("Done");
+    esc(&mut h);
+    assert!(!has(&h, "Done") && !has(&h, "Continue"));
+}
+
+#[test]
+fn esc_closes_the_measure_delay_sheet_running_or_done_without_measuring_again() {
+    let mut h = open(demo_config());
+    click(&mut h, &delay_label(256));
+    click(&mut h, "Measure delay…");
+    h.get_by_label("Measured delay: 5.4 ms");
+    esc(&mut h);
+    assert!(!has(&h, "Measured delay: 5.4 ms") && !has(&h, "Measure again"));
+    assert!(
+        matches!(
+            h.state().worker.shared.lock().unwrap().measure,
+            crate::worker::MeasureState::Done(Ok(_))
+        ),
+        "not measured again"
+    );
+
+    click(&mut h, &delay_label(256));
+    click(&mut h, "Measure delay…");
+    h.state().worker.shared.lock().unwrap().measure = crate::worker::MeasureState::Running;
+    settle(&mut h);
+    h.get_by_label("Cancel");
+    esc(&mut h);
+    assert!(!has(&h, "Cancel") && !has(&h, "Measure again"));
+}
+
+#[test]
+fn esc_cancels_the_uninstall_question() {
+    let (runner, calls) = recording(Ok(()));
+    let mut h = with_runner(installed(), runner);
+    uninstall(&mut h);
+    h.get_by_label("Uninstall the audio driver?");
+    esc(&mut h);
+    assert!(!has(&h, "Uninstall the audio driver?"));
+    assert!(calls.lock().unwrap().is_empty(), "nothing was uninstalled");
+}
+
+#[test]
+fn esc_closes_each_menu_and_does_nothing_else() {
+    let mut h = with_runner(installed(), never_run());
+    let before = h.state().cfg.clone();
+    for (opener, item) in [
+        (delay_label(256), "Measure delay…"),
+        ("More actions".to_string(), "Uninstall…"),
+        ("Add source".to_string(), "Search sources"),
+    ] {
+        click(&mut h, &opener);
+        h.get_by_label(item);
+        esc(&mut h);
+        assert!(!has(&h, item), "{item} stays open");
+    }
+    assert_eq!(h.state().cfg, before, "no edit was made");
+    assert!(!h.state().setup.shown(), "no sheet was opened");
+}
+
+#[test]
+fn the_os_reduce_motion_setting_turns_the_switch_slide_and_sheet_fade_off() {
+    let mut h = open(demo_config());
+    let knob = egui::Id::unique("a switch knob");
+    // A switch asks egui for the animated value of its state; right after a toggle that is the
+    // start of the slide, or already the end of it.
+    let after_toggle = |h: &Harness<App>| {
+        h.ctx.animate_bool_responsive(knob, false);
+        h.ctx.animate_bool_responsive(knob, true)
+    };
+    assert!(h.ctx.global_style().animation_time > 0.0);
+    assert!(after_toggle(&h) < 1.0, "slides");
+
+    h.state_mut().os.reduce_motion = Arc::new(|| true);
+    settle(&mut h);
+    assert_eq!(
+        h.ctx.global_style().animation_time,
+        0.0,
+        "sheets do not fade"
+    );
+    let knob = egui::Id::unique("another switch knob");
+    h.ctx.animate_bool_responsive(knob, false);
+    assert_eq!(h.ctx.animate_bool_responsive(knob, true), 1.0, "jumps");
+
+    h.state_mut().os.reduce_motion = Arc::new(|| false);
+    settle(&mut h);
+    assert!(h.ctx.global_style().animation_time > 0.0, "and back");
 }

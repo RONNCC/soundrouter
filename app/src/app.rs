@@ -84,8 +84,6 @@ pub struct App {
     preset_pick: Option<String>,
     /// egui time of the current frame.
     now: f64,
-    /// Why the real audio engine did not start; the app then only edits and saves the config.
-    engine_error: Option<String>,
     /// Health banners the user closed, and when each device's dropout counter last grew.
     dismissed: health::Dismissed,
     dropouts: health::Dropouts,
@@ -99,6 +97,8 @@ struct Os {
     login_is_on: Arc<dyn Fn() -> bool + Send + Sync>,
     set_login: Arc<dyn Fn(bool) -> std::io::Result<()> + Send + Sync>,
     open_url: Arc<dyn Fn(&str) + Send + Sync>,
+    /// macOS "Reduce motion": the switch knob and the sheets then jump instead of sliding and fading.
+    reduce_motion: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl Os {
@@ -107,8 +107,28 @@ impl Os {
             login_is_on: Arc::new(login::is_enabled),
             set_login: Arc::new(login::set_enabled),
             open_url: Arc::new(setup::open_url),
+            reduce_motion: Arc::new(system_reduces_motion),
         }
     }
+}
+
+/// Tests never read the machine's setting, so a snapshot looks the same on every Mac.
+#[cfg(target_os = "macos")]
+fn system_reduces_motion() -> bool {
+    !cfg!(test)
+        && objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_reduces_motion() -> bool {
+    false
+}
+
+/// The standing banner while the worker retries starting the engine.
+const ENGINE_RETRYING: &str = "Audio engine not ready yet. Retrying";
+
+fn engine_banner(why: &str) -> String {
+    format!("{ENGINE_RETRYING} ({why}). Nothing is routed until it starts.")
 }
 
 /// Label and dot color for a device state; idle devices show no dot.
@@ -296,17 +316,10 @@ impl App {
             presets,
             preset_pick: None,
             now: 0.0,
-            engine_error: None,
             dismissed: health::Dismissed::default(),
             dropouts: health::Dropouts::default(),
             os: Os::system(),
         }
-    }
-
-    /// The real engine failed to start: show why until a real one runs.
-    pub fn engine_unavailable(mut self, why: Option<String>) -> Self {
-        self.engine_error = why;
-        self
     }
 
     /// Keep routing when the window closes: menu-bar item plus close-to-hide state.
@@ -579,7 +592,6 @@ impl App {
             Some(SetupAction::Measure) => self.measure_now(),
             Some(SetupAction::Demo) => {
                 self.demo = true;
-                self.engine_error = None;
                 self.path = None; // never overwrite the saved config with demo edits
                 self.presets = Presets::load(None).0; // nor the saved presets
                 self.cfg = crate::fake::demo_config();
@@ -1271,7 +1283,8 @@ impl App {
                 });
         }
 
-        if let Some(why) = self.engine_error.clone().filter(|_| !self.demo) {
+        let engine_error = self.worker.shared.lock().unwrap().engine_error.clone();
+        if let Some(why) = engine_error.filter(|_| !self.demo) {
             egui::Panel::top("engine_unavailable")
                 .frame(
                     egui::Frame::default()
@@ -1279,12 +1292,7 @@ impl App {
                         .inner_margin(Margin::same(10)),
                 )
                 .show(ui, |ui| {
-                    ui.colored_label(
-                        t.bad_ink,
-                        format!(
-                            "SoundRouter could not start its audio engine ({why}). Nothing is routed. Quit and reopen SoundRouter to try again."
-                        ),
-                    );
+                    ui.colored_label(t.bad_ink, engine_banner(&why));
                 });
         }
 
@@ -1400,7 +1408,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let t = tokens(ctx.theme() == Theme::Dark);
-        ctx.global_style_mut(|s| crate::theme::apply_style(s, &t));
+        let reduce_motion = (self.os.reduce_motion)();
+        ctx.global_style_mut(|s| crate::theme::apply_style(s, &t, reduce_motion));
         // Frames come from the worker (meters changed) and from animations; nothing polls here.
         self.now = ctx.input(|i| i.time);
         if self.undo.as_ref().is_some_and(|u| self.now > u.until) {
