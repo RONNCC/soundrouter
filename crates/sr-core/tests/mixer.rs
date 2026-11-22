@@ -215,7 +215,7 @@ fn many_swaps_and_full_queue() {
 #[test]
 fn ramp_has_no_step() {
     let (mut m, mut h, _) = setup(&dev(), &layout());
-    let n = 64;
+    let n = 512; // a block of at least RAMP_FRAMES (480) ramps across the whole block
     let ins = vec![vec![1.0; n], vec![1.0; n]];
     run(&mut m, &ins, 4, n);
     let mut d = dev();
@@ -241,12 +241,12 @@ fn monitor_enable_ramps() {
     let mut d = dev();
     d.monitors.push(mon("spk", true, 0.0));
     let (mut m, mut h, _) = setup(&d, &layout());
-    let ins = vec![vec![1.0; 32], vec![1.0; 32]];
-    run(&mut m, &ins, 4, 32);
+    let ins = vec![vec![1.0; 512], vec![1.0; 512]];
+    run(&mut m, &ins, 4, 512);
     d.monitors[0].enabled = false;
     h.set_plan(MixPlan::compile(&d, &layout()));
-    let o = run(&mut m, &ins, 4, 32);
-    assert!(o[2][0] > 0.9 && o[2][31].abs() < 1e-5);
+    let o = run(&mut m, &ins, 4, 512);
+    assert!(o[2][0] > 0.9 && o[2][511].abs() < 1e-5);
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn newest_plan_wins_after_audio_thread_was_away() {
         d.sources[0].volume_db = db;
         h.set_plan(MixPlan::compile(&d, &layout()));
     }
-    let n = 64;
+    let n = 512;
     let o = run(&mut m, &vec![vec![1.0; n]; 2], 4, n);
     assert!(
         close(o[0][n - 1], 10f32.powf(-30.0 / 20.0)),
@@ -383,7 +383,7 @@ fn process_is_far_below_realtime_budget() {
 #[test]
 fn device_mute_ramps_without_a_step_and_holds_across_blocks() {
     let (mut m, mut h, _) = setup(&dev(), &layout());
-    let n = 64;
+    let n = 512;
     let ins = vec![vec![1.0; n], vec![1.0; n]];
     run(&mut m, &ins, 4, n);
     let mut d = dev();
@@ -408,7 +408,7 @@ fn a_plan_swap_continues_the_device_ramp_from_what_was_applied() {
     let mut d = dev();
     d.muted = true;
     let (mut m, mut h, _) = setup(&d, &layout());
-    let n = 64;
+    let n = 512;
     let ins = vec![vec![1.0; n], vec![1.0; n]];
     run(&mut m, &ins, 4, n);
     d.muted = false;
@@ -481,7 +481,7 @@ fn system_gain_scales_app_sources_from_the_first_sample_and_leaves_other_sources
 #[test]
 fn system_gain_changes_ramp_without_a_step_and_survive_a_plan_swap() {
     let (mut m, mut h, _) = setup(&app_dev(), &layout());
-    let n = 64;
+    let n = 512;
     let ins = vec![vec![1.0; n], vec![1.0; n]];
     run(&mut m, &ins, 4, n);
     h.sys_gain().set("s1", 0.0);
@@ -542,5 +542,74 @@ fn a_wire_listed_twice_is_one_wire_not_double_level() {
         o[2].iter().all(|x| *x == 1.0),
         "monitor wire counted twice: {:?}",
         o[2]
+    );
+}
+
+/// Runs `blocks` blocks of `n` frames of constant input 1.0 and returns channel 0 end to end.
+fn series(m: &mut Mixer, n: usize, blocks: usize) -> Vec<f32> {
+    let ins = vec![vec![1.0; n], vec![1.0; n]];
+    (0..blocks)
+        .flat_map(|_| run(m, &ins, 4, n).swap_remove(0))
+        .collect()
+}
+
+/// A mute or unmute takes the same 480 frames (10 ms at 48 kHz) whatever the block size: a 64-frame
+/// buffer used to fade in 1.3 ms, which is a click on low frequencies.
+#[test]
+fn mute_and_unmute_fade_over_the_same_frames_at_any_block_size() {
+    for n in [1, 3, 33, 64, 128, 256, 480, 512] {
+        let blocks = 600usize.div_ceil(n) + 1;
+        let (mut m, mut h, _) = setup(&dev(), &layout());
+        series(&mut m, n, 2);
+        let mut d = dev();
+        d.muted = true;
+        h.set_plan(MixPlan::compile(&d, &layout()));
+        let down = series(&mut m, n, blocks);
+        let len = n.max(480); // frames the fade takes: 480, or the whole block when that is longer
+        let step = 1.0 / len as f32 + 1e-6;
+        assert!(
+            down.windows(2).all(|w| w[0] >= w[1] && w[0] - w[1] <= step),
+            "{n}: steps"
+        );
+        assert!(down[0] >= 1.0 - step, "{n}: starts at {}", down[0]);
+        let first_zero = down
+            .iter()
+            .position(|x| *x == 0.0)
+            .expect("reaches exact silence");
+        assert!(
+            first_zero.abs_diff(len - 1) <= n,
+            "{n}: silent after {first_zero} frames"
+        );
+        assert!(down[first_zero..].iter().all(|x| *x == 0.0), "{n}");
+        d.muted = false;
+        h.set_plan(MixPlan::compile(&d, &layout()));
+        let up = series(&mut m, n, blocks);
+        assert!(
+            up.windows(2).all(|w| w[1] >= w[0] && w[1] - w[0] <= step),
+            "{n}: up steps"
+        );
+        assert_eq!(*up.last().unwrap(), 1.0, "{n}");
+        assert!(up[0] <= step, "{n}: starts from silence");
+    }
+}
+
+/// A reversal in mid-fade continues from where the fade was, not from either end.
+#[test]
+fn a_reversal_mid_fade_continues_from_where_it_was() {
+    let (mut m, mut h, _) = setup(&dev(), &layout());
+    series(&mut m, 64, 1);
+    let mut d = dev();
+    d.muted = true;
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    let down = series(&mut m, 64, 3); // 192 of 480 frames
+    let at = *down.last().unwrap();
+    assert!((at - (1.0 - 192.0 / 480.0)).abs() < 1e-4, "{at}");
+    d.muted = false;
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    let up = series(&mut m, 64, 1);
+    assert!(
+        (up[0] - at).abs() <= 1.0 / 480.0 + 1e-5 && up[0] > at,
+        "{} after {at}",
+        up[0]
     );
 }

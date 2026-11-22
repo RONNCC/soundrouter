@@ -20,12 +20,29 @@ pub struct IoLayout {
     pub outputs: Vec<Option<OutPort>>,
 }
 
-/// A linear gain that ramps from `cur` (previously applied) to `target` across a block.
+/// Frames a gain change takes to cross one unit of gain: 10 ms at 48 kHz. A block shorter than this
+/// (64-frame buffers are 1.3 ms) moves only part of the way and the next blocks go on, so a mute or a
+/// volume jump never steps in less time than that; a longer block ramps across the whole block.
+const RAMP_FRAMES: f32 = 480.0;
+
+/// Where a gain that is at `cur` and wants `target` stands after `n` frames.
+fn slew(cur: f32, target: f32, n: usize) -> f32 {
+    let reach = cur.abs().max(target.abs()).max(1.0) / RAMP_FRAMES * n as f32;
+    if (target - cur).abs() <= reach {
+        target
+    } else {
+        cur + reach.copysign(target - cur)
+    }
+}
+
+/// A linear gain that ramps from `cur` (previously applied) toward `target` across a block, by at most
+/// [`RAMP_FRAMES`]'s worth (`next` is where this block ends).
 /// `key` identifies it across plans so a swap continues from the old applied value.
 struct Gain {
     key: u64,
     cur: f32,
     target: f32,
+    next: f32,
 }
 impl Gain {
     fn new(key: impl Hash, db: f32, off: bool) -> Gain {
@@ -41,6 +58,7 @@ impl Gain {
             key: h.finish(),
             cur: target,
             target,
+            next: target,
         }
     }
     fn inherit(&mut self, old: &[Gain]) {
@@ -84,6 +102,7 @@ struct AppSys {
     cell: Arc<AtomicU32>,
     cur: f32,
     target: f32,
+    next: f32,
 }
 impl AppSys {
     /// 0..=1; a NaN or negative value reads as unity or silence so a bad publish cannot blow up the output.
@@ -185,6 +204,7 @@ impl MixPlan {
                 cell: Arc::new(AtomicU32::new(1.0f32.to_bits())),
                 cur: 1.0,
                 target: 1.0,
+                next: 1.0,
             })
             .collect();
         let mut taps = Vec::new();
@@ -310,6 +330,16 @@ impl MixPlan {
         meters: &Meters,
     ) {
         let end = off + n;
+        for g in &mut self.srcs {
+            g.next = slew(g.cur, g.target, n);
+        }
+        for a in &mut self.apps {
+            a.next = slew(a.cur, a.target, n);
+        }
+        self.dev_gain.next = slew(self.dev_gain.cur, self.dev_gain.target, n);
+        for m in &mut self.mons {
+            m.gain.next = slew(m.gain.cur, m.gain.target, n);
+        }
         for c in 0..self.nch {
             self.acc[c * MAX_FRAMES..][..n].fill(0.0);
         }
@@ -317,26 +347,26 @@ impl MixPlan {
             let g = &self.srcs[t.src];
             let (s0, s1) = t
                 .app
-                .map_or((1.0, 1.0), |i| (self.apps[i].cur, self.apps[i].target));
+                .map_or((1.0, 1.0), |i| (self.apps[i].cur, self.apps[i].next));
             ramp_add(
                 &mut self.acc[t.vch * MAX_FRAMES..][..n],
                 &inputs[t.in_idx][off..end],
                 g.cur * s0,
-                g.target * s1,
+                g.next * s1,
             );
         }
         for a in &mut self.apps {
-            a.cur = a.target;
+            a.cur = a.next;
         }
         for g in &mut self.srcs {
-            g.cur = g.target;
+            g.cur = g.next;
         }
         for &i in &self.meter_in {
             meters.update_input(i, peak(&inputs[i][off..end]));
         }
         for c in 0..self.nch {
             let ch = &mut self.acc[c * MAX_FRAMES..][..n];
-            ramp_scale(ch, self.dev_gain.cur, self.dev_gain.target);
+            ramp_scale(ch, self.dev_gain.cur, self.dev_gain.next);
             let p = if self.acc_finite {
                 peak_finite(ch)
             } else {
@@ -344,7 +374,7 @@ impl MixPlan {
             };
             meters.update_output(c, p);
         }
-        self.dev_gain.cur = self.dev_gain.target;
+        self.dev_gain.cur = self.dev_gain.next;
         for &(c, slot) in &self.dev_out {
             ramp_add(
                 &mut outputs[slot][off..end],
@@ -359,10 +389,10 @@ impl MixPlan {
                     &mut outputs[slot][off..end],
                     &self.acc[c * MAX_FRAMES..][..n],
                     m.gain.cur,
-                    m.gain.target,
+                    m.gain.next,
                 );
             }
-            m.gain.cur = m.gain.target;
+            m.gain.cur = m.gain.next;
         }
     }
 }

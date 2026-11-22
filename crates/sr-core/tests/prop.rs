@@ -307,21 +307,30 @@ proptest! {
         h.set_plan(plan(start));
         let ins = vec![vec![amp; n], vec![amp; n]];
         let mut applied = gain(start);
+        let mut target = applied; // the newest plan's gain; the applied one keeps moving toward it
         let mut prev = applied * amp;
+        // The oracle of how far a gain gets in one block: at most 1/480 per frame (10 ms at 48 kHz).
+        let slew = |cur: f32, target: f32| {
+            let reach = n as f32 / 480.0;
+            if (target - cur).abs() <= reach { target } else { cur + reach.copysign(target - cur) }
+        };
         run(&mut m, &ins, 4, n);
         for plans in blocks {
             for &p in &plans {
                 h.set_plan(plan(p));
             }
-            let target = plans.last().map_or(applied, |&p| gain(p)); // newest plan wins
+            if let Some(&p) = plans.last() {
+                target = gain(p); // newest plan wins
+            }
+            let next = slew(applied, target);
             let o = run(&mut m, &ins, 4, n);
-            let bound = (target - applied).abs() * amp / n as f32 + 1e-5;
+            let bound = (next - applied).abs() * amp / n as f32 + 1e-5;
             for &x in &o[0] {
                 prop_assert!((x - prev).abs() <= bound, "step {prev} -> {x} > {bound}");
                 prev = x;
             }
-            prop_assert!((prev - target * amp).abs() <= 1e-4, "ended at {prev}, want {}", target * amp);
-            applied = target;
+            prop_assert!((prev - next * amp).abs() <= 1e-4, "ended at {prev}, want {}", next * amp);
+            applied = next;
         }
     }
 

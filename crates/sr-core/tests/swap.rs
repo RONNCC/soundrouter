@@ -123,8 +123,9 @@ fn oracle(c: &Cfg, x: &[f64]) -> Vec<f64> {
 }
 
 /// Upper bound of any slot's level while moving from `a` to `b`: the oracle on the union of both
-/// routings with the larger gain at every stage.
-fn reach(a: &Cfg, b: &Cfg, x: &[f64]) -> Vec<f64> {
+/// routings with the larger gain at every stage (`flat`: every stage at its ceiling, +6 dB per source,
+/// 0 dB device and monitor: what a slewing gain, which moves 1/480 per frame whatever its level, scales).
+fn reach(a: &Cfg, b: &Cfg, x: &[f64], flat: bool) -> Vec<f64> {
     let u = Cfg {
         wires: a
             .wires
@@ -151,6 +152,13 @@ fn reach(a: &Cfg, b: &Cfg, x: &[f64]) -> Vec<f64> {
             (None, None) => None,
         },
     };
+    if flat {
+        let mut u = u;
+        u.src_db = vec![(6.0, false); SRCS];
+        u.dev_db = 0.0;
+        u.mon = u.mon.map(|(_, w)| (0.0, w));
+        return oracle(&u, x);
+    }
     oracle(&u, x)
 }
 
@@ -162,8 +170,9 @@ fn block(m: &mut Mixer, x: &[f64], n: usize) -> Vec<Vec<f32>> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
-    /// Swaps between random routings: every swap block ends on the oracle's steady value and no output
-    /// steps by more than a ramp over the block allows (a hard step of the whole level change is a click).
+    /// Swaps between random routings: no output steps by more than a crossfade over the swap block (or a
+    /// gain slew after it) allows (a hard step of the whole level change is a click), and 2000 frames
+    /// later every slot sits on the oracle's steady value.
     #[test]
     fn swaps_neither_click_nor_drift_from_the_oracle(
         seq in prop::collection::vec((cfg(), 16usize..200), 2..8),
@@ -172,34 +181,38 @@ proptest! {
         let (mut m, mut h) = mixer(Arc::new(Meters::new()));
         h.set_plan(MixPlan::compile(&device(&seq[0].0), &layout6()));
         block(&mut m, &x, seq[0].1);
-        let mut prev = oracle(&seq[0].0, &x);
+        let mut last = oracle(&seq[0].0, &x);
         let mut prevc = seq[0].0.clone();
         for (c, n) in &seq[1..] {
             h.set_plan(MixPlan::compile(&device(c), &layout6()));
-            let o = block(&mut m, &x, *n);
             let want = oracle(c, &x);
-            let top = reach(&prevc, c, &x);
-            for s in 0..OUTS {
-                // the crossfade, the source, device and monitor gain ramps can all be moving at once
-                let bound = 5.0 * top[s] / *n as f64 + 1e-4;
-                let mut last = prev[s];
-                for &v in &o[s] {
-                    prop_assert!(
-                        (f64::from(v) - last).abs() <= bound,
-                        "slot {s}: {last} -> {v} exceeds {bound} (n={n}, swap {:?} -> {:?})",
-                        prev[s],
-                        want[s]
-                    );
-                    last = f64::from(v);
+            let top = reach(&prevc, c, &x, false);
+            let flat = reach(&prevc, c, &x, true);
+            // The swap block, then blocks until the gains have settled (+24 dB to silence is 1800 frames).
+            for b in 0..=2000usize.div_ceil(*n) {
+                let o = block(&mut m, &x, *n);
+                for s in 0..OUTS {
+                    // the crossfade, the source, device and monitor gain ramps can all be moving at once;
+                    // after the swap block only the gain slews are
+                    let bound = if b == 0 { 5.0 * top[s] / *n as f64 + 8.0 * flat[s] / 480.0 } else { 8.0 * flat[s] / 480.0 } + 1e-4;
+                    for &v in &o[s] {
+                        prop_assert!(
+                            (f64::from(v) - last[s]).abs() <= bound,
+                            "slot {s} block {b}: {} -> {v} exceeds {bound} (n={n})",
+                            last[s]
+                        );
+                        last[s] = f64::from(v);
+                    }
                 }
-                prop_assert!((last - want[s]).abs() <= 1e-3 * (1.0 + want[s].abs()), "slot {s} ended at {last}, oracle {}", want[s]);
             }
-            // The block after the swap is steady on the oracle value.
             let o = block(&mut m, &x, *n);
             for s in 0..OUTS {
-                prop_assert!(o[s].iter().all(|v| (f64::from(*v) - want[s]).abs() <= 1e-3 * (1.0 + want[s].abs())));
+                prop_assert!(
+                    o[s].iter().all(|v| (f64::from(*v) - want[s]).abs() <= 1e-3 * (1.0 + want[s].abs())),
+                    "slot {s} settled at {}, oracle {}", o[s][0], want[s]
+                );
             }
-            prev = want;
+            last = want;
             prevc = c.clone();
         }
     }
