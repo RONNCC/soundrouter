@@ -279,8 +279,10 @@ struct Vdev {
     /// The tapped apps play but the taps deliver only zeros (see [`SilenceWatch`]).
     tap_silent: bool,
     /// Times a foreign change of the aggregates' buffer size was set back; capped so a size the HAL
-    /// refuses cannot loop.
+    /// refuses cannot loop. Forgotten after [`BUFFER_RESET_WINDOW`] without one ([`fresh_resets`]).
     buffer_resets: u32,
+    /// When the last of those set-backs happened.
+    buffer_reset_at: Option<Instant>,
 }
 // SAFETY: `cb` is only dereferenced by the IOProc thread; control-side access is limited to the atomics in `Shared`.
 unsafe impl Send for Vdev {}
@@ -1019,6 +1021,15 @@ fn dead_targets(
 /// Foreign buffer-size changes are set back at most this often per vdev.
 const MAX_BUFFER_RESETS: u32 = 3;
 
+/// A vdev lives for weeks: three foreign changes spread over that time must each be set back. The
+/// count is only a loop guard, so it is forgotten after this long without a set-back.
+const BUFFER_RESET_WINDOW: Duration = Duration::from_secs(60);
+
+/// `resets` still counted `since_last` set-back (`None`: there was none).
+fn fresh_resets(resets: u32, since_last: Option<Duration>) -> u32 {
+    since_last.map_or(0, |d| if d >= BUFFER_RESET_WINDOW { 0 } else { resets })
+}
+
 /// Whether a changed aggregate buffer size (`now`) should be set back to `want`: it differs and the
 /// vdev has not used up its resets.
 fn should_reset_buffer(now: Option<u32>, want: u32, resets: u32) -> bool {
@@ -1034,8 +1045,10 @@ fn reassert_buffers(g: &mut Inner, ids: &BTreeSet<String>) {
         let want = v.spec.buffer_frames;
         for agg in std::iter::once(v.agg).chain(v.tapagg.as_ref().map(|t| t.agg)) {
             let now = hal::get_global::<u32>(agg, kAudioDevicePropertyBufferFrameSize).ok();
+            v.buffer_resets = fresh_resets(v.buffer_resets, v.buffer_reset_at.map(|t| t.elapsed()));
             if should_reset_buffer(now, want, v.buffer_resets) {
                 v.buffer_resets += 1;
+                v.buffer_reset_at = Some(Instant::now());
                 log::info!(
                     "device '{id}': aggregate buffer changed to {now:?}, setting {want} again"
                 );
@@ -2381,6 +2394,7 @@ fn build_vdev(
         silence: SilenceWatch::default(),
         tap_silent: false,
         buffer_resets: 0,
+        buffer_reset_at: None,
         zombies: parked,
         tap_dirty: false,
         warnings: Vec::new(),

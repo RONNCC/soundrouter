@@ -958,6 +958,29 @@ fn foreign_buffer_changes_are_set_back_a_few_times() {
 }
 
 #[test]
+fn the_reset_count_is_a_loop_guard_not_a_lifetime_budget() {
+    let s = Duration::from_secs;
+    // Fresh set-backs keep counting: a size the HAL refuses stays capped within the window.
+    assert_eq!(
+        fresh_resets(MAX_BUFFER_RESETS, Some(s(5))),
+        MAX_BUFFER_RESETS
+    );
+    assert!(!should_reset_buffer(
+        Some(512),
+        256,
+        fresh_resets(MAX_BUFFER_RESETS, Some(s(59)))
+    ));
+    // A foreign change a minute after the last set-back (weeks into a run) is set back again.
+    assert_eq!(fresh_resets(MAX_BUFFER_RESETS, Some(s(60))), 0);
+    assert!(should_reset_buffer(
+        Some(512),
+        256,
+        fresh_resets(MAX_BUFFER_RESETS, Some(s(3600)))
+    ));
+    assert_eq!(fresh_resets(0, None), 0, "none yet");
+}
+
+#[test]
 fn used_devices_are_sources_and_enabled_monitors_of_enabled_devices_without_our_own() {
     let mut on = vdev(
         vec![

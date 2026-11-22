@@ -121,6 +121,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - App: the log file is rotated while the app runs (2 MB, one `.1` kept), not only at launch: a menu-bar app lives for weeks, and a flapping device or a repeating warning grew one file without bound.
 - Engine: the health thread no longer asks the TCC daemon about System Audio Recording twice a second forever (a ~10 ms round trip each, measured); it asks only while a tapped app is playing.
 - App: with the window open but no device turned on, the worker thread wakes twice a second instead of 30 times (there are no meters to read).
+- Engine: a foreign change of an aggregate's buffer size is set back each time it happens, not only the first three in the vdev's life; the cap now only stops a size the HAL refuses from looping (it is forgotten after a minute without a set-back).
 
 ## [0.1.0]
 
