@@ -205,7 +205,6 @@ fn every_control_of_the_demo_window_has_an_accessible_name() {
     for label in [
         NEW_DEVICE,
         "Remove Loopback Audio",
-        REMOVE_DEVICE,
         "Select Loopback Audio",
         "Rename Loopback Audio",
         "Enable Loopback Audio",
@@ -221,6 +220,8 @@ fn every_control_of_the_demo_window_has_an_accessible_name() {
     ] {
         h.get_by_label(label);
     }
+    // The row's x is the one way to remove a device: the footer has no such button.
+    assert!(h.query_by_label("Remove device").is_none());
 }
 
 #[test]
@@ -241,7 +242,7 @@ fn deleting_the_last_device_selects_the_new_last_one_and_empties_cleanly() {
     let mut h = open(demo_config());
     click(&mut h, "Select Zoom Out");
     assert_eq!(h.state().selected, 2);
-    click(&mut h, REMOVE_DEVICE);
+    click(&mut h, "Remove Zoom Out");
     assert_eq!(h.state().cfg.devices.len(), 2);
     assert_eq!(h.state().selected, 1);
     assert_eq!(
@@ -253,9 +254,8 @@ fn deleting_the_last_device_selects_the_new_last_one_and_empties_cleanly() {
     assert!(h.state().cfg.devices.is_empty());
     assert_eq!(h.state().selected, 0);
     assert!(h.query_by_label("Device name").is_none());
-    // nothing left to delete: the button is inert instead of panicking
-    click(&mut h, REMOVE_DEVICE);
-    assert!(h.state().cfg.devices.is_empty());
+    // the footer has no remove button to press with nothing selected
+    assert!(h.query_by_label("Remove device").is_none());
     // and the user can start over
     click(&mut h, NEW_DEVICE);
     assert_eq!(h.state().cfg.devices.len(), 1);
@@ -1981,19 +1981,18 @@ fn the_undo_toast_expires_and_the_next_edit_replaces_it() {
 }
 
 #[test]
-fn deleting_a_device_can_be_undone_from_both_delete_buttons() {
-    for button in [REMOVE_DEVICE, "Remove Stream Mix"] {
-        let mut h = open(demo_config());
-        click(&mut h, "Select Stream Mix");
-        let before = h.state().cfg.clone();
-        click(&mut h, button);
-        assert_eq!(h.state().cfg.devices.len(), before.devices.len() - 1);
-        h.get_by_label("Removed Stream Mix");
-        click(&mut h, "Undo");
-        assert_eq!(h.state().cfg, before, "{button}");
-        assert_eq!(h.state().selected, 1);
-        h.get_by_label("Select Stream Mix");
-    }
+fn deleting_a_device_can_be_undone() {
+    let mut h = open(demo_config());
+    click(&mut h, "Select Stream Mix");
+    let before = h.state().cfg.clone();
+    assert!(h.query_by_label("Remove device").is_none(), "no footer button");
+    click(&mut h, "Remove Stream Mix");
+    assert_eq!(h.state().cfg.devices.len(), before.devices.len() - 1);
+    h.get_by_label("Removed Stream Mix");
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before);
+    assert_eq!(h.state().selected, 1);
+    h.get_by_label("Select Stream Mix");
 }
 
 #[test]
@@ -2672,15 +2671,10 @@ fn two_clicks(h: &mut Harness<App>, label: &str) {
 fn a_double_click_on_a_remove_button_removes_one_thing_only() {
     // The second click would land on whatever moved up under the pointer, and only the last
     // removal can be undone: the first one would be lost for good.
-    for (label, gone) in [
-        ("Remove Loopback Audio", "Loopback Audio"),
-        (REMOVE_DEVICE, "Loopback Audio"),
-    ] {
-        let mut h = open(demo_config());
-        two_clicks(&mut h, label);
-        assert_eq!(names(&h), ["Stream Mix", "Zoom Out"], "{label}");
-        h.get_by_label(&format!("Removed {gone}"));
-    }
+    let mut h = open(demo_config());
+    two_clicks(&mut h, "Remove Loopback Audio");
+    assert_eq!(names(&h), ["Stream Mix", "Zoom Out"]);
+    h.get_by_label("Removed Loopback Audio");
     let mut h = open(demo_config());
     let sources = h.state().cfg.devices[0].sources.len();
     two_clicks(&mut h, "Remove Safari");

@@ -39,7 +39,6 @@ const BLANK_NAME: &str = "Device names can't be empty, so SoundRouter kept the o
 /// Sidebar button, empty-state hint and tests all use this one name.
 pub const NEW_DEVICE: &str = "New device";
 /// Window footer buttons; tests click them by these names.
-const REMOVE_DEVICE: &str = "Remove device";
 const TEST_SETUP: &str = "Test setup";
 /// Room for the traffic lights in the unified titlebar.
 const TITLEBAR_H: f32 = 46.0;
@@ -975,7 +974,7 @@ impl App {
         if x.clicked() && !x.double_clicked() {
             edits.push(Edit::RemoveDevice(i));
         }
-        x.on_hover_text(format!("Remove {}", dev.name));
+        x.on_hover_text("Remove device");
         let sw = Rect::from_center_size(pos2(x_at.x - 9.0 - 10.0 - 16.0, x_at.y), vec2(32.0, 18.0));
         let on = switch(
             ui,
@@ -1059,37 +1058,6 @@ impl App {
                     r.top() + 0.5,
                     Stroke::new(1.0, t.hairline.gamma_multiply(0.6)),
                 );
-                let has = self.selected < self.cfg.devices.len();
-                let remove_w = setup::footer_width(ui, REMOVE_DEVICE);
-                let btn = Rect::from_center_size(
-                    pos2(r.left() + 26.0 + remove_w / 2.0, r.center().y),
-                    vec2(remove_w, 26.0),
-                );
-                let resp = ui.interact(btn, Id::unique("delete"), Sense::click());
-                name_button(&resp, REMOVE_DEVICE);
-                let fill = if resp.hovered() && has {
-                    t.hairline
-                } else {
-                    t.raised
-                };
-                let a = if has { 1.0 } else { 0.4 };
-                ui.painter().rect(
-                    btn,
-                    CornerRadius::same(radius::PILL),
-                    fill.gamma_multiply(a),
-                    Stroke::new(1.0, t.hairline),
-                    egui::StrokeKind::Inside,
-                );
-                ui.painter().text(
-                    btn.center(),
-                    Align2::CENTER_CENTER,
-                    REMOVE_DEVICE,
-                    label(),
-                    t.ink.gamma_multiply(a),
-                );
-                if has && resp.clicked() && !resp.double_clicked() {
-                    edits.push(Edit::RemoveDevice(self.selected));
-                }
                 let real_driver = self
                     .engine_status()
                     .driver_version
@@ -1182,7 +1150,7 @@ impl App {
                 if self.toast.is_none()
                     && let Some(u) = &self.undo
                 {
-                    let x = btn.right() + 18.0;
+                    let x = r.left() + 26.0;
                     let width = r.right() - 18.0 - x - reserved;
                     let text = format!("{} {}.", u.verb, u.name);
                     let font = body();
@@ -1233,7 +1201,7 @@ impl App {
                     ),
                     None => return,
                 };
-                let x = btn.right() + 18.0;
+                let x = r.left() + 26.0;
                 let width = r.right() - 18.0 - x - reserved;
                 graph::text_left(ui, x, r.center().y, &msg, body(), color, width);
                 let status = ui.interact(

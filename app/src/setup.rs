@@ -1445,7 +1445,7 @@ pub fn footer_width(ui: &egui::Ui, label: &str) -> f32 {
     (w + 28.0).max(64.0)
 }
 
-/// Footer button in the style of the Remove device button.
+/// A pill button for the window footer.
 pub fn footer_button(
     ui: &mut egui::Ui,
     rect: Rect,

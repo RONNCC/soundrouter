@@ -109,7 +109,7 @@ Motion only answers an action: a short plug-in pop when a wire connects, eased s
 
 ### Footer
 
-The sidebar footer and the window footer are both 44 px, so their hairlines are one line. Left to right in the sidebar: "New device", the one primary action, in `accent_ink` with a ⊕ and a `selected` pill on hover. In the window footer: "Remove device" (same word as the row's remove button, the toast and Undo), the status text, then "Audio delay: Balanced" (a chip that opens the delay menu), "Test setup" and a quiet "…" button. "Uninstall…" is inside that menu, under "Permissions" (the sheet below): it is destructive and used once, so it must not sit next to the buttons people press.
+The sidebar footer and the window footer are both 44 px, so their hairlines are one line. Left to right in the sidebar: "New device", the one primary action, in `accent_ink` with a ⊕ and a `selected` pill on hover. In the window footer: the status text (or the "Removed … Undo" toast) from the left content edge, then "Audio delay: Balanced" (a chip that opens the delay menu), "Test setup" and a quiet "…" button. "Uninstall…" is inside that menu, under "Permissions" (the sheet below): it is destructive and used once, so it must not sit next to the buttons people press.
 
 ### Health banner and dropout dot
 
