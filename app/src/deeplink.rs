@@ -2,24 +2,50 @@
 //! "get URL" Apple event; they wait here until the app's event loop takes them.
 use eframe::egui::Context;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// A flood of links (any local process can send them) is not worth remembering.
 const MAX_PENDING: usize = 8;
 /// Longest link kept; a preset name is at most 64 characters, even fully percent-encoded.
 const MAX_LEN: usize = 1024;
 
+/// Links accepted per `WINDOW`: every one re-applies a preset (the engine is rebuilt), and any local process or
+/// web page can send them. A person pressing a button does not come close.
+const BURST: usize = 4;
+const WINDOW: Duration = Duration::from_secs(2);
+
 #[derive(Default)]
-struct Queue(Mutex<Vec<String>>);
+struct State {
+    pending: Vec<String>,
+    /// Start of the current window and the links accepted in it.
+    window: Option<(Instant, usize)>,
+}
+
+#[derive(Default)]
+struct Queue(Mutex<State>);
 
 impl Queue {
     fn push(&self, url: String) {
-        let mut q = self.0.lock().unwrap();
-        if q.len() < MAX_PENDING && url.len() <= MAX_LEN {
-            q.push(url);
+        self.push_at(url, Instant::now());
+    }
+
+    fn push_at(&self, url: String, now: Instant) {
+        let mut s = self.0.lock().unwrap();
+        if s.pending.len() >= MAX_PENDING || url.len() > MAX_LEN {
+            return;
+        }
+        let (start, n) = match s.window {
+            Some((start, n)) if now.duration_since(start) < WINDOW => (start, n),
+            _ => (now, 0),
+        };
+        s.window = Some((start, n + 1));
+        if n < BURST {
+            s.pending.push(url);
         }
     }
+
     fn take(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().unwrap())
+        std::mem::take(&mut self.0.lock().unwrap().pending)
     }
 }
 
@@ -38,7 +64,7 @@ pub fn take() -> Vec<String> {
 /// Wake the event loop when a link arrives. Links that came earlier wait in the queue.
 pub fn wake_on_link(ctx: &Context) {
     let _ = WAKE.set(ctx.clone());
-    if !queue().0.lock().unwrap().is_empty() {
+    if !queue().0.lock().unwrap().pending.is_empty() {
         ctx.request_repaint();
     }
 }
@@ -141,12 +167,43 @@ mod tests {
     }
 
     #[test]
-    fn a_flood_or_an_oversized_link_is_dropped() {
+    fn a_burst_is_capped_per_window_and_the_window_reopens() {
+        let (q, t0) = (Queue::default(), Instant::now());
+        for i in 0..100 {
+            q.push_at(format!("soundrouter://preset/{i}"), t0);
+        }
+        assert_eq!(q.take().len(), BURST);
+        q.push_at("soundrouter://preset/late".into(), t0 + WINDOW / 2);
+        assert!(q.take().is_empty(), "still the same window");
+        q.push_at("soundrouter://preset/next".into(), t0 + WINDOW);
+        assert_eq!(q.take(), ["soundrouter://preset/next"]);
+    }
+
+    #[test]
+    fn a_flood_taken_every_frame_is_still_limited() {
+        // Taking after each link (what the event loop does) must not reset the limit: every accepted link
+        // re-applies a preset, which rebuilds the engine.
         let q = Queue::default();
+        let mut applied = 0;
         for i in 0..100 {
             q.push(format!("soundrouter://preset/{i}"));
+            applied += q.take().len();
+        }
+        assert_eq!(applied, BURST);
+    }
+
+    #[test]
+    fn links_nobody_takes_pile_up_only_to_the_pending_cap() {
+        let (q, t0) = (Queue::default(), Instant::now());
+        for i in 0..100 {
+            q.push_at(format!("soundrouter://preset/{i}"), t0 + WINDOW * i);
         }
         assert_eq!(q.take().len(), MAX_PENDING);
+    }
+
+    #[test]
+    fn an_oversized_link_is_dropped() {
+        let q = Queue::default();
         q.push(format!("soundrouter://preset/{}", "x".repeat(MAX_LEN)));
         assert!(q.take().is_empty());
     }
