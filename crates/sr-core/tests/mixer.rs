@@ -617,7 +617,7 @@ fn a_reversal_mid_fade_continues_from_where_it_was() {
 /// A gain ramp must land exactly on its target, however many changes came before and whatever the block
 /// size: if `cur` ever stopped one ulp short (an f32 ramp end `from + step * n` is not exactly `to`), a
 /// steady device would sit at 0.9999 of the level the user set for as long as it runs. Thousands of random
-/// volume/mute changes, each followed by a ramp block and a settled block with random lengths.
+/// volume/mute changes, each followed by the fade (blocks of random lengths) and a settled block.
 #[test]
 fn after_any_number_of_gain_changes_a_settled_block_is_bit_exact() {
     let mut state = 0x2545_F491_4F6C_DD1Du64;
@@ -640,7 +640,10 @@ fn after_any_number_of_gain_changes_a_settled_block_is_bit_exact() {
         d.muted = dev_muted;
         h.set_plan(MixPlan::compile(&d, &layout()));
         let ins = vec![vec![1.0; 300], vec![1.0; 300]];
-        run(&mut m, &ins, 4, 1 + next() as usize % 300); // the ramp block
+        // The fade crosses one unit of gain per 480 frames: 30 x 300 frames cover the widest step (+24 dB).
+        for _ in 0..30 {
+            run(&mut m, &ins, 4, 1 + next() as usize % 300);
+        }
         let n = 1 + next() as usize % 300;
         let want =
             (if muted { 0.0 } else { gain(src_db) }) * if dev_muted { 0.0 } else { gain(dev_db) };
