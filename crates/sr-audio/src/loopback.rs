@@ -56,6 +56,8 @@ impl Stats {
             .store((sample_time + frames as f64).to_bits(), Relaxed);
         let mut ss = 0f64;
         for (i, &x) in data.iter().enumerate() {
+            // A NaN or inf sample (a buggy app playing into the device) would poison the energy for good.
+            let x = if x.is_finite() { x } else { 0.0 };
             ss += f64::from(x * x);
             let c = i % ch;
             if c < MAX_CH {
@@ -525,6 +527,15 @@ mod tests {
         assert!((s.rms_dbfs() - 20.0 * 0.5f64.log10()).abs() < 1e-6);
         assert_eq!(s.take_peaks(2), [0.5, 0.5]);
         assert_eq!(s.take_peaks(2), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_nan_sample_does_not_turn_the_rms_into_silence() {
+        let s = Stats::new();
+        s.feed(&[0.5, f32::NAN, f32::INFINITY, 0.5], 2, 0.0);
+        s.feed(&[0.5; 4], 2, 2.0);
+        assert!(s.rms_dbfs() > -20.0, "{}", s.rms_dbfs());
+        assert_eq!(s.take_peaks(2), [0.5, 0.5]);
     }
 
     #[test]
