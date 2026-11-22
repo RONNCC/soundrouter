@@ -26,6 +26,20 @@ pub fn cable_color(index: usize) -> Color32 {
     CABLES[index % CABLES.len()]
 }
 
+/// Output-channel colours, in channel order (Okabe-Ito hues, the black swapped for violet and
+/// reordered so neighbours differ). Channel `n` takes slot `n % 8`; each further 8 channels
+/// mix the slot toward the contrast end of the theme (`CHANNEL_TIER_MIX`). Every entry keeps
+/// 3:1 against `raised` and `canvas` of its theme (`theme::tests::channel_palette`).
+/// Order: blue, orange, green, pink, yellow, sky, vermillion, violet.
+const CHANNELS_LIGHT: [u32; 8] = [
+    0x0072B2, 0xC26A00, 0x00875F, 0xB5568C, 0x9A7B00, 0x2B8FCB, 0xD0480A, 0x7550D8,
+];
+const CHANNELS_DARK: [u32; 8] = [
+    0x3D9BE0, 0xE69F00, 0x1FBF8F, 0xE08BBA, 0xF0E442, 0x56B4E9, 0xF0733A, 0xA58BFF,
+];
+/// How far tier 0, 1, 2, 3 (then repeating) of eight channels move from the base hue.
+const CHANNEL_TIER_MIX: [f32; 4] = [0.0, 0.3, 0.15, 0.45];
+
 /// Corner radii: deliberately not one value for everything. Jacks and dots are circles.
 pub mod radius {
     /// Channel strips (cards) and sheets.
@@ -76,6 +90,25 @@ pub struct Tokens {
     /// Dims the window behind a modal sheet.
     pub scrim: Color32,
     pub switch_off: Color32,
+    /// Dark theme: tokens() picked the dark column.
+    pub dark: bool,
+    /// Output-channel colours (slots 0..8); read them through `channel`.
+    pub channels: [Color32; 8],
+}
+
+impl Tokens {
+    /// Colour of output channel `ch` (0-based): its slot's hue, mixed further toward white (dark
+    /// theme) or black (light theme) every eight channels. Neighbouring channels never match.
+    pub fn channel(&self, ch: usize) -> Color32 {
+        let base = self.channels[ch % 8];
+        let mix = CHANNEL_TIER_MIX[ch / 8 % CHANNEL_TIER_MIX.len()];
+        let end = if self.dark {
+            Color32::WHITE
+        } else {
+            Color32::BLACK
+        };
+        base.lerp_to_gamma(end, mix)
+    }
 }
 
 pub fn tokens(dark: bool) -> Tokens {
@@ -103,6 +136,8 @@ pub fn tokens(dark: bool) -> Tokens {
             shadow: Color32::from_black_alpha(110),
             scrim: Color32::from_black_alpha(110),
             switch_off: hex(0x3A4056),
+            dark: true,
+            channels: CHANNELS_DARK.map(hex),
         }
     } else {
         Tokens {
@@ -127,6 +162,8 @@ pub fn tokens(dark: bool) -> Tokens {
             shadow: Color32::from_rgba_unmultiplied(21, 24, 38, 40),
             scrim: Color32::from_rgba_unmultiplied(21, 24, 38, 70),
             switch_off: hex(0xC5CBD9),
+            dark: false,
+            channels: CHANNELS_LIGHT.map(hex),
         }
     }
 }
@@ -344,6 +381,40 @@ mod tests {
         assert_eq!(tile_tint("Safari"), tile_tint("Safari"));
         assert_eq!(hex(0x0A84FF), Color32::from_rgb(10, 132, 255));
         assert_eq!(cable_color(8), cable_color(0));
+    }
+
+    /// Every channel colour is a visible 3:1 non-text mark on cards and canvas, neighbours (the
+    /// ones whose cables sit side by side) differ clearly, and the mapping is stable.
+    #[test]
+    fn channel_palette() {
+        for dark in [false, true] {
+            let t = tokens(dark);
+            let rgb = |c: Color32| [c.r(), c.g(), c.b()].map(f64::from);
+            let dist = |a: Color32, b: Color32| {
+                let (a, b) = (rgb(a), rgb(b));
+                (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
+            };
+            for ch in 0..64 {
+                let c = t.channel(ch);
+                assert_eq!(c, t.channel(ch), "stable");
+                for bg in [t.raised, t.canvas] {
+                    let r = contrast(c, bg);
+                    assert!(r >= 3.0, "dark={dark} ch {ch} {c:?} on {bg:?}: {r:.2}");
+                }
+                if ch > 0 {
+                    let d = dist(c, t.channel(ch - 1));
+                    assert!(d >= 50.0, "dark={dark} ch {ch} vs {}: {d:.0}", ch - 1);
+                }
+            }
+            // The first eight are eight different hues.
+            for a in 0..8 {
+                for b in 0..a {
+                    assert_ne!(t.channel(a), t.channel(b));
+                }
+            }
+            // Past the end of the table the tiers wrap rather than panic.
+            assert_eq!(t.channel(8 * 4), t.channel(0));
+        }
     }
 
     /// Text tokens keep 4.5:1 on every surface they sit on, in both themes.

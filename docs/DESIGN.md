@@ -6,7 +6,7 @@ Status: the tokens, fonts and egui style below are in place, and every screen re
 
 ## The one memorable thing
 
-Colour-coded patch cables and segmented LED meters. Every source gets its own cable colour, cables sag like real cables and end in round jacks. Everything around them is quiet, flat and disciplined, so the cables carry the picture.
+Colour-coded patch cables and segmented LED meters. Every output channel gets its own colour, a cable wears the colour of the channel it ends at, cables sag like real cables and end in round jacks. Everything around them is quiet, flat and disciplined, so the cables carry the picture.
 
 ## Tokens
 
@@ -26,19 +26,23 @@ All colours, radii and type roles live in `app/src/theme.rs` (`Tokens`, `radius`
 
 Elevation is tonal: a raised surface is one step lighter (dark) or whiter (light) than what it sits on, outlined by a hairline. There are no gradients.
 
-### Cables
+### Cables and channel colours
 
-Assigned per source in order (`cable_color(index)`), stable per source id, the same on both themes:
+Colour names a channel, not a source. The colour of output channel `n` (1-based in the UI) is `Tokens::channel(n - 1)`: eight hues from the Okabe-Ito set (the black swapped for violet and reordered so neighbours differ), one value per theme, each at least 3:1 against `raised` and `canvas` of its theme (`theme::tests::channel_palette` computes it). From channel 9 on the same eight hues come back mixed toward white (dark) or black (light) by 0, 30, 15 and 45 % per group of eight, so neighbouring channels never match up to 64.
 
-| Signal Blue | Cable Magenta | Tangerine | Mint Tape | Violet | Cyan | Sun | Coral |
-|---|---|---|---|---|---|---|---|
-| `#3B6CFF` | `#E8458B` | `#FF8A1F` | `#19B98A` | `#8B5CF6` | `#12AEDB` | `#F2C21B` | `#FF5C5C` |
+| Channel | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| Light | `#0072B2` | `#C26A00` | `#00875F` | `#B5568C` | `#9A7B00` | `#2B8FCB` | `#D0480A` | `#7550D8` |
+| Dark | `#3D9BE0` | `#E69F00` | `#1FBF8F` | `#E08BBA` | `#F0E442` | `#56B4E9` | `#F0733A` | `#A58BFF` |
 
-Coral is deliberately pinker and redder than the terracotta `#D97757` that generated designs default to. App and device tiles without a real icon (`tile_tint`) draw from the same set.
+- **Cable.** Solid, in the colour of the channel it ends at: a stereo source into channels 1 and 2 shows two colours, a mono mic into L and R shows two. A cable into a monitor takes the monitor channel's own colour (its row number).
+- **Output-side jacks** (output channels, monitors) wear their own channel's colour at all times: an open one is a thin ring in that colour on the card, a wired one is solid with a heavier ring and a soft halo.
+- **Source jacks** follow their cables. With none the jack is a neutral grey ring; with one it is solid in the colour of the channel that cable ends at; with two or more it is a larger ring in equal arcs, one per destination in channel order, up to three, and from a fourth cable on a "+N" badge counts the rest. The ring stays honest about where the signal goes.
+- **Source identity** (`theme::CABLES`, in order: Signal Blue `#3B6CFF`, Cable Magenta `#E8458B`, Tangerine `#FF8A1F`, Mint Tape `#19B98A`, Violet `#8B5CF6`, Cyan `#12AEDB`, Sun `#F2C21B`, Coral `#FF5C5C`; the same on both themes) is only the small dot before the card title (`cable_color(id number)`, stable when other sources come and go) and the icon tile. Device rows in the sidebar keep `cable_color(index)` too.
+- **Never colour alone.** Row labels keep the channel number and side ("1 (L)"), and wired is also a heavier ring. Hovering a cable or a jack thickens every cable it touches, enlarges both jacks of each and shows a tooltip such as "Safari, channel 1 (L) to Channel 3 (L)", one line per cable.
+- A muted source or a disabled device fades its cables and jacks into the canvas.
 
-In the graph the colour of a source is the number in its id (`s3` is slot 2, so removing another source never recolours it), used for the jack before its card title and for every wire that carries it. A wire from an output channel takes the colour of the first source feeding that channel, grey when nothing does. A muted source or a disabled device fades its cables into the canvas.
-
-A cable is a cubic bezier whose handles run out of each end and sag in proportion to the horizontal run (`layout::wire_points`, capped at 36 px): 3 px of cable colour over a 1 px darker outline, ending in round jacks (a filled circle, a lighter ring, a dark hole; an empty socket is a raised circle with a muted ring). A hovered wire thickens and shows an x at its middle. Meters are 20-segment LED ladders, one segment per 3 dB from -57 to 0 dBFS: green to -12, amber to -3, red above, unlit segments in `track`, and the segment at the peak holds its light.
+A cable is a cubic bezier whose handles run out of each end and sag in proportion to the horizontal run (`layout::wire_points`, capped at 36 px): 3 px of cable colour over a 1 px darker outline, ending in round jacks (a filled circle, a lighter ring, a dark hole; an empty socket is a raised circle with a ring). A hovered wire thickens and shows an x at its middle. Meters are 20-segment LED ladders, one segment per 3 dB from -57 to 0 dBFS: green to -12, amber to -3, red above, unlit segments in `track`, and the segment at the peak holds its light.
 
 ### Status and accent
 

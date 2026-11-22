@@ -96,23 +96,109 @@ pub fn darken(c: Color32) -> Color32 {
 /// Radius of a jack at rest.
 pub const JACK_R: f32 = 6.0;
 
-/// A round jack. `None` is an empty socket; `Some(color)` a plug in that cable colour. `scale`
-/// grows it for the plug-in pop.
-pub fn jack(p: &Painter, at: Pos2, plug: Option<Color32>, scale: f32, t: &Tokens) {
+/// How a jack looks.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Plug {
+    /// No cable: an empty socket, its ring in a channel colour or neutral grey (`None`).
+    Open(Option<Color32>),
+    /// One cable: solid in that cable's colour.
+    One(Color32),
+    /// Two or more cables: the first three destination colours as equal arcs, and the cable count.
+    Split([Color32; 3], usize),
+}
+
+impl Plug {
+    /// The look of a jack that `n` cables leave, the first three ending in `first` (in order).
+    pub fn of(first: [Color32; 3], n: usize) -> Plug {
+        match n {
+            0 => Plug::Open(None),
+            1 => Plug::One(first[0]),
+            _ => Plug::Split(first, n),
+        }
+    }
+}
+
+impl Plug {
+    /// The same look with every colour passed through `f`.
+    pub fn map(self, f: impl Fn(Color32) -> Color32) -> Plug {
+        match self {
+            Plug::Open(c) => Plug::Open(c.map(f)),
+            Plug::One(c) => Plug::One(f(c)),
+            Plug::Split(cols, n) => Plug::Split(cols.map(f), n),
+        }
+    }
+
+    /// An open ring as the solid plug of its colour (the preview of a drop); others unchanged.
+    pub fn solid(self) -> Plug {
+        match self {
+            Plug::Open(Some(c)) => Plug::One(c),
+            other => other,
+        }
+    }
+}
+
+/// Arc `i` of `k` equal arcs of a ring, from the top, clockwise: a polyline.
+fn arc(at: Pos2, r: f32, i: usize, k: usize) -> Vec<Pos2> {
+    const STEPS: usize = 10;
+    let turn = std::f32::consts::TAU / k as f32;
+    let a0 = -std::f32::consts::FRAC_PI_2 + turn * i as f32;
+    (0..=STEPS)
+        .map(|s| {
+            let a = a0 + turn * s as f32 / STEPS as f32;
+            at + vec2(a.cos(), a.sin()) * r
+        })
+        .collect()
+}
+
+/// A round jack. `scale` grows it for the plug-in pop; `hot` lights it (hovered cable or jack).
+/// Wired jacks are solid with a heavier ring and a soft halo, open ones a thin ring on the card.
+pub fn jack(p: &Painter, at: Pos2, plug: Plug, scale: f32, hot: bool, t: &Tokens) {
     let r = JACK_R * scale;
+    let hole = |k: f32| p.circle_filled(at, r * k, Color32::from_black_alpha(170));
     match plug {
-        Some(c) => {
-            p.circle(at, r, c, Stroke::new(1.0, darken(c)));
+        Plug::One(c) => {
+            p.circle_filled(at, r * 1.6, c.gamma_multiply(if hot { 0.45 } else { 0.18 }));
+            p.circle(
+                at,
+                r,
+                c,
+                Stroke::new(if hot { 2.5 } else { 2.0 }, darken(c)),
+            );
             p.circle_stroke(
                 at,
                 r * 0.6,
                 Stroke::new(1.0, c.lerp_to_gamma(Color32::WHITE, 0.55)),
             );
-            p.circle_filled(at, r * 0.28, Color32::from_black_alpha(170));
+            hole(0.28);
         }
-        None => {
-            p.circle(at, r, t.raised, Stroke::new(1.5, t.muted));
+        Plug::Open(ring) => {
+            let c = ring.unwrap_or(t.muted);
+            if hot {
+                p.circle_filled(at, r * 1.6, c.gamma_multiply(0.3));
+            }
+            p.circle(at, r, t.raised, Stroke::new(if hot { 2.5 } else { 1.5 }, c));
             p.circle_filled(at, r * 0.34, Color32::from_black_alpha(110));
+        }
+        Plug::Split(cols, n) => {
+            // Larger than a plain jack: a ring in several colours needs the room to read.
+            let (k, r) = (n.min(3), r * 1.3);
+            p.circle_filled(at, r, t.raised);
+            for (i, c) in cols.iter().take(k).enumerate() {
+                p.add(egui::Shape::line(
+                    arc(at, r - 1.75, i, k),
+                    Stroke::new(if hot { 4.5 } else { 3.5 }, *c),
+                ));
+            }
+            hole(0.39);
+            if n > 3 {
+                p.text(
+                    at + vec2(r + 3.0, -r - 1.0),
+                    Align2::LEFT_BOTTOM,
+                    format!("+{}", n - 3),
+                    crate::theme::caption(),
+                    t.ink,
+                );
+            }
         }
     }
 }
@@ -300,6 +386,28 @@ mod tests {
         assert_eq!(led_lit(level(lin(0.0))), LED_SEGMENTS);
         assert_eq!(led_lit(1.5), LED_SEGMENTS);
         assert_eq!(led_lit(f32::NAN), 0);
+    }
+
+    #[test]
+    fn a_jack_is_open_solid_or_split_by_its_cable_count() {
+        let (a, b, c) = (Color32::RED, Color32::GREEN, Color32::BLUE);
+        assert_eq!(Plug::of([a, b, c], 0), Plug::Open(None));
+        assert_eq!(Plug::of([a, b, c], 1), Plug::One(a));
+        assert_eq!(Plug::of([a, b, c], 2), Plug::Split([a, b, c], 2));
+        assert_eq!(Plug::of([a, b, c], 9), Plug::Split([a, b, c], 9));
+    }
+
+    #[test]
+    fn a_ring_splits_into_equal_arcs_that_meet() {
+        let at = pos2(10.0, 10.0);
+        for k in [2, 3] {
+            let arcs: Vec<_> = (0..k).map(|i| arc(at, 5.0, i, k)).collect();
+            for (i, a) in arcs.iter().enumerate() {
+                let next = &arcs[(i + 1) % k];
+                assert!(a.last().unwrap().distance(next[0]) < 1e-3);
+                assert!(a.iter().all(|q| (q.distance(at) - 5.0).abs() < 1e-3));
+            }
+        }
     }
 
     #[test]

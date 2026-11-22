@@ -10,7 +10,7 @@ use crate::meter::{PeakHold, level};
 use crate::model::{Edit, Link, Port, can_link, ch_label, links};
 use crate::theme::{Tokens, body, cable_color, caption, label, num, radius, section, tile_tint};
 use crate::widgets::{
-    chevron, darken, jack, loops, menu_hint, meter, name_button, name_widget, plus_circle,
+    Plug, chevron, darken, jack, loops, menu_hint, meter, name_button, name_widget, plus_circle,
     slider_knob, switch, tile, xmark,
 };
 use eframe::egui::{
@@ -486,13 +486,13 @@ pub fn no_devices(ui: &mut Ui, t: &Tokens, area: Rect) -> bool {
     let mid = area.center();
     let art = mid.y - 84.0;
     let (a, b) = (pos2(mid.x - 76.0, art), pos2(mid.x + 76.0, art));
-    let cable = cable_color(0);
+    let cable = t.channel(0);
     for end in [a, b] {
         p.circle(end, 22.0, t.raised, Stroke::new(2.0, t.hairline));
     }
     draw_cable(&p, wire_points(a, b), cable, 6.0);
     for end in [a, b] {
-        jack(&p, end, Some(cable), 2.4, t);
+        jack(&p, end, Plug::One(cable), 2.4, false, t);
     }
     p.text(
         pos2(mid.x, mid.y - 14.0),
@@ -984,19 +984,13 @@ fn card(
             .x
             - 14.0
     });
-    // A source wears its cable colour: a small jack before the title.
+    // A source keeps its identity colour: a small dot before the title.
     let title_x = r.left()
         + 14.0
         + match c.id {
             CardId::Src(i) => {
                 let at = pos2(r.left() + 14.0 + 5.0, r.top() + HEAD_H / 2.0);
-                jack(
-                    &painter,
-                    at,
-                    Some(source_color(dev, i).gamma_multiply(dim)),
-                    0.85,
-                    t,
-                );
+                painter.circle_filled(at, 4.5, source_color(dev, i).gamma_multiply(dim));
                 16.0
             }
             _ => 0.0,
@@ -1297,7 +1291,8 @@ pub fn source_slot(id: &str, index: usize) -> usize {
         .map_or(index, |n| n.saturating_sub(1))
 }
 
-/// The cable colour of `dev.sources[i]`, on its card, its jacks and every wire from it.
+/// The identity colour of `dev.sources[i]`: the dot before its card title. Cables and jacks
+/// take output-channel colours instead.
 fn source_color(dev: &VirtualDevice, i: usize) -> Color32 {
     cable_color(source_slot(&dev.sources[i].id, i))
 }
@@ -1313,6 +1308,76 @@ fn feeding_source(all: &[Link], p: Port) -> Option<usize> {
             .find(|l| l.to == p)
             .and_then(|l| feeding_source(all, l.from)),
     }
+}
+
+/// The output channel a port stands for, which names its colour: a device channel's own number,
+/// a monitor row's own number. A source port has none; its jack follows its cables.
+fn port_channel(p: Port) -> Option<u16> {
+    match p {
+        Port::Src { .. } => None,
+        Port::OutIn { ch } | Port::OutOut { ch } | Port::Mon { ch, .. } => Some(ch),
+    }
+}
+
+/// Colour of the cable `l`: that of the channel it ends at.
+fn cable_color_of(l: Link, t: &Tokens) -> Color32 {
+    port_channel(l.to).map_or(t.muted, |ch| t.channel(usize::from(ch)))
+}
+
+/// Look of the jack at `p`. Output-side and monitor jacks always wear their own channel's
+/// colour (a ring when open, solid when wired). A source jack is grey with no cable, takes the
+/// colour of the channel its cable ends at, and with more cables shows the lowest three
+/// destination channels as equal arcs (Plug::Split counts the rest).
+fn jack_plug(all: &[Link], p: Port, t: &Tokens) -> Plug {
+    if let Some(ch) = port_channel(p) {
+        let c = t.channel(usize::from(ch));
+        return if all.iter().any(|l| l.to == p || l.from == p) {
+            Plug::One(c)
+        } else {
+            Plug::Open(Some(c))
+        };
+    }
+    let dests = || {
+        all.iter()
+            .filter(|l| l.from == p)
+            .filter_map(|l| port_channel(l.to))
+    };
+    let mut first = [t.muted; 3];
+    let mut last = None;
+    for slot in &mut first {
+        let Some(ch) = dests().filter(|&c| last.is_none_or(|x| c > x)).min() else {
+            break;
+        };
+        *slot = t.channel(usize::from(ch));
+        last = Some(ch);
+    }
+    Plug::of(first, dests().count())
+}
+
+/// "Safari, channel 1 (L) to Channel 3 (L)": what a cable joins, for its tooltip.
+fn link_tip(g: &GraphCtx, l: Link) -> String {
+    let from = match l.from {
+        Port::Src { src, ch } => {
+            let s = &g.dev.sources[src];
+            let name = source_title(g.hw, g.apps, g.installed, s).0;
+            format!("{name}, channel {}", ch_label(ch, s.channels))
+        }
+        Port::OutOut { ch } => format!("Output channel {}", ch_label(ch, 0)),
+        Port::OutIn { .. } | Port::Mon { .. } => String::new(),
+    };
+    let to = match l.to {
+        Port::OutIn { ch } => format!("Channel {}", ch_label(ch, 0)),
+        Port::Mon { mon, ch } => {
+            let m = &g.dev.monitors[mon];
+            format!(
+                "{}, channel {}",
+                monitor_title(m, g.hw),
+                ch_label(ch, mon_rows(m, g.hw))
+            )
+        }
+        Port::Src { .. } | Port::OutOut { .. } => String::new(),
+    };
+    format!("{from} to {to}")
 }
 
 const POP_SECS: f64 = 0.12;
@@ -1433,11 +1498,9 @@ fn wires_and_ports(
             .map(|t0| pop_scale(now - t0))
             .fold(1.0, f32::max)
     };
-    // A cable has the colour of the source it carries; a muted source or a disabled device
+    // A cable has the colour of the channel it ends at; a muted source or a disabled device
     // fades it into the canvas.
-    let cable = |p: Port| {
-        let src = feeding_source(&all, p);
-        let c = src.map_or(t.muted, |s| source_color(dev, s));
+    let fade = |c: Color32, src: Option<usize>| {
         if dev.enabled && src.is_none_or(|s| !dev.sources[s].muted) {
             c
         } else {
@@ -1462,41 +1525,52 @@ fn wires_and_ports(
     {
         edits.push(Edit::Unlink(d, all[n]));
     }
+    // A hovered jack or cable lights every cable it touches and the jacks at their ends.
+    let lit = |l: &Link, n: usize| {
+        hovered_wire == Some(n) || hover.is_some_and(|h| h == l.from || h == l.to)
+    };
     for (n, l) in all.iter().enumerate() {
         let (Some(a), Some(b)) = (layout.port_pos(l.from), layout.port_pos(l.to)) else {
             continue;
         };
-        let hot = hover == Some(l.from) || hover == Some(l.to) || hovered_wire == Some(n);
+        let c = fade(cable_color_of(*l, t), feeding_source(&all, l.from));
         draw_cable(
             &painter,
             wire_points(a, b),
-            cable(l.from),
-            if hot { 4.5 } else { 3.0 },
+            c,
+            if lit(l, n) { 4.5 } else { 3.0 },
         );
     }
     if let (Some(from), Some(pos)) = (st.drag, pointer)
         && let Some(a) = layout.port_pos(from)
     {
         let end = target.and_then(|p| layout.port_pos(p)).unwrap_or(pos);
-        draw_cable(&painter, wire_points(a, end), cable(from), 3.0);
+        // The cable in flight shows the colour it will take where it lands.
+        let c = target
+            .and_then(port_channel)
+            .map_or(t.muted, |ch| t.channel(usize::from(ch)));
+        draw_cable(&painter, wire_points(a, end), c, 3.0);
         if target.is_none() {
             // The loose end carries its plug until it lands.
-            jack(&painter, end, Some(cable(from)), 1.0, t);
+            jack(&painter, end, Plug::One(c), 1.0, false, t);
         }
     }
     for &p in &ports {
         let Some(pos) = layout.port_pos(p) else {
             continue;
         };
-        let linked = all.iter().any(|l| l.from == p || l.to == p);
-        let hot = hover == Some(p) || target == Some(p);
-        let plug = match (linked, target == Some(p), st.drag) {
-            (true, _, _) => Some(cable(p)),
-            (false, true, Some(from)) => Some(cable(from)),
-            _ => None,
-        };
+        let mut plug = jack_plug(&all, p, t);
+        if target == Some(p) {
+            plug = plug.solid();
+        }
+        let plug = plug.map(|c| fade(c, feeding_source(&all, p)));
+        let lights = all
+            .iter()
+            .enumerate()
+            .any(|(n, l)| (l.from == p || l.to == p) && lit(l, n));
+        let hot = lights || hover == Some(p) || target == Some(p) || st.drag == Some(p);
         let grow = if hot { 1.25 } else { 1.0 };
-        jack(&painter, pos, plug, grow * pop(p), t);
+        jack(&painter, pos, plug, grow * pop(p), hot, t);
     }
     // The hovered wire shows where a click takes it out.
     if let Some(n) = hovered_wire
@@ -1505,6 +1579,26 @@ fn wires_and_ports(
         let mid = wire_mid(&wire_points(a, b));
         painter.circle(mid, 9.0, t.raised, Stroke::new(1.0, t.bad_ink));
         xmark(&painter, mid, t.bad_ink);
+    }
+    // What the hovered cable (or every cable of the hovered jack) joins, in words.
+    if st.drag.is_none() && (hovered_wire.is_some() || hover.is_some()) {
+        let tip = all
+            .iter()
+            .enumerate()
+            .filter(|&(n, l)| hovered_wire == Some(n) || (hovered_wire.is_none() && lit(l, n)))
+            .map(|(_, l)| link_tip(g, *l))
+            .take(6)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !tip.is_empty() {
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
+                ui.layer_id(),
+                Id::unique(("cable_tip", d)),
+                egui::PopupAnchor::Pointer,
+            )
+            .show(|ui| ui.label(tip));
+        }
     }
 }
 
@@ -1877,6 +1971,91 @@ mod tests {
         assert_eq!(feeding_source(&all, Port::Mon { mon: 0, ch: 0 }), None);
     }
 
+    fn link(from: Port, to: Port) -> Link {
+        Link { from, to }
+    }
+
+    #[test]
+    fn a_cable_wears_the_colour_of_the_channel_it_ends_at() {
+        for dark in [false, true] {
+            let t = tokens(dark);
+            let src = |src, ch| Port::Src { src, ch };
+            // a stereo source into channels 1 and 2: two cables, two colours
+            let a = cable_color_of(link(src(0, 0), Port::OutIn { ch: 0 }), &t);
+            let b = cable_color_of(link(src(0, 1), Port::OutIn { ch: 1 }), &t);
+            assert_eq!((a, b), (t.channel(0), t.channel(1)));
+            assert_ne!(a, b);
+            // the source does not matter, only where the cable lands
+            let c = cable_color_of(link(src(2, 0), Port::OutIn { ch: 1 }), &t);
+            assert_eq!(c, b);
+            // a monitor cable takes its monitor channel's colour
+            let m = link(Port::OutOut { ch: 3 }, Port::Mon { mon: 1, ch: 0 });
+            assert_eq!(cable_color_of(m, &t), t.channel(0));
+        }
+    }
+
+    #[test]
+    fn a_source_jack_shows_where_its_cables_go_and_an_output_jack_its_own_channel() {
+        let t = tokens(true);
+        let src = Port::Src { src: 0, ch: 0 };
+        let out = |ch| Port::OutIn { ch };
+        let ch = |n: usize| t.channel(n);
+        // nothing wired: a source jack is neutral, an output jack still wears its colour
+        assert_eq!(jack_plug(&[], src, &t), Plug::Open(None));
+        assert_eq!(jack_plug(&[], out(2), &t), Plug::Open(Some(ch(2))));
+        // one cable: the colour of the channel it ends at
+        let one = [link(src, out(2))];
+        assert_eq!(jack_plug(&one, src, &t), Plug::One(ch(2)));
+        assert_eq!(jack_plug(&one, out(2), &t), Plug::One(ch(2)));
+        assert_eq!(jack_plug(&one, out(1), &t), Plug::Open(Some(ch(1))));
+        // two cables: both colours, lowest channel first whatever the wire order
+        let two = [link(src, out(3)), link(src, out(1))];
+        assert_eq!(
+            jack_plug(&two, src, &t),
+            Plug::Split([ch(1), ch(3), t.muted], 2)
+        );
+        // many: the three lowest channels and the true count, which is what "+N" counts from
+        let many: Vec<Link> = [5, 2, 0, 7, 4].map(|c| link(src, out(c))).to_vec();
+        assert_eq!(
+            jack_plug(&many, src, &t),
+            Plug::Split([ch(0), ch(2), ch(4)], 5)
+        );
+        // another source's cables do not colour this jack
+        let other = [link(Port::Src { src: 1, ch: 0 }, out(0))];
+        assert_eq!(jack_plug(&other, src, &t), Plug::Open(None));
+        // a monitor jack follows the same rule with its own row
+        let mon = Port::Mon { mon: 0, ch: 1 };
+        assert_eq!(jack_plug(&[], mon, &t), Plug::Open(Some(ch(1))));
+        let wired = [link(Port::OutOut { ch: 1 }, mon)];
+        assert_eq!(jack_plug(&wired, mon, &t), Plug::One(ch(1)));
+    }
+
+    #[test]
+    fn a_cable_tooltip_names_both_ends() {
+        let tk = tokens(true);
+        let mut dev = device();
+        dev.wires.clear();
+        let g = GraphCtx {
+            dev_idx: 0,
+            dev: &dev,
+            hw: &[],
+            apps: &[],
+            icons: &IconTextures::default(),
+            installed: &[],
+            reading: None,
+            t: &tk,
+            mic: TccStatus::Granted,
+            min_h: 500.0,
+        };
+        let l = link(Port::Src { src: 0, ch: 0 }, Port::OutIn { ch: 2 });
+        assert_eq!(link_tip(&g, l), "y, channel 1 (L) to Channel 3 (L)");
+        let m = link(Port::OutOut { ch: 1 }, Port::Mon { mon: 0, ch: 1 });
+        assert_eq!(
+            link_tip(&g, m),
+            "Output channel 2 (R) to spk, channel 2 (R)"
+        );
+    }
+
     #[test]
     fn the_plug_in_pop_swells_then_settles_and_only_while_young() {
         assert_eq!(pop_scale(-1.0), 1.0);
@@ -2054,6 +2233,70 @@ mod tests {
                 dev.monitors.clear();
                 let mut h = harness(theme, dev, false, false);
                 h.run_steps(3);
+                h.snapshot(name);
+                results.extend_harness(&mut h);
+            }
+        }
+
+        /// A 4-channel device fed by three sources: Safari's left channel leaves by two cables
+        /// (a split jack), Pass-Thru's by four (a split jack with "+1"), every cable wears the colour of the channel it ends at.
+        fn four_channel() -> VirtualDevice {
+            let mut c = demo_config();
+            apply(&mut c, Edit::GrowChannels(0));
+            let dev = &mut c.devices[0];
+            let ids: Vec<String> = dev.sources.iter().map(|s| s.id.clone()).collect();
+            dev.wires = [
+                (0, 0, 0),
+                (0, 1, 1),
+                (0, 0, 2),
+                (1, 0, 2),
+                (1, 1, 3),
+                (2, 0, 0),
+                (2, 0, 1),
+                (2, 0, 2),
+                (2, 0, 3),
+            ]
+            .map(|(s, src_ch, out_ch)| sr_core::config::Wire {
+                source: ids[s].clone(),
+                src_ch,
+                out_ch,
+            })
+            .to_vec();
+            c.devices.remove(0)
+        }
+
+        #[test]
+        fn four_channel_device_wired_from_three_sources() {
+            let mut results = egui_kittest::SnapshotResults::new();
+            for (theme, name) in [
+                (Theme::Dark, "graph_four_channel_dark"),
+                (Theme::Light, "graph_four_channel_light"),
+            ] {
+                let mut h = harness(theme, four_channel(), true, false);
+                h.run_steps(30);
+                h.snapshot(name);
+                results.extend_harness(&mut h);
+            }
+        }
+
+        #[test]
+        fn hovering_a_jack_lights_its_cables_and_names_them() {
+            let mut results = egui_kittest::SnapshotResults::new();
+            for (theme, name) in [
+                (Theme::Dark, "graph_hover_dark"),
+                (Theme::Light, "graph_hover_light"),
+            ] {
+                let mut h = harness(theme, four_channel(), true, false);
+                h.run_steps(3);
+                let at = h
+                    .state()
+                    .layout
+                    .as_ref()
+                    .unwrap()
+                    .port_pos(Port::Src { src: 0, ch: 0 })
+                    .unwrap();
+                h.hover_at(at);
+                h.run_steps(6);
                 h.snapshot(name);
                 results.extend_harness(&mut h);
             }
