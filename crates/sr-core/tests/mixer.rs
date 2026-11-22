@@ -613,3 +613,42 @@ fn a_reversal_mid_fade_continues_from_where_it_was() {
         up[0]
     );
 }
+
+/// A gain ramp must land exactly on its target, however many changes came before and whatever the block
+/// size: if `cur` ever stopped one ulp short (an f32 ramp end `from + step * n` is not exactly `to`), a
+/// steady device would sit at 0.9999 of the level the user set for as long as it runs. Thousands of random
+/// volume/mute changes, each followed by a ramp block and a settled block with random lengths.
+#[test]
+fn after_any_number_of_gain_changes_a_settled_block_is_bit_exact() {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let (mut m, mut h, _) = setup(&dev(), &layout());
+    let gain = |db: f32| 10f32.powf(db.min(MAX_DB) / 20.0);
+    for i in 0..5000 {
+        let mut d = dev();
+        let db = |r: u32| (r % 8400) as f32 / 100.0 - 60.0; // -60.00 ..= +23.99 dB
+        let (src_db, dev_db) = (db(next()), db(next()));
+        let (muted, dev_muted) = (next() % 7 == 0, next() % 11 == 0);
+        d.sources[0].volume_db = src_db;
+        d.sources[0].muted = muted;
+        d.volume_db = dev_db;
+        d.muted = dev_muted;
+        h.set_plan(MixPlan::compile(&d, &layout()));
+        let ins = vec![vec![1.0; 300], vec![1.0; 300]];
+        run(&mut m, &ins, 4, 1 + next() as usize % 300); // the ramp block
+        let n = 1 + next() as usize % 300;
+        let want =
+            (if muted { 0.0 } else { gain(src_db) }) * if dev_muted { 0.0 } else { gain(dev_db) };
+        for x in &run(&mut m, &ins, 4, n)[0] {
+            assert_eq!(
+                *x, want,
+                "change {i}: src {src_db} dB (muted {muted}), device {dev_db} dB (muted {dev_muted})"
+            );
+        }
+    }
+}
