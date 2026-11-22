@@ -1,5 +1,6 @@
 //! The three-column graph (Sources | Output Channels | Monitors): painting and interaction.
 //! Reads the config, emits `Edit`s; never mutates it.
+use crate::app_icons::{LOOK_AHEAD, Look, PickerIcons, visible_rows, wanted};
 use crate::icons::{self, IconTextures};
 use crate::layout::{
     CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, TOP, body_height, wire_distance,
@@ -62,6 +63,8 @@ pub struct GraphState {
     pub show_background: bool,
     /// Which button's popup the search text belongs to, when more than one can open it.
     filter_owner: Option<Id>,
+    /// Icons of the Choose App… list, loaded for the rows in view only.
+    pub picker: PickerIcons,
 }
 
 /// A row per hardware output channel, and for every wired channel past them (a headset that
@@ -235,6 +238,7 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
         card(ui, g, st, edits, c, dt, &key);
     }
     wires_and_ports(ui, g, st, edits, &layout);
+    st.picker.end_frame();
     layout
 }
 
@@ -542,6 +546,9 @@ pub fn no_devices(ui: &mut Ui, t: &Tokens, area: Rect) -> bool {
     resp.clicked()
 }
 
+/// Height of a menu row.
+const ROW_H: f32 = 24.0;
+
 /// One menu line: icon, label, accent highlight on hover. Returns true when clicked.
 fn menu_row(
     ui: &mut Ui,
@@ -558,12 +565,20 @@ fn menu_row(
     } else {
         Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), sense);
     resp.widget_info(|| WidgetInfo::labeled(egui::Role::Button, enabled, label));
     let hot = enabled && resp.hovered();
     let p = ui.painter();
     if hot {
         p.rect_filled(rect, CornerRadius::same(4), t.accent);
+    }
+    if resp.has_focus() {
+        p.rect_stroke(
+            rect,
+            CornerRadius::same(4),
+            Stroke::new(2.0, t.focus),
+            StrokeKind::Inside,
+        );
     }
     let color = match (enabled, hot) {
         (_, true) => Color32::WHITE,
@@ -603,15 +618,38 @@ fn menu_row(
 
 /// The app's real icon, else its coloured letter tile.
 fn app_icon(p: &egui::Painter, r: Rect, icons: &IconTextures, key: &str, name: &str, alpha: f32) {
-    if let Some(tex) = icons.get(key) {
-        let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        p.image(tex.id(), r, full, Color32::WHITE.gamma_multiply(alpha));
-    } else {
-        let glyph = name
-            .chars()
-            .next()
-            .map_or("?".into(), |c| c.to_uppercase().to_string());
-        tile(p, r, tile_tint(name), &glyph, r.height() * 0.53, alpha);
+    match icons.get(key) {
+        Some(tex) => icon_image(p, r, tex, alpha),
+        None => letter_tile(p, r, name, alpha),
+    }
+}
+
+fn icon_image(p: &egui::Painter, r: Rect, tex: &egui::TextureHandle, alpha: f32) {
+    let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    p.image(tex.id(), r, full, Color32::WHITE.gamma_multiply(alpha));
+}
+
+fn letter_tile(p: &egui::Painter, r: Rect, name: &str, alpha: f32) {
+    let glyph = name
+        .chars()
+        .next()
+        .map_or("?".into(), |c| c.to_uppercase().to_string());
+    tile(p, r, tile_tint(name), &glyph, r.height() * 0.53, alpha);
+}
+
+/// A Choose App… row's icon: the real one, the letter tile when the app has none, and a neutral
+/// tile of the same size while it loads, so nothing shifts when it arrives.
+fn picker_icon(p: &egui::Painter, r: Rect, t: &Tokens, look: &Look, name: &str, alpha: f32) {
+    match look {
+        Look::Icon(tex) => icon_image(p, r, tex, alpha),
+        Look::Missing => letter_tile(p, r, name, alpha),
+        Look::Loading => {
+            p.rect_filled(
+                r,
+                CornerRadius::same((r.width() * 0.24) as u8),
+                t.muted.gamma_multiply(0.2 * alpha),
+            );
+        }
     }
 }
 
@@ -772,33 +810,68 @@ fn source_menu(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<E
     }
     let mut picked = false;
     ui.menu_button("Choose App…", |ui| {
-        ui.set_min_width(210.0);
+        ui.set_width(MENU_W);
         if g.installed.is_empty() {
             ui.label("Scanning applications…");
         }
-        egui::ScrollArea::vertical()
-            .max_height(320.0)
-            .show(ui, |ui| {
-                for a in g.installed {
-                    let kind = SourceKind::App {
-                        bundle_id: a.bundle_id.clone(),
-                    };
-                    let exists = dev.sources.iter().any(|s| s.kind == kind);
-                    if ui
-                        .add_enabled(!exists, egui::Button::new(&a.name))
-                        .clicked()
-                    {
-                        edits.push(Edit::AddSource(d, kind, 2));
-                        picked = true;
-                        ui.close();
-                    }
-                }
-            });
+        picked = installed_list(ui, g, &mut st.picker, edits);
     });
     if picked {
         ui.close();
     }
     ui.checkbox(&mut st.show_background, "Show background processes");
+}
+
+/// Choose App…: every installed app, newest-first icons only for the rows in view (plus a little
+/// look-ahead), loaded off the UI thread. Returns whether an app was picked.
+fn installed_list(
+    ui: &mut Ui,
+    g: &GraphCtx,
+    picker: &mut PickerIcons,
+    edits: &mut Vec<Edit>,
+) -> bool {
+    let ctx = ui.ctx().clone();
+    picker.begin(&ctx);
+    let mut picked = false;
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .show(ui, |ui| {
+            let pitch = ROW_H + ui.spacing().item_spacing.y;
+            let clip = ui.clip_rect();
+            let seen = visible_rows(
+                ui.cursor().top(),
+                pitch,
+                g.installed.len(),
+                clip.top(),
+                clip.bottom(),
+            );
+            let ask = wanted(&seen, g.installed.len(), LOOK_AHEAD)
+                .into_iter()
+                .map(|i| g.installed[i].bundle_id.as_str())
+                .filter(|k| g.icons.get(k).is_none());
+            picker.request(&ctx, ask);
+            for (i, a) in g.installed.iter().enumerate() {
+                let kind = SourceKind::App {
+                    bundle_id: a.bundle_id.clone(),
+                };
+                let exists = g.dev.sources.iter().any(|s| s.kind == kind);
+                let alpha = if exists { 0.5 } else { 1.0 };
+                // Rows out of view are not touched, so they age out of the cache.
+                let look = match g.icons.get(&a.bundle_id) {
+                    Some(tex) => Look::Icon(tex.clone()),
+                    None if seen.contains(&i) => picker.look(&a.bundle_id),
+                    None => Look::Loading,
+                };
+                let paint =
+                    |p: &egui::Painter, r: Rect| picker_icon(p, r, g.t, &look, &a.name, alpha);
+                if menu_row(ui, g.t, !exists, &a.name, "", paint) {
+                    edits.push(Edit::AddSource(g.dev_idx, kind, 2));
+                    picked = true;
+                    ui.close();
+                }
+            }
+        });
+    picked
 }
 
 fn monitor_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {

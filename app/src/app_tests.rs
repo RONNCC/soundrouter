@@ -974,6 +974,72 @@ mod snapshots {
     }
 
     #[test]
+    fn choose_app_list_loading_and_with_icons() {
+        const NAMES: [&str; 16] = [
+            "Chrome Remote Desktop Host Uninstaller",
+            "Clock",
+            "ColorSync Utility",
+            "Comet",
+            "Console",
+            "Contacts",
+            "Cursor",
+            "Dictionary",
+            "Digital Color Meter",
+            "Disk Utility",
+            "Docker",
+            "FaceTime",
+            "Finder",
+            "Firefox",
+            "Font Book",
+            "Freeform",
+        ];
+        let open_list = |h: &mut Harness<'static, App>| {
+            let apps = NAMES
+                .iter()
+                .enumerate()
+                .map(|(i, n)| AppInfo {
+                    // the uninstaller is a bundle without an icon
+                    bundle_id: if i == 0 {
+                        "com.example.uninstaller.noicon".into()
+                    } else {
+                        format!("com.example.{n}")
+                    },
+                    name: n.to_string(),
+                    running_output: false,
+                    regular: true,
+                })
+                .collect();
+            h.state_mut().graph.installed.set(apps).unwrap();
+            h.state_mut().graph.picker.manual(Box::new(fake_icon));
+            settle(h);
+            click(h, "Add source");
+            click(h, "Choose App…");
+        };
+        let mut results = egui_kittest::SnapshotResults::new();
+        for theme in [Theme::Dark, Theme::Light] {
+            shot(
+                "choose_app_loading",
+                theme,
+                demo_config(),
+                None,
+                open_list,
+                &mut results,
+            );
+            shot(
+                "choose_app_icons",
+                theme,
+                demo_config(),
+                None,
+                |h| {
+                    open_list(h);
+                    answer_icons(h);
+                },
+                &mut results,
+            );
+        }
+    }
+
+    #[test]
     fn sidebar_only_window_with_row_x() {
         let mut results = egui_kittest::SnapshotResults::new();
         for (theme, suffix) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
@@ -2651,6 +2717,202 @@ fn choose_app_stays_inside_a_minimum_size_window() {
         }
     );
     assert!(!has(&h, "Choose App…"), "both menus closed");
+}
+
+/// Deterministic stand-in for AppKit: a rounded square tinted by the key, nothing for `*.noicon`.
+fn fake_icon(key: &str) -> Option<egui::ColorImage> {
+    if key.ends_with(".noicon") {
+        return None;
+    }
+    let h = key
+        .bytes()
+        .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)));
+    let tint = egui::Color32::from_rgb(
+        (h >> 16) as u8 | 0x40,
+        (h >> 8) as u8 | 0x40,
+        h as u8 | 0x40,
+    );
+    let mut img = egui::ColorImage::filled([64, 64], tint);
+    for y in 0..64usize {
+        for x in 0..64usize {
+            // Transparent corners (radius 14) and a light disc, like a glyph.
+            let (dx, dy) = (x.min(63 - x) as f32, y.min(63 - y) as f32);
+            let out =
+                dx < 14.0 && dy < 14.0 && ((14.0 - dx).powi(2) + (14.0 - dy).powi(2)).sqrt() > 14.0;
+            let glyph = ((x as f32 - 32.0).powi(2) + (y as f32 - 32.0).powi(2)).sqrt() < 12.0;
+            if out {
+                img.pixels[y * 64 + x] = egui::Color32::TRANSPARENT;
+            } else if glyph {
+                img.pixels[y * 64 + x] = egui::Color32::from_white_alpha(200);
+            }
+        }
+    }
+    Some(img)
+}
+
+/// `n` installed apps `App 000…`, with `com.example.007` and `com.example.noicon`-style gaps made by the caller.
+fn installed_apps(n: usize) -> Vec<AppInfo> {
+    (0..n)
+        .map(|i| AppInfo {
+            bundle_id: if i == 7 {
+                "com.example.007.noicon".into()
+            } else {
+                format!("com.example.{i:03}")
+            },
+            name: format!("App {i:03}"),
+            running_output: false,
+            regular: true,
+        })
+        .collect()
+}
+
+/// Window with `n` installed apps whose icon lookups wait for `answer_icons`; returns what was looked up.
+fn choose_app_window(n: usize) -> (Harness<'static, App>, Arc<Mutex<Vec<String>>>) {
+    let mut h = open(demo_config());
+    h.state_mut()
+        .graph
+        .installed
+        .set(installed_apps(n))
+        .unwrap();
+    let looked_up = Arc::new(Mutex::new(Vec::new()));
+    let log = looked_up.clone();
+    h.state_mut().graph.picker.manual(Box::new(move |k| {
+        log.lock().unwrap().push(k.to_string());
+        fake_icon(k)
+    }));
+    settle(&mut h);
+    click(&mut h, "Add source");
+    click(&mut h, "Choose App…");
+    (h, looked_up)
+}
+
+fn answer_icons(h: &mut Harness<App>) {
+    let ctx = h.ctx.clone();
+    let waiting = !h.state().graph.picker.queued().is_empty();
+    h.state_mut().graph.picker.answer(&ctx);
+    h.step();
+    // The first frame after an answer exists because the loader asked for it.
+    assert!(
+        !waiting
+            || h.ctx
+                .repaint_causes()
+                .iter()
+                .any(|c| c.file.contains("app_icons")),
+        "an arriving icon must wake the UI: {:?}",
+        h.ctx.repaint_causes()
+    );
+    settle(h);
+}
+
+/// Row number of `App 012`-style keys and labels.
+fn row_of(key: &str) -> usize {
+    key.trim_start_matches("com.example.")[..3].parse().unwrap()
+}
+
+#[test]
+fn choose_app_shows_placeholders_first_then_icons_when_the_loader_answers() {
+    let (mut h, looked_up) = choose_app_window(300);
+    let p = &h.state().graph.picker;
+    let asked = p.queued();
+    assert!(
+        !asked.is_empty() && asked.len() <= 24,
+        "{} lookups",
+        asked.len()
+    );
+    assert!(
+        asked.iter().all(|k| row_of(k) < 24),
+        "only the top of the list: {asked:?}"
+    );
+    assert_eq!(
+        (p.textures(), p.missing()),
+        (0, 0),
+        "placeholders until the loader answers"
+    );
+    h.get_by_label("App 000"); // a placeholder row is still a named button
+    assert!(
+        looked_up.lock().unwrap().is_empty(),
+        "nothing resolves on the UI thread"
+    );
+
+    answer_icons(&mut h);
+    let p = &h.state().graph.picker;
+    assert_eq!(p.textures() + p.missing(), asked.len());
+    assert_eq!(
+        p.missing(),
+        1,
+        "the app without an icon is remembered, not retried"
+    );
+    assert!(p.queued().iter().all(|k| !asked.contains(k)), "no repeats");
+    h.get_by_label("App 000");
+    h.get_by_label("App 007");
+
+    // Settled with the list open: no frames are asked for.
+    answer_icons(&mut h);
+    h.run_steps(60);
+    assert!(
+        !h.ctx.has_requested_repaint(),
+        "{:?}",
+        h.ctx.repaint_causes()
+    );
+}
+
+#[test]
+fn choose_app_scrolling_requests_only_the_rows_in_view() {
+    let (mut h, looked_up) = choose_app_window(300);
+    answer_icons(&mut h);
+    answer_icons(&mut h);
+    h.get_by_label("App 250").scroll_to_me();
+    settle(&mut h);
+    let asked = h.state().graph.picker.queued();
+    assert!(!asked.is_empty(), "the rows now in view are requested");
+    assert!(
+        asked.iter().all(|k| (230..300).contains(&row_of(k))),
+        "only near the viewport: {asked:?}"
+    );
+    answer_icons(&mut h);
+    answer_icons(&mut h);
+    let all = looked_up.lock().unwrap().clone();
+    assert!(all.len() < 100, "{} of 300 rows resolved", all.len());
+    assert!(
+        !all.iter().any(|k| (60..220).contains(&row_of(k))),
+        "rows never in view stay unresolved"
+    );
+    let mut once = all.clone();
+    once.sort();
+    once.dedup();
+    assert_eq!(once.len(), all.len(), "no icon is looked up twice");
+
+    // Picking closes both menus and drops what the list held.
+    click(&mut h, "App 250");
+    h.run_steps(3);
+    let p = &h.state().graph.picker;
+    assert_eq!((p.textures(), p.in_flight(), p.queued().len()), (0, 0, 0));
+    assert_eq!(p.missing(), 1, "failures last the session");
+    assert_eq!(
+        h.state().cfg.devices[0].sources.last().unwrap().kind,
+        SourceKind::App {
+            bundle_id: "com.example.250".into()
+        }
+    );
+}
+
+#[test]
+fn choose_app_rows_keep_their_names_and_disable_apps_already_added() {
+    let (mut h, _) = choose_app_window(12);
+    answer_icons(&mut h);
+    for i in 0..12 {
+        h.get_by_label(&format!("App {i:03}"));
+    }
+    // The icon is only decoration: the accessible name is the app's name alone.
+    assert!(!has(&h, "App 003 icon"));
+    click(&mut h, "App 003");
+    click(&mut h, "Add source");
+    click(&mut h, "Choose App…");
+    assert!(
+        h.get_by_label("App 003").accesskit_node().is_disabled(),
+        "already a source"
+    );
+    assert!(!h.get_by_label("App 004").accesskit_node().is_disabled());
 }
 
 /// Two quick clicks at one spot (a double-click), a frame apart, as a mouse delivers them.
