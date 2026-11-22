@@ -11,14 +11,6 @@ pub fn default_path() -> Option<PathBuf> {
 /// Highest config `version` this build understands.
 const SUPPORTED_VERSION: u64 = 1;
 
-/// `version` of a JSON document, if it has a numeric one.
-fn file_version(text: &[u8]) -> Option<u64> {
-    serde_json::from_slice::<serde_json::Value>(text)
-        .ok()?
-        .get("version")?
-        .as_u64()
-}
-
 fn future_version_msg(v: u64) -> String {
     format!(
         "Config was written by a newer SoundRouter (version {v}); using defaults and leaving the file untouched"
@@ -57,7 +49,7 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
             );
         }
     };
-    if let Some(v) = file_version(&text).filter(|&v| v > SUPPORTED_VERSION) {
+    if let Some(v) = sr_core::fsio::file_version(&text).filter(|&v| v > SUPPORTED_VERSION) {
         return (default_config(), Some(future_version_msg(v)));
     }
     let problem = match serde_json::from_slice::<Config>(&text) {
@@ -75,16 +67,7 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
 /// (shortcut: `Config` has no catch-all; the version refusal protects newer files, upgrade if
 /// same-version extensions appear).
 pub fn save(path: &Path, cfg: &Config) -> std::io::Result<()> {
-    if let Some(v) = std::fs::read(path)
-        .ok()
-        .and_then(|t| file_version(&t))
-        .filter(|&v| v > SUPPORTED_VERSION)
-    {
-        return Err(std::io::Error::other(format!(
-            "{} was written by a newer SoundRouter (version {v}); not overwriting it",
-            path.display()
-        )));
-    }
+    sr_core::fsio::check_replaceable(path, SUPPORTED_VERSION)?;
     sr_core::fsio::write_atomic(path, &serde_json::to_vec_pretty(cfg)?)
 }
 
@@ -276,6 +259,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         assert!(bad_files(&path).is_empty());
         assert!(!path.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A config the load could not read became defaults in memory; the first edit must not save
+    /// them over the real file (transient EIO/EACCES on a network home, a restore in progress).
+    #[cfg(unix)]
+    #[test]
+    fn save_never_replaces_a_config_it_could_not_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut real = default_config();
+        apply(&mut real, Edit::NewDevice);
+        save(&path, &real).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            let _ = std::fs::remove_dir_all(dir);
+            return; // running as root: permissions are not enforced
+        }
+        let (cfg, msg) = load(&path);
+        assert_eq!(cfg, default_config());
+        assert!(msg.unwrap().starts_with("Could not read config"));
+        assert!(save(&path, &cfg).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load(&path), (real, None));
         let _ = std::fs::remove_dir_all(dir);
     }
 

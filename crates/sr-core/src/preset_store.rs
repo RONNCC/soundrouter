@@ -1,5 +1,5 @@
 //! `presets.json` next to `config.json`: atomic writes, versioned, forward-compatible.
-use crate::fsio::{quarantine, write_atomic};
+use crate::fsio::{check_replaceable, file_version, quarantine, write_atomic};
 use crate::lock::support_dir;
 use crate::preset::{PRESETS_VERSION, PresetFile};
 use std::path::{Path, PathBuf};
@@ -10,13 +10,6 @@ pub fn default_path() -> Option<PathBuf> {
 
 /// A real file is a few KB; anything this big is corrupt or hostile and is not read into memory.
 const MAX_BYTES: u64 = 4 << 20;
-
-fn file_version(text: &[u8]) -> Option<u64> {
-    serde_json::from_slice::<serde_json::Value>(text)
-        .ok()?
-        .get("version")?
-        .as_u64()
-}
 
 /// The presets at `path`, plus a message when something was wrong.
 ///
@@ -63,18 +56,9 @@ pub fn load(path: &Path) -> (PresetFile, Option<String>) {
     }
 }
 
-/// Atomic write; refuses to replace a file written by a newer version.
+/// Atomic write; refuses to replace a file written by a newer version, or one it cannot read.
 pub fn save(path: &Path, presets: &PresetFile) -> std::io::Result<()> {
-    if let Some(v) = std::fs::read(path)
-        .ok()
-        .and_then(|t| file_version(&t))
-        .filter(|&v| v > u64::from(PRESETS_VERSION))
-    {
-        return Err(std::io::Error::other(format!(
-            "{} was written by a newer SoundRouter (version {v}); not overwriting it",
-            path.display()
-        )));
-    }
+    check_replaceable(path, u64::from(PRESETS_VERSION))?;
     write_atomic(path, &serde_json::to_vec_pretty(presets)?)
 }
 
@@ -184,6 +168,27 @@ mod tests {
         let err = save(&path, &f).unwrap_err();
         assert!(err.to_string().contains("newer"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_never_replaces_presets_it_could_not_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+        let mut f = PresetFile::default();
+        f.save_as("Streaming", &scene()).unwrap();
+        save(&path, &f).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        let (loaded, msg) = load(&path);
+        assert_eq!(loaded, PresetFile::default());
+        assert!(msg.unwrap().starts_with("Could not read presets"));
+        assert!(save(&path, &loaded).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load(&path), (f, None));
     }
 
     #[test]
