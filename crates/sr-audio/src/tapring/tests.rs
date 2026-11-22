@@ -215,3 +215,105 @@ fn a_swap_serves_the_newest_receiver_and_returns_the_old_ones() {
     assert_eq!(inp.poll(), 0);
     handle.flush();
 }
+
+/// xorshift: deterministic pseudo-random walk, no dependency and no timer.
+fn next(s: &mut u64) -> u64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    *s
+}
+
+/// Any mix of pushes and pulls, with any block, read size and cushion, plays frames in the order they
+/// were pushed: never a repeat, never an earlier frame after a later one, and each read is contiguous.
+/// Underflows in the ring arithmetic would panic here (overflow checks are on in tests).
+#[test]
+fn random_traffic_never_replays_or_reorders_frames() {
+    for (seed, cushion) in [(1u64, 0usize), (2, 1), (3, 37), (4, B), (5, 300), (6, 1000)] {
+        let stats = Arc::new(TapStats::default());
+        let (mut tx, mut rx) = channel(2, cushion, stats.clone());
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let (mut pushed, mut last, mut played) = (0usize, None::<f32>, 0u32);
+        let mut dst = planar();
+        for _ in 0..20_000 {
+            let n = 1 + next(&mut s) as usize % 300;
+            if next(&mut s).is_multiple_of(2) {
+                push(&mut tx, pushed, n);
+                pushed += n;
+            } else {
+                rx.pull(n, &mut dst, 0);
+                let (c0, c1) = (&dst[..n], &dst[MAX_FRAMES..][..n]);
+                if c0.iter().all(|&x| x == 0.0) && c1.iter().all(|&x| x == 0.0) {
+                    continue;
+                }
+                // frame 0 of the stream is the value 0 on both channels: only a pull that starts at
+                // it is all-zero in its first frame, so look at the whole read for the contiguity.
+                let first = c0[0];
+                for (f, (&a, &b)) in c0.iter().zip(c1).enumerate() {
+                    assert_eq!(a, first + f as f32, "cushion {cushion}: gap inside a read");
+                    assert_eq!(b, -a);
+                }
+                if let Some(prev) = last {
+                    assert!(first > prev, "cushion {cushion}: {first} after {prev}");
+                }
+                last = Some(first + (n - 1) as f32);
+                played += 1;
+            }
+        }
+        assert!(played > 100, "cushion {cushion}: nothing played");
+    }
+}
+
+/// Producer threads, the audio thread and the control thread, as in the engine: each generation is a new
+/// ring with its own producer, published through the mailbox while the audio thread keeps pulling.
+/// What the audio thread plays is contiguous within a generation and never goes back to an older one.
+/// (Under ThreadSanitizer this is what shows a missing acquire/release in the ring or the mailbox.)
+#[test]
+fn rings_swapped_under_a_running_audio_thread_play_in_order() {
+    use std::sync::atomic::AtomicBool;
+    const GEN: usize = 100_000;
+    let stats = Arc::new(TapStats::default());
+    let (mut inp, mut handle) = tap_in(stats.clone());
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let audio = s.spawn(|| {
+            let (mut dst, mut last, mut heard) = (planar(), None::<usize>, 0u32);
+            while !stop.load(Relaxed) {
+                let ch = inp.poll();
+                inp.pull(ch.max(2), 100, &mut dst, 0);
+                if ch != 2 || dst[..100].iter().all(|&x| x == 0.0) {
+                    continue;
+                }
+                let first = dst[0] as usize;
+                for f in 0..100 {
+                    assert_eq!(dst[f], (first + f) as f32, "gap inside a read");
+                    assert_eq!(dst[MAX_FRAMES + f], -dst[f]);
+                }
+                if let Some(prev) = last {
+                    assert!(first > prev, "{first} played after {prev}");
+                }
+                last = Some(first + 99);
+                heard += 1;
+            }
+            heard
+        });
+        for g in 1..=30usize {
+            let (mut tx, rx) = channel(2, B, stats.clone());
+            let producer = s.spawn(move || {
+                for k in 0..40 {
+                    push(&mut tx, g * GEN + k * B, B);
+                    std::thread::yield_now();
+                }
+            });
+            handle.publish(rx);
+            producer.join().unwrap();
+            handle.flush();
+        }
+        stop.store(true, Relaxed);
+        // A pull costs microseconds against a 128-frame block per push: the audio thread heard plenty.
+        assert!(
+            audio.join().unwrap() > 0,
+            "the audio thread never played a block"
+        );
+    });
+}
