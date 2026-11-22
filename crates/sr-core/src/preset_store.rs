@@ -62,6 +62,23 @@ pub fn save(path: &Path, presets: &PresetFile) -> std::io::Result<()> {
     write_atomic(path, &serde_json::to_vec_pretty(presets)?)
 }
 
+/// Hold this around a load-change-save of `path` (`sr-cli preset save`): another holder waits, so
+/// two such updates at once both land instead of the later one saving over the earlier. The lock
+/// is released when the returned file is dropped, or when the process dies.
+pub fn lock_for_update(path: &Path) -> std::io::Result<std::fs::File> {
+    let lock = path.with_extension("lock");
+    if let Some(dir) = lock.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock)?;
+    f.lock()?;
+    Ok(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,7 +116,11 @@ mod tests {
         f.save_as("Streaming", &scene()).unwrap();
         f.save_as("Podcast", &scene()).unwrap();
         save(&path, &f).unwrap();
-        assert!(!path.with_extension("json.tmp").exists());
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["presets.json"], "no temp file left behind");
         assert_eq!(load(&path), (f.clone(), None));
         f.delete("Podcast");
         save(&path, &f).unwrap();

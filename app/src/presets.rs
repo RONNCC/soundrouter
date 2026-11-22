@@ -155,6 +155,13 @@ impl Presets {
         Ok(())
     }
 
+    /// Held from the reload to the save of one change, so `sr-cli preset save` running at that
+    /// moment waits instead of one of the two changes being lost. Without the lock file (no path,
+    /// unwritable folder) the change goes ahead as before.
+    fn update_lock(&self) -> Option<std::fs::File> {
+        preset_store::lock_for_update(self.path.as_deref()?).ok()
+    }
+
     fn persist(&mut self) -> Option<String> {
         let path = self.path.as_ref()?;
         let res = preset_store::save(path, &self.file);
@@ -202,6 +209,7 @@ impl Presets {
                     }
                 }
                 Some(true) => {
+                    let _lock = self.update_lock();
                     self.refresh();
                     let done = match &st.rename_of {
                         None => self.file.save_as(&st.text, cfg).map(|replaced| {
@@ -257,6 +265,7 @@ impl Presets {
                 None => self.sheet = Sheet::Delete(name),
                 Some(false) => self.sheet = Sheet::Manage,
                 Some(true) => {
+                    let _lock = self.update_lock();
                     self.refresh();
                     self.file.delete(&name);
                     out.toast = self

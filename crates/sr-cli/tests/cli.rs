@@ -416,3 +416,64 @@ fn a_closed_stdout_ends_the_process_quietly_not_with_a_panic() {
     assert!(!err.contains("panicked"), "{err}");
     assert_ne!(out.status.code(), Some(101));
 }
+
+#[test]
+fn concurrent_preset_saves_all_land() {
+    // Each process loads, adds its preset and saves: without the lock a later save drops an earlier one.
+    let home = home_with_config("v1", -6.0);
+    let bin = cli().get_program().to_owned();
+    let kids: Vec<_> = (0..8)
+        .map(|i| {
+            std::process::Command::new(&bin)
+                .env("HOME", home.path())
+                .args(["preset", "save", &format!("P{i}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for k in kids {
+        let out = k.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let list = cli()
+        .env("HOME", home.path())
+        .args(["preset", "list"])
+        .output()
+        .unwrap();
+    let list = String::from_utf8_lossy(&list.stdout);
+    for i in 0..8 {
+        assert!(list.contains(&format!("P{i}  ")), "P{i} lost:\n{list}");
+    }
+}
+
+#[test]
+fn preset_apply_never_overwrites_a_config_from_a_newer_version() {
+    let home = home_with_config("v1", -6.0);
+    preset(home.path(), &["save", "Quiet"]).code(0);
+    let path = support(home.path()).join("config.json");
+    let newer = r#"{"version":2,"devices":[],"future":{"x":1}}"#;
+    std::fs::write(&path, newer).unwrap();
+    preset(home.path(), &["apply", "Quiet", "--add-devices"])
+        .code(1)
+        .stderr(predicate::str::contains("version 2"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+}
+
+#[test]
+fn preset_names_with_unicode_and_quotes_round_trip() {
+    let home = home_with_config("v1", -6.0);
+    let name = "Stream 🎙 \"live\" — café";
+    preset(home.path(), &["save", name]).code(0);
+    preset(home.path(), &["list"])
+        .code(0)
+        .stdout(predicate::str::contains(name));
+    write_config(home.path(), &[("v1", 0.0)]);
+    preset(home.path(), &["apply", name]).code(0);
+    assert_eq!(config_volumes(home.path()), [-6.0]);
+}

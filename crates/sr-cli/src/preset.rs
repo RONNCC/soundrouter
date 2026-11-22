@@ -59,6 +59,8 @@ pub fn list(p: &Paths) -> Result<()> {
 
 pub fn save(p: &Paths, name: &str) -> Result<()> {
     let cfg = load_config(p)?;
+    // Two `preset save` at once would both load the old file; the second save would drop the first.
+    let _lock = preset_store::lock_for_update(&p.presets).context("locking presets.json")?;
     let mut f = load_presets(p);
     let replaced = f.save_as(name, &cfg).map_err(|e| anyhow!(e))?;
     preset_store::save(&p.presets, &f)?;

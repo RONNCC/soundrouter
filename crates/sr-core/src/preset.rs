@@ -626,4 +626,23 @@ mod tests {
         }
         assert_eq!(preset_url("a b"), "soundrouter://preset/a%20b");
     }
+
+    proptest::proptest! {
+        /// Any local process can send any string as a link: parsing never panics, and a name the
+        /// app wrote into a link comes back byte for byte.
+        #[test]
+        fn links_never_panic_and_names_round_trip(
+            junk in proptest::prelude::any::<String>(),
+            name in proptest::prelude::any::<String>(),
+        ) {
+            let _ = parse_url(&junk);
+            let _ = parse_url(&format!("soundrouter://preset/{junk}"));
+            if !name.trim().is_empty() {
+                proptest::prop_assert_eq!(
+                    parse_url(&preset_url(&name)),
+                    Ok(UrlAction::Preset(name))
+                );
+            }
+        }
+    }
 }

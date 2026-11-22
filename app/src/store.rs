@@ -83,6 +83,14 @@ mod tests {
         d
     }
 
+    fn temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
     #[test]
     fn round_trip() {
         let dir = tmpdir("rt");
@@ -91,7 +99,7 @@ mod tests {
         apply(&mut cfg, Edit::AddSource(0, SourceKind::PassThru, 0));
         apply(&mut cfg, Edit::AddMonitor(0, "spk".into(), 2));
         save(&path, &cfg).unwrap();
-        assert!(!path.with_extension("json.tmp").exists());
+        assert!(temp_files(path.parent().unwrap()).is_empty());
         let (back, msg) = load(&path);
         assert_eq!(back, cfg);
         assert!(msg.is_none());
@@ -258,7 +266,7 @@ mod tests {
         assert!(err.to_string().contains("newer"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         assert!(bad_files(&path).is_empty());
-        assert!(!path.with_extension("json.tmp").exists());
+        assert!(temp_files(&dir).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -305,7 +313,7 @@ mod tests {
         let err = save(&path, &default_config()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("config.json"));
-        assert!(!path.exists() && !path.with_extension("json.tmp").exists());
+        assert!(!path.exists() && temp_files(&dir).is_empty());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -341,6 +349,29 @@ mod tests {
             let kept = path.exists() && std::fs::read(&path).unwrap() == bytes
                 || bad_files(&path).iter().any(|p| std::fs::read(p).unwrap() == bytes);
             proptest::prop_assert!(kept, "file contents lost");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// Whatever strings a user (or a preset, or a hand edit) puts in names and ids: a config that
+        /// validates is saved and loaded back unchanged, never quarantined and never altered.
+        #[test]
+        fn any_strings_in_a_valid_config_survive_save_and_load(
+            name in proptest::prelude::any::<String>(),
+            id in proptest::prelude::any::<String>(),
+            uid in proptest::prelude::any::<String>(),
+            src_name in proptest::prelude::any::<String>(),
+        ) {
+            let mut cfg = default_config();
+            cfg.devices[0].name = name;
+            cfg.devices[0].id = id;
+            apply(&mut cfg, Edit::AddMonitor(0, uid, 2));
+            cfg.devices[0].monitors[0].name = src_name;
+            proptest::prop_assume!(cfg.validate().is_ok());
+            static CASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let dir = tmpdir(&format!("str{}", CASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let path = dir.join("config.json");
+            save(&path, &cfg).unwrap();
+            proptest::prop_assert_eq!(load(&path), (cfg, None));
             let _ = std::fs::remove_dir_all(dir);
         }
     }
