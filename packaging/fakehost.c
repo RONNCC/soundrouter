@@ -746,6 +746,203 @@ static int fuzz(unsigned long long seed, int steps) {
     return 0;
 }
 
+// 10. Hostile inputs. Everything the HAL should never send but a bug elsewhere in coreaudiod, or a new macOS, might: wild sample
+// times, absurd frame counts, missing arguments, undersized or oversized property buffers, unknown selectors and scopes, random
+// bytes as property values. Nothing may crash, write past a buffer, or change a device's format. `hostile` is part of the default run.
+static void hio(AudioObjectID d, UInt32 ch, int op, double t, double now, UInt32 fr) {
+    size_t n = (size_t)fr * ch; UInt32* b = malloc((n + GW) * sizeof *b); CHECK(b);
+    for (size_t i = 0; i < n + GW; i++) b[i] = SENT;
+    AudioServerPlugInIOCycleInfo ci; memset(&ci, 0, sizeof ci);
+    ci.mInputTime.mSampleTime = ci.mOutputTime.mSampleTime = t; ci.mCurrentTime.mSampleTime = now;
+    CHECK(D->DoIOOperation(gDrv, d, 0, 1, op, fr, &ci, b, NULL) == 0);
+    for (size_t i = n; i < n + GW; i++) CHECK(b[i] == SENT);
+    free(b);
+}
+static void hostileIO(AudioObjectID d, UInt32 ch) {
+    static const double ts[] = { NAN, INFINITY, -INFINITY, 1e300, -1e300, 9.3e18, -9.3e18, 9007199254740993.0, 4503599627370496.0, -1, 0, 0.5, 100000 };
+    static const UInt32 fr[] = { 1, 2, 3, 255, 4097, 8191, 8192, 8193, 16384, 65536 };
+    static const int ops[] = { kAudioServerPlugInIOOperationReadInput, kAudioServerPlugInIOOperationWriteMix };
+    for (size_t i = 0; i < sizeof ts / sizeof *ts; i++)
+        for (size_t j = 0; j < sizeof fr / sizeof *fr; j++)
+            for (int o = 0; o < 2; o++) hio(d, ch, ops[o], ts[i], ts[(i + 3) % (sizeof ts / sizeof *ts)], fr[j]);
+    // Nothing to do, or nothing to do it with: refused without touching anything.
+    AudioServerPlugInIOCycleInfo ci; memset(&ci, 0, sizeof ci); float one[4] = { 1, 2, 3, 4 };
+    for (int o = 0; o < 2; o++) {
+        CHECK(D->DoIOOperation(gDrv, d, 0, 1, ops[o], 0, &ci, one, NULL) == 0);
+        CHECK(D->DoIOOperation(gDrv, d, 0, 1, ops[o], 64, &ci, NULL, NULL) == 0);
+        { AudioServerPlugInIOCycleInfo* none = NULL; CHECK(D->DoIOOperation(gDrv, d, 0, 1, ops[o], 64, none, one, NULL) == 0); }
+    }
+    CHECK(one[0] == 1 && one[3] == 4);
+}
+static uint64_t gHr = 88172645463325252ull;
+static uint32_t hr(uint32_t n) { gHr ^= gHr << 13; gHr ^= gHr >> 7; gHr ^= gHr << 17; return (uint32_t)(gHr % n); }
+static void hostileProps(int iters) {
+    static const UInt32 sels[] = {
+        kAudioObjectPropertyBaseClass, kAudioObjectPropertyClass, kAudioObjectPropertyOwner, kAudioObjectPropertyName, kAudioObjectPropertyManufacturer,
+        kAudioObjectPropertyOwnedObjects, kAudioPlugInPropertyDeviceList, kAudioPlugInPropertyBoxList, kAudioPlugInPropertyClockDeviceList,
+        kAudioPlugInPropertyTranslateUIDToDevice, kAudioPlugInPropertyTranslateUIDToBox, kAudioPlugInPropertyResourceBundle,
+        kAudioObjectPropertyCustomPropertyInfoList, 'srcf', 'srvr', 'srov', 'srla', kAudioDevicePropertyDeviceUID, kAudioDevicePropertyModelUID,
+        kAudioDevicePropertyTransportType, kAudioDevicePropertyRelatedDevices, kAudioDevicePropertyClockDomain, kAudioDevicePropertyDeviceIsAlive,
+        kAudioDevicePropertyDeviceIsRunning, kAudioDevicePropertyDeviceCanBeDefaultDevice, kAudioDevicePropertyDeviceCanBeDefaultSystemDevice,
+        kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyAvailableNominalSampleRates, kAudioDevicePropertyIsHidden,
+        kAudioDevicePropertyZeroTimeStampPeriod, kAudioDevicePropertyPreferredChannelsForStereo, kAudioDevicePropertyLatency,
+        kAudioDevicePropertySafetyOffset, kAudioDevicePropertyStreams, kAudioObjectPropertyControlList, kAudioStreamPropertyVirtualFormat,
+        kAudioStreamPropertyPhysicalFormat, kAudioStreamPropertyAvailableVirtualFormats, kAudioStreamPropertyAvailablePhysicalFormats,
+        kAudioStreamPropertyDirection, kAudioStreamPropertyTerminalType, kAudioStreamPropertyStartingChannel, kAudioStreamPropertyLatency,
+        kAudioStreamPropertyIsActive, kAudioLevelControlPropertyScalarValue, kAudioLevelControlPropertyDecibelValue,
+        kAudioLevelControlPropertyDecibelRange, kAudioLevelControlPropertyConvertScalarToDecibels, kAudioLevelControlPropertyConvertDecibelsToScalar,
+        kAudioBooleanControlPropertyValue, kAudioControlPropertyScope, kAudioControlPropertyElement };
+    static const UInt32 scopes[] = { kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput,
+                                     kAudioObjectPropertyScopePlayThrough, 0x2A2A2A2A, 0, 0xFFFFFFFF };
+    static const UInt32 asks[] = { 0, 1, 3, 4, 5, 7, 8, 9, 12, 16, 39, 40, 41, 100, 4096, 65536 };
+    static const UInt32 elems[] = { 0, 1, 2, 0xFFFFFFFF };
+    const size_t GP = 64;
+    unsigned char* out = malloc(65536 + GP); unsigned char zero[64] = { 0 }; CHECK(out);
+    CFStringRef qs = CFSTR("soundrouter:v1");
+    for (int it = 0; it < iters; it++) {
+        AudioObjectID o = hr(4) ? hr(300) : kAudioObjectPlugInObject;
+        UInt32 sel = hr(8) ? sels[hr(sizeof sels / sizeof *sels)] : hr(0xFFFFFFFF);
+        AudioObjectPropertyAddress a = { sel, scopes[hr(sizeof scopes / sizeof *scopes)], elems[hr(4)] };
+        Boolean has = D->HasProperty(gDrv, o, 0, &a), set = 7;
+        OSStatus se = D->IsPropertySettable(gDrv, o, 0, &a, &set);
+        CHECK(has ? (se == 0 && (set == 0 || set == 1)) : se != 0);
+        UInt32 qsz = hr(3) == 0 ? (hr(2) ? sizeof qs : hr(40)) : 0; const void* qp = qsz == 8 ? (hr(2) ? (const void*)&qs : (const void*)zero) : qsz ? (const void*)zero : NULL;
+        UInt32 sz = 0xDEADBEEF;
+        OSStatus ss = D->GetPropertyDataSize(gDrv, o, 0, &a, qsz, qp, &sz);
+        CHECK(has == (ss == 0));
+        UInt32 ask = asks[hr(sizeof asks / sizeof *asks)]; if (ss == 0 && hr(2)) ask = sz + hr(3) - 1;
+        if ((int)ask < 0 || ask > 65536) ask = 4096;
+        memset(out, 0x5A, ask + GP); if (ask >= 4) { Float32 in = 0.5f; memcpy(out, &in, 4); } // the input of the dB/scalar conversions
+        UInt32 got = 0xFFFFFFFF;
+        OSStatus e = D->GetPropertyData(gDrv, o, 0, &a, qsz, qp, ask, &got, out);
+        for (size_t k = ask; k < ask + GP; k++) CHECK(out[k] == 0x5A);
+        if (e) continue;
+        CHECK(has && got <= ask);
+        if (isCF(sel) && got == sizeof(CFTypeRef)) { CFTypeRef p; memcpy(&p, out, sizeof p); CHECK(p); CFRelease(p); }
+    }
+    // Property values from nowhere: random bytes of every size to every object and selector. The 8-byte form of a plug-in property is a
+    // CF pointer, which the HAL hands over valid, so those get CF objects that are not what the driver wants.
+    CFTypeRef junk[] = { CFSTR("x"), kCFNull, (CFTypeRef)CFNumberCreate(0, kCFNumberSInt64Type, &(SInt64){ -1 }), (CFTypeRef)CFDictionaryCreate(0, NULL, NULL, 0, NULL, NULL), NULL };
+    static const UInt32 setsz[] = { 0, 1, 3, 4, 5, 8, 9, 16, 40, 41, 64 };
+    for (int it = 0; it < iters; it++) {
+        AudioObjectID o = hr(4) ? hr(300) : kAudioObjectPlugInObject;
+        UInt32 sel = hr(3) ? sels[hr(sizeof sels / sizeof *sels)] : hr(0xFFFFFFFF);
+        AudioObjectPropertyAddress a = { sel, scopes[hr(sizeof scopes / sizeof *scopes)], elems[hr(4)] };
+        UInt32 n = setsz[hr(sizeof setsz / sizeof *setsz)]; unsigned char data[64 + 8]; for (size_t k = 0; k < sizeof data; k++) data[k] = (unsigned char)hr(256);
+        if (o == kAudioObjectPlugInObject && n == 8) { CFTypeRef p = junk[hr(5)]; memcpy(data, &p, sizeof p); }
+        if (sel == kAudioLevelControlPropertyScalarValue && n == 4 && hr(2)) { Float32 f[] = { NAN, INFINITY, -INFINITY, 2, -3 }; memcpy(data, &f[hr(5)], 4); }
+        OSStatus e = D->SetPropertyData(gDrv, o, 0, &a, 0, NULL, n, data);
+        if (e == 0) CHECK(o != kAudioObjectPlugInObject || sel == 'srla'); // the plug-in only takes a CFNumber for 'srla'; 'srcf' needs a list
+    }
+    setReadAhead(0);
+    free(out);
+}
+// What the hostile run must have left alone: every device at its format, every control a finite value in range.
+static void hostileSettled(void) {
+    UInt32 n = nDevices(); AudioObjectID l[64]; ids(kAudioObjectPlugInObject, kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, l);
+    for (UInt32 i = 0; i < n; i++) {
+        CHECK(rateOf(l[i]) == 48000 && chansOf(l[i], kAudioObjectPropertyScopeInput) == chansOf(l[i], kAudioObjectPropertyScopeOutput));
+        AudioObjectID c[8]; if (ids(l[i], kAudioObjectPropertyControlList, kAudioObjectPropertyScopeGlobal, c) != 4) continue;
+        for (int k = 0; k < 4; k += 2) { Float32 v = -1; CHECK(getBytes(c[k], kAudioLevelControlPropertyScalarValue, 0, &v, 4) == 0 && v >= 0 && v <= 1); }
+        for (int k = 1; k < 4; k += 2) CHECK(u32(c[k], kAudioBooleanControlPropertyValue, 0) <= 1);
+    }
+}
+
+// 11. Concurrency: fakehost <driver> stress [SECONDS]. V and C each have their own IO thread (ReadInput then WriteMix per cycle, as one HAL
+// device thread does) on a virtual clock that a third thread advances; this thread attaches and detaches the engine (C: its thread parked,
+// StopIO, StartIO) and restarts V the same way, and flips the read-ahead, all while the IO threads run. A frame's value encodes its sample
+// time and ring (A: 1..2^20, B: 2^21 + 1..), so a read must be silence or consecutive frames of one ring, in time order, never older than
+// the read and at most the read-ahead cap newer: no torn read, no stale frame resurrected by a StopIO that races a write, no frame of a later lap.
+enum { SB = 64, SM = 1 << 20, SBASE_B = 1 << 21 };
+static volatile int64_t gClk; static volatile int gSRun;
+typedef struct { AudioObjectID id; int engine; volatile int run, parked; uint64_t reads, nonzero; } SIO;
+static SIO gSIO[2];
+static volatile int gSFail;
+static float tagOf(int engine, int64_t t) { return (float)((engine ? SBASE_B : 0) + (t & (SM - 1)) + 1); }
+static int stressCheck(const SIO* s, const float* b, int64_t t, int64_t c0, int64_t c1, char* why, size_t wn) {
+    if (c1 - c0 > 8192) return 1; // the reader was descheduled for long enough that a writer may legitimately have lapped it
+    float prev = 0; int started = 0, ended = 0, ring = -1;
+    for (int f = 0; f < SB; f++) {
+        float x = b[2 * f];
+        if (b[2 * f + 1] != x) { snprintf(why, wn, "channels differ at frame %d: %g %g", f, x, b[2 * f + 1]); return 0; }
+        if (x == 0) { if (started) ended = 1; continue; }
+        int r = x > SBASE_B ? 1 : 0; int64_t id = (int64_t)x - (r ? SBASE_B : 0) - 1; // sample time mod 2^20
+        if (x != x || id < 0 || id >= SM) { snprintf(why, wn, "frame %d is %g, not a frame of either ring", f, x); return 0; }
+        if (ended) { snprintf(why, wn, "silence inside a run at frame %d", f); return 0; }
+        if (ring >= 0 && r != ring) { snprintf(why, wn, "ring switched inside a read at frame %d", f); return 0; }
+        if (s->engine && r != 0) { snprintf(why, wn, "C.in returned ring B data"); return 0; }
+        if (started && x != tagOf(r, (int64_t)prev - (r ? SBASE_B : 0))) { snprintf(why, wn, "frame %d not consecutive (%g after %g)", f, x, prev); return 0; }
+        int64_t ahead = (id - ((t + f) & (SM - 1)) + SM) & (SM - 1); // frames newer than the read position
+        if (ahead > 4096) { snprintf(why, wn, "frame %d: time offset %lld from the read position (stale, or a later lap)", f, (long long)ahead); return 0; }
+        ring = r; prev = x; started = 1;
+    }
+    return 1;
+}
+static void* ioThread(void* arg) {
+    SIO* s = arg; int64_t k = gClk / SB + 1;
+    float in[SB * 2], out[SB * 2]; AudioServerPlugInIOCycleInfo ci;
+    while (gSRun) {
+        if (!__atomic_load_n(&s->run, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&s->parked, 1, __ATOMIC_RELEASE);
+            while (!__atomic_load_n(&s->run, __ATOMIC_ACQUIRE) && gSRun) sched_yield();
+            k = gClk / SB + 1; __atomic_store_n(&s->parked, 0, __ATOMIC_RELEASE);
+            continue;
+        }
+        int64_t now = k * SB;
+        if (__atomic_load_n(&gClk, __ATOMIC_ACQUIRE) < now) { sched_yield(); continue; }
+        memset(&ci, 0, sizeof ci);
+        ci.mCurrentTime.mSampleTime = (double)now; ci.mInputTime.mSampleTime = (double)(now - SB); ci.mOutputTime.mSampleTime = (double)(now + 2 * SB);
+        for (int i = 0; i < SB * 2; i++) in[i] = 0x7FC0DEAD;
+        int64_t c0 = __atomic_load_n(&gClk, __ATOMIC_ACQUIRE);
+        OSStatus e = D->DoIOOperation(gDrv, s->id, 0, 1, kAudioServerPlugInIOOperationReadInput, SB, &ci, in, NULL);
+        int64_t c1 = __atomic_load_n(&gClk, __ATOMIC_ACQUIRE);
+        char why[160];
+        if (e || !stressCheck(s, in, now - SB, c0, c1, why, sizeof why)) {
+            if (!__atomic_exchange_n(&gSFail, 1, __ATOMIC_SEQ_CST)) printf("FAIL stress: %s read at %lld (status %d): %s\n", s->engine ? "C.in" : "V.in", (long long)(now - SB), (int)e, e ? "error" : why);
+            return NULL;
+        }
+        s->reads++; for (int i = 0; i < SB; i++) if (in[2 * i] != 0) { s->nonzero++; break; }
+        for (int i = 0; i < SB; i++) out[2 * i] = out[2 * i + 1] = tagOf(s->engine, now + 2 * SB + i);
+        if (D->DoIOOperation(gDrv, s->id, 0, 1, kAudioServerPlugInIOOperationWriteMix, SB, &ci, out, NULL)) { __atomic_store_n(&gSFail, 1, __ATOMIC_SEQ_CST); return NULL; }
+        k++;
+    }
+    return NULL;
+}
+static void* clockThread(void* arg) {
+    while (gSRun) { usleep(100); __atomic_store_n(&gClk, gClk + SB, __ATOMIC_RELEASE); }
+    return NULL;
+}
+static void parkIO(SIO* s) { __atomic_store_n(&s->run, 0, __ATOMIC_RELEASE); while (!__atomic_load_n(&s->parked, __ATOMIC_ACQUIRE) && !gSFail) sched_yield(); }
+static int stress(int seconds) {
+    gRng = 0x9E3779B97F4A7C15ull;
+    AudioObjectID V = byUID("soundrouter:v1"), C = byUID("soundrouter:v1.engine"); CHECK(V && C);
+    gSIO[0] = (SIO){ V, 0, 0, 0, 0, 0 }; gSIO[1] = (SIO){ C, 1, 0, 0, 0, 0 };
+    gSRun = 1; pthread_t th[3];
+    CHECK(D->StartIO(gDrv, V, 1) == 0);
+    gSIO[0].run = 1;
+    pthread_create(&th[0], NULL, clockThread, NULL); pthread_create(&th[1], NULL, ioThread, &gSIO[0]); pthread_create(&th[2], NULL, ioThread, &gSIO[1]);
+    uint64_t t0 = mach_absolute_time(); mach_timebase_info_data_t tb; mach_timebase_info(&tb); gTps = 1e9 * tb.denom / tb.numer;
+    int cOn = 0, nC = 0, nV = 0, nRA = 0; SInt64 ra = 0;
+    while (since(t0) < seconds && !gSFail) {
+        usleep(50 + rnd(1500));
+        uint32_t k = rnd(10);
+        if (k < 6) { // engine attach/detach
+            if (cOn) { parkIO(&gSIO[1]); CHECK(D->StopIO(gDrv, C, 7) == 0); }
+            else { CHECK(D->StartIO(gDrv, C, 7) == 0); __atomic_store_n(&gSIO[1].run, 1, __ATOMIC_RELEASE); }
+            cOn = !cOn; nC++;
+        } else if (k < 8) { // V restarts (apps quit and start)
+            parkIO(&gSIO[0]); CHECK(D->StopIO(gDrv, V, 1) == 0); CHECK(D->StartIO(gDrv, V, 1) == 0); __atomic_store_n(&gSIO[0].run, 1, __ATOMIC_RELEASE); nV++;
+        } else { ra = !ra; setReadAhead(ra); nRA++; }
+    }
+    gSRun = 0; for (int i = 0; i < 3; i++) pthread_join(th[i], NULL);
+    if (gSFail) return 1;
+    CHECK(gSIO[0].reads > 1000 && gSIO[0].nonzero > 100 && gSIO[1].reads > 100);
+    printf("STRESS OK %d s: V reads %llu (%llu with audio), C reads %llu (%llu with audio), engine toggles %d, V restarts %d, read-ahead flips %d, overloads V %lld C %lld\n",
+           seconds, (unsigned long long)gSIO[0].reads, (unsigned long long)gSIO[0].nonzero, (unsigned long long)gSIO[1].reads, (unsigned long long)gSIO[1].nonzero, nC, nV, nRA,
+           (long long)overloads(V), (long long)overloads(C));
+    return 0;
+}
+
 int main(int argc, char** argv) {
     CHECK(argc > 1);
     char bin[1024]; snprintf(bin, sizeof bin, "%s/Contents/MacOS/SoundRouter", argv[1]);
@@ -762,6 +959,7 @@ int main(int argc, char** argv) {
     CHECK(D->Initialize(gDrv, &gHost) == 0);
     CHECK(u32(kAudioObjectPlugInObject, kAudioObjectPropertyClass, 0) == kAudioPlugInClassID);
     if (argc > 3 && !strcmp(argv[2], "fuzz")) return fuzz(strtoull(argv[3], NULL, 10), argc > 4 ? atoi(argv[4]) : 300);
+    if (argc > 2 && !strcmp(argv[2], "stress")) return stress(argc > 3 ? atoi(argv[3]) : 10);
 
     // 2. default (empty storage): one visible device soundrouter:v1 (2ch) + hidden companion.
     AudioObjectID V = byUID("soundrouter:v1"), C = byUID("soundrouter:v1.engine");
@@ -1395,6 +1593,23 @@ int main(int argc, char** argv) {
     CHECK(setConfig(CFArrayCreate(0, NULL, 0, &kCFTypeArrayCallBacks)) == 0);
     CHECK(nDevices() == 0 && !byUID("soundrouter:v1") && gStore && CFArrayGetCount(gStore) == 0);
     printf("ok remove all\n");
+
+    // 10. hostile inputs on a 64-channel, a 2-channel and a mono device (and their companions).
+    {
+        const char* u[] = { "soundrouter:h64", "soundrouter:h2", "soundrouter:h1" }; const char* n[] = { "H64", "H2", "H1" }; int c[] = { 64, 2, 1 };
+        sleep(2); // the slots the storm freed are quarantined for 1 s
+        reinit(cfg(3, u, n, c));
+        CHECK(nDevices() == 6);
+        for (int i = 0; i < 3; i++) {
+            char ce[64]; snprintf(ce, sizeof ce, "%s.engine", u[i]);
+            hostileIO(byUID(u[i]), (UInt32)c[i]); hostileIO(byUID(ce), (UInt32)c[i]);
+        }
+        hostileProps(30000);
+        hostileSettled();
+        printf("ok hostile sample times, frame counts, property sizes, selectors, scopes and values\n");
+        reinit(CFArrayCreate(0, NULL, 0, &kCFTypeArrayCallBacks));
+        CHECK(nDevices() == 0);
+    }
     printf("ALL OK (notifications=%d)\n", gNotifies);
     return 0;
 }
