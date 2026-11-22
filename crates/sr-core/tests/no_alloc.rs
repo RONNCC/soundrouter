@@ -70,4 +70,11 @@ fn plan_swap_on_audio_thread_does_not_allocate() {
     let before = ALLOCS.with(|c| c.get());
     m.process(&ins, &mut refs, 64);
     assert_eq!(ALLOCS.with(|c| c.get()) - before, 0);
+    // A different routing (a monitor appears) runs the crossfade over the first block.
+    let mut d2 = dev();
+    d2.monitors.push(mon("spk", true, 0.0));
+    h.set_plan(MixPlan::compile(&d2, &l));
+    let before = ALLOCS.with(|c| c.get());
+    m.process(&ins, &mut refs, 64);
+    assert_eq!(ALLOCS.with(|c| c.get()) - before, 0);
 }

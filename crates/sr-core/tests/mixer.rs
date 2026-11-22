@@ -178,6 +178,14 @@ fn plan_swap_applies_next_block() {
         out_ch: 0,
     }]; // different routing
     h.set_plan(MixPlan::compile(&d, &layout()));
+    // The new routing is crossfaded in over this block (a step would click) and is exact after it.
+    let o = run(&mut m, &ones(8), 4, 8);
+    assert!(
+        o[0][0] < 1.0 && o[0][0] > 0.5 && close(o[0][7], 0.5),
+        "{:?}",
+        o[0]
+    );
+    assert!(o[1][0] > 0.0 && close(o[1][7], 0.0), "{:?}", o[1]);
     let o = run(&mut m, &ones(8), 4, 8);
     assert!(o[0].iter().all(|x| *x == 0.5));
     assert!(o[1].iter().all(|x| *x == 0.0));

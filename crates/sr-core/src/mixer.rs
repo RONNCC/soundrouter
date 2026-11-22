@@ -113,6 +113,9 @@ pub struct MixPlan {
     acc: Vec<f32>, // nch * MAX_FRAMES vdev channel scratch
     /// Every `acc` row provably holds finite samples, so its meter can skip the finite check.
     acc_finite: bool,
+    /// Hash of which input reaches which output (wires, monitors); gains do not count. Two plans with
+    /// different keys cannot be joined by a gain ramp, so the mixer crossfades them.
+    route: u64,
 }
 
 /// Taps into one vdev channel up to which `acc` stays finite: each tap adds at most
@@ -217,7 +220,7 @@ impl MixPlan {
                 dev_out.push((usize::from(*c), slot));
             }
         }
-        let mons = dev
+        let mons: Vec<MonPlan> = dev
             .monitors
             .iter()
             .map(|m| {
@@ -250,6 +253,14 @@ impl MixPlan {
             .collect();
         let acc_finite =
             (0..nch).all(|c| taps.iter().filter(|t| t.vch == c).count() <= MAX_FINITE_TAPS);
+        let mut h = DefaultHasher::new();
+        for t in &taps {
+            (t.in_idx, t.vch, srcs[t.src].key).hash(&mut h);
+        }
+        dev_out.hash(&mut h);
+        for m in &mons {
+            (m.gain.key, &m.wires).hash(&mut h);
+        }
         MixPlan {
             in_len: layout.inputs.len(),
             out_len: layout.outputs.len(),
@@ -263,6 +274,7 @@ impl MixPlan {
             meter_in,
             acc: vec![0.0; nch * MAX_FRAMES],
             acc_finite,
+            route: h.finish(),
         }
     }
 
@@ -379,6 +391,12 @@ impl Drop for Mailbox {
 /// Audio-thread side; zero alloc in process.
 pub struct Mixer {
     plan: Option<Box<MixPlan>>,
+    /// The plan a newly applied one replaced when their routing differs: it runs once more, over the
+    /// first block, and the two outputs are crossfaded (a wire or monitor that appears or goes away
+    /// would otherwise step).
+    fade: Option<Box<MixPlan>>,
+    /// `MAX_CH` rows of `MAX_FRAMES` for the fading plan's output.
+    fade_buf: Vec<f32>,
     slot: Arc<Mailbox>,
     ret: Producer<Box<MixPlan>>,
     meters: Arc<Meters>,
@@ -396,6 +414,8 @@ pub fn mixer(meters: Arc<Meters>) -> (Mixer, MixerHandle) {
     (
         Mixer {
             plan: None,
+            fade: None,
+            fade_buf: vec![0.0; MAX_CH * MAX_FRAMES],
             slot: slot.clone(),
             ret,
             meters,
@@ -433,9 +453,20 @@ impl MixerHandle {
 impl Mixer {
     fn poll(&mut self) {
         if let Some(mut new) = self.slot.take() {
+            if let Some(stale) = self.fade.take() {
+                let _ = self.ret.push(stale); // a fade the block loop never reached
+            }
             if let Some(old) = self.plan.take() {
                 new.inherit(&old);
-                let _ = self.ret.push(old); // full return queue: drops here, cannot happen by sizing
+                if old.route != new.route
+                    && old.in_len == new.in_len
+                    && old.out_len == new.out_len
+                    && old.out_len <= MAX_CH
+                {
+                    self.fade = Some(old);
+                } else {
+                    let _ = self.ret.push(old); // full return queue: drops here, cannot happen by sizing
+                }
             } else {
                 // Nothing applied yet: start at V's level, do not fade in from unity.
                 new.apps.iter_mut().for_each(|a| a.cur = a.read());
@@ -457,7 +488,15 @@ impl Mixer {
             out.fill(0.0);
         }
         self.poll();
-        let Some(plan) = self.plan.as_deref_mut() else {
+        let Mixer {
+            plan,
+            fade,
+            fade_buf,
+            meters,
+            ret,
+            ..
+        } = &mut *self;
+        let Some(plan) = plan.as_deref_mut() else {
             return;
         };
         if inputs.len() != plan.in_len
@@ -465,15 +504,48 @@ impl Mixer {
             || inputs.iter().any(|s| s.len() < frames)
             || outputs.iter().any(|s| s.len() < frames)
         {
-            self.meters.mismatch_count.fetch_add(1, Relaxed);
+            meters.mismatch_count.fetch_add(1, Relaxed);
             return;
         }
         plan.apps.iter_mut().for_each(|a| a.target = a.read());
         let mut off = 0;
         while off < frames {
             let n = (frames - off).min(MAX_FRAMES);
-            plan.run(inputs, outputs, off, n, &self.meters);
+            plan.run(inputs, outputs, off, n, meters);
+            if let Some(mut old) = fade.take() {
+                crossfade(&mut old, fade_buf, inputs, outputs, n, meters);
+                let _ = ret.push(old); // back to the control side, never freed on the audio thread
+            }
             off += n;
+        }
+    }
+}
+
+/// The first `n` frames of `new_out` (what the new plan wrote) become a linear crossfade from what the
+/// `old` plan writes for the same inputs: the output starts on the old routing and ends on the new one.
+fn crossfade(
+    old: &mut MixPlan,
+    scratch: &mut [f32],
+    inputs: &[&[f32]],
+    new_out: &mut [&mut [f32]],
+    n: usize,
+    meters: &Meters,
+) {
+    let rows = old.out_len;
+    let mut refs: [&mut [f32]; MAX_CH] = std::array::from_fn(|_| &mut [][..]);
+    for (r, row) in refs
+        .iter_mut()
+        .zip(scratch.chunks_mut(MAX_FRAMES))
+        .take(rows)
+    {
+        row.fill(0.0);
+        *r = row;
+    }
+    old.run(inputs, &mut refs[..rows], 0, n, meters);
+    let inv = 1.0 / n as f32;
+    for (new, old) in new_out.iter_mut().zip(&refs[..rows]) {
+        for (k, (y, o)) in new[..n].iter_mut().zip(old.iter()).enumerate() {
+            *y = *o + (*y - *o) * ((k + 1) as f32 * inv);
         }
     }
 }
