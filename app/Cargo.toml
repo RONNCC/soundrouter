@@ -17,7 +17,7 @@ serde_json.workspace = true
 eframe = "=0.37.0"
 log = "0.4"
 fern = "0.7"
-jiff = { version = "0.2", default-features = false, features = ["std"] } # log timestamps (humantime is unmaintained, RUSTSEC-2026-0542)
+jiff = { version = "1.0", default-features = false, features = ["std"] } # log timestamps (humantime is unmaintained, RUSTSEC-2026-0542)
 env_filter = { version = "2", default-features = false }
 tray-icon = "0.26.1"
 
