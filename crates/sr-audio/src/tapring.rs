@@ -73,6 +73,9 @@ pub struct TapRx {
     cushion: usize,
     /// False until `cushion` frames are buffered, and again after an underrun.
     primed: bool,
+    /// The next block is the first one after priming: it fades in, because the stream starts at
+    /// whatever level the app happens to be at (a step from silence is a click).
+    ramp_in: bool,
     tmp: Vec<f32>,
     stats: Arc<TapStats>,
 }
@@ -103,6 +106,7 @@ pub fn channel(ch: usize, cushion: usize, stats: Arc<TapStats>) -> (TapTx, TapRx
             ch,
             cushion,
             primed: false,
+            ramp_in: false,
             tmp: vec![0.0; MAX_FRAMES * ch],
             stats,
         },
@@ -143,6 +147,7 @@ impl TapRx {
             ch: 0,
             cushion: 0,
             primed: false,
+            ramp_in: false,
             tmp: Vec::new(),
             stats,
         }
@@ -166,6 +171,7 @@ impl TapRx {
                 return false; // still prefilling: not an underrun
             }
             self.primed = true;
+            self.ramp_in = true;
             priming = true;
         }
         if avail < n {
@@ -206,10 +212,14 @@ impl TapRx {
             }
             return;
         }
+        let ramp = std::mem::take(&mut self.ramp_in);
         for c in 0..ch {
             let row = &mut dst[(c0 + c) * MAX_FRAMES..][..n];
             for (f, d) in row.iter_mut().enumerate() {
                 *d = self.tmp[f * ch + c];
+                if ramp {
+                    *d *= (f + 1) as f32 / n as f32;
+                }
             }
         }
     }

@@ -34,9 +34,11 @@ fn waits_for_the_cushion_then_plays_in_order() {
     assert!(dst[2 * MAX_FRAMES..][..B].iter().all(|&x| x == 0.0));
     push(&mut tx, B, B);
     rx.pull(B, &mut dst, 2);
+    // The first block after priming fades in (a stream starts at whatever level the app is at).
     for f in 0..B {
-        assert_eq!(dst[2 * MAX_FRAMES + f], f as f32);
-        assert_eq!(dst[3 * MAX_FRAMES + f], -(f as f32));
+        let g = (f + 1) as f32 / B as f32;
+        assert_eq!(dst[2 * MAX_FRAMES + f], f as f32 * g);
+        assert_eq!(dst[3 * MAX_FRAMES + f], -(f as f32) * g);
     }
     assert_eq!(stats.counters(), TapCounters::default());
     assert_eq!(stats.level.load(Relaxed) as usize, B);
@@ -140,7 +142,12 @@ fn a_dry_ring_is_one_underrun_then_silence_until_the_cushion_is_back() {
     push(&mut tx, 2 * B, B);
     push(&mut tx, 3 * B, B);
     rx.pull(B, &mut dst, 0);
-    assert_eq!(dst[0], (2 * B) as f32);
+    // Re-primed: this block fades in again, the one after is plain.
+    assert_eq!(dst[B - 1], (3 * B - 1) as f32);
+    assert!(dst[..B].windows(2).all(|w| w[0] < w[1]) && dst[0] < 2.0 * B as f32 * 0.02);
+    push(&mut tx, 4 * B, B);
+    rx.pull(B, &mut dst, 0);
+    assert_eq!(dst[0], (3 * B) as f32);
     assert_eq!(stats.counters().underruns, 1);
 }
 
@@ -153,8 +160,8 @@ fn a_pile_up_drops_the_oldest_frames() {
     }
     rx.pull(B, &mut dst, 0);
     assert_eq!(stats.counters().trims, 1);
-    // It plays the block that leaves exactly the cushion behind.
-    assert_eq!(dst[0], (8 * B) as f32);
+    // It plays the block that leaves exactly the cushion behind (fading in: the last sample is whole).
+    assert_eq!(dst[B - 1], (9 * B - 1) as f32);
     assert_eq!(stats.level.load(Relaxed) as usize, B);
     push(&mut tx, 10 * B, B);
     rx.pull(B, &mut dst, 0);
