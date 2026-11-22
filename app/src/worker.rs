@@ -13,7 +13,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const METER_PERIOD: Duration = Duration::from_millis(33);
-/// Wake-up period while the window is hidden: no meters are read, only messages and refreshes.
+/// Wake-up period while there are no meters to read (window hidden, or no device enabled): only
+/// messages and refreshes.
 const HIDDEN_PERIOD: Duration = Duration::from_millis(500);
 const REFRESH_PERIOD: Duration = Duration::from_secs(2);
 
@@ -83,7 +84,8 @@ struct Core {
 
 impl Core {
     fn period(&self) -> Duration {
-        if self.visible.load(Relaxed) {
+        // A device that is off has no meters: 30 wake-ups a second would read nothing.
+        if self.visible.load(Relaxed) && self.pump.cfg.devices.iter().any(|d| d.enabled) {
             METER_PERIOD
         } else {
             HIDDEN_PERIOD
@@ -619,6 +621,28 @@ mod tests {
             pump.tick(None, t0 + REFRESH_PERIOD, &snap),
             "a refresh always counts"
         );
+    }
+
+    #[test]
+    fn the_worker_wakes_at_30_hz_only_with_a_window_and_a_device_to_meter() {
+        let (_tx, _snap, mut core) = Worker::core(
+            Box::new(FakeBackend::new()),
+            Context::default(),
+            Box::new(|_| None),
+        );
+        assert_eq!(core.period(), HIDDEN_PERIOD, "no device: nothing to meter");
+        core.pump.cfg = default_config();
+        assert!(core.pump.cfg.devices.iter().any(|d| d.enabled));
+        assert_eq!(core.period(), METER_PERIOD);
+        core.visible.store(false, Relaxed);
+        assert_eq!(core.period(), HIDDEN_PERIOD, "hidden window");
+        core.visible.store(true, Relaxed);
+        core.pump
+            .cfg
+            .devices
+            .iter_mut()
+            .for_each(|d| d.enabled = false);
+        assert_eq!(core.period(), HIDDEN_PERIOD, "every device off");
     }
 
     #[test]
