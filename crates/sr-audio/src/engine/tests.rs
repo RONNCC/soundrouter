@@ -745,6 +745,46 @@ fn monitor_wire_beyond_hardware_channels_is_reported() {
 }
 
 #[test]
+fn a_monitor_wire_into_the_input_the_device_reads_is_a_feedback_loop() {
+    let w = |out_ch, dst_ch| MonitorWire { out_ch, dst_ch };
+    let mut bh = mon("BlackHole16ch_UID", true);
+    // 0 -> 0 closes the loop (mic wire BlackHole in 0 -> vdev 0); 0 -> 8 and 1 -> 1 do not: the source
+    // is not wired from in 8 and vdev 1 gets nothing from BlackHole in 1.
+    bh.wires = vec![w(0, 0), w(0, 8), w(1, 1)];
+    let mut off = mon("BlackHole16ch_UID", false);
+    off.wires = vec![w(0, 0)];
+    let dev = vdev(
+        vec![src(
+            "bh",
+            SourceKind::Device {
+                uid: "BlackHole16ch_UID".into(),
+            },
+        )],
+        vec![wire("bh", 0, 0), wire("bh", 1, 0)],
+        vec![bh.clone(), off],
+    );
+    let virt = |u: &str| u == "BlackHole16ch_UID";
+    let (clean, warnings) = without_feedback(&dev, &virt);
+    assert_eq!(clean.monitors[0].wires, [w(0, 8), w(1, 1)]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("feed itself") && warnings[0].contains("output channel 0"));
+    assert_eq!(
+        clean.monitors[1].wires,
+        [w(0, 0)],
+        "a disabled monitor is not in the aggregate"
+    );
+    // The same wiring on a real interface is a headphone monitor.
+    assert_eq!(without_feedback(&dev, &|_| false), (dev.clone(), vec![]));
+    // A different source device cannot loop through this one.
+    let other = vdev(
+        vec![src("mic", SourceKind::Device { uid: "mic".into() })],
+        vec![wire("mic", 0, 0)],
+        vec![bh],
+    );
+    assert_eq!(without_feedback(&other, &virt), (other.clone(), vec![]));
+}
+
+#[test]
 fn retry_delay_schedule_and_give_up() {
     assert_eq!(retry_delay(0), None);
     assert_eq!(retry_delay(1), Some(EVENT_DEBOUNCE));

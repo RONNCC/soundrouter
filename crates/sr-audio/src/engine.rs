@@ -1993,6 +1993,45 @@ fn monitor_warnings(dev: &VirtualDevice, subs: &[SubDesc]) -> Vec<String> {
     out
 }
 
+/// `dev` without the monitor wires that would feed its own mix back into itself, and a warning for each.
+/// A loopback device (BlackHole and the like: `loopback(uid)`) hands what is written to its output channel
+/// k back on its input channel k. A monitor wire to channel k of such a device, with a Device source of
+/// the same device wired from its channel k to that wire's vdev channel, is a loop whose gain is the
+/// product of the gains on it: a sustained buzz at unity, a runaway above (the mixer has no limiter).
+/// Nothing else rejects it: the same wiring on a real interface is only a headphone monitor.
+fn without_feedback(
+    dev: &VirtualDevice,
+    loopback: &dyn Fn(&str) -> bool,
+) -> (VirtualDevice, Vec<String>) {
+    let mut out = dev.clone();
+    let mut warnings = Vec::new();
+    for m in out.monitors.iter_mut().filter(|m| m.enabled) {
+        if !loopback(&m.device_uid) {
+            continue;
+        }
+        let uid = m.device_uid.clone();
+        m.wires.retain(|mw| {
+            let loops = dev.wires.iter().any(|w| {
+                w.out_ch == mw.out_ch
+                    && w.src_ch == mw.dst_ch
+                    && dev.sources.iter().any(|s| {
+                        s.id == w.source && matches!(&s.kind, SourceKind::Device { uid: u } if *u == uid)
+                    })
+            });
+            if loops {
+                warnings.push(format!(
+                    "device '{}': monitor '{uid}' wire from channel {} to output channel {} is not routed: \
+                     that device plays its output channel back on the same input channel, which this device \
+                     reads, so the mix would feed itself",
+                    dev.id, mw.out_ch, mw.dst_ch
+                ));
+            }
+            !loops
+        });
+    }
+    (out, warnings)
+}
+
 /// The mixer handles at most `MAX_CH` channels per direction. Fail loudly rather than drop channels:
 /// the aggregate's inputs are the device's own channels + hardware sources + 2 per app tap, its
 /// outputs the device's channels + enabled monitors' channels.
@@ -2036,12 +2075,19 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
             v.taps.len()
         )
     })?;
-    let warnings = monitor_warnings(&v.dev, &v.subs);
+    let (dev, loops) = without_feedback(&v.dev, &|uid| {
+        hal::device_by_uid(uid).is_some_and(|d| {
+            hal::get_global::<u32>(d, kAudioDevicePropertyTransportType).ok()
+                == Some(kAudioDeviceTransportTypeVirtual)
+        })
+    });
+    let mut warnings = monitor_warnings(&v.dev, &v.subs);
+    warnings.extend(loops);
     for w in warnings.iter().filter(|w| !v.warnings.contains(w)) {
         log::warn!("{w}");
     }
     v.warnings = warnings;
-    v.handle.set_plan(MixPlan::compile(&v.dev, &lay));
+    v.handle.set_plan(MixPlan::compile(&dev, &lay));
     v.layout = lay;
     v.shared
         .expected
