@@ -1058,6 +1058,38 @@ fn reassert_buffers(g: &mut Inner, ids: &BTreeSet<String>) {
     }
 }
 
+/// Longest a burst of events may hold back a pass, on top of one settle period. A device that flaps
+/// faster than the debounce (a Bluetooth headset switching profiles, a hub resetting) would otherwise
+/// restart the quiet period forever and starve every rebuild.
+const MAX_BATCH: Duration = Duration::from_secs(3);
+
+/// Absorbs `first` and every event that follows within the settle period, up to the batch cap; false
+/// when the engine is shutting down. `recv(wait)` is the channel's `recv_timeout`, `now` the clock.
+fn gather(
+    pending: &mut Pending,
+    first: Event,
+    level: u32,
+    recv: &mut dyn FnMut(Duration) -> Result<Event, RecvTimeoutError>,
+    now: &dyn Fn() -> Instant,
+) -> bool {
+    let deadline = now() + settle(true, level) + MAX_BATCH;
+    let mut ev = first;
+    loop {
+        if !pending.absorb(ev) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(now());
+        if left.is_zero() {
+            return true;
+        }
+        match recv(settle(pending.wake, level).min(left)) {
+            Ok(e) => ev = e,
+            Err(RecvTimeoutError::Timeout) => return true,
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
     let mut retry = Retry::default();
     loop {
@@ -1073,19 +1105,18 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
                 Err(_) => return,
             },
         };
-        if let Some(mut ev) = first {
+        if let Some(ev) = first {
             let level = retry
                 .fails
                 .max(lock(&inner).io_fails.values().copied().max().unwrap_or(0));
-            loop {
-                if !pending.absorb(ev) {
-                    return;
-                }
-                match rx.recv_timeout(settle(pending.wake, level)) {
-                    Ok(e) => ev = e,
-                    Err(RecvTimeoutError::Timeout) => break,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
+            if !gather(
+                &mut pending,
+                ev,
+                level,
+                &mut |d| rx.recv_timeout(d),
+                &Instant::now,
+            ) {
+                return;
             }
         }
         let mut g = lock(&inner);

@@ -886,6 +886,67 @@ fn settle_waits_longer_after_wake() {
     assert_eq!(settle(true, 8), MAX_BACKOFF);
 }
 
+/// A scripted clock and channel: each `recv(wait)` either delivers an event `gap` after the last one
+/// (when `wait` reaches that far) or times out after `wait`. No real time passes.
+struct Script {
+    base: Instant,
+    at: std::cell::Cell<Duration>,
+    gap: Duration,
+    events: std::cell::Cell<u32>,
+}
+
+impl Script {
+    fn new(gap: Duration) -> Script {
+        Script {
+            base: Instant::now(),
+            at: Default::default(),
+            gap,
+            events: Default::default(),
+        }
+    }
+
+    fn gather(&self, p: &mut Pending, level: u32) -> bool {
+        let recv = |wait: Duration| {
+            if wait >= self.gap {
+                self.at.set(self.at.get() + self.gap);
+                self.events.set(self.events.get() + 1);
+                Ok(Event::Devices)
+            } else {
+                self.at.set(self.at.get() + wait);
+                Err(RecvTimeoutError::Timeout)
+            }
+        };
+        gather(p, Event::Devices, level, &mut { recv }, &|| {
+            self.base + self.at.get()
+        })
+    }
+}
+
+#[test]
+fn a_quiet_batch_ends_after_one_settle_period() {
+    let s = Script::new(Duration::from_secs(10));
+    let mut p = Pending::default();
+    assert!(s.gather(&mut p, 0));
+    assert_eq!((s.at.get(), s.events.get()), (EVENT_DEBOUNCE, 0));
+    assert!(p.devs);
+}
+
+#[test]
+fn a_device_flapping_faster_than_the_debounce_cannot_starve_the_pass() {
+    // An event every 150 ms is always inside the 200 ms quiet period: without a cap the pass never runs.
+    let s = Script::new(Duration::from_millis(150));
+    let mut p = Pending::default();
+    assert!(s.gather(&mut p, 0));
+    let cap = settle(true, 0) + MAX_BATCH;
+    assert!(
+        s.at.get() <= cap,
+        "waited {:?} of at most {cap:?}",
+        s.at.get()
+    );
+    assert!(s.events.get() > 5, "the burst was really absorbed");
+    assert!(p.devs);
+}
+
 #[test]
 fn pending_absorbs_events_until_shutdown() {
     let mut p = Pending::default();
