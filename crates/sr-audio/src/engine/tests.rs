@@ -1487,6 +1487,21 @@ fn apply_drops_disabled_devices_from_recovery_and_clears_background_errors() {
     assert_eq!(background_message(&g.bg_errors), None);
 }
 
+/// Measured live: a vdev built on the visible device (companion published late) stayed there for good: the
+/// hidden companions are not in the HAL's device list, so their arrival raised no event that differs from
+/// an echo. The worker polls a fallback vdev instead, until its companion was tried and failed.
+#[test]
+fn a_vdev_on_the_visible_fallback_waits_for_its_companion() {
+    let (vis, comp) = ("soundrouter:v1", companion_uid("soundrouter:v1"));
+    assert!(on_fallback("v1", vis, &[]));
+    assert!(!on_fallback("v1", &comp, &[]));
+    // The companion was tried as main and failed: the fallback is final.
+    assert!(!on_fallback("v1", vis, &[comp]));
+    // Another device's visible uid is not this vdev's fallback; an override main never is.
+    assert!(!on_fallback("v2", vis, &[]));
+    assert!(!on_fallback("v1", "BlackHole16ch_UID", &[]));
+}
+
 /// Measured live: a monitor whose stream layout changed (2 -> 4 channels, no device-list or rate change)
 /// left the whole vdev silent (every cycle a shape mismatch) with the status still Running.
 #[test]

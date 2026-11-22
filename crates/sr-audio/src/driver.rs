@@ -133,6 +133,15 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_uids_reports_missing_after_timeout() {
+        let uid = "soundrouter:no-such-device".to_string();
+        let t0 = Instant::now();
+        let missing = wait_for_uids(std::slice::from_ref(&uid), Duration::from_millis(200));
+        assert_eq!(missing, vec![uid]);
+        assert!(t0.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[test]
     fn rejects_bad_shapes() {
         let s = NSString::from_str("x");
         assert!(array_to_devices(&s).is_err());

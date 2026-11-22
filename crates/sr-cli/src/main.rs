@@ -94,6 +94,8 @@ enum DriverOp {
     },
 }
 
+const DEVICE_WAIT: Duration = Duration::from_secs(15);
+
 static STOP: AtomicBool = AtomicBool::new(false);
 fn install_ctrlc() -> Result<()> {
     Ok(ctrlc::set_handler(|| STOP.store(true, Relaxed))?)
@@ -184,9 +186,13 @@ fn main() -> Result<()> {
             .context("parsing device list")?;
             driver::set_devices(driver::require_plugin()?, &list)?;
             let uids: Vec<String> = list.iter().map(|d| d.uid.clone()).collect();
-            let missing = driver::wait_for_uids(&uids, Duration::from_secs(2));
+            // coreaudiod publishes a new device a few seconds after the set (longer under load)
+            let missing = driver::wait_for_uids(&uids, DEVICE_WAIT);
             if !missing.is_empty() {
-                bail!("set accepted but devices did not appear: {missing:?}");
+                bail!(
+                    "set accepted but devices did not appear within {} s: {missing:?}",
+                    DEVICE_WAIT.as_secs()
+                );
             }
             println!("ok: {} device(s)", list.len());
             Ok(())

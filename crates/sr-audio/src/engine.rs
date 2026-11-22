@@ -276,6 +276,7 @@ struct Vdev {
     starter: Option<JoinHandle<()>>,
     /// Build number (the aggregate uid suffix); ignores [`Event::IoStart`] of a retired build.
     build: u64,
+    built_at: Instant,
     /// Nominal rate of the main and sub devices at build / start; a rate event that leaves these
     /// unchanged is an echo of our own aggregate.
     rates: Vec<(String, f64)>,
@@ -1184,11 +1185,42 @@ fn gather(
     }
 }
 
+/// How often the worker looks for the companion of a vdev that was built on the visible device, and for how
+/// long after the build. The hidden companions are not in the HAL's device list, so one published late
+/// raises no device event the worker can tell from an echo of our own aggregates.
+const COMPANION_POLL: Duration = Duration::from_secs(1);
+const COMPANION_POLL_WINDOW: Duration = Duration::from_secs(60);
+
+/// Whether a vdev with this `main` and `passed_over` runs on the visible fallback while its companion was
+/// never tried as main, so a later apply moves it there as soon as the companion exists.
+fn on_fallback(id: &str, main: &str, passed_over: &[String]) -> bool {
+    let vis = format!("{DEVICE_UID_PREFIX}{id}");
+    main == vis && !passed_over.contains(&companion_uid(&vis))
+}
+
+/// A fallback vdev still within its poll window.
+fn awaits_companion(v: &Vdev) -> bool {
+    on_fallback(&v.dev.id, &v.spec.main, &v.passed_over)
+        && v.built_at.elapsed() < COMPANION_POLL_WINDOW
+}
+
+/// A fallback vdev whose companion exists now.
+fn companion_arrived(v: &Vdev) -> bool {
+    on_fallback(&v.dev.id, &v.spec.main, &v.passed_over)
+        && hal::device_by_uid(&companion_uid(&format!("{DEVICE_UID_PREFIX}{}", v.dev.id))).is_some()
+}
+
 fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
     let mut retry = Retry::default();
     loop {
         let mut pending = Pending::default();
-        let first = match retry.wait() {
+        let first = match retry.wait().or_else(|| {
+            lock(&inner)
+                .vdevs
+                .values()
+                .any(awaits_companion)
+                .then_some(COMPANION_POLL)
+        }) {
             Some(d) => match rx.recv_timeout(d) {
                 Ok(e) => Some(e),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -1222,7 +1254,8 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
             // Start failures counted while the device was held must not cap the rebuild now.
             g.io_fails.clear();
         }
-        let devs = device_news(released, pending.devs, &mut g.dev_set, current_device_set);
+        let devs = device_news(released, pending.devs, &mut g.dev_set, current_device_set)
+            || g.vdevs.values().any(companion_arrived);
         let Some(op) = retry.choose(devs, pending.wake, !targets.is_empty(), pending.procs) else {
             continue;
         };
@@ -2168,7 +2201,7 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
         if v.spec.split {
             rebuild_tap_agg(v)?;
             v.tap_dirty = false;
-            return Ok(());
+            return tap_result(v);
         }
         v.shared.expected.store(0, Release); // silence until the new layout is in
         let uids: Vec<String> = v.taps.iter().map(|t| t.uid.clone()).collect();
@@ -2192,6 +2225,18 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
         refresh_layout(v)?;
         restrict_inputs(v.agg, v.proc_id, &v.subs, &v.spec.readers, v.taps.len());
         v.tap_dirty = false;
+    }
+    tap_result(v)
+}
+
+/// A sync that could not create a tap fails once the rest is done, so [`Retry`] tries again with backoff
+/// and surfaces the error instead of waiting for the next edit or process event.
+fn tap_result(v: &Vdev) -> Result<()> {
+    if v.tap_missing {
+        bail!(
+            "device '{}': a tap for an app source failed to create",
+            v.dev.id
+        );
     }
     Ok(())
 }
@@ -2769,6 +2814,7 @@ fn build_vdev(
         warnings: Vec::new(),
         width_note: None,
         passed_over: Vec::new(),
+        built_at: Instant::now(),
     };
     // From here `Drop` cleans up the aggregate, taps and callback state.
     refresh_layout(&mut v)?;
@@ -2815,6 +2861,12 @@ fn build_vdev(
             log::warn!("device '{}': tap aggregate failed: {e:#}", dev.id);
             park_failed_taps(&mut v.taps, &mut v.zombies, &mut v.tap_dirty, events);
         }
+    }
+    // A tap that could not be created is retried by a sync: ask for one now, not at the next edit.
+    if v.tap_missing
+        && let Some(tx) = events
+    {
+        let _ = tx.send(Event::Processes);
     }
     Ok(v)
 }

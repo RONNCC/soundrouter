@@ -166,3 +166,29 @@ fn add_rename_rechannel_disable_remove_while_running() {
     e.apply(&empty).unwrap();
     check(&e, &empty, "remove all");
 }
+
+/// Devices enabled together while the driver publishes their companions one by one: one whose main was
+/// the visible fallback at its build must still move to its companion (the device event that announces
+/// the companion must not compare equal to a baseline taken after the vdev decided).
+#[test]
+#[ignore = "needs the SoundRouter driver installed; changes the driver device list"]
+fn devices_enabled_together_all_reach_their_companions() {
+    let mut e = Engine::new().unwrap();
+    let on = cfg(
+        vec![
+            dev("la", "A", 2, true),
+            dev("lb", "B", 2, true),
+            dev("lc", "C", 2, true),
+        ],
+        256,
+    );
+    let off = cfg(vec![], 256);
+    for round in 0..4 {
+        e.apply(&on).unwrap();
+        check(&e, &on, &format!("round {round}: all on"));
+        e.apply(&off).unwrap();
+        check(&e, &off, &format!("round {round}: all off"));
+        // coreaudiod needs a moment to drain the removals before it publishes the next three.
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}

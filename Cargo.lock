@@ -4267,6 +4267,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
+ "env_logger",
  "libc",
  "log",
  "objc2 0.6.5",
