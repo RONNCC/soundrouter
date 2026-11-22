@@ -1095,7 +1095,7 @@ mod snapshots {
         let mut results = egui_kittest::SnapshotResults::new();
         for (theme, suffix) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
             let mut h = Harness::builder()
-                .with_size(vec2(243.0, 330.0))
+                .with_size(vec2(243.0, 345.0))
                 .with_step_dt(0.05)
                 .with_theme(theme)
                 .with_context_setup(crate::theme::install_fonts)

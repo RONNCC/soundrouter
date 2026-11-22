@@ -3,19 +3,19 @@
 use crate::app_icons::{LOOK_AHEAD, Look, PickerIcons, visible_rows, wanted};
 use crate::icons::{self, IconTextures};
 use crate::layout::{
-    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, TOP, body_height, wire_distance,
-    wire_mid, wire_points,
+    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, ROW_H as ROW_PITCH, TOP,
+    body_height, wire_distance, wire_mid, wire_points,
 };
 use crate::meter::{PeakHold, level};
 use crate::model::{Edit, Link, Port, can_link, ch_label, links};
 use crate::theme::{Tokens, body, cable_color, caption, label, num, radius, section, tile_tint};
 use crate::widgets::{
-    Plug, chevron, darken, jack, loops, menu_hint, meter, name_button, name_widget, plus_circle,
-    slider_knob, switch, tile, xmark,
+    MIN_HIT, Plug, chevron, darken, hit, jack, loops, menu_hint, meter, name_button, name_widget,
+    plus_circle, slider, switch, tile, x_button, xmark,
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Popup, PopupCloseBehavior, Pos2, Rect,
-    Response, Sense, Shape, Slider, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo,
+    Response, Sense, Shape, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo,
     epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
 };
 use sr_core::backend::{AppInfo, HwDevice, MeterReading, TccStatus};
@@ -318,7 +318,7 @@ fn column_headers(
                 if dev.channels > 2 {
                     let resp = plus_circle(
                         ui,
-                        pos2(right - 38.0, base - 28.0),
+                        pos2(right - 44.0, base - 28.0),
                         id.with("minus"),
                         t,
                         true,
@@ -421,9 +421,15 @@ fn empty_slot(
         vec2(btn_w, 28.0),
     );
     p.galley(rect.min + vec2(PAD, PAD), words, t.muted);
-    let resp = ui.interact(btn, id, Sense::click());
+    let resp = hit(ui, btn, id);
     name_button(&resp, name);
-    let fill = if resp.hovered() { t.selected } else { t.raised };
+    let fill = if resp.is_pointer_button_down_on() {
+        t.selected.lerp_to_gamma(Color32::BLACK, 0.12)
+    } else if resp.hovered() {
+        t.selected
+    } else {
+        t.raised
+    };
     let pill = CornerRadius::same(radius::PILL);
     p.rect(
         btn,
@@ -524,9 +530,11 @@ pub fn no_devices(ui: &mut Ui, t: &Tokens, area: Rect) -> bool {
         pos2(mid.x, top + words.size().y + 16.0 + 16.0),
         vec2(btn_w, 32.0),
     );
-    let resp = ui.interact(btn, Id::unique("create_first_device"), Sense::click());
+    let resp = hit(ui, btn, Id::unique("create_first_device"));
     name_button(&resp, text);
-    let fill = if resp.hovered() {
+    let fill = if resp.is_pointer_button_down_on() {
+        t.accent.lerp_to_gamma(Color32::BLACK, 0.28)
+    } else if resp.hovered() {
         t.accent.lerp_to_gamma(Color32::BLACK, 0.15)
     } else {
         t.accent
@@ -547,7 +555,7 @@ pub fn no_devices(ui: &mut Ui, t: &Tokens, area: Rect) -> bool {
 }
 
 /// Height of a menu row.
-const ROW_H: f32 = 24.0;
+const ROW_H: f32 = 28.0;
 
 /// One menu line: icon, label, accent highlight on hover. Returns true when clicked.
 fn menu_row(
@@ -566,6 +574,11 @@ fn menu_row(
         Sense::hover()
     };
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), sense);
+    let resp = if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    };
     resp.widget_info(|| WidgetInfo::labeled(egui::Role::Button, enabled, label));
     let hot = enabled && resp.hovered();
     let p = ui.painter();
@@ -999,7 +1012,7 @@ fn card(
         - 14.0
         - title_x
         - if on.is_some() {
-            84.0 + note_w.max(0.0)
+            94.0 + note_w.max(0.0)
         } else {
             0.0
         };
@@ -1024,13 +1037,13 @@ fn card(
             CardId::Out(_) => unreachable!(),
         };
         let at = pos2(r.right() - 14.0 - 8.0, r.top() + HEAD_H / 2.0);
-        let x = ui.interact(
-            Rect::from_center_size(at, vec2(18.0, 18.0)),
+        let x = x_button(
+            ui,
+            at,
             Id::unique(("card_x", d, c.id)),
-            Sense::click(),
+            t,
+            &format!("{label} {title}"),
         );
-        name_button(&x, &format!("{label} {title}"));
-        xmark(&painter, at, if x.hovered() { t.bad_ink } else { t.muted });
         // A double-click's second click would remove the card that moved up under the pointer.
         if x.clicked() && !x.double_clicked() {
             edits.push(edit);
@@ -1038,13 +1051,19 @@ fn card(
         x.on_hover_text(format!("{label} {title}"));
     }
     if let Some(on_now) = on {
+        // 4 px between the X's target and the switch's; "On"/"Off" toggles it too.
         let sw = Rect::from_center_size(
-            pos2(r.right() - 14.0 - 22.0 - 16.0, r.top() + HEAD_H / 2.0),
+            pos2(r.right() - 14.0 - 8.0 - 40.0, r.top() + HEAD_H / 2.0),
             vec2(32.0, 18.0),
         );
+        let mut reach = sw.expand2(vec2(6.0, 0.0));
+        if note.is_none() {
+            reach.min.x -= 6.0 + 28.0;
+        }
         let new = switch(
             ui,
             sw,
+            reach,
             Id::unique(("card_on", d, c.id)),
             on_now,
             t,
@@ -1137,11 +1156,13 @@ fn card(
         return;
     }
     let y0 = body_top + body_h;
+    // The strip reaches up into the card's last meter row: nothing there takes a click, and below
+    // it the volume slider starts.
     let strip = Rect::from_min_max(
-        pos2(r.left() + 14.0, y0 - 6.0),
+        pos2(r.left() + 14.0, y0 + FOOT_H - MIN_HIT),
         pos2(r.right() - 14.0, y0 + FOOT_H),
     );
-    let resp = ui.interact(strip, Id::unique(("opt", d, c.id)), Sense::click());
+    let resp = hit(ui, strip, Id::unique(("opt", d, c.id)));
     name_button(&resp, &format!("{title} options"));
     let aimed = resp.hovered() || resp.has_focus();
     if c.expanded || aimed || ui.rect_contains_pointer(r) {
@@ -1170,7 +1191,7 @@ fn card(
     painter.hline(r.x_range(), y0, Stroke::new(1.0, t.hairline));
     let vrow = Rect::from_min_size(
         pos2(r.left() + 14.0, y0 + FOOT_H),
-        vec2(r.width() - 28.0, 22.0),
+        vec2(r.width() - 28.0, MIN_HIT),
     );
     painter.text(
         pos2(vrow.left(), vrow.center().y),
@@ -1183,14 +1204,18 @@ fn card(
     // changes when the slider is moved.
     let before = vol_db.clamp(-60.0, 12.0);
     let mut v = before;
-    let slider =
-        Rect::from_x_y_ranges((vrow.left() + 46.0)..=(vrow.right() - 52.0), vrow.y_range());
-    let vol = ui.scope_builder(UiBuilder::new().max_rect(slider), |ui| {
-        ui.spacing_mut().slider_width = slider.width();
-        ui.add(Slider::new(&mut v, -60.0..=12.0).show_value(false))
-    });
-    name_widget(ui, &vol.inner, &format!("{title} volume"));
-    slider_knob(&painter, vol.inner.rect, (v - -60.0) / 72.0, t);
+    let slider_rect =
+        Rect::from_x_y_ranges((vrow.left() + 46.0)..=(vrow.right() - 60.0), vrow.y_range());
+    slider(
+        ui,
+        slider_rect,
+        Id::unique(("card_vol", d, c.id)),
+        &format!("{title} volume"),
+        &mut v,
+        -60.0..=12.0,
+        0.0,
+        t,
+    );
     let moved = (v - before).abs() > 1e-4;
     painter.text(
         pos2(vrow.right(), vrow.center().y),
@@ -1206,14 +1231,12 @@ fn card(
             CardId::Out(_) => unreachable!(),
         });
     }
-    let mut rm_y = y0 + FOOT_H + 26.0;
+    let mut rm_y = y0 + FOOT_H + MIN_HIT;
     if let CardId::Src(i) = c.id {
         let s = &dev.sources[i];
         if matches!(s.kind, SourceKind::App { .. }) {
-            let row = Rect::from_min_size(
-                pos2(r.left() + 14.0, y0 + FOOT_H + 24.0),
-                vec2(r.width() - 28.0, 20.0),
-            );
+            let row =
+                Rect::from_min_size(pos2(r.left() + 14.0, rm_y), vec2(r.width() - 28.0, MIN_HIT));
             let mut m = s.mute_original;
             let cb = ui.scope_builder(UiBuilder::new().max_rect(row), |ui| {
                 ui.checkbox(
@@ -1228,8 +1251,8 @@ fn card(
             rm_y += MUTE_H;
         }
     }
-    let rm = Rect::from_min_size(pos2(r.left() + 14.0, rm_y), vec2(120.0, 20.0));
-    let resp = ui.interact(rm, Id::unique(("rm", d, c.id)), Sense::click());
+    let rm = Rect::from_min_size(pos2(r.left() + 14.0, rm_y), vec2(120.0, MIN_HIT));
+    let resp = hit(ui, rm, Id::unique(("rm", d, c.id)));
     let (label, edit) = match c.id {
         CardId::Src(i) => ("Remove Source", Edit::RemoveSource(d, i)),
         CardId::Mon(i) => ("Remove Monitor", Edit::RemoveMonitor(d, i)),
@@ -1434,11 +1457,15 @@ fn wires_and_ports(
         let Some(pos) = layout.port_pos(p) else {
             continue;
         };
-        let resp = ui.interact(
-            Rect::from_center_size(pos, vec2(20.0, 20.0)),
-            Id::unique(("port", d, p)),
-            Sense::click_and_drag(),
-        );
+        // Rows sit 24 px apart, so a port's target is 28 wide and 24 tall: the one place the
+        // pointer minimum is the macOS 24 rather than `MIN_HIT`.
+        let resp = ui
+            .interact(
+                Rect::from_center_size(pos, vec2(MIN_HIT, ROW_PITCH)),
+                Id::unique(("port", d, p)),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         name_button(&resp, &port_label(g, p));
         if resp.drag_started() {
             if p.is_output() {
@@ -1513,7 +1540,7 @@ fn wires_and_ports(
         (None, Some(pos), None) if on_graph(pos) => {
             all.iter()
                 .position(|l| match (layout.port_pos(l.from), layout.port_pos(l.to)) {
-                    (Some(a), Some(b)) => wire_distance(&wire_points(a, b), pos) < 5.0,
+                    (Some(a), Some(b)) => wire_distance(&wire_points(a, b), pos) < 7.0,
                     _ => false,
                 })
         }

@@ -10,7 +10,7 @@ use crate::model::{
     Edit, MIN_DB, apps_readout, db_to_pct, delay_readout, delay_readout_tip, pct_to_db,
 };
 use crate::theme::{Tokens, body, label, num, radius};
-use crate::widgets::{chevron, fader, meter, name_widget, speaker};
+use crate::widgets::{chevron, fader, halo, hit as hit_target, meter, speaker};
 use eframe::egui::{
     self, Align2, CornerRadius, Id, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, WidgetInfo,
     accesskit::Role, pos2, text::LayoutJob, text::TextFormat, vec2,
@@ -232,7 +232,8 @@ pub fn show(ui: &mut Ui, card: Rect, t: &Tokens, st: &mut State, f: &Facts, edit
 
     // Chevron: full card or one-line strip.
     let hit = Rect::from_center_size(pos2(card.left() + 22.0, cy), vec2(28.0, 28.0));
-    let toggle = ui.interact(hit, Id::unique("summary_toggle"), Sense::click());
+    let toggle = hit_target(ui, hit, Id::unique("summary_toggle"));
+    halo(ui, &toggle, t);
     let name = if st.collapsed {
         "Expand device summary"
     } else {
@@ -329,8 +330,14 @@ pub fn show(ui: &mut Ui, card: Rect, t: &Tokens, st: &mut State, f: &Facts, edit
     );
     let mut pct = db_to_pct(dev.volume_db).clamp(0.0, 100.0);
     let before = pct;
-    let slider = fader(ui, slider_rect, &mut pct, t);
-    name_widget(ui, &slider, "Master volume");
+    let slider = fader(
+        ui,
+        slider_rect,
+        Id::unique("summary_fader"),
+        "Master volume",
+        &mut pct,
+        t,
+    );
     slider.on_hover_text("Master volume");
     if (pct - before).abs() > 1e-3 {
         edits.push(Edit::Volume(f.idx, pct_to_db(pct)));

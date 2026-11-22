@@ -6,7 +6,7 @@ use crate::sheet::{
 use crate::theme::{Tokens, tokens};
 use crate::widgets::name_button;
 use crate::worker::{MeasureState, SelfTestState};
-use eframe::egui::{self, Align2, Context, CornerRadius, Id, Rect, Sense, Stroke, Theme};
+use eframe::egui::{self, Align2, Context, CornerRadius, Id, Rect, Stroke, Theme};
 use sr_core::backend::{EngineStatus, TccStatus};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1453,9 +1453,15 @@ pub fn footer_button(
     label: &str,
     t: &Tokens,
 ) -> egui::Response {
-    let resp = ui.interact(rect, Id::unique(id), Sense::click());
+    let resp = crate::widgets::hit(ui, rect, Id::unique(id));
     name_button(&resp, label);
-    let fill = if resp.hovered() { t.hairline } else { t.raised };
+    let fill = if resp.is_pointer_button_down_on() {
+        t.hairline.lerp_to_gamma(t.muted, 0.3)
+    } else if resp.hovered() {
+        t.hairline
+    } else {
+        t.raised
+    };
     ui.painter().rect(
         rect,
         CornerRadius::same(crate::theme::radius::PILL),

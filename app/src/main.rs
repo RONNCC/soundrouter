@@ -121,6 +121,7 @@ fn main() -> eframe::Result {
         opts,
         Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
+            theme::apply_input(&cc.egui_ctx);
             deeplink::wake_on_link(&cc.egui_ctx);
             cc.egui_ctx.set_theme(args.theme);
             #[cfg(target_os = "macos")]

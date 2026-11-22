@@ -1,10 +1,12 @@
 //! Small painted controls: switch, meter, slider knob, icons.
 use crate::meter::FLOOR_DB;
 use crate::theme::Tokens;
+use crate::theme::radius;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Id, Painter, Pos2, Rect, Response, Sense, Slider,
-    Stroke, TextStyle, Ui, UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
+    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Painter, Pos2, Rect, Response,
+    Sense, Stroke, Ui, WidgetInfo, accesskit::Role, pos2, vec2,
 };
+use std::ops::RangeInclusive;
 
 /// Names a painted button so screen readers (and tests) can find it.
 pub fn name_button(resp: &Response, label: &str) {
@@ -17,17 +19,73 @@ pub fn name_widget(ui: &Ui, resp: &Response, label: &str) {
         .accesskit_node_builder(resp.id, |n| n.set_label(label));
 }
 
-pub fn switch(ui: &mut Ui, rect: Rect, id: Id, on: bool, t: &Tokens, label: &str) -> bool {
-    let resp = ui.interact(rect, id, Sense::click());
+/// Smallest side of anything the pointer must hit. macOS asks for 24 pt; 28 is what the sidebar
+/// and cards are laid out for, so a small glyph still takes a careless click.
+pub const MIN_HIT: f32 = 28.0;
+
+/// Press and hover feedback fades over this long: quick enough to feel instant, long enough to see.
+const PRESS_SECS: f32 = 0.08;
+
+/// The pointer target of a control drawn in `visual`: at least `MIN_HIT` each way, centred on it.
+pub fn hit_rect(visual: Rect) -> Rect {
+    Rect::from_center_size(visual.center(), visual.size().max(vec2(MIN_HIT, MIN_HIT)))
+}
+
+/// A clickable control drawn in `visual` (a glyph may be much smaller): its response covers
+/// `hit_rect(visual)` and the cursor is a pointing hand over it.
+pub fn hit(ui: &Ui, visual: Rect, id: Id) -> Response {
+    ui.interact(hit_rect(visual), id, Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Quiet backdrop behind a glyph button: faint on hover, firmer while the button is down.
+pub fn halo(ui: &Ui, resp: &Response, t: &Tokens) {
+    let over = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("over"), resp.hovered(), PRESS_SECS);
+    let down = ui.ctx().animate_bool_with_time(
+        resp.id.with("down"),
+        resp.is_pointer_button_down_on(),
+        PRESS_SECS,
+    );
+    let a = 0.12 * over + 0.14 * down;
+    if a > 0.0 {
+        ui.painter().rect_filled(
+            resp.rect.shrink(2.0),
+            CornerRadius::same(radius::INPUT),
+            t.muted.gamma_multiply(a),
+        );
+    }
+}
+
+/// Switch drawn in `rect`. A click anywhere in `reach` (the switch and its label, plus a margin)
+/// toggles it; the target is never smaller than `MIN_HIT`. Returns the new state.
+pub fn switch(
+    ui: &mut Ui,
+    rect: Rect,
+    reach: Rect,
+    id: Id,
+    on: bool,
+    t: &Tokens,
+    label: &str,
+) -> bool {
+    let resp = hit(ui, reach.union(rect), id);
     resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, on, label));
     let new = if resp.clicked() { !on } else { on };
     let k = ui.ctx().animate_bool_responsive(id, new);
+    let down = ui.ctx().animate_bool_with_time(
+        id.with("down"),
+        resp.is_pointer_button_down_on(),
+        PRESS_SECS,
+    );
     let p = ui.painter();
     let r = rect.height() / 2.0;
     p.rect_filled(
         rect,
         CornerRadius::same(r as u8),
-        t.switch_off.lerp_to_gamma(t.accent, k),
+        t.switch_off
+            .lerp_to_gamma(t.accent, k)
+            .lerp_to_gamma(Color32::BLACK, 0.18 * down),
     );
     let knob = r - 2.0;
     let x = egui::lerp((rect.left() + knob + 2.0)..=(rect.right() - knob - 2.0), k);
@@ -203,34 +261,132 @@ pub fn jack(p: &Painter, at: Pos2, plug: Plug, scale: f32, hot: bool, t: &Tokens
     }
 }
 
-/// White knob with a hairline edge, painted over egui's grey slider handle.
-/// `r` is the slider's response rect, `frac` the value in 0..=1.
-pub fn slider_knob(p: &Painter, r: Rect, frac: f32, t: &Tokens) {
-    let rad = r.height() / 2.5; // egui's handle radius
-    let c = pos2(
-        egui::lerp((r.left() + rad)..=(r.right() - rad), frac.clamp(0.0, 1.0)),
-        r.center().y,
+/// Radius of the visible knob (21 px across); the target around it is the whole strip.
+const KNOB_R: f32 = 10.5;
+
+/// Horizontal slider in `rect` (its value in `range`), one drag target `MIN_HIT` tall and as wide
+/// as `rect`. A press on the rail jumps the knob there; a press on the knob grabs it where it is.
+/// Double-click or Option-click gives `reset`; the arrow keys and screen readers step 1 %.
+#[allow(clippy::too_many_arguments)]
+pub fn slider(
+    ui: &mut Ui,
+    rect: Rect,
+    id: Id,
+    label: &str,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    reset: f32,
+    t: &Tokens,
+) -> Response {
+    use egui::accesskit::{Action, ActionData};
+    let (lo, hi) = (*range.start(), *range.end());
+    let strip = Rect::from_center_size(
+        rect.center(),
+        vec2(rect.width(), rect.height().max(MIN_HIT)),
     );
-    p.circle(c, rad + 1.0, Color32::WHITE, Stroke::new(1.0, t.hairline));
+    let resp = ui.interact(strip, id, Sense::click_and_drag());
+    let (x0, x1) = (strip.left() + KNOB_R, strip.right() - KNOB_R);
+    let x_of = |v: f32| egui::lerp(x0..=x1, ((v - lo) / (hi - lo)).clamp(0.0, 1.0));
+
+    let grab = id.with("grab");
+    if let (true, Some(p)) = (
+        resp.is_pointer_button_down_on(),
+        resp.interact_pointer_pos(),
+    ) {
+        let off = match ui.data(|d| d.get_temp::<f32>(grab)) {
+            Some(off) => off,
+            None => {
+                let off = x_of(*value) - p.x;
+                let off = if off.abs() <= KNOB_R { off } else { 0.0 };
+                ui.data_mut(|d| d.insert_temp(grab, off));
+                off
+            }
+        };
+        *value = lo + (hi - lo) * ((p.x + off - x0) / (x1 - x0)).clamp(0.0, 1.0);
+    } else {
+        ui.data_mut(|d| d.remove_temp::<f32>(grab));
+    }
+    if resp.double_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.alt)) {
+        *value = reset;
+    }
+
+    let mut steps = ui.input(|i| {
+        (i.num_accesskit_action_requests(id, Action::Increment) as f32)
+            - (i.num_accesskit_action_requests(id, Action::Decrement) as f32)
+    });
+    if resp.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
+        steps += ui.input(|i| {
+            (i.num_presses(egui::Key::ArrowRight) as f32)
+                - (i.num_presses(egui::Key::ArrowLeft) as f32)
+        });
+    }
+    if steps != 0.0 {
+        *value = (*value + steps * (hi - lo) / 100.0).clamp(lo, hi);
+    }
+    let set = ui.input(|i| {
+        i.accesskit_action_requests(id, Action::SetValue)
+            .filter_map(|r| match r.data {
+                Some(ActionData::NumericValue(v)) => Some(v as f32),
+                _ => None,
+            })
+            .last()
+    });
+    if let Some(v) = set {
+        *value = v.clamp(lo, hi);
+    }
+
+    resp.widget_info(|| WidgetInfo::slider(true, f64::from(*value), label));
+    ui.ctx().accesskit_node_builder(id, |b| {
+        b.set_min_numeric_value(f64::from(lo));
+        b.set_max_numeric_value(f64::from(hi));
+        b.add_action(Action::SetValue);
+        b.add_action(Action::Increment);
+        b.add_action(Action::Decrement);
+    });
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+    }
+
+    let p = ui.painter();
+    let c = pos2(x_of(*value), rect.center().y);
+    let rail = Rect::from_x_y_ranges(
+        (strip.left() + 2.0)..=(strip.right() - 2.0),
+        (c.y - 2.0)..=(c.y + 2.0),
+    );
+    p.rect_filled(rail, CornerRadius::same(2), t.switch_off);
+    let fill = Rect::from_x_y_ranges(rail.left()..=c.x.max(rail.left()), rail.y_range());
+    p.rect_filled(fill, CornerRadius::same(2), t.accent);
+    let grown = if resp.is_pointer_button_down_on() {
+        1.0
+    } else if resp.hovered() {
+        0.5
+    } else {
+        0.0
+    };
+    p.circle(
+        c,
+        KNOB_R + grown,
+        Color32::WHITE,
+        Stroke::new(1.0, t.muted.gamma_multiply(0.6)),
+    );
+    if resp.has_focus() {
+        p.circle_stroke(c, KNOB_R + 3.0, Stroke::new(2.0, t.focus));
+    }
+    resp
 }
 
-/// Volume slider (percent, 0..=100) filling `rect`, with the 14 px knob; the caller names it.
-pub fn fader(ui: &mut Ui, rect: Rect, pct: &mut f32, t: &Tokens) -> Response {
-    let resp = ui
-        .scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            // egui sizes a slider from the body text height and `interact_size`; shrink both so the
-            // knob painted over its handle can be the 14 px one.
-            let style = ui.style_mut();
-            style.spacing.interact_size.y = rect.height();
-            if let Some(body) = style.text_styles.get_mut(&TextStyle::Body) {
-                body.size = 8.0;
-            }
-            ui.spacing_mut().slider_width = rect.width() - 4.0;
-            ui.add(Slider::new(pct, 0.0..=100.0).show_value(false))
-        })
-        .inner;
-    slider_knob(ui.painter(), resp.rect, *pct / 100.0, t);
-    resp
+/// Volume slider in percent (0..=100, 100 is 0 dB), double-click gives 100.
+pub fn fader(ui: &mut Ui, rect: Rect, id: Id, label: &str, pct: &mut f32, t: &Tokens) -> Response {
+    slider(ui, rect, id, label, pct, 0.0..=100.0, 100.0, t)
 }
 
 /// The ⊕ / ⊖ mark, without any interaction.
@@ -269,9 +425,10 @@ pub fn plus_circle(
     minus: bool,
     label: &str,
 ) -> Response {
-    let rect = Rect::from_center_size(center, vec2(22.0, 22.0));
-    let resp = ui.interact(rect, id, Sense::click());
+    let visual = Rect::from_center_size(center, vec2(16.0, 16.0));
+    let resp = hit(ui, visual, id);
     name_button(&resp, label);
+    halo(ui, &resp, t);
     let c = if resp.hovered() { t.ink } else { t.muted };
     plus_glyph(ui.painter(), center, c, minus);
     resp
@@ -282,6 +439,19 @@ pub fn xmark(p: &Painter, center: Pos2, c: Color32) {
     let s = Stroke::new(1.4, c);
     p.line_segment([center + vec2(-4.0, -4.0), center + vec2(4.0, 4.0)], s);
     p.line_segment([center + vec2(-4.0, 4.0), center + vec2(4.0, -4.0)], s);
+}
+
+/// The remove button: a × (about 8 px) in a `MIN_HIT` target that reddens on hover.
+pub fn x_button(ui: &mut Ui, center: Pos2, id: Id, t: &Tokens, label: &str) -> Response {
+    let resp = hit(ui, Rect::from_center_size(center, vec2(8.0, 8.0)), id);
+    name_button(&resp, label);
+    halo(ui, &resp, t);
+    xmark(
+        ui.painter(),
+        center,
+        if resp.hovered() { t.bad_ink } else { t.muted },
+    );
+    resp
 }
 
 pub fn chevron(p: &Painter, center: Pos2, open: bool, color: Color32) {
@@ -303,8 +473,8 @@ pub fn speaker(
     t: &Tokens,
     label: &str,
 ) -> Response {
-    let rect = Rect::from_center_size(center, vec2(22.0, 22.0));
-    let resp = ui.interact(rect, id, Sense::click());
+    let resp = hit(ui, Rect::from_center_size(center, vec2(16.0, 16.0)), id);
+    halo(ui, &resp, t);
     resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, muted, label));
     let c = if muted {
         t.bad_ink
@@ -427,6 +597,20 @@ mod tests {
                 assert!(a.iter().all(|q| (q.distance(at) - 5.0).abs() < 1e-3));
             }
         }
+    }
+
+    #[test]
+    fn a_small_glyph_gets_a_28_point_target_and_a_big_one_keeps_its_size() {
+        let small = Rect::from_center_size(pos2(50.0, 40.0), vec2(8.0, 8.0));
+        let r = hit_rect(small);
+        assert_eq!(
+            (r.size(), r.center()),
+            (vec2(MIN_HIT, MIN_HIT), small.center())
+        );
+        let wide = Rect::from_center_size(pos2(50.0, 40.0), vec2(120.0, 12.0));
+        assert_eq!(hit_rect(wide).size(), vec2(120.0, MIN_HIT));
+        let big = Rect::from_center_size(pos2(50.0, 40.0), vec2(60.0, 40.0));
+        assert_eq!(hit_rect(big), big);
     }
 
     #[test]

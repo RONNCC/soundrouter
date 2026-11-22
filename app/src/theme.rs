@@ -276,6 +276,19 @@ pub fn soft_shadow(t: &Tokens) -> Shadow {
 /// "Reduce motion" changes it.
 const ANIMATION_SECS: f32 = 0.2;
 
+/// How far (px) the pointer may travel between press and release and still make a click, and how
+/// long (s) it may stay down. egui's 6 px and 0.8 s drop the click of a hand that drifts or hesitates.
+pub const CLICK_SLOP: f32 = 10.0;
+pub const CLICK_SECS: f64 = 1.2;
+
+/// Forgiving click detection, read by egui at the start of each frame.
+pub fn apply_input(ctx: &egui::Context) {
+    ctx.options_mut(|o| {
+        o.input_options.max_click_dist = CLICK_SLOP;
+        o.input_options.max_click_duration = CLICK_SECS;
+    });
+}
+
 /// Maps the tokens onto egui's style so stock widgets (menus, checkboxes, sliders, tooltips,
 /// scroll bars, text fields) match the painted ones. `reduce_motion` (the macOS setting) makes
 /// egui's animations instant: the switch knob jumps and sheets appear without a fade.
@@ -290,6 +303,7 @@ pub fn apply_style(s: &mut egui::Style, t: &Tokens, reduce_motion: bool) {
     ]
     .into();
     s.interaction.selectable_labels = false;
+    s.visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
     s.spacing.interact_size.y = 28.0;
     s.spacing.button_padding = vec2(12.0, 5.0);
     s.spacing.menu_margin = egui::Margin::same(6);

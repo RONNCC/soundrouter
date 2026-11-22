@@ -403,6 +403,7 @@ pub fn button_named(ui: &mut Ui, t: &Tokens, label: &str, name: &str, kind: Kind
     let galley = ui.painter().layout_no_wrap(label.to_string(), font, text);
     let size = vec2((galley.size().x + 28.0).max(72.0), BUTTON_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp.on_hover_cursor(eframe::egui::CursorIcon::PointingHand);
     name_button(&resp, name);
     let base = match kind {
         Kind::Primary => t.accent,

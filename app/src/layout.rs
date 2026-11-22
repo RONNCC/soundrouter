@@ -8,9 +8,9 @@ pub const ICON_BODY: f32 = 48.0;
 pub const ROW_H: f32 = 24.0;
 /// Strip under the channel rows that holds the options chevron.
 pub const FOOT_H: f32 = 16.0;
-pub const OPTIONS_H: f32 = 58.0;
+pub const OPTIONS_H: f32 = 60.0;
 /// Extra height of an expanded app card: the "Mute in original output" row.
-pub const MUTE_H: f32 = 22.0;
+pub const MUTE_H: f32 = 28.0;
 pub const OUT_PAD: f32 = 10.0;
 pub const GAP: f32 = 16.0;
 /// Space above the first card for the column headers.

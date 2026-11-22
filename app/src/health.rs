@@ -271,11 +271,9 @@ pub fn banner(ui: &mut egui::Ui, t: &Tokens, issue: &Issue, more: usize) -> Clic
         vec2(close_w, close_w),
     );
     at -= close_w;
-    let resp = ui.interact(close, Id::unique("health_close"), Sense::click());
+    let resp = crate::widgets::hit(ui, close, Id::unique("health_close"));
     name_button(&resp, "Dismiss notice");
-    if resp.hovered() {
-        ui.painter().circle_filled(close.center(), 11.0, t.hairline);
-    }
+    crate::widgets::halo(ui, &resp, t);
     xmark(
         ui.painter(),
         close.center(),

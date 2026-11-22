@@ -104,13 +104,27 @@ Motion only answers an action: a short plug-in pop when a wire connects, eased s
 
 With macOS "Reduce motion" on, egui's animation time is 0 (`theme::apply_style`): the switch knob jumps and sheets appear without a fade. The setting is read every frame through `Os::reduce_motion`; tests never read the machine's.
 
+## Hit targets and pointer feedback
+
+Every control is reached by a pointer that is rarely exact, so the target is never the glyph. The rules, kept in `app/src/widgets.rs` (`hit`, `hit_rect`, `halo`, `slider`, `switch`, `x_button`) and checked by `app/src/hit_tests.rs`:
+
+- **28 pt minimum.** Every button, switch, slider, port and menu row has an interaction rect of at least 28 x 28 (`MIN_HIT`; the macOS minimum is 24 and `hit_tests` fails below it), even when the glyph is 8 px: `hit(ui, visual, id)` allocates the larger rect centred on what is drawn. The one exception is the graph's ports, 28 wide and 24 tall, because channel rows sit 24 px apart.
+- **4 px between neighbours.** Targets never overlap: in a sidebar row the X's target ends 4 px before the switch's, the mute button 4 px before the slider's. A click in the gap goes to the nearer control, never to both.
+- **Bigger than the visible switch.** The sidebar switch reaches 6 px past its track on both sides; a card's switch also takes the "On"/"Off" word beside it.
+- **One strip per slider.** A slider is a single drag target 28 px tall and as wide as its rail plus the knob; a click on the rail jumps the knob there, a press on the knob grabs it where it is (no jump), a drag keeps following the pointer above and below the strip. The knob is 21 px (22 pressed). Double-click or Option-click gives 100 % (0 dB); the arrow keys and VoiceOver step 1 %.
+- **Rows select on press.** A row answers when the button goes down, not up. Controls on top of it (the name too) take their own presses; the name passes the press on to the row, and a double-click on it still renames. A switched-off device is greyed by colour only: its row, switch, mute and slider stay fully live.
+- **Forgiving clicks.** egui counts a click only if the pointer moved at most 6 px and the press lasted under 0.8 s. The app sets 10 px and 1.2 s (`theme::apply_input`, `CLICK_SLOP`, `CLICK_SECS`), so a hand that drifts or hesitates still clicks.
+- **The pointer says what it can do.** A pointing hand over everything clickable (stock buttons through `Visuals::interact_cursor`, painted ones through `hit`), a horizontal resize cursor over sliders. Glyph buttons show a quiet halo on hover and a firmer one while pressed, filled buttons darken, switches darken, the slider knob grows; all fade over 80 ms.
+- **The first click counts.** A click on an inactive window both focuses it and acts: winit's `accepts_first_mouse` is on by default on macOS and eframe leaves it alone, so there is nothing to set.
+- **Frames follow input.** egui repaints on every input event, and the worker never holds the UI's lock while it talks to the engine (`worker::tests::meters_only_for_enabled_devices_and_lock_never_held_over_backend`), so a click is handled in the frame after it arrives.
+
 ## Chrome and copy
 
 ### Sidebar
 
 - **No vibrancy.** The sidebar is an opaque `panel`, in both themes. The macOS blur showed through a 55 % panel and moved the contrast of every row with the wallpaper behind the window, while the main pane next to it is flat `canvas`; a translucent strip beside a flat one looked like two apps. The window is still created transparent with the blur view under it (`main.rs`), but nothing translucent is painted over it, so it is invisible. Revisit only if the main pane becomes translucent too.
 - **Title and traffic lights.** The window has no title bar and its content runs under the traffic lights, so the sidebar header is a 46 px band: the lights sit at the left, "Devices" starts at x = 84, past them, and a hairline closes the band. Nothing else is drawn in the band.
-- **Rows.** The icon tile takes the device's cable colour (`cable_color(index)`, so a device keeps its colour until a device above it is removed) with a white loop glyph. The selected row is the `selected` fill plus a 3 px bar in the same colour on the straight part of its left edge. The name is the label role, "N channels" is a muted caption, the volume slider has a 14 px knob and the percentage is in the `Num` face. State dot, switch and remove button share the right edge.
+- **Rows.** The icon tile takes the device's cable colour (`cable_color(index)`, so a device keeps its colour until a device above it is removed) with a white loop glyph. The selected row is the `selected` fill plus a 3 px bar in the same colour on the straight part of its left edge. The name is the label role, "N channels" is a muted caption, the volume slider has a 21 px knob in a 28 px strip, rows are 84 px and the percentage is in the `Num` face. State dot, switch and remove button share the right edge.
 - **No loop glyph next to "Devices".** Tried and dropped, by the mirror test: each row already carries the loop mark in its own colour, and a fourth copy in the header added nothing the tiles do not say.
 
 ### Footer

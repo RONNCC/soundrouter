@@ -17,7 +17,7 @@ use crate::theme::{
 };
 use crate::tray::{self, Action, Event, Tray, WinState};
 use crate::widgets::{
-    fader, loops, name_button, name_widget, pencil, plus_glyph, speaker, switch, xmark,
+    fader, hit, loops, name_button, name_widget, pencil, plus_glyph, speaker, switch, x_button,
 };
 use crate::worker::Worker;
 use eframe::egui::{
@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SIDEBAR_W: f32 = 250.0;
-const ROW_H: f32 = 78.0;
+const ROW_H: f32 = 84.0;
 /// Sidebar footer and window footer share a height, so their hairlines are one line.
 const FOOTER_H: f32 = 44.0;
 pub const PERMISSION_BANNER: &str =
@@ -247,7 +247,12 @@ fn delay_menu(
             "{n} frames per buffer. Added delay = 2 buffers × {n} frames ÷ 48,000 frames per second = {:.1} ms, at 48 kHz.",
             delay_ms(n)
         );
-        if resp.on_hover_text(tip).clicked() && !on {
+        if resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(tip)
+            .clicked()
+            && !on
+        {
             edits.push(Edit::BufferFrames(n));
         }
     }
@@ -777,17 +782,22 @@ impl App {
                     Stroke::new(1.0, t.hairline.gamma_multiply(0.6)),
                 );
                 let cy = foot.center().y;
-                let new = ui.interact(
+                let new = hit(
+                    ui,
                     Rect::from_min_size(pos2(foot.left() + 10.0, cy - 14.0), vec2(132.0, 28.0)),
                     Id::unique("new_dev"),
-                    Sense::click(),
                 );
                 name_button(&new, NEW_DEVICE);
                 if new.hovered() {
+                    let down = new.is_pointer_button_down_on();
                     ui.painter().rect_filled(
                         new.rect,
                         CornerRadius::same(radius::PILL),
-                        t.selected,
+                        if down {
+                            t.selected.lerp_to_gamma(Color32::BLACK, 0.12)
+                        } else {
+                            t.selected
+                        },
                     );
                 }
                 plus_glyph(
@@ -813,7 +823,11 @@ impl App {
         let dev = &self.cfg.devices[i];
         let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
         name_button(&resp, &format!("Select {}", dev.name));
-        if resp.clicked() {
+        // Selects on press, so the row answers before the button comes up. A control on top of the
+        // row takes its own presses and leaves the row's flag unset.
+        if resp.clicked()
+            || (resp.is_pointer_button_down_on() && ui.input(|k| k.pointer.primary_pressed()))
+        {
             self.selected = i;
         }
         if i == self.selected && std::mem::take(&mut self.reveal) {
@@ -859,7 +873,7 @@ impl App {
         let name_pos = pos2(icon.right() + 10.0, inner.top() + 18.0);
         let name_rect = Rect::from_min_size(
             pos2(name_pos.x, name_pos.y - 10.0),
-            vec2(inner.right() - 72.0 - name_pos.x, 20.0),
+            vec2(inner.right() - 80.0 - name_pos.x, 20.0),
         );
         let renaming_here = matches!(&self.renaming, Some((r, _)) if *r == i);
         if renaming_here {
@@ -896,12 +910,18 @@ impl App {
                 g,
                 t.ink,
             );
-            let hit = ui.interact(
+            let hit = hit(
+                ui,
                 Rect::from_min_size(name_rect.min, vec2(shown.max(40.0), 20.0)),
                 Id::unique(("name", i)),
-                Sense::click(),
             );
             name_button(&hit, &format!("Rename {}", dev.name));
+            // The name sits on top of the row, so it passes the press on.
+            if hit.clicked()
+                || (hit.is_pointer_button_down_on() && ui.input(|k| k.pointer.primary_pressed()))
+            {
+                self.selected = i;
+            }
             if hit.double_clicked() {
                 self.renaming = Some((i, dev.name.clone()));
             }
@@ -962,7 +982,7 @@ impl App {
             .find_map(|(id, s)| (id == dev.id).then_some(s))
             .unwrap_or_default();
         if let Some((text, color)) = state_look(&state, t) {
-            let c = pos2(inner.right() - 16.0, inner.top() + 36.0);
+            let c = pos2(inner.right() - 16.0, inner.top() + 38.0);
             if state != DeviceState::Running {
                 ui.painter().circle_filled(c, 4.0, color);
             }
@@ -976,26 +996,24 @@ impl App {
             dot.on_hover_text(text);
         }
         let x_at = pos2(inner.right() - 16.0, inner.top() + 18.0);
-        let x = ui.interact(
-            Rect::from_center_size(x_at, vec2(18.0, 18.0)),
-            Id::unique(("dev_x", i)),
-            Sense::click(),
-        );
-        name_button(&x, &format!("Remove {}", dev.name));
-        xmark(
-            ui.painter(),
+        let x = x_button(
+            ui,
             x_at,
-            if x.hovered() { t.bad_ink } else { t.muted },
+            Id::unique(("dev_x", i)),
+            t,
+            &format!("Remove {}", dev.name),
         );
         // A double-click's second click would remove the row that moved up under the pointer.
         if x.clicked() && !x.double_clicked() {
             edits.push(Edit::RemoveDevice(i));
         }
         x.on_hover_text("Remove device");
-        let sw = Rect::from_center_size(pos2(x_at.x - 9.0 - 10.0 - 16.0, x_at.y), vec2(32.0, 18.0));
+        // 4 px between the X's target and the switch's.
+        let sw = Rect::from_center_size(pos2(x_at.x - 40.0, x_at.y), vec2(32.0, 18.0));
         let on = switch(
             ui,
             sw,
+            sw.expand2(vec2(6.0, 0.0)),
             Id::unique(("dev_on", i)),
             dev.enabled,
             t,
@@ -1005,7 +1023,7 @@ impl App {
             edits.push(Edit::Enable(i, on));
         }
         // Volume row: mute, slider, percent.
-        let vy = inner.top() + 57.0;
+        let vy = inner.top() + 60.0;
         let mute = speaker(
             ui,
             pos2(inner.left() + 22.0, vy),
@@ -1020,11 +1038,17 @@ impl App {
         let mut pct = db_to_pct(dev.volume_db).clamp(0.0, 100.0);
         let before = pct;
         let sl = Rect::from_x_y_ranges(
-            (inner.left() + 38.0)..=(inner.right() - 52.0),
-            (vy - 7.5)..=(vy + 7.5),
+            (inner.left() + 40.0)..=(inner.right() - 48.0),
+            (vy - 14.0)..=(vy + 14.0),
         );
-        let slider = fader(ui, sl, &mut pct, t);
-        name_widget(ui, &slider, &format!("{} volume", dev.name));
+        fader(
+            ui,
+            sl,
+            Id::unique(("vol", i)),
+            &format!("{} volume", dev.name),
+            &mut pct,
+            t,
+        );
         if (pct - before).abs() > 1e-3 {
             edits.push(Edit::Volume(i, pct_to_db(pct)));
         }
@@ -1073,7 +1097,7 @@ impl App {
                 if real_driver {
                     // Uninstall is destructive and rare: it lives behind a quiet "…" menu.
                     let more = Rect::from_min_size(pos2(right - 28.0, by), vec2(28.0, 26.0));
-                    let resp = ui.interact(more, Id::unique("more"), Sense::click());
+                    let resp = hit(ui, more, Id::unique("more"));
                     name_button(&resp, "More actions");
                     let tint = if resp.hovered() { t.ink } else { t.muted };
                     if resp.hovered() {
@@ -1175,17 +1199,14 @@ impl App {
                     .widget_info(|| {
                         WidgetInfo::labeled(Role::Label, true, format!("{} {}", u.verb, u.name))
                     });
-                    let hit = ui.interact(
-                        Rect::from_center_size(
-                            pos2(x + tw + 6.0 + 18.0, r.center().y),
-                            vec2(36.0, 22.0),
-                        ),
-                        Id::unique("undo"),
-                        Sense::click(),
+                    let undo = Rect::from_center_size(
+                        pos2(x + tw + 6.0 + 18.0, r.center().y),
+                        vec2(36.0, 22.0),
                     );
+                    let hit = hit(ui, undo, Id::unique("undo"));
                     name_button(&hit, "Undo");
                     ui.painter().text(
-                        hit.rect.left_center(),
+                        undo.left_center(),
                         Align2::LEFT_CENTER,
                         "Undo",
                         font,
@@ -1439,6 +1460,7 @@ impl eframe::App for App {
         let t = tokens(ctx.theme() == Theme::Dark);
         let reduce_motion = (self.os.reduce_motion)();
         ctx.global_style_mut(|s| crate::theme::apply_style(s, &t, reduce_motion));
+        crate::theme::apply_input(&ctx);
         // Frames come from the worker (meters changed) and from animations; nothing polls here.
         self.now = ctx.input(|i| i.time);
         if self.undo.as_ref().is_some_and(|u| self.now > u.until) {
@@ -1506,6 +1528,10 @@ impl eframe::App for App {
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "hit_tests.rs"]
+mod hit_tests;
 
 #[cfg(test)]
 #[path = "presets_tests.rs"]
