@@ -2,7 +2,7 @@
 
 SoundRouter patches audio between apps, microphones and virtual devices. The people using it record podcasts, stream, play music or sit on calls, and the one thing the window has to make obvious is who hears what. The visual language comes from the studio: patch bays, console strips, patch cables ending in jacks, LED level ladders, faders, tape.
 
-Status: the tokens, fonts and egui style below are in place, and every screen reads them. The sidebar, footer, sheets, welcome, copy, the graph (source cables, jacks, LED ladders, empty states), the health banner and the permissions sheet are done.
+Status: the tokens, fonts and egui style below are in place, and every screen reads them. The sidebar, footer, sheets, welcome, copy, the device summary card, the graph (source cables, jacks, LED ladders, empty states), the health banner and the permissions sheet are done.
 
 ## The one memorable thing
 
@@ -116,6 +116,16 @@ With macOS "Reduce motion" on, egui's animation time is 0 (`theme::apply_style`)
 ### Footer
 
 The sidebar footer and the window footer are both 44 px, so their hairlines are one line. Left to right in the sidebar: "New device", the one primary action, in `accent_ink` with a ⊕ and a `selected` pill on hover. In the window footer: the status text (or the "Removed … Undo" toast) from the left content edge, then "Audio delay: Balanced" (a chip that opens the delay menu), "Test setup" and a quiet "…" button. "Uninstall…" is inside that menu, under "Permissions" (the sheet below): it is destructive and used once, so it must not sit next to the buttons people press.
+
+### Device summary card
+
+One full-width card between the device title and the graph (`app/src/summary.rs`; `raised` with a hairline, radius 14, 24 px from each pane edge like the graph's cards). It is the layer that ties the sidebar row to the graph: the same device, read live, and the one place its state and master level sit together. It reads only the config, `EngineStatus` and the meters, and emits the sidebar's own `Edit::Volume` and `Edit::Mute`, so the card and the row never disagree.
+
+- **Row 1** (the whole card when collapsed): the chevron ("Collapse device summary" / "Expand device summary"; the choice lasts for the session and is not saved), the status chip, the amber dropout dot while the device's counter grows ("N dropouts since start", same logic as the sidebar), the output ladders, the mute button ("Mute device") and the master fader ("Master volume") with its dB readout in the `Num` face.
+- **Status chip.** A pill with a dot and the state in words: Running (`ok`), Starting and Waiting for permission (`warn`), Error (`bad`), and the quiet Not connected and Off (a hollow dot on `canvas`). Off wins over whatever the engine last said. The tooltip explains it, and for Error carries the failure text, which also fills row 2 in `bad_ink` with an ellipsis and the same tooltip.
+- **Output level.** One stereo pair of the same 20-segment ladders as the graph (same -60..0 dBFS scale, same peak hold, 6 px high) per channel pair, at most four, then "+N" with a tooltip. Each pair takes 44 to 200 px; when the row is narrow the fader gives way first (down to 72 px), then pairs drop out. There is no clipping dot: the mixer counts clipped blocks (`Meters::clipped_blocks`), but neither `MeterReading` nor `EngineStatus` carries the count to the window.
+- **Row 2:** "Delay 5.3 ms" with a dimmer "Apps 29 ms" (the sidebar's readout and tooltip), or "No delay reading yet" until audio runs, and "N sources, M outputs, K monitors" right-aligned (M counts output channels, as the Output channels column does). "Test setup" and "Audio delay" stay in the footer; the card only shows what they measure.
+- **Layout.** Full card 76 px, strip 40 px; at the 1000 px minimum window the card is 702 px wide and nothing clips. Names and long text (an engine error) end in an ellipsis with the full text in a tooltip.
 
 ### Health banner and dropout dot
 

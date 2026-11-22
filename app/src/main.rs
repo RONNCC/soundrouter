@@ -16,6 +16,7 @@ mod presets;
 mod setup;
 mod sheet;
 mod store;
+mod summary;
 mod theme;
 mod tray;
 mod widgets;

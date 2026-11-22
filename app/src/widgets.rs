@@ -2,8 +2,8 @@
 use crate::meter::FLOOR_DB;
 use crate::theme::Tokens;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Id, Painter, Pos2, Rect, Response, Sense, Stroke,
-    Ui, WidgetInfo, accesskit::Role, pos2, vec2,
+    self, Align2, Color32, CornerRadius, FontId, Id, Painter, Pos2, Rect, Response, Sense, Slider,
+    Stroke, TextStyle, Ui, UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 
 /// Names a painted button so screen readers (and tests) can find it.
@@ -212,6 +212,25 @@ pub fn slider_knob(p: &Painter, r: Rect, frac: f32, t: &Tokens) {
         r.center().y,
     );
     p.circle(c, rad + 1.0, Color32::WHITE, Stroke::new(1.0, t.hairline));
+}
+
+/// Volume slider (percent, 0..=100) filling `rect`, with the 14 px knob; the caller names it.
+pub fn fader(ui: &mut Ui, rect: Rect, pct: &mut f32, t: &Tokens) -> Response {
+    let resp = ui
+        .scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            // egui sizes a slider from the body text height and `interact_size`; shrink both so the
+            // knob painted over its handle can be the 14 px one.
+            let style = ui.style_mut();
+            style.spacing.interact_size.y = rect.height();
+            if let Some(body) = style.text_styles.get_mut(&TextStyle::Body) {
+                body.size = 8.0;
+            }
+            ui.spacing_mut().slider_width = rect.width() - 4.0;
+            ui.add(Slider::new(pct, 0.0..=100.0).show_value(false))
+        })
+        .inner;
+    slider_knob(ui.painter(), resp.rect, *pct / 100.0, t);
+    resp
 }
 
 /// The ⊕ / ⊖ mark, without any interaction.

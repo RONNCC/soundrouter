@@ -11,17 +11,18 @@ use crate::model::{
 use crate::presets::{self, Presets};
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, OPEN_SETTINGS, Setup};
 use crate::store;
+use crate::summary;
 use crate::theme::{
     Tokens, body, cable_color, caption, device_title, label, num, radius, section, strong, tokens,
 };
 use crate::tray::{self, Action, Event, Tray, WinState};
 use crate::widgets::{
-    loops, name_button, name_widget, pencil, plus_glyph, slider_knob, speaker, switch, xmark,
+    fader, loops, name_button, name_widget, pencil, plus_glyph, speaker, switch, xmark,
 };
 use crate::worker::Worker;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, Id, Margin, Rect, Sense, Slider, Stroke, TextEdit,
-    TextStyle, Theme, UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
+    self, Align2, Color32, CornerRadius, Id, Margin, Rect, Sense, Stroke, TextEdit, Theme,
+    UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
 use sr_core::config::{BUFFER_FRAMES, Config, MAX_NAME_CHARS, SourceKind};
@@ -87,6 +88,8 @@ pub struct App {
     /// Health banners the user closed, and when each device's dropout counter last grew.
     dismissed: health::Dismissed,
     dropouts: health::Dropouts,
+    /// The device summary card above the graph: collapsed or not, and its meters' peak holds.
+    summary: summary::State,
     os: Os,
 }
 
@@ -318,6 +321,7 @@ impl App {
             now: 0.0,
             dismissed: health::Dismissed::default(),
             dropouts: health::Dropouts::default(),
+            summary: summary::State::default(),
             os: Os::system(),
         }
     }
@@ -1018,19 +1022,8 @@ impl App {
             (inner.left() + 38.0)..=(inner.right() - 52.0),
             (vy - 7.5)..=(vy + 7.5),
         );
-        let slider = ui.scope_builder(UiBuilder::new().max_rect(sl), |ui| {
-            // egui sizes a slider from the body text height and `interact_size`; shrink both so the
-            // knob painted over its handle can be the sidebar's 14 px one.
-            let style = ui.style_mut();
-            style.spacing.interact_size.y = sl.height();
-            if let Some(body) = style.text_styles.get_mut(&TextStyle::Body) {
-                body.size = 8.0;
-            }
-            ui.spacing_mut().slider_width = sl.width() - 4.0;
-            ui.add(Slider::new(&mut pct, 0.0..=100.0).show_value(false))
-        });
-        name_widget(ui, &slider.inner, &format!("{} volume", dev.name));
-        slider_knob(ui.painter(), slider.inner.rect, pct / 100.0, t);
+        let slider = fader(ui, sl, &mut pct, t);
+        name_widget(ui, &slider, &format!("{} volume", dev.name));
         if (pct - before).abs() > 1e-3 {
             edits.push(Edit::Volume(i, pct_to_db(pct)));
         }
@@ -1352,7 +1345,31 @@ impl App {
                 let reading = snap.meters.get(&dev.id).cloned();
                 self.icon_tex.sync(ui.ctx(), &snap.icons);
                 drop(snap);
-                let area = Rect::from_min_max(pos2(full.left(), full.top() + 44.0), full.max);
+                let live = self.engine_status();
+                let state = live
+                    .per_device
+                    .iter()
+                    .find_map(|(id, s)| (*id == dev.id).then(|| s.clone()))
+                    .unwrap_or_default();
+                let card = summary::rect(full, self.summary.collapsed);
+                summary::show(
+                    ui,
+                    card,
+                    t,
+                    &mut self.summary,
+                    &summary::Facts {
+                        idx: self.selected,
+                        dev,
+                        state: &state,
+                        delay_ms: device_delay_ms(&live, &dev.id),
+                        apps_ms: device_tap_ms(&live, &dev.id),
+                        reading: reading.as_ref(),
+                        dropouts: self.dropouts.growing(&dev.id, self.now),
+                    },
+                    edits,
+                );
+                let area =
+                    Rect::from_min_max(pos2(full.left(), summary::graph_top(card)), full.max);
                 ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink(false)
@@ -1485,3 +1502,7 @@ mod preset_tests;
 #[cfg(test)]
 #[path = "health_tests.rs"]
 mod health_tests;
+
+#[cfg(test)]
+#[path = "summary_tests.rs"]
+mod summary_tests;
