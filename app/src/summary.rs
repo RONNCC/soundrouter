@@ -12,7 +12,7 @@ use crate::model::{
 use crate::theme::{Tokens, body, label, num, radius};
 use crate::widgets::{chevron, fader, meter, name_widget, speaker};
 use eframe::egui::{
-    self, Align2, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, Ui, WidgetInfo,
+    self, Align2, CornerRadius, Id, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, WidgetInfo,
     accesskit::Role, pos2, text::LayoutJob, text::TextFormat, vec2,
 };
 use sr_core::backend::{DeviceState, MeterReading};
@@ -62,6 +62,8 @@ pub struct Facts<'a> {
     pub reading: Option<&'a MeterReading>,
     /// Dropout count while it grew within the last few seconds.
     pub dropouts: Option<u64>,
+    /// The synthetic engine is in use (the chip says so, whatever it reports).
+    pub demo: bool,
 }
 
 /// Where the card sits in the main pane `full`.
@@ -84,6 +86,8 @@ pub enum Tone {
     Warn,
     Bad,
     Quiet,
+    /// Demo mode: neutral, not a state of real audio.
+    Demo,
 }
 
 /// The status chip: the words always say it, the colour only agrees.
@@ -94,13 +98,16 @@ pub struct Chip {
     pub tip: String,
 }
 
-pub fn chip(enabled: bool, state: &DeviceState) -> Chip {
+pub const DEMO_TIP: &str = "Demo mode: audio is synthetic. Nothing here touches your real audio.";
+
+pub fn chip(enabled: bool, state: &DeviceState, demo: bool) -> Chip {
     let (text, tone, tip) = match (enabled, state) {
         (false, _) => (
             "Off",
             Tone::Quiet,
             "Switched off in the sidebar.".to_owned(),
         ),
+        (true, _) if demo => ("Demo", Tone::Demo, DEMO_TIP.to_owned()),
         (true, DeviceState::Running) => ("Running", Tone::Ok, "Audio is being routed.".to_owned()),
         (true, DeviceState::Starting) => ("Starting", Tone::Warn, "Starting up.".to_owned()),
         (true, DeviceState::WaitingForPermission) => (
@@ -116,6 +123,32 @@ pub fn chip(enabled: bool, state: &DeviceState) -> Chip {
         ),
     };
     Chip { text, tone, tip }
+}
+
+/// The small "DEMO" pill beside the window title, so synthetic audio is never taken for real.
+pub fn demo_pill(ui: &mut Ui, t: &Tokens, left_center: Pos2) {
+    let (signal, ink) = tone_colors(Tone::Demo, t);
+    let p = ui.painter();
+    let g = p.layout_no_wrap("DEMO".to_owned(), label(), ink);
+    let pill = Rect::from_min_size(
+        pos2(left_center.x, left_center.y - 10.0),
+        vec2(g.size().x + 16.0, 20.0),
+    );
+    p.rect(
+        pill,
+        CornerRadius::same(radius::PILL),
+        signal.gamma_multiply(0.14),
+        Stroke::new(1.0, signal.gamma_multiply(0.4)),
+        StrokeKind::Inside,
+    );
+    p.galley(
+        pos2(pill.left() + 8.0, pill.center().y - g.size().y / 2.0),
+        g,
+        ink,
+    );
+    let hit = ui.interact(pill, Id::new("demo_pill"), Sense::hover());
+    hit.widget_info(|| WidgetInfo::labeled(Role::Label, true, "Demo mode"));
+    hit.on_hover_text(DEMO_TIP);
 }
 
 /// How many channel pairs the meter shows in `room` px, and how many are left out ("+N").
@@ -172,6 +205,7 @@ fn tone_colors(tone: Tone, t: &Tokens) -> (egui::Color32, egui::Color32) {
         Tone::Warn => (t.warn, t.warn_ink),
         Tone::Bad => (t.bad, t.bad_ink),
         Tone::Quiet => (t.muted, t.muted),
+        Tone::Demo => (t.channels[7], t.ink), // violet: no state colour, so never read as one
     }
 }
 
@@ -225,7 +259,7 @@ pub fn show(ui: &mut Ui, card: Rect, t: &Tokens, st: &mut State, f: &Facts, edit
     toggle.on_hover_text(name);
 
     // Status chip.
-    let chip = chip(dev.enabled, f.state);
+    let chip = chip(dev.enabled, f.state, f.demo);
     let (signal, ink) = tone_colors(chip.tone, t);
     let g = p.layout_no_wrap(chip.text.to_owned(), label(), ink);
     let pill = Rect::from_min_size(
@@ -447,7 +481,7 @@ mod tests {
 
     #[test]
     fn chip_says_the_state_in_words() {
-        let on = |s: &DeviceState| chip(true, s);
+        let on = |s: &DeviceState| chip(true, s, false);
         assert_eq!(
             (
                 on(&DeviceState::Running).text,
@@ -472,6 +506,24 @@ mod tests {
     }
 
     #[test]
+    fn demo_chip_says_demo_whatever_the_engine_reports() {
+        for s in [
+            DeviceState::Idle,
+            DeviceState::Running,
+            DeviceState::Starting,
+            DeviceState::Failed("x".into()),
+        ] {
+            let c = chip(true, &s, true);
+            assert_eq!((c.text, c.tone), ("Demo", Tone::Demo));
+            assert_eq!(c.tip, DEMO_TIP);
+        }
+        // a device that is switched off is still off
+        assert_eq!(chip(false, &DeviceState::Idle, true).text, "Off");
+        // outside demo mode Idle keeps its words
+        assert_eq!(chip(true, &DeviceState::Idle, false).text, "Not connected");
+    }
+
+    #[test]
     fn a_device_that_is_off_is_off_whatever_the_engine_last_said() {
         for s in [
             DeviceState::Idle,
@@ -479,7 +531,7 @@ mod tests {
             DeviceState::Starting,
             DeviceState::Failed("x".into()),
         ] {
-            let c = chip(false, &s);
+            let c = chip(false, &s, false);
             assert_eq!((c.text, c.tone), ("Off", Tone::Quiet));
         }
     }

@@ -62,6 +62,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Packaging: with `SIGN_ID` the driver, `sr-cli`, app and dmg get the hardened runtime and a secure timestamp; the version comes from `[workspace.package]` in `Cargo.toml` and is stamped into both `Info.plist` files; the driver pkg removes an older driver before installing; `notarize.sh` checks signatures first and reports Apple's log on rejection; release workflow checks the tag, attaches checksums and labels unsigned builds. See `docs/RELEASING.md`.
 - New virtual devices, and the first-run "Loopback Audio" device, start with a Pass-Thru source wired 1→1, 2→2 (Loopback-style). Existing configs are not touched.
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
+- App: **Demo mode is unmistakable.** The summary chip reads "Demo" (violet dot, tooltip "Demo mode: audio is synthetic. Nothing here touches your real audio.") instead of "Not connected" while the synthetic meters move, and a small "DEMO" pill (accessible name "Demo mode") sits beside the device title. The footer line stays. A device that is switched off still reads "Off".
 
 ### Fixed
 - Engine: a process listing that began before a coreaudiod restart (`forget_processes`) no longer writes its pid/bundle cache back; the cache has a generation counter and a listing merges only its new entries, so reused process object ids cannot tap the wrong app.

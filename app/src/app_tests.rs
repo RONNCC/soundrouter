@@ -588,6 +588,24 @@ fn demo_mode_says_so_and_nothing_else_by_default() {
     assert!(h.query_by_label_contains("Demo mode").is_none());
 }
 
+#[test]
+fn demo_mode_marks_the_title_and_the_chip() {
+    let h = window(
+        demo_config(),
+        Box::new(FakeBackend::frozen(1.5)),
+        None,
+        Theme::Light,
+        true,
+    );
+    h.get_by_label("Demo mode"); // the DEMO pill beside the title
+    h.get_by_label("Device state: Demo");
+    assert!(h.query_by_label("Device state: Not connected").is_none());
+    let h = open(demo_config());
+    assert!(h.query_by_label("Demo mode").is_none());
+    assert!(h.query_by_label("Device state: Demo").is_none());
+    h.get_by_label("Device state: Not connected");
+}
+
 /// Fake backend with many apps and output devices, to overflow the Sources and Monitors popups.
 struct Crowded(FakeBackend);
 
@@ -886,15 +904,17 @@ mod snapshots {
         before: impl FnOnce(&mut Harness<'static, App>),
         results: &mut egui_kittest::SnapshotResults,
     ) {
-        shot_with(name, theme, cfg, toast, false, before, results);
+        shot_with(name, theme, cfg, toast, false, false, before, results);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn shot_with(
         name: &str,
         theme: Theme,
         cfg: Config,
         toast: Option<&str>,
         low_power_mode: bool,
+        demo: bool,
         before: impl FnOnce(&mut Harness<'static, App>),
         results: &mut egui_kittest::SnapshotResults,
     ) {
@@ -914,7 +934,7 @@ mod snapshots {
                 backend.status.low_power_mode = low_power_mode;
                 let backend = Box::new(backend);
                 let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
-                let mut app = App::new(cfg, None, w, toast.map(str::to_string), false, false);
+                let mut app = App::new(cfg, None, w, toast.map(str::to_string), false, demo);
                 app.setup.skip_intro(); // the real marker may not exist on this machine
                 app
             });
@@ -937,6 +957,23 @@ mod snapshots {
     #[test]
     fn main_view() {
         both("main", demo_config, None, |_| {});
+    }
+
+    #[test]
+    fn demo_main_view() {
+        let mut results = egui_kittest::SnapshotResults::new();
+        for theme in [Theme::Dark, Theme::Light] {
+            shot_with(
+                "demo_main",
+                theme,
+                demo_config(),
+                None,
+                false,
+                true,
+                |_| {},
+                &mut results,
+            );
+        }
     }
 
     #[test]
@@ -1108,6 +1145,7 @@ mod snapshots {
                 cfg,
                 None,
                 true,
+                false,
                 |h| click(h, &delay_label(128)),
                 &mut results,
             );

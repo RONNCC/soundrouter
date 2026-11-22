@@ -1334,6 +1334,10 @@ impl App {
                         t.muted
                     },
                 );
+                if self.demo {
+                    let x = title_rect.left() + w.min(330.0) + 36.0;
+                    summary::demo_pill(ui, t, pos2(x, title_rect.center().y));
+                }
                 if name != dev.name {
                     edits.push(Edit::Rename(self.selected, name));
                 }
@@ -1372,6 +1376,7 @@ impl App {
                         apps_ms: device_tap_ms(&live, &dev.id),
                         reading: reading.as_ref(),
                         dropouts: self.dropouts.growing(&dev.id, self.now),
+                        demo: self.demo,
                     },
                     edits,
                 );
