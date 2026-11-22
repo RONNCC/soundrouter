@@ -1,4 +1,5 @@
 //! The routing engine: one private aggregate + IOProc per enabled virtual device.
+use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -266,6 +267,8 @@ struct Vdev {
     tap_dirty: bool,
     /// Non-fatal config problems found by the last layout refresh, see [`Engine::warnings`].
     warnings: Vec<String>,
+    /// The layout was cut to `MAX_CH` channels (set by the last layout refresh, part of `warnings`).
+    width_note: Option<String>,
     /// The `AudioDeviceStart` thread; `None` once joined.
     starter: Option<JoinHandle<()>>,
     /// Build number (the aggregate uid suffix); ignores [`Event::IoStart`] of a retired build.
@@ -483,6 +486,8 @@ pub struct Engine {
     /// `None` when the IOKit registration failed (logged); wake recovery is then off.
     power: Option<PowerWatch>,
     health: Option<HealthThread>,
+    /// The app list, refreshed off the caller's thread (see [`apps::AppListCache`]).
+    apps: Arc<apps::AppListCache>,
 }
 
 /// How often the health thread looks at the vdevs.
@@ -630,6 +635,7 @@ impl Engine {
             .map_err(|e| log::warn!("no health watch: {e:#}"))
             .ok();
         Ok(Engine {
+            apps: Arc::default(),
             inner,
             tx,
             worker: Some(worker),
@@ -964,7 +970,10 @@ impl Pending {
             Event::Processes => self.procs = true,
             Event::Wake => self.wake = true,
             // Every object id went stale: rebuild everything, as after a wake.
-            Event::ServiceRestarted => self.wake = true,
+            Event::ServiceRestarted => {
+                apps::forget_processes();
+                self.wake = true;
+            }
             // Re-reads the device list, which only acts when it really changed (status is read live).
             Event::DefaultOutput => self.devs = true,
             Event::Dead(uid) => {
@@ -1340,7 +1349,12 @@ fn device_trouble(g: &Inner) -> (Vec<HogInfo>, Vec<String>) {
 
 impl Backend for Engine {
     fn apply(&mut self, cfg: &Config) -> Result<()> {
-        apply_locked(&mut lock(&self.inner), cfg, sync_driver)
+        let mut g = lock(&self.inner);
+        if apply_plan_only(&mut g, cfg) {
+            sr_core::trace::stage("engine: plan-only apply done");
+            return Ok(());
+        }
+        apply_locked(&mut g, cfg, sync_driver)
     }
 
     fn hardware(&self) -> Vec<HwDevice> {
@@ -1362,7 +1376,7 @@ impl Backend for Engine {
     }
 
     fn apps(&self) -> Vec<AppInfo> {
-        apps::app_infos(&apps::list_groups())
+        self.apps.get_with(|| apps::app_infos(&apps::list_groups()))
     }
 
     fn status(&self) -> EngineStatus {
@@ -1551,9 +1565,9 @@ fn main_candidates_in(
     c
 }
 
-fn sync_driver(cfg: &Config) -> Result<()> {
+fn sync_driver(cfg: &Config, settled: &[String]) -> Result<bool> {
     if std::env::var_os(MAIN_UID_OVERRIDE).is_some_and(|v| !v.is_empty()) {
-        return Ok(());
+        return Ok(false);
     }
     let want: Vec<DriverDevice> = cfg
         .devices
@@ -1567,13 +1581,24 @@ fn sync_driver(cfg: &Config) -> Result<()> {
         .collect();
     let plugin = match driver::find_plugin() {
         Some(p) => p,
-        None if want.is_empty() => return Ok(()),
+        None if want.is_empty() => return Ok(false),
         // Looks again: the plug-in may have appeared since, so this must not assume an error.
         None => driver::require_plugin()?,
     };
+    sr_core::trace::stage("sync_driver: plugin found");
     let old = driver::get_devices(plugin).unwrap_or_default();
+    sr_core::trace::stage("sync_driver: list read");
+    let changed = old != want;
     let removed = push_devices(&want, old, |l| driver::set_devices(plugin, l))?;
-    wait_driver_settled(&want, &removed)
+    sr_core::trace::stage("sync_driver: list set");
+    let pending: Vec<DriverDevice> = want
+        .into_iter()
+        .filter(|d| !settled.contains(&d.uid))
+        .collect();
+    if !pending.is_empty() || !removed.is_empty() {
+        wait_driver_settled(&pending, &removed)?;
+    }
+    Ok(changed)
 }
 
 /// Sets `want` even when the driver already has it: an identical list stores and announces nothing, but the
@@ -1662,8 +1687,13 @@ fn wait_driver_settled(want: &[DriverDevice], removed: &[String]) -> Result<()> 
     }
 }
 
+/// Brings the driver's device list in line with a config, given the uids whose aggregate already runs
+/// (settled); true when the driver's list changed.
+type DriverSync = fn(&Config, &[String]) -> Result<bool>;
+
 /// `sync` brings the driver's device list in line with `cfg` (a parameter so tests can fail it without a driver).
-fn apply_locked(g: &mut Inner, cfg: &Config, sync: fn(&Config) -> Result<()>) -> Result<()> {
+fn apply_locked(g: &mut Inner, cfg: &Config, sync: DriverSync) -> Result<()> {
+    sr_core::trace::stage("engine: apply start");
     cfg.validate().map_err(|e| anyhow!("invalid config: {e}"))?;
     // Kept even if the driver does not settle in time: the device events that follow rebuild this
     // config. Keeping the previous one instead let the next background apply undo the user's change.
@@ -1687,10 +1717,24 @@ fn apply_locked(g: &mut Inner, cfg: &Config, sync: fn(&Config) -> Result<()>) ->
     }
     // A removed vdev's start failures must not keep stretching the worker's debounce.
     g.io_fails.retain(|id, _| enabled.contains_key(id.as_str()));
-    sync(cfg)?;
-    // Taken before any aggregate is built: our own create/destroy events must compare equal (F4).
-    g.dev_set = current_device_set();
-    let groups = apps::list_groups();
+    // A device whose aggregate runs was settled when it was built; waiting on it again costs a dozen
+    // HAL round trips per apply.
+    let settled: Vec<String> = g
+        .vdevs
+        .iter()
+        .filter(|(_, v)| matches!(v.io(), IoState::Running))
+        .map(|(id, _)| format!("{DEVICE_UID_PREFIX}{id}"))
+        .collect();
+    if sync(cfg, &settled)? {
+        // Taken after the driver changed its device list, so our own change compares equal (F4).
+        g.dev_set = current_device_set();
+    }
+    sr_core::trace::stage("engine: driver synced");
+    let groups: LazyCell<Vec<AppGroup>> = LazyCell::new(|| {
+        let groups = apps::list_groups_for_taps();
+        sr_core::trace::stage("engine: app groups listed");
+        groups
+    });
     let mut errors = Vec::new();
     for dev in cfg.devices.iter().filter(|d| d.enabled) {
         if let Err(e) = apply_vdev(g, dev, cfg.buffer_frames, &groups) {
@@ -1735,11 +1779,28 @@ fn keep_in_place(
             == Some(&live.main)
 }
 
+/// Whether an edit leaves the taps alone, so it needs no process listing and no tap work: the same app
+/// sources (id, app, mute-original) and no failed sync waiting. An app that starts or stops is a process
+/// event, which re-syncs the taps on its own.
+fn taps_in_sync(old: &VirtualDevice, new: &VirtualDevice, dirty: bool, zombies: usize) -> bool {
+    !dirty && zombies == 0 && app_sources(old).eq(app_sources(new))
+}
+
+/// The process listing is one HAL round trip per process, the slowest step of an apply: it is read on
+/// first use, and only for a device that has app sources.
+fn groups_for<'a>(dev: &VirtualDevice, groups: &'a LazyCell<Vec<AppGroup>>) -> &'a [AppGroup] {
+    if app_sources(dev).next().is_some() {
+        LazyCell::force(groups).as_slice()
+    } else {
+        &[]
+    }
+}
+
 fn apply_vdev(
     g: &mut Inner,
     dev: &VirtualDevice,
     buffer_frames: u32,
-    groups: &[AppGroup],
+    groups: &LazyCell<Vec<AppGroup>>,
 ) -> Result<()> {
     let cands = main_candidates(dev);
     if cands.is_empty() {
@@ -1765,9 +1826,20 @@ fn apply_vdev(
                 split,
             )
         {
+            let in_sync = taps_in_sync(&v.dev, dev, v.tap_dirty, v.zombies.len());
             v.dev = dev.clone();
-            match sync_taps(v, groups).and_then(|()| refresh_layout(v)) {
-                Ok(()) => return Ok(()),
+            // Only an edit of the app sources or a failed tap sync needs the process listing: a mute,
+            // volume or wire edit is a plan swap and nothing else.
+            let taps = if in_sync {
+                Ok(())
+            } else {
+                sync_taps(v, groups_for(dev, groups))
+            };
+            match taps.and_then(|()| refresh_layout(v)) {
+                Ok(()) => {
+                    sr_core::trace::stage("vdev updated in place");
+                    return Ok(());
+                }
                 // F8: the live aggregate is out of step (e.g. a subdevice's streams changed): rebuild it.
                 Err(e) => log::warn!(
                     "device '{}': in-place update failed, rebuilding: {e:#}",
@@ -1775,8 +1847,11 @@ fn apply_vdev(
                 ),
             }
         }
+        sr_core::trace::stage("vdev needs rebuild");
         retire(g.vdevs.remove(&dev.id));
     }
+    // Our own aggregate create/destroy events must compare equal to this baseline (F4).
+    g.dev_set = current_device_set();
     let mut last = anyhow!("no candidate main device");
     let mut passed_over = Vec::new();
     for main in cands {
@@ -1790,11 +1865,12 @@ fn apply_vdev(
                 split,
                 readers: input_readers(dev, &main),
             },
-            groups,
+            groups_for(dev, groups),
             g.tx.as_ref(),
             &g.activity,
         ) {
             Ok(mut v) => {
+                sr_core::trace::stage("vdev built");
                 log::info!("device '{}': aggregate main device '{main}'", dev.id);
                 v.passed_over = passed_over;
                 g.vdevs.insert(dev.id.clone(), v);
@@ -1812,7 +1888,7 @@ fn apply_vdev(
 
 /// Re-sync the taps of every vdev; one vdev's failure does not stop the others.
 fn retap(g: &mut Inner) -> Result<()> {
-    let groups = apps::list_groups();
+    let groups = apps::list_groups_for_taps();
     let errors: Vec<String> = g
         .vdevs
         .iter_mut()
@@ -2163,6 +2239,7 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
         .chain(v.tapagg.iter().flat_map(|t| t.bufs.iter().copied()))
         .collect();
     let aout = hal::stream_channels(v.agg, kAudioObjectPropertyScopeOutput);
+    sr_core::trace::stage("refresh_layout: streams read");
     let li = layout_inputs(&v.dev, &v.spec.main);
     let tap_ids: Vec<String> = v.taps.iter().map(|t| t.source_id.clone()).collect();
     let spec = LayoutSpec {
@@ -2175,6 +2252,18 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
     // A device wider than the mixer (more than MAX_CH channels) degrades to its first MAX_CH channels
     // with a warning rather than failing every route of the vdev.
     let (lay, width) = layout::clamp_width(layout::build_layout(&spec, &ain, &aout)?);
+    sr_core::trace::stage("refresh_layout: built");
+    v.width_note = width.map(|w| format!("device '{}': {w}", v.dev.id));
+    v.layout = lay;
+    publish_plan(v);
+    v.shared
+        .expected
+        .store(layout::shape_key_of(&main_in, &aout), Release);
+    Ok(())
+}
+
+/// Compiles the mix plan for `v.dev` against the layout the vdev already has and hands it to the IOProc.
+fn publish_plan(v: &mut Vdev) {
     let (dev, loops) = without_feedback(&v.dev, &|uid| {
         hal::device_by_uid(uid).is_some_and(|d| {
             hal::get_global::<u32>(d, kAudioDevicePropertyTransportType).ok()
@@ -2183,17 +2272,67 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
     });
     let mut warnings = monitor_warnings(&v.dev, &v.subs);
     warnings.extend(loops);
-    warnings.extend(width.map(|w| format!("device '{}': {w}", v.dev.id)));
+    warnings.extend(v.width_note.clone());
     for w in warnings.iter().filter(|w| !v.warnings.contains(w)) {
         log::warn!("{w}");
     }
     v.warnings = warnings;
-    v.handle.set_plan(MixPlan::compile(&dev, &lay));
-    v.layout = lay;
-    v.shared
-        .expected
-        .store(layout::shape_key_of(&main_in, &aout), Release);
-    Ok(())
+    v.handle.set_plan(MixPlan::compile(&dev, &v.layout));
+    sr_core::trace::stage("plan published");
+}
+
+/// Whether `new` differs from the live `old` only in what a mix plan holds: gains, mutes, wires and
+/// monitor volumes. Everything else (name, channels, the sources and monitors themselves, an app's mute
+/// flag) changes the driver list, the aggregate or the taps.
+fn plan_only_change(old: &VirtualDevice, new: &VirtualDevice) -> bool {
+    old.name == new.name
+        && old.channels == new.channels
+        && old.sources.len() == new.sources.len()
+        && old.sources.iter().zip(&new.sources).all(|(a, b)| {
+            (&a.id, &a.kind, a.channels, a.mute_original)
+                == (&b.id, &b.kind, b.channels, b.mute_original)
+        })
+        && old.monitors.len() == new.monitors.len()
+        && old
+            .monitors
+            .iter()
+            .zip(&new.monitors)
+            .all(|(a, b)| (&a.device_uid, a.enabled) == (&b.device_uid, b.enabled))
+}
+
+/// A user edit that only changes what a mix plan holds swaps the plan of each live vdev and nothing
+/// else: no driver sync, process listing or layout read, each a HAL round trip that takes tens to
+/// hundreds of milliseconds while coreaudiod is busy, with the meters frozen meanwhile. Hot-plug and
+/// process events still rebuild through `apply_locked`, so this only runs from the user's apply, and only
+/// in a clean steady state. False: the caller does the full apply.
+fn apply_plan_only(g: &mut Inner, cfg: &Config) -> bool {
+    let enabled: Vec<&VirtualDevice> = cfg.devices.iter().filter(|d| d.enabled).collect();
+    let steady = g.cfg.is_some()
+        && g.bg_errors.is_empty()
+        && g.recovering.is_empty()
+        && !enabled.is_empty()
+        && enabled.len() == g.vdevs.len()
+        && cfg.validate().is_ok();
+    if !steady
+        || !enabled.iter().all(|d| {
+            g.vdevs.get(&d.id).is_some_and(|v| {
+                matches!(v.io(), IoState::Running)
+                    && v.spec.buffer_frames == cfg.buffer_frames
+                    && plan_only_change(&v.dev, d)
+                    && taps_in_sync(&v.dev, d, v.tap_dirty, v.zombies.len())
+            })
+        })
+    {
+        return false;
+    }
+    g.cfg = Some(cfg.clone());
+    for d in enabled {
+        if let Some(v) = g.vdevs.get_mut(&d.id) {
+            v.dev = d.clone();
+            publish_plan(v);
+        }
+    }
+    true
 }
 
 /// Asks the aggregate for `frames`-frame IO buffers; outside the device's range or on any HAL
@@ -2228,7 +2367,9 @@ fn spawn_starter(
     std::thread::Builder::new()
         .name("sr-audio-start".into())
         .spawn(move || {
+            sr_core::trace::stage("AudioDeviceStart begin");
             let st = unsafe { AudioDeviceStart(agg, proc_id) };
+            sr_core::trace::stage("AudioDeviceStart returned");
             sh.state.store(
                 if st == 0 {
                     1
@@ -2260,6 +2401,7 @@ fn build_vdev(
     let xruns = Arc::new(AtomicU64::new(0));
     // The object ids the listeners attach to; a same-uid replug gives the device a new one ([`replugged`]).
     let dev_objs = read_objs(&spec);
+    sr_core::trace::stage("build: begin");
     let mut listeners: Vec<Listener> = events.map_or_else(Vec::new, |tx| {
         dev_objs
             .iter()
@@ -2312,6 +2454,7 @@ fn build_vdev(
             .collect()
     });
     let rates = read_rates(&spec);
+    sr_core::trace::stage("build: listeners + rates read");
     let mut taps = Vec::new();
     for (id, b, mute) in app_sources(dev) {
         let objs = app_objs(groups, b);
@@ -2391,6 +2534,7 @@ fn build_vdev(
             hal::fourcc(st)
         );
     }
+    sr_core::trace::stage("build: aggregate created");
     if let Some(tx) = events {
         let id = dev.id.clone();
         listeners.extend(
@@ -2429,14 +2573,17 @@ fn build_vdev(
             out_bufs: hal::stream_channels(id, kAudioObjectPropertyScopeOutput),
         });
     }
+    sr_core::trace::stage("build: sub streams read");
     let meters = Arc::new(Meters::new());
     let (mx, handle) = mixer(meters.clone());
-    let mut sysvol = sysvol::SysVol::start(
-        &spec.main,
-        &format!("{DEVICE_UID_PREFIX}{}", dev.id),
-        handle.sys_gain(),
-    );
+    let v_uid = format!("{DEVICE_UID_PREFIX}{}", dev.id);
+    let mut sysvol = if app_sources(dev).next().is_some() {
+        sysvol::SysVol::start(&spec.main, &v_uid, handle.sys_gain())
+    } else {
+        sysvol::SysVol::deferred(&spec.main, &v_uid, handle.sys_gain())
+    };
     sysvol.set_apps(app_procs(dev, groups));
+    sr_core::trace::stage("build: sysvol started");
     let split = spec.split;
     let tap_stats = Arc::new(TapStats::default());
     let (tap_cb, tap_handle) = tap_in(tap_stats.clone());
@@ -2496,13 +2643,16 @@ fn build_vdev(
         zombies: parked,
         tap_dirty: false,
         warnings: Vec::new(),
+        width_note: None,
         passed_over: Vec::new(),
     };
     // From here `Drop` cleans up the aggregate, taps and callback state.
     refresh_layout(&mut v)?;
+    sr_core::trace::stage("build: layout refreshed");
     // Only the aggregate is asked: a size requested for V or C from this process (no IO of ours on V)
     // changed neither a client's cycle nor the loop delay when measured; a client's size is its own.
     set_buffer_frames(agg, v.spec.buffer_frames);
+    sr_core::trace::stage("build: buffer size set");
     let st = unsafe {
         AudioDeviceCreateIOProcID(
             agg,
@@ -2512,6 +2662,7 @@ fn build_vdev(
         )
     };
     hal::check("AudioDeviceCreateIOProcID", st).context("creating IOProc")?;
+    sr_core::trace::stage("build: IOProc created");
     restrict_inputs(
         agg,
         v.proc_id,
@@ -2530,6 +2681,7 @@ fn build_vdev(
         dev.id.clone(),
         seq,
     )?);
+    sr_core::trace::stage("build: starter spawned");
     v.handle.flush();
     if split {
         // The main aggregate is already running every other path: the taps follow, and a failure here

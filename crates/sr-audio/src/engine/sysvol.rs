@@ -126,6 +126,8 @@ pub(super) struct SysVol {
     _controls: Vec<Listener>,
     /// The app process objects' device lists; replaced when the processes change.
     procs: Vec<Listener>,
+    /// What `start` needs, kept by [`SysVol::deferred`].
+    pending: Option<(String, String, Arc<SysGain>)>,
 }
 
 impl SysVol {
@@ -184,11 +186,29 @@ impl SysVol {
             state: Some(state),
             _controls: ctl,
             procs: Vec::new(),
+            pending: None,
+        }
+    }
+
+    /// A `SysVol` that does nothing until `set_apps` gets its first app source: a vdev without app sources
+    /// skips the dozen HAL reads and listeners of `start`, which dominated a device's switch-on while
+    /// coreaudiod was busy.
+    pub(super) fn deferred(main: &str, uid: &str, out: Arc<SysGain>) -> SysVol {
+        SysVol {
+            pending: Some((main.to_owned(), uid.to_owned(), out)),
+            ..SysVol::default()
         }
     }
 
     /// The app sources and the process objects each one taps now (empty: not running).
     pub(super) fn set_apps(&mut self, apps: Vec<(String, Vec<u32>)>) {
+        // First app source of a vdev that was built without one: read V's controls now.
+        if self.state.is_none()
+            && !apps.is_empty()
+            && let Some((main, uid, out)) = self.pending.take()
+        {
+            *self = SysVol::start(&main, &uid, out);
+        }
         let Some(state) = &self.state else {
             return;
         };

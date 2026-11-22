@@ -662,6 +662,7 @@ impl App {
             }
             return;
         }
+        sr_core::trace::click("ui: edit committed");
         let adds_input = edits
             .iter()
             .any(|e| matches!(e, Edit::AddSource(_, SourceKind::Device { .. }, _)));
@@ -1343,6 +1344,12 @@ impl App {
                 let apps = snap.apps.clone();
                 let installed = self.graph.installed.clone();
                 let reading = snap.meters.get(&dev.id).cloned();
+                if reading
+                    .as_ref()
+                    .is_some_and(|r| r.sources.iter().any(|(_, c)| c.iter().any(|p| *p > 0.0)))
+                {
+                    sr_core::trace::once("ui: frame drawn with source signal");
+                }
                 self.icon_tex.sync(ui.ctx(), &snap.icons);
                 drop(snap);
                 let live = self.engine_status();

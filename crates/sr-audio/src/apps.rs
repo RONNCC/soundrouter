@@ -2,7 +2,11 @@
 //! or `Chrome.helper` play audio on behalf of their owning app).
 use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_void};
-use std::sync::OnceLock;
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering::{AcqRel, Release},
+};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
 use objc2_core_audio::*;
@@ -102,6 +106,48 @@ pub fn app_infos(groups: &[AppGroup]) -> Vec<AppInfo> {
         .collect()
 }
 
+/// The app list the UI shows, refreshed off the caller's thread. A listing is several HAL round trips
+/// per process and took a second or more while coreaudiod was busy: on the backend worker that froze
+/// the meters and held back the user's next click. `get_with` returns the last list at once and runs the
+/// next listing on a helper thread; only the very first call has nothing to return and waits.
+#[derive(Default)]
+pub struct AppListCache {
+    list: Mutex<Option<Vec<AppInfo>>>,
+    busy: AtomicBool,
+}
+
+impl AppListCache {
+    pub fn get_with(
+        self: &Arc<Self>,
+        lister: impl FnOnce() -> Vec<AppInfo> + Send + 'static,
+    ) -> Vec<AppInfo> {
+        let cached = self
+            .list
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(cached) = cached else {
+            let first = lister();
+            *self.list.lock().unwrap_or_else(PoisonError::into_inner) = Some(first.clone());
+            return first;
+        };
+        if !self.busy.swap(true, AcqRel) {
+            let me = self.clone();
+            let spawned = std::thread::Builder::new()
+                .name("sr-audio-apps".into())
+                .spawn(move || {
+                    let fresh = lister();
+                    *me.list.lock().unwrap_or_else(PoisonError::into_inner) = Some(fresh);
+                    me.busy.store(false, Release);
+                });
+            if spawned.is_err() {
+                self.busy.store(false, Release);
+            }
+        }
+        cached
+    }
+}
+
 /// Live system resolver.
 pub struct SystemResolver;
 
@@ -141,25 +187,70 @@ impl Resolver for SystemResolver {
     }
 }
 
-pub fn process_list() -> Vec<ProcInfo> {
+/// Pid and bundle id of each process object: neither changes for the life of an object, and each
+/// is one HAL round trip (milliseconds, tens while coreaudiod is busy) per process, which made every
+/// listing take a second with a few dozen audio processes.
+static PROC_IDS: Mutex<BTreeMap<u32, (i32, String)>> = Mutex::new(BTreeMap::new());
+
+/// Object ids restart when coreaudiod does: forget what was read.
+pub fn forget_processes() {
+    PROC_IDS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
+/// `with_output` also reads `kAudioProcessPropertyIsRunningOutput`, which changes and so is read
+/// every time (the slowest of the three reads); only the app list shows it.
+fn read_processes(with_output: bool) -> Vec<ProcInfo> {
     let objs = hal::get_u32s(SYSTEM, kAudioHardwarePropertyProcessObjectList).unwrap_or_default();
-    objs.into_iter()
+    let mut ids = {
+        let mut c = PROC_IDS.lock().unwrap_or_else(PoisonError::into_inner);
+        c.retain(|o, _| objs.contains(o));
+        c.clone()
+    };
+    let before = ids.len();
+    let list = objs
+        .into_iter()
         .filter_map(|obj| {
-            let pid: i32 = hal::get_global(obj, kAudioProcessPropertyPID).ok()?;
+            let (pid, bundle_id) = match ids.entry(obj) {
+                std::collections::btree_map::Entry::Occupied(e) => e.get().clone(),
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    let pid: i32 = hal::get_global(obj, kAudioProcessPropertyPID).ok()?;
+                    let bundle =
+                        hal::get_string(obj, kAudioProcessPropertyBundleID).unwrap_or_default();
+                    e.insert((pid, bundle)).clone()
+                }
+            };
             Some(ProcInfo {
                 obj,
                 pid,
-                bundle_id: hal::get_string(obj, kAudioProcessPropertyBundleID).unwrap_or_default(),
-                running_output: hal::get_global::<u32>(obj, kAudioProcessPropertyIsRunningOutput)
-                    .unwrap_or(0)
-                    != 0,
+                bundle_id,
+                running_output: with_output
+                    && hal::get_global::<u32>(obj, kAudioProcessPropertyIsRunningOutput)
+                        .unwrap_or(0)
+                        != 0,
             })
         })
-        .collect()
+        .collect();
+    if ids.len() != before {
+        *PROC_IDS.lock().unwrap_or_else(PoisonError::into_inner) = ids;
+    }
+    list
+}
+
+pub fn process_list() -> Vec<ProcInfo> {
+    read_processes(true)
 }
 
 pub fn list_groups() -> Vec<AppGroup> {
     group(&process_list(), &SystemResolver)
+}
+
+/// [`list_groups`] without `running_output` (always false): what tapping needs, at about a third of
+/// the HAL calls.
+pub fn list_groups_for_taps() -> Vec<AppGroup> {
+    group(&read_processes(false), &SystemResolver)
 }
 
 /// Where `installed_apps` looks. shortcut: top level and `Utilities` only, no nested folders.
@@ -344,5 +435,45 @@ mod tests {
         assert!(ids.iter().any(|(b, _)| *b == "com.x.alpha"));
         assert!(got.iter().all(|a| !a.running_output && a.regular));
         assert!(got[0].name.to_lowercase() < got[1].name.to_lowercase());
+    }
+
+    fn info(name: &str) -> AppInfo {
+        AppInfo {
+            bundle_id: name.into(),
+            name: name.into(),
+            running_output: false,
+            regular: true,
+        }
+    }
+
+    /// A slow listing (coreaudiod busy) must never hold up the caller after the first one.
+    #[test]
+    fn a_slow_app_listing_never_blocks_the_caller_after_the_first() {
+        let cache = Arc::new(AppListCache::default());
+        assert_eq!(cache.get_with(|| vec![info("a")])[0].name, "a");
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        // Returns the old list while the new listing waits on `gate`; a second call starts no second one.
+        let slow = move || {
+            gate.recv().unwrap();
+            done.send(()).unwrap();
+            vec![info("b")]
+        };
+        assert_eq!(cache.get_with(slow)[0].name, "a");
+        assert_eq!(
+            cache.get_with(|| panic!("a listing is already running"))[0].name,
+            "a"
+        );
+        release.send(()).unwrap();
+        finished.recv().unwrap();
+        // The helper stores the list right after `done`: until then the call returns the old one.
+        let seen = loop {
+            let seen = cache.get_with(|| vec![info("c")])[0].name.clone();
+            if seen != "a" {
+                break seen;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(seen, "b");
     }
 }

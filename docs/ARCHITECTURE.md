@@ -190,6 +190,22 @@ Every event funnels into the one `sr-audio-events` worker thread (the HAL calls 
 - **Timestamps without `SampleTimeValid`.** `Cb::track_time` ignores such an output stamp (no glitch counted; the baseline is forgotten like at the first cycle, so the next valid cycle is not compared with a stale end). The delay readout already needed the flag on both stamps.
 - **Volume reads.** V's volume and mute listeners can run on different HAL threads. `State::update_gain` reads the controls and publishes the gain in one critical section (as `read_follow` does for the default output), so the last publish always carries the latest read and a change between a read and a publish cannot leave a stale `SysGain`; the baseline read in `SysVol::start` follows the listener registration.
 
+### Click to first meter
+
+What an edit costs, from cheapest to dearest (`Engine::apply`; the worker thread blocks on it, so the meters freeze meanwhile):
+
+| Edit | What happens | HAL round trips |
+|---|---|---|
+| Source On/Off (mute), volume, wire, monitor volume | **Plan swap** (`apply_plan_only`): the new `MixPlan` is compiled against the layout the vdev already has and handed to the IOProc mailbox. No driver sync, process listing, layout read or rebuild. Taken only for a user edit in a steady state (every enabled device has a running vdev, no background error pending); hot-plug and process events still go through the full `apply_locked`. | 0 (1-2 per enabled monitor) |
+| A rename, or any edit while a background error is pending or a vdev is not running | `apply_locked`: driver list set, process listing only when the app sources changed (`taps_in_sync`), layout re-read. A device whose aggregate already runs is not waited for again. | tens |
+| App source added or removed | Tap aggregate only (`rebuild_tap_agg`): tap create, aggregate create, IOProc, start. | ~20 |
+| Device source, monitor, channel count, buffer size | The vdev (and its tap aggregate) is rebuilt. | ~50 |
+| Device switched on | The driver publishes the virtual device (coreaudiod, 1.2-2.7 s measured on a loaded Mac, not ours to shorten) and the vdev is built. `SysVol` (V's volume controls, ~25 reads) starts only when the device has an app source. | |
+
+Slow things never run on the backend worker's click path: the app list is `AppListCache` (stale-while-revalidate: the last list at once, the next listing on a helper thread), process pid and bundle ids are read once per process object (`apps::PROC_IDS`), and only the app list reads `kAudioProcessPropertyIsRunningOutput`. Each HAL round trip is under 1 ms on an idle coreaudiod and 40-200 ms on a busy one, so the number of calls is what an apply costs.
+
+`SR_TRACE_APPLY=1` prints one stderr line per stage with the milliseconds since the click (`sr_core::trace`): UI edit, worker message, apply start, driver sync, process listing, in-place or rebuild, aggregate create, IOProc create, `AudioDeviceStart`, plan published, first non-silent source meter read by the worker, first frame drawn with signal. Off, each stage is one cached atomic load, never on the audio thread.
+
 ## Presets
 
 A preset (`sr_core::preset`) is `{name, buffer_frames, devices}`: the config's devices with everything the GUI edits, and the Audio delay setting. `presets.json` (`{version, presets}`, `sr_core::preset_store`) sits next to `config.json`; writes are atomic (`sr_core::fsio::write_atomic`), unknown fields are ignored on load and not kept on save, a corrupt, oversized or non-UTF-8 file is moved to `presets.json.bad` and reported, and a file with a newer `version` is ignored and never overwritten. A preset that no longer validates is kept; applying it reports why.

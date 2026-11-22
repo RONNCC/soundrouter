@@ -133,6 +133,7 @@ pub(super) struct TapAggSpec<'a> {
 /// Builds and starts the tap aggregate. Its receiver comes back for the caller to publish to the main
 /// IOProc; until then (and until the start returns, which blocks on the TCC prompt) the ring just fills.
 pub(super) fn build(s: &TapAggSpec) -> Result<(TapAgg, TapRx)> {
+    sr_core::trace::stage("tapagg: build begin");
     let Some(main_dev) = hal::device_by_uid(s.main) else {
         bail!("tap aggregate main '{}' vanished", s.main);
     };
@@ -182,6 +183,7 @@ pub(super) fn build(s: &TapAggSpec) -> Result<(TapAgg, TapRx)> {
         )
     };
     hal::check("create tap aggregate", st)?;
+    sr_core::trace::stage("tapagg: aggregate created");
     let destroy = |what: anyhow::Error| {
         unsafe { AudioHardwareDestroyAggregateDevice(agg) };
         what
@@ -205,6 +207,7 @@ pub(super) fn build(s: &TapAggSpec) -> Result<(TapAgg, TapRx)> {
             s.taps.len()
         )));
     }
+    sr_core::trace::stage("tapagg: streams present");
     let bufs: Vec<u16> = ain[comp_in.len()..].to_vec();
     let ch: usize = bufs.iter().map(|&c| usize::from(c)).sum();
     if ch == 0 || ch > MAX_CH {
@@ -271,6 +274,7 @@ pub(super) fn build(s: &TapAggSpec) -> Result<(TapAgg, TapRx)> {
         )
     };
     hal::check("AudioDeviceCreateIOProcID (taps)", st).context("creating tap IOProc")?;
+    sr_core::trace::stage("tapagg: IOProc created");
     t.starter = Some(spawn_starter(
         agg,
         t.proc_id,

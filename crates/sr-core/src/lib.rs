@@ -8,3 +8,4 @@ pub mod mixer;
 pub mod preset;
 pub mod preset_store;
 pub mod selftest;
+pub mod trace;

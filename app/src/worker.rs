@@ -78,6 +78,10 @@ impl Joinable {
     }
 }
 
+/// How long after an apply that starts or rebuilds a device its status is read again (the start takes
+/// tens of milliseconds).
+const AFTER_START_REFRESH: Duration = Duration::from_millis(300);
+
 /// Progress of the loopback self-test the setup sheet asks for.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum SelfTestState {
@@ -223,6 +227,28 @@ fn drain_latest(rx: &Receiver<Msg>, first: Option<Msg>) -> Batch {
     b
 }
 
+/// Whether applying `new` over `old` switches on or rebuilds a device (a mute, volume or wire edit
+/// does not): the edits after which a device's status goes through "Starting".
+fn starts_something(old: &Config, new: &Config) -> bool {
+    old.buffer_frames != new.buffer_frames
+        || new.devices.iter().filter(|d| d.enabled).any(|d| {
+            old.devices.iter().find(|o| o.id == d.id).is_none_or(|o| {
+                !o.enabled
+                    || o.channels != d.channels
+                    || o.sources.len() != d.sources.len()
+                    || o.sources
+                        .iter()
+                        .zip(&d.sources)
+                        .any(|(a, b)| (&a.kind, a.mute_original) != (&b.kind, b.mute_original))
+                    || o.monitors.len() != d.monitors.len()
+                    || o.monitors
+                        .iter()
+                        .zip(&d.monitors)
+                        .any(|(a, b)| (&a.device_uid, a.enabled) != (&b.device_uid, b.enabled))
+            })
+        })
+}
+
 /// Icons kept in the snapshot: every executable ever seen adds one, and a long session sees many.
 const ICON_CAP: usize = 64;
 
@@ -283,14 +309,18 @@ impl Pump {
             n => n,
         };
         let mut apply_result = None;
+        let mut starts = false;
         if let Some(c) = newest {
+            sr_core::trace::stage("worker: apply begins");
             let r = self.backend.apply(&c);
+            sr_core::trace::stage("worker: apply returned");
             // The status bar shows it too, but only the log file survives for a bug report.
             apply_result = Some(r.err().map(|e| {
                 let msg = format!("{e:#}");
                 log::warn!("apply failed: {msg}");
                 msg
             }));
+            starts = starts_something(&self.cfg, &c);
             self.cfg = c;
             self.applied = true;
         }
@@ -302,12 +332,25 @@ impl Pump {
                 .filter_map(|d| Some((d.id.clone(), self.backend.meters(&d.id)?)))
                 .collect()
         });
+        if self.visible
+            && sr_core::trace::enabled()
+            && let Some(m) = &meters
+            && m.values()
+                .any(|r| r.sources.iter().any(|(_, c)| c.iter().any(|p| *p > 0.0)))
+        {
+            sr_core::trace::once("worker: first non-silent source meter read");
+        }
         let refresh = (now >= self.next_refresh).then(|| {
             self.next_refresh = now + REFRESH_PERIOD;
             let apps = self.backend.apps();
             let icons = self.new_icons(&apps);
             (self.backend.hardware(), apps, self.backend.status(), icons)
         });
+        // A device that was just switched on or rebuilt shows "Starting" until the next status refresh:
+        // pull it in to a moment after the start instead of leaving the dot amber for up to 2 s.
+        if starts {
+            self.next_refresh = self.next_refresh.min(Instant::now() + AFTER_START_REFRESH);
+        }
         let mut s = snap.lock().unwrap();
         let mut changed = apply_result.is_some() || refresh.is_some();
         if let Some(r) = apply_result {
@@ -558,6 +601,7 @@ impl Worker {
     }
 
     pub fn apply(&self, cfg: &Config) {
+        sr_core::trace::stage("worker: apply message sent");
         self.send(Msg::Apply(cfg.clone()));
     }
 
@@ -861,6 +905,63 @@ mod tests {
             .iter_mut()
             .for_each(|d| d.enabled = false);
         assert_eq!(core.period(), HIDDEN_PERIOD, "every device off");
+    }
+
+    /// The click that switches a device on arrives while the worker waits out the slow hidden period:
+    /// the message ends the wait, the apply and the first meter read share that wake-up, and the next
+    /// wait is already the 30 Hz one (nothing sleeps through a 500 ms period after the click).
+    #[test]
+    fn switching_a_device_on_is_applied_and_metered_in_one_wakeup_and_the_next_is_fast() {
+        let (_tx, snap, mut core) = Worker::core(
+            Box::new(FakeBackend::new()),
+            Context::default(),
+            Box::new(|_| None),
+            None,
+            Arc::new(Instant::now),
+        );
+        let mut off = default_config();
+        off.devices.iter_mut().for_each(|d| d.enabled = false);
+        core.iterate(Some(Msg::Apply(off)));
+        assert_eq!(core.period(), HIDDEN_PERIOD);
+        assert!(snap.lock().unwrap().meters.is_empty());
+        core.iterate(Some(Msg::Apply(default_config())));
+        assert_eq!(core.period(), METER_PERIOD);
+        assert!(!snap.lock().unwrap().meters.is_empty(), "metered at once");
+    }
+
+    #[test]
+    fn only_edits_that_start_a_device_pull_the_status_refresh_in() {
+        let on = default_config();
+        let mut muted = on.clone();
+        muted.devices[0].sources[0].muted = true;
+        muted.devices[0].volume_db = -6.0;
+        assert!(
+            !starts_something(&on, &muted),
+            "a mute or volume edit starts nothing"
+        );
+        let mut off = on.clone();
+        off.devices[0].enabled = false;
+        assert!(starts_something(&off, &on), "switched on");
+        assert!(!starts_something(&on, &off), "switched off");
+        let mut wider = on.clone();
+        wider.devices[0].channels = 4;
+        assert!(starts_something(&on, &wider));
+        let mut less = on.clone();
+        less.devices[0].sources.clear();
+        assert!(starts_something(&on, &less));
+        assert!(starts_something(&Config::default(), &on), "a new device");
+        let (mut pump, _log, snap) = setup();
+        let t0 = Instant::now();
+        pump.tick(Some(on.clone()), t0, &snap);
+        assert!(pump.next_refresh <= Instant::now() + AFTER_START_REFRESH);
+        pump.tick(None, t0, &snap);
+        pump.next_refresh = t0 + REFRESH_PERIOD;
+        pump.tick(Some(muted), t0, &snap);
+        assert_eq!(
+            pump.next_refresh,
+            t0 + REFRESH_PERIOD,
+            "a mute leaves it alone"
+        );
     }
 
     #[test]

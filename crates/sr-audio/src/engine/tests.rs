@@ -1317,7 +1317,7 @@ fn apply_keeps_the_newest_config_when_the_driver_does_not_settle() {
     g.cfg = Some(old.clone());
     let mut new = old.clone();
     new.devices[0].channels = 8;
-    let slow: fn(&Config) -> Result<()> = |_| bail!("driver devices not ready");
+    let slow: DriverSync = |_, _| bail!("driver devices not ready");
     assert!(apply_locked(&mut g, &new, slow).is_err());
     // A background apply after the next device event must rebuild `new`, not re-apply (undo to) `old`.
     assert_eq!(g.cfg, Some(new));
@@ -1482,7 +1482,7 @@ fn apply_drops_disabled_devices_from_recovery_and_clears_background_errors() {
     g.bg_errors
         .insert(Op::Apply, "device 'v1': no companion".into());
     // ... then the user disables v1: the apply succeeds, so neither may linger in the status.
-    apply_locked(&mut g, &cfg, |_| Ok(())).unwrap();
+    apply_locked(&mut g, &cfg, |_, _| Ok(false)).unwrap();
     assert!(g.recovering.is_empty());
     assert_eq!(background_message(&g.bg_errors), None);
 }
@@ -2037,4 +2037,98 @@ fn a_device_shared_by_two_vdevs_combines_their_builds_in_any_order() {
     assert_eq!(combine_builds([b, a].into_iter()), Some((2, true)));
     assert_eq!(combine_builds([a].into_iter()), Some((2, false)));
     assert_eq!(combine_builds(std::iter::empty()), None);
+}
+
+// ---- a user edit that only changes the mix plan must not touch the aggregate, taps or driver ----
+
+fn live_dev() -> VirtualDevice {
+    vdev(
+        vec![
+            app("a", "com.x.player"),
+            src("m", SourceKind::Device { uid: "mic".into() }),
+        ],
+        vec![wire("a", 0, 0), wire("m", 0, 1)],
+        vec![mon("spk", true)],
+    )
+}
+
+/// Turning a source On or Off (its mute), moving a gain or a wire is a plan swap: the aggregate's
+/// sub-devices, readers and taps stay exactly as they are, so nothing is rebuilt.
+#[test]
+fn toggling_a_source_mute_or_a_wire_is_plan_only() {
+    let old = live_dev();
+    let edits: [fn(&mut VirtualDevice); 8] = [
+        |d| d.sources[0].muted = true,
+        |d| d.sources[1].muted = true,
+        |d| d.sources[1].volume_db = -6.0,
+        |d| d.sources[0].name = "renamed".into(),
+        |d| d.wires.push(wire("a", 1, 1)),
+        |d| d.wires.clear(),
+        |d| (d.muted, d.volume_db) = (true, -3.0),
+        |d| d.monitors[0].volume_db = -2.0,
+    ];
+    for edit in edits {
+        let mut new = old.clone();
+        edit(&mut new);
+        assert!(plan_only_change(&old, &new));
+        assert!(
+            taps_in_sync(&old, &new, false, 0),
+            "no process listing needed"
+        );
+        assert_eq!(plan_subs(&old, &|_| true), plan_subs(&new, &|_| true));
+        assert_eq!(input_readers(&old, "main"), input_readers(&new, "main"));
+    }
+}
+
+#[test]
+fn edits_that_change_the_aggregate_the_taps_or_the_driver_are_not_plan_only() {
+    let old = live_dev();
+    let edits: [fn(&mut VirtualDevice); 10] = [
+        |d| d.name = "other".into(),
+        |d| d.channels = 4,
+        |d| {
+            d.sources
+                .push(src("n", SourceKind::Device { uid: "mic2".into() }))
+        },
+        |d| d.sources.push(app("b", "com.y")),
+        |d| {
+            d.sources.remove(1);
+        },
+        |d| d.sources[1].kind = SourceKind::Device { uid: "mic2".into() },
+        |d| d.sources[1].channels = 1,
+        |d| d.sources[0].mute_original = true,
+        |d| d.monitors[0].enabled = false,
+        |d| d.monitors.push(mon("hp", false)),
+    ];
+    for edit in edits {
+        let mut new = old.clone();
+        edit(&mut new);
+        assert!(!plan_only_change(&old, &new));
+    }
+}
+
+#[test]
+fn the_process_listing_is_needed_only_for_app_source_edits_or_a_failed_tap_sync() {
+    let old = live_dev();
+    let mut mic = old.clone();
+    mic.sources
+        .push(src("n", SourceKind::Device { uid: "mic2".into() }));
+    assert!(
+        taps_in_sync(&old, &mic, false, 0),
+        "a new device source leaves the taps alone"
+    );
+    let mut added = old.clone();
+    added.sources.push(app("b", "com.y"));
+    assert!(!taps_in_sync(&old, &added, false, 0));
+    let mut flipped = old.clone();
+    flipped.sources[0].mute_original = true;
+    assert!(!taps_in_sync(&old, &flipped, false, 0));
+    assert!(
+        !taps_in_sync(&old, &old, true, 0),
+        "a failed tap-list update waits for a sync"
+    );
+    assert!(
+        !taps_in_sync(&old, &old, false, 1),
+        "so do taps that left but are not destroyed yet"
+    );
 }
