@@ -153,6 +153,12 @@ fn claim_engine_at(
 }
 
 fn main() -> Result<()> {
+    // Rust ignores SIGPIPE, so `sr-cli list | head` would panic in `println!` (exit 101, a backtrace
+    // hint on stderr). Restore the default: a closed pipe ends the process quietly, like any tool.
+    // SAFETY: `signal` with SIG_DFL runs before any thread exists and installs no handler.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let level = match cli.verbose {
         0 => "warn",

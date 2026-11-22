@@ -395,3 +395,24 @@ fn preset_apply_hands_over_to_the_running_app_instead_of_editing_its_config() {
         "the app owns the config"
     );
 }
+
+/// `sr-cli preset list | head -0`: the reader is gone before the first write. Rust ignores SIGPIPE,
+/// so without the default restored `println!` panicked (exit 101 and a "panicked at" report).
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_ends_the_process_quietly_not_with_a_panic() {
+    use std::process::Stdio;
+    let home = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(cli().get_program())
+        .args(["preset", "list"])
+        .env("HOME", home.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "{err}");
+    assert_ne!(out.status.code(), Some(101));
+}
