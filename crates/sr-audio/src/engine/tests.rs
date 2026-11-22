@@ -993,6 +993,62 @@ fn new_events_land_in_pending() {
 }
 
 #[test]
+fn a_hog_release_is_news_a_hog_grab_is_not() {
+    let mut p = Pending::default();
+    assert!(p.absorb(Event::Hog("mic".into())));
+    assert!(p.absorb(Event::Hog("mic".into())));
+    assert_eq!(p.hogs, set(&["mic"]));
+    assert!(
+        !p.devs && !p.wake,
+        "no rebuild by itself: the worker asks the HAL"
+    );
+    assert!(p.hog_released(&|_| false), "nobody holds it now");
+    assert!(!p.hog_released(&|_| true), "still held by another process");
+    assert!(
+        !Pending::default().hog_released(&|_| false),
+        "no hog event, no release"
+    );
+    // One released device is enough, even when another is still held.
+    p.absorb(Event::Hog("dac".into()));
+    assert!(p.hog_released(&|uid| uid == "dac"));
+}
+
+fn zombie_tap(id: u32) -> Tap {
+    Tap {
+        source_id: "a".into(),
+        bundle: "com.a".into(),
+        id,
+        uid: format!("t{id}"),
+        objs: vec![1],
+        mute: false,
+    }
+}
+
+#[test]
+fn a_failed_first_tap_aggregate_parks_the_taps_and_asks_for_a_retap() {
+    let (tx, rx) = channel();
+    let (mut taps, mut zombies, mut dirty) = (vec![zombie_tap(1)], vec![zombie_tap(2)], false);
+    park_failed_taps(&mut taps, &mut zombies, &mut dirty, Some(&tx));
+    assert!(taps.is_empty() && dirty);
+    assert_eq!(zombies.iter().map(|t| t.id).collect::<Vec<_>>(), [2, 1]);
+    let mut p = Pending::default();
+    assert!(p.absorb(rx.try_recv().expect("a process event was sent")));
+    assert!(p.procs, "the worker's next pass is a retap");
+    assert_eq!(
+        Retry::default().choose(false, false, false, p.procs),
+        Some(Op::Retap)
+    );
+    // That retap failing again goes through the capped backoff, then surfaces once.
+    let (mut r, mut errs) = (Retry::default(), BTreeMap::new());
+    for _ in 0..=MAX_RETRIES {
+        r.record(Op::Retap, Err(anyhow!("tap aggregate")), &mut errs);
+    }
+    assert_eq!((r.wait(), errs.len()), (None, 1));
+    // No event channel (tests, shutdown): still parked, nothing to send.
+    park_failed_taps(&mut vec![], &mut zombies, &mut dirty, None);
+}
+
+#[test]
 fn a_dead_device_rebuilds_only_the_vdevs_built_on_it() {
     let (a, b) = (
         rates(&[("c1", 48e3), ("mic", 48e3)]),
@@ -1457,13 +1513,22 @@ fn split_taps_mix_in_from_the_ring_next_to_the_main_inputs() {
     assert!(out.all_zero(), "still prefilling: silent, not a mismatch");
     push_tap(&mut tx, SB);
     let out = run_split(&mut r, |i| if i % 2 == 0 { 0.25 } else { 0.0 });
+    // The first primed block fades in (g ramps 1/SB .. 1); the ring's own tests pin the ramp.
     for f in 0..SB {
-        assert_eq!(out.data[0][f * 2], 0.25 + f as f32 / 1024.0, "L f{f}");
-        assert_eq!(out.data[0][f * 2 + 1], -(f as f32) / 1024.0, "R f{f}");
+        let g = (f + 1) as f32 / SB as f32;
+        assert_eq!(out.data[0][f * 2], 0.25 + f as f32 / 1024.0 * g, "L f{f}");
+        assert_eq!(out.data[0][f * 2 + 1], -(f as f32) / 1024.0 * g, "R f{f}");
     }
     push_tap(&mut tx, 2 * SB);
     let out = run_split(&mut r, |_| 0.0);
-    assert_eq!(out.data[0][0], SB as f32 / 1024.0, "next block follows");
+    // Steady state: the next block follows, unramped.
+    for f in 0..SB {
+        assert_eq!(
+            out.data[0][f * 2],
+            (SB + f) as f32 / 1024.0,
+            "L f{f} steady"
+        );
+    }
     assert_eq!(r.meters.mismatch_count(), 0);
     assert_eq!(r.stats.counters(), crate::tapring::TapCounters::default());
 }
@@ -1525,7 +1590,14 @@ fn plan_and_ring_swap_in_either_order_without_a_mismatch() {
         &split_layout(&dev, &["a".to_owned()]),
     ));
     let out = run_split(&mut r, |_| 0.0);
-    assert_eq!(out.data[0][2], 1.0 / 1024.0);
+    // Frame 1 of the ring's first block: it fades in, so 2/SB of the tap's 1/1024.
+    assert_eq!(out.data[0][2], 1.0 / 1024.0 * (2.0 / SB as f32));
+    let out = run_split(&mut r, |_| 0.0);
+    assert_eq!(
+        out.data[0][2],
+        (SB + 1) as f32 / 1024.0,
+        "one fade per ring, not per swap"
+    );
     assert_eq!(r.meters.mismatch_count(), 0);
 }
 
@@ -1574,17 +1646,19 @@ fn the_tap_ioproc_copies_the_tap_buffers_frame_major_and_skips_the_companion_inp
     assert_eq!(cb.stats.counters(), TapCounters::default());
     let mut dst = vec![0.0; 4 * MAX_FRAMES];
     rx.pull(frames, &mut dst, 0);
+    // Cushion 0 primes at once, so this first block fades in (g = (f + 1) / frames).
     for f in 0..frames {
-        assert_eq!(dst[f], (f * 2) as f32, "tap 1 L f{f}");
-        assert_eq!(dst[MAX_FRAMES + f], (f * 2 + 1) as f32, "tap 1 R f{f}");
+        let g = (f + 1) as f32 / frames as f32;
+        assert_eq!(dst[f], (f * 2) as f32 * g, "tap 1 L f{f}");
+        assert_eq!(dst[MAX_FRAMES + f], (f * 2 + 1) as f32 * g, "tap 1 R f{f}");
         assert_eq!(
             dst[2 * MAX_FRAMES + f],
-            1000.0 + (f * 2) as f32,
+            (1000.0 + (f * 2) as f32) * g,
             "tap 2 L f{f}"
         );
         assert_eq!(
             dst[3 * MAX_FRAMES + f],
-            1000.0 + (f * 2 + 1) as f32,
+            (1000.0 + (f * 2 + 1) as f32) * g,
             "tap 2 R f{f}"
         );
     }

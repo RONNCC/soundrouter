@@ -108,6 +108,7 @@ pub struct IconTextures(HashMap<String, TextureHandle>);
 
 impl IconTextures {
     pub fn sync(&mut self, ctx: &Context, images: &HashMap<String, Arc<ColorImage>>) {
+        self.0.retain(|key, _| images.contains_key(key)); // the worker dropped it: free the texture
         for (key, img) in images {
             self.0.entry(key.clone()).or_insert_with(|| {
                 ctx.load_texture(format!("icon:{key}"), img.clone(), TextureOptions::LINEAR)

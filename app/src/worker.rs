@@ -5,7 +5,7 @@ use crate::icons::{self, IconResolver};
 use eframe::egui::{ColorImage, Context};
 use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading, SelfTest};
 use sr_core::config::{Config, SourceKind};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -41,7 +41,7 @@ pub struct Snapshot {
     pub meters: HashMap<String, MeterReading>,
     pub hardware: Vec<HwDevice>,
     pub apps: Vec<AppInfo>,
-    /// App icons by source key (bundle id or `path:<exe>`); only ever grows.
+    /// App icons by source key (bundle id or `path:<exe>`); the least recently seen go past 64.
     pub icons: HashMap<String, Arc<ColorImage>>,
     /// Error of the most recent `apply`; cleared by the next success.
     pub apply_error: Option<String>,
@@ -160,6 +160,9 @@ fn drain_latest(rx: &Receiver<Msg>, first: Option<Msg>) -> Batch {
     b
 }
 
+/// Icons kept in the snapshot: every executable ever seen adds one, and a long session sees many.
+const ICON_CAP: usize = 64;
+
 /// One worker iteration. Backend calls run with the snapshot mutex released, so the UI never
 /// blocks behind slow CoreAudio work.
 struct Pump {
@@ -167,8 +170,10 @@ struct Pump {
     cfg: Config,
     next_refresh: Instant,
     resolve_icon: IconResolver,
-    /// Keys already looked up (hit or miss), so a refresh never repeats an AppKit call.
-    icons_tried: HashSet<String>,
+    /// Keys already looked up (hit or miss), so a refresh never repeats an AppKit call, with the
+    /// refresh (`icon_clock`) that last found them running or configured.
+    icon_used: HashMap<String, u64>,
+    icon_clock: u64,
     /// The window can be seen: only then are meters read.
     visible: bool,
 }
@@ -245,6 +250,7 @@ impl Pump {
             s.hardware = hw;
             s.apps = apps;
             s.icons.extend(icons);
+            self.trim_icons(&mut s.icons);
         }
         changed
     }
@@ -260,16 +266,35 @@ impl Pump {
                 SourceKind::App { bundle_id } => Some(bundle_id.as_str()),
                 _ => None,
             });
+        self.icon_clock += 1;
+        let clock = self.icon_clock;
         let keys: Vec<String> = apps
             .iter()
             .map(|a| a.bundle_id.as_str())
             .chain(configured)
-            .filter(|k| self.icons_tried.insert((*k).to_string()))
+            .filter(|k| self.icon_used.insert((*k).to_string(), clock).is_none())
             .map(str::to_string)
             .collect();
         keys.into_iter()
             .filter_map(|k| Some((k.clone(), Arc::new((self.resolve_icon)(&k)?))))
             .collect()
+    }
+
+    /// Drops the icons least recently seen running or configured beyond [`ICON_CAP`] (they resolve
+    /// again if the app comes back), and forgets lookups that missed for keys no longer in use.
+    fn trim_icons(&mut self, icons: &mut HashMap<String, Arc<ColorImage>>) {
+        while icons.len() > ICON_CAP {
+            let oldest = icons
+                .keys()
+                .min_by_key(|k| self.icon_used.get(*k).copied().unwrap_or(0))
+                .cloned();
+            let Some(k) = oldest else { break };
+            icons.remove(&k);
+            self.icon_used.remove(&k);
+        }
+        let clock = self.icon_clock;
+        self.icon_used
+            .retain(|k, &mut t| t == clock || icons.contains_key(k));
     }
 }
 
@@ -290,7 +315,8 @@ impl Worker {
             cfg: Config::default(),
             next_refresh: Instant::now(),
             resolve_icon,
-            icons_tried: HashSet::new(),
+            icon_used: HashMap::new(),
+            icon_clock: 0,
             visible: true,
         };
         let core = Core {
@@ -511,7 +537,8 @@ mod tests {
             cfg: Config::default(),
             next_refresh: Instant::now(),
             resolve_icon: Box::new(|_| None),
-            icons_tried: HashSet::new(),
+            icon_used: HashMap::new(),
+            icon_clock: 0,
             visible: true,
         };
         (pump, log, snap)
@@ -707,6 +734,52 @@ mod tests {
             asked,
             ["com.fake.configured", "com.fake.missing", "com.fake.player"]
         );
+    }
+
+    #[test]
+    fn the_snapshot_keeps_at_most_64_icons_and_drops_the_least_recently_seen() {
+        let (mut pump, _log, snap) = setup();
+        let asked = Arc::new(Mutex::new(0usize));
+        let count = asked.clone();
+        pump.resolve_icon = Box::new(move |_| {
+            *count.lock().unwrap() += 1;
+            Some(ColorImage::filled([1, 1], Color32::RED))
+        });
+        let seen = |pump: &mut Pump, range: std::ops::Range<usize>| {
+            let apps: Vec<AppInfo> = range
+                .map(|i| AppInfo {
+                    bundle_id: format!("path:/bin/x{i}"),
+                    name: String::new(),
+                    running_output: true,
+                    regular: false,
+                })
+                .collect();
+            let icons = pump.new_icons(&apps);
+            let mut s = snap.lock().unwrap();
+            s.icons.extend(icons);
+            pump.trim_icons(&mut s.icons);
+            s.icons.len()
+        };
+        let has = |i: usize| {
+            snap.lock()
+                .unwrap()
+                .icons
+                .contains_key(&format!("path:/bin/x{i}"))
+        };
+        assert_eq!(seen(&mut pump, 0..30), 30);
+        assert_eq!(seen(&mut pump, 30..64), 64);
+        // 36 more executables: the 30 seen longest ago go, then 6 of the next oldest.
+        assert_eq!(seen(&mut pump, 64..100), 64);
+        assert!((0..30).all(|i| !has(i)));
+        assert!((64..100).all(has), "what is running now stays");
+        assert_eq!(pump.icon_used.len(), 64, "lookups go with their icons");
+        // A dropped one resolves again when its app returns; a kept one does not.
+        let before = *asked.lock().unwrap();
+        assert_eq!(seen(&mut pump, 0..1), 64);
+        assert_eq!(*asked.lock().unwrap(), before + 1);
+        assert!(has(0));
+        assert_eq!(seen(&mut pump, 99..100), 64);
+        assert_eq!(*asked.lock().unwrap(), before + 1);
     }
 
     #[test]

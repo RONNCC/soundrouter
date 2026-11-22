@@ -387,6 +387,8 @@ enum Event {
     },
     /// A device (uid) reported a change of `kAudioDevicePropertyDeviceIsAlive`.
     Dead(String),
+    /// A device (uid) reported a change of `kAudioDevicePropertyHogMode`.
+    Hog(String),
     /// An aggregate of this vdev id changed its IO buffer size.
     Buffer(String),
     /// coreaudiod restarted (`kAudioHardwarePropertyServiceRestarted`): every object id is invalid.
@@ -894,6 +896,8 @@ struct Pending {
     wake: bool,
     /// Uids of devices that reported an IsAlive change.
     dead: BTreeSet<String>,
+    /// Uids of devices whose hog mode changed.
+    hogs: BTreeSet<String>,
     /// Ids of vdevs whose aggregate changed its buffer size.
     buffers: BTreeSet<String>,
     /// Uids of devices whose nominal rate changed.
@@ -903,6 +907,12 @@ struct Pending {
 }
 
 impl Pending {
+    /// Whether a device that changed its hog mode is now held by no other process: a vdev that
+    /// failed while another app held it only rebuilds on a pass that sees it free.
+    fn hog_released(&self, held: &dyn Fn(&str) -> bool) -> bool {
+        self.hogs.iter().any(|uid| !held(uid))
+    }
+
     /// Records `ev`; false for `Shutdown`.
     fn absorb(&mut self, ev: Event) -> bool {
         match ev {
@@ -916,6 +926,9 @@ impl Pending {
             Event::DefaultOutput => self.devs = true,
             Event::Dead(uid) => {
                 self.dead.insert(uid);
+            }
+            Event::Hog(uid) => {
+                self.hogs.insert(uid);
             }
             Event::Buffer(id) => {
                 self.buffers.insert(id);
@@ -1121,7 +1134,14 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
         }
         let mut g = lock(&inner);
         let targets = recovery_targets(&mut g, &mut pending);
-        let devs = pending.devs && current_device_set() != g.dev_set;
+        let released = pending.hog_released(&|uid| {
+            hal::device_by_uid(uid).is_some_and(|d| health::hog_info(d).is_some())
+        });
+        if released {
+            // Start failures counted while the device was held must not cap the rebuild now.
+            g.io_fails.clear();
+        }
+        let devs = released || (pending.devs && current_device_set() != g.dev_set);
         let Some(op) = retry.choose(devs, pending.wake, !targets.is_empty(), pending.procs) else {
             continue;
         };
@@ -2235,6 +2255,16 @@ fn build_vdev(
                             move || Event::Dead(u.clone())
                         },
                     ),
+                    Listener::new(
+                        obj,
+                        kAudioDevicePropertyHogMode,
+                        kAudioObjectPropertyScopeGlobal,
+                        tx.clone(),
+                        {
+                            let u = uid.clone();
+                            move || Event::Hog(u.clone())
+                        },
+                    ),
                     Listener::counter(obj, kAudioDeviceProcessorOverload, xruns.clone()),
                 ]
                 .map(|l| {
@@ -2470,10 +2500,26 @@ fn build_vdev(
         v.taps = std::mem::take(&mut v.zombies);
         if let Err(e) = rebuild_tap_agg(&mut v) {
             log::warn!("device '{}': tap aggregate failed: {e:#}", dev.id);
-            v.zombies = std::mem::take(&mut v.taps);
+            park_failed_taps(&mut v.taps, &mut v.zombies, &mut v.tap_dirty, events);
         }
     }
     Ok(v)
+}
+
+/// A split vdev's first tap aggregate failed: the taps wait as zombies, `dirty` makes the next sync
+/// rebuild even when it sees no diff, and a process event starts that sync now. A repeated failure
+/// then goes through [`Retry`]: backoff, a cap, and the error surfaced once.
+fn park_failed_taps(
+    taps: &mut Vec<Tap>,
+    zombies: &mut Vec<Tap>,
+    dirty: &mut bool,
+    events: Option<&Sender<Event>>,
+) {
+    zombies.append(taps);
+    *dirty = true;
+    if let Some(tx) = events {
+        let _ = tx.send(Event::Processes);
+    }
 }
 
 unsafe extern "C-unwind" fn ioproc(

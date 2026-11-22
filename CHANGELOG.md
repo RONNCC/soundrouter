@@ -57,6 +57,9 @@ All notable changes to this project are documented here. The format follows [Kee
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
 
 ### Fixed
+- Engine: a split vdev whose first tap aggregate failed to build left its taps parked with no retry until the next process event; it now schedules a retap at once, which goes through the capped backoff and surfaces the error once.
+- Engine: a device another app held in hog mode and later released never made a failed vdev rebuild; the per-device listeners now include `kAudioDevicePropertyHogMode` and a release triggers a rebuild pass (start-failure counts reset).
+- App: the snapshot's app icons (one 16 KB image per executable ever seen) are capped at 64, least recently seen dropped; the UI frees the textures of dropped ones.
 - Mixer: a routing change while audio plays (a wire, source or monitor added or removed, a monitor wired differently) stepped the output by the whole level of the change (a click); the mixer now crossfades the old and the new plan over the first block after the swap (`mixer::crossfade`, `swap.rs` oracle test).
 - Mixer: a wire (or monitor wire) listed twice in a config summed twice (+6 dB); duplicates are now one wire.
 - CLI/App: two `sr-cli preset save` at once (or one while the app saves a preset) each loaded the old `presets.json` and the later save dropped the earlier preset; a load-change-save of the presets file now holds `presets.lock`, so both land.
