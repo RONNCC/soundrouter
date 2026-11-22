@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::{
-    AtomicBool,
-    Ordering::{AcqRel, Release},
+    AtomicBool, AtomicU64,
+    Ordering::{AcqRel, Acquire, Release},
 };
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -190,53 +190,103 @@ impl Resolver for SystemResolver {
 /// Pid and bundle id of each process object: neither changes for the life of an object, and each
 /// is one HAL round trip (milliseconds, tens while coreaudiod is busy) per process, which made every
 /// listing take a second with a few dozen audio processes.
-static PROC_IDS: Mutex<BTreeMap<u32, (i32, String)>> = Mutex::new(BTreeMap::new());
+struct ProcCache {
+    ids: Mutex<BTreeMap<u32, (i32, String)>>,
+    /// Bumped (under `ids`) by [`ProcCache::forget`]: a listing that began before it must not store
+    /// what it read, or object ids reused after a coreaudiod restart would map to the old apps.
+    generation: AtomicU64,
+}
+
+static PROCS: ProcCache = ProcCache {
+    ids: Mutex::new(BTreeMap::new()),
+    generation: AtomicU64::new(0),
+};
+
+/// What a listing reads from the HAL; injectable for tests.
+trait ProcSource {
+    fn objects(&self) -> Vec<u32>;
+    /// Pid and bundle id of a process object; `None` when the pid is unreadable.
+    fn identity(&self, obj: u32) -> Option<(i32, String)>;
+    fn running_output(&self, obj: u32) -> bool;
+}
+
+struct HalProcs;
+
+impl ProcSource for HalProcs {
+    fn objects(&self) -> Vec<u32> {
+        hal::get_u32s(SYSTEM, kAudioHardwarePropertyProcessObjectList).unwrap_or_default()
+    }
+    fn identity(&self, obj: u32) -> Option<(i32, String)> {
+        let pid: i32 = hal::get_global(obj, kAudioProcessPropertyPID).ok()?;
+        let bundle = hal::get_string(obj, kAudioProcessPropertyBundleID).unwrap_or_default();
+        Some((pid, bundle))
+    }
+    fn running_output(&self, obj: u32) -> bool {
+        hal::get_global::<u32>(obj, kAudioProcessPropertyIsRunningOutput).unwrap_or(0) != 0
+    }
+}
+
+impl ProcCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, (i32, String)>> {
+        self.ids.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn forget(&self) {
+        let mut ids = self.lock();
+        self.generation.fetch_add(1, AcqRel);
+        ids.clear();
+    }
+
+    /// `with_output` also reads `kAudioProcessPropertyIsRunningOutput`, which changes and so is read
+    /// every time (the slowest of the three reads); only the app list shows it.
+    fn read(&self, hal: &dyn ProcSource, with_output: bool) -> Vec<ProcInfo> {
+        let generation = self.generation.load(Acquire);
+        let objs = hal.objects();
+        let mut ids = {
+            let mut c = self.lock();
+            c.retain(|o, _| objs.contains(o));
+            c.clone()
+        };
+        let before = ids.len();
+        let mut fresh = BTreeMap::new();
+        let list = objs
+            .into_iter()
+            .filter_map(|obj| {
+                let (pid, bundle_id) = match ids.get(&obj) {
+                    Some(known) => known.clone(),
+                    None => {
+                        let read = hal.identity(obj)?;
+                        ids.insert(obj, read.clone());
+                        fresh.insert(obj, read.clone());
+                        read
+                    }
+                };
+                Some(ProcInfo {
+                    obj,
+                    pid,
+                    bundle_id,
+                    running_output: with_output && hal.running_output(obj),
+                })
+            })
+            .collect();
+        if ids.len() != before {
+            // Merged into the live map, and only if nothing was forgotten since this listing began.
+            let mut live = self.lock();
+            if self.generation.load(Acquire) == generation {
+                live.extend(fresh);
+            }
+        }
+        list
+    }
+}
 
 /// Object ids restart when coreaudiod does: forget what was read.
 pub fn forget_processes() {
-    PROC_IDS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
+    PROCS.forget();
 }
 
-/// `with_output` also reads `kAudioProcessPropertyIsRunningOutput`, which changes and so is read
-/// every time (the slowest of the three reads); only the app list shows it.
 fn read_processes(with_output: bool) -> Vec<ProcInfo> {
-    let objs = hal::get_u32s(SYSTEM, kAudioHardwarePropertyProcessObjectList).unwrap_or_default();
-    let mut ids = {
-        let mut c = PROC_IDS.lock().unwrap_or_else(PoisonError::into_inner);
-        c.retain(|o, _| objs.contains(o));
-        c.clone()
-    };
-    let before = ids.len();
-    let list = objs
-        .into_iter()
-        .filter_map(|obj| {
-            let (pid, bundle_id) = match ids.entry(obj) {
-                std::collections::btree_map::Entry::Occupied(e) => e.get().clone(),
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    let pid: i32 = hal::get_global(obj, kAudioProcessPropertyPID).ok()?;
-                    let bundle =
-                        hal::get_string(obj, kAudioProcessPropertyBundleID).unwrap_or_default();
-                    e.insert((pid, bundle)).clone()
-                }
-            };
-            Some(ProcInfo {
-                obj,
-                pid,
-                bundle_id,
-                running_output: with_output
-                    && hal::get_global::<u32>(obj, kAudioProcessPropertyIsRunningOutput)
-                        .unwrap_or(0)
-                        != 0,
-            })
-        })
-        .collect();
-    if ids.len() != before {
-        *PROC_IDS.lock().unwrap_or_else(PoisonError::into_inner) = ids;
-    }
-    list
+    PROCS.read(&HalProcs, with_output)
 }
 
 pub fn process_list() -> Vec<ProcInfo> {
@@ -435,6 +485,78 @@ mod tests {
         assert!(ids.iter().any(|(b, _)| *b == "com.x.alpha"));
         assert!(got.iter().all(|a| !a.running_output && a.regular));
         assert!(got[0].name.to_lowercase() < got[1].name.to_lowercase());
+    }
+
+    struct FakeHal<'a> {
+        objs: Vec<u32>,
+        apps: HashMap<u32, (i32, &'static str)>,
+        /// Runs while the first identity is being read: a coreaudiod restart mid-listing.
+        during: Option<&'a dyn Fn()>,
+    }
+
+    impl ProcSource for FakeHal<'_> {
+        fn objects(&self) -> Vec<u32> {
+            self.objs.clone()
+        }
+        fn identity(&self, obj: u32) -> Option<(i32, String)> {
+            if let Some(f) = self.during {
+                f();
+            }
+            self.apps.get(&obj).map(|&(p, b)| (p, b.to_owned()))
+        }
+        fn running_output(&self, _: u32) -> bool {
+            false
+        }
+    }
+
+    /// A listing that began before `forget` must not store what it read: after a coreaudiod restart the
+    /// object ids are reused, and a stale id -> (pid, bundle) would tap the wrong app.
+    #[test]
+    fn a_listing_that_began_before_a_forget_does_not_restore_stale_ids() {
+        let cache = ProcCache {
+            ids: Mutex::new(BTreeMap::new()),
+            generation: AtomicU64::new(0),
+        };
+        let apps = HashMap::from([(7, (100, "old.app"))]);
+        let forget = || cache.forget();
+        let hal = FakeHal {
+            objs: vec![7],
+            apps,
+            during: Some(&forget),
+        };
+        // The listing itself still reports what it read.
+        assert_eq!(cache.read(&hal, false)[0].bundle_id, "old.app");
+        assert!(cache.lock().is_empty(), "stale entry restored");
+        // After the restart object 7 is another app: the next listing reads it afresh.
+        let hal = FakeHal {
+            objs: vec![7],
+            apps: HashMap::from([(7, (200, "new.app"))]),
+            during: None,
+        };
+        let l = cache.read(&hal, false);
+        assert_eq!((l[0].pid, l[0].bundle_id.as_str()), (200, "new.app"));
+        assert_eq!(cache.lock().get(&7), Some(&(200, "new.app".to_owned())));
+    }
+
+    /// New entries are merged into the live map, not written over it, and vanished objects drop out.
+    #[test]
+    fn a_listing_merges_into_the_cache_and_drops_vanished_objects() {
+        let cache = ProcCache {
+            ids: Mutex::new(BTreeMap::from([
+                (1, (10, "a".to_owned())),
+                (9, (90, "gone".to_owned())),
+            ])),
+            generation: AtomicU64::new(0),
+        };
+        let hal = FakeHal {
+            objs: vec![1, 2],
+            apps: HashMap::from([(2, (20, "b"))]),
+            during: None,
+        };
+        let l = cache.read(&hal, false);
+        assert_eq!(l.iter().map(|p| p.pid).collect::<Vec<_>>(), [10, 20]);
+        let keys: Vec<u32> = cache.lock().keys().copied().collect();
+        assert_eq!(keys, [1, 2]);
     }
 
     fn info(name: &str) -> AppInfo {

@@ -109,6 +109,23 @@ pub fn routed(c0: usize, ch: usize) -> usize {
     ch.min(MAX_CH.saturating_sub(c0))
 }
 
+/// A split vdev's app taps come from their own ring, which the IOProc reads whole or not at all (a
+/// channel count that differs from the plan's gives silence for every tap). When the `tap_ch` tap
+/// channels at the end of `lay.inputs` would be cut by [`clamp_width`], they are all dropped here
+/// instead, with a note saying so. Run before [`clamp_width`].
+pub fn drop_overflowing_taps(lay: &mut IoLayout, tap_ch: usize) -> Option<String> {
+    let n = lay.inputs.len();
+    if tap_ch == 0 || n <= MAX_CH {
+        return None;
+    }
+    lay.inputs.truncate(n - tap_ch);
+    Some(format!(
+        "{tap_ch} app-tap channels do not fit next to {} device input channels (the engine mixes at most \
+         {MAX_CH} per direction): app capture is off for this device",
+        n - tap_ch
+    ))
+}
+
 /// `lay` cut to its first `MAX_CH` channels per direction, with a note when something was dropped: a
 /// device wider than the mixer still routes its first channels and the rest stay silent. Wires to a
 /// dropped channel are dropped by `MixPlan::compile`.
@@ -266,6 +283,30 @@ mod tests {
         let (l, note) = clamp_width(layout_of(MAX_CH + 2, 2));
         assert_eq!((l.inputs.len(), l.outputs.len()), (MAX_CH, 2));
         assert!(note.unwrap().contains("66 input / 2 output"));
+    }
+
+    #[test]
+    fn taps_that_overflow_are_dropped_whole() {
+        // 62 device + 4 tap channels: the cut would fall inside the taps.
+        let mut l = layout_of(62 + 4, 2);
+        let note = drop_overflowing_taps(&mut l, 4).unwrap();
+        assert_eq!(l.inputs.len(), 62);
+        assert!(
+            note.contains("4 app-tap channels") && note.contains("62 device"),
+            "{note}"
+        );
+        assert!(note.contains("app capture is off"), "{note}");
+        // Exactly full and nothing to drop stay as they are.
+        let mut l = layout_of(60 + 4, 2);
+        assert_eq!(drop_overflowing_taps(&mut l, 4), None);
+        assert_eq!(l.inputs.len(), 64);
+        let mut l = layout_of(66, 2);
+        assert_eq!(drop_overflowing_taps(&mut l, 0), None);
+        assert_eq!(
+            l.inputs.len(),
+            66,
+            "no taps: clamp_width's flat cut applies"
+        );
     }
 
     #[test]

@@ -2072,7 +2072,7 @@ fn toggling_a_source_mute_or_a_wire_is_plan_only() {
         edit(&mut new);
         assert!(plan_only_change(&old, &new));
         assert!(
-            taps_in_sync(&old, &new, false, 0),
+            taps_in_sync(&old, &new, false, false, 0),
             "no process listing needed"
         );
         assert_eq!(plan_subs(&old, &|_| true), plan_subs(&new, &|_| true));
@@ -2114,21 +2114,106 @@ fn the_process_listing_is_needed_only_for_app_source_edits_or_a_failed_tap_sync(
     mic.sources
         .push(src("n", SourceKind::Device { uid: "mic2".into() }));
     assert!(
-        taps_in_sync(&old, &mic, false, 0),
+        taps_in_sync(&old, &mic, false, false, 0),
         "a new device source leaves the taps alone"
     );
     let mut added = old.clone();
     added.sources.push(app("b", "com.y"));
-    assert!(!taps_in_sync(&old, &added, false, 0));
+    assert!(!taps_in_sync(&old, &added, false, false, 0));
     let mut flipped = old.clone();
     flipped.sources[0].mute_original = true;
-    assert!(!taps_in_sync(&old, &flipped, false, 0));
+    assert!(!taps_in_sync(&old, &flipped, false, false, 0));
     assert!(
-        !taps_in_sync(&old, &old, true, 0),
+        !taps_in_sync(&old, &old, true, false, 0),
         "a failed tap-list update waits for a sync"
     );
     assert!(
-        !taps_in_sync(&old, &old, false, 1),
+        !taps_in_sync(&old, &old, false, false, 1),
         "so do taps that left but are not destroyed yet"
     );
+    assert!(
+        !taps_in_sync(&old, &old, false, true, 0),
+        "and a tap that failed to create: the next edit retries it"
+    );
+}
+
+// ---- review fixes ----
+
+/// After an unrelated hot-plug the baseline moves to the set the worker read, so the echoes that follow
+/// (Devices, DefaultOutput) compare equal and run no apply.
+#[test]
+fn a_changed_device_set_becomes_the_baseline_so_later_echoes_are_filtered() {
+    let mut base = vec![dev("mic", 10)];
+    let plugged = vec![dev("mic", 10), dev("usb", 12)];
+    assert!(device_news(false, true, &mut base, || plugged.clone()));
+    assert_eq!(base, plugged);
+    assert!(!device_news(false, true, &mut base, || plugged.clone()));
+    assert!(!device_news(false, false, &mut base, || panic!(
+        "no device event: no HAL read"
+    )));
+    // A released hog applies and refreshes too; an unchanged set without news does not.
+    let mut base = vec![dev("mic", 10)];
+    assert!(device_news(true, false, &mut base, || plugged.clone()));
+    assert_eq!(base, plugged);
+}
+
+/// A split vdev with 62 device inputs and 4 tap channels cuts the taps whole: the IOProc reads a tap
+/// ring only at its full channel count, and a half-cut one silenced every tap.
+#[test]
+fn a_tap_cut_by_the_channel_limit_is_dropped_whole_with_a_note() {
+    let subs = [sub("comp", true, &[62], &[2])];
+    let dev = vdev(
+        vec![src("pt", SourceKind::PassThru), app("a", "com.x")],
+        vec![],
+        vec![],
+    );
+    let li = layout_inputs(&dev, "comp");
+    let taps = ["a".to_owned()];
+    let spec = LayoutSpec {
+        subs: &subs,
+        passthru: li.passthru.as_deref(),
+        device_sources: &li.device_sources,
+        monitors: &li.monitors,
+        taps: &taps,
+    };
+    let mut lay = layout::build_layout(&spec, &[62, 4], &[2]).unwrap();
+    assert_eq!(lay.inputs.len(), 66);
+    let note = layout::drop_overflowing_taps(&mut lay, 4).unwrap();
+    let (lay, rest) = layout::clamp_width(lay);
+    assert_eq!((lay.inputs.len(), rest), (62, None));
+    assert!(lay.inputs.iter().flatten().all(|(id, _)| id != "a"));
+    assert!(note.contains("app capture is off"), "{note}");
+    // The health watch skips a tap that is not in the layout: its silence is not a denied permission.
+    assert!(!tap_in_layout(&lay, "a"));
+    assert!(tap_in_layout(&lay, "pt"));
+}
+
+/// A device that left the driver's list (changed outside) is waited for even while its aggregate runs.
+#[test]
+fn a_running_device_missing_from_the_drivers_list_is_still_waited_for() {
+    let (a, b, a4) = (want_dev("a", 2), want_dev("b", 2), want_dev("a", 4));
+    let settled = [a.uid.clone(), b.uid.clone()];
+    let wait = |want: &[&DriverDevice], settled: &[String], old: &[&DriverDevice]| {
+        let own = |l: &[&DriverDevice]| l.iter().map(|d| (*d).clone()).collect::<Vec<_>>();
+        let got = unsettled_wants(own(want), settled, &own(old));
+        got.into_iter()
+            .map(|d| (d.uid, d.channels))
+            .collect::<Vec<_>>()
+    };
+    let key = |d: &DriverDevice| (d.uid.clone(), d.channels);
+    assert_eq!(
+        wait(&[&a, &b], &settled, &[&a]),
+        vec![key(&b)],
+        "b left the list"
+    );
+    assert_eq!(
+        wait(&[&a], &settled, &[&a4]),
+        vec![key(&a)],
+        "another channel count"
+    );
+    assert!(
+        wait(&[&a], &settled, &[&a]).is_empty(),
+        "listed and running"
+    );
+    assert_eq!(wait(&[&a], &[], &[&a]), vec![key(&a)], "not running");
 }

@@ -265,6 +265,9 @@ struct Vdev {
     zombies: Vec<Tap>,
     /// The aggregate's tap list (or layout) may be out of date: the next sync must redo it (F7).
     tap_dirty: bool,
+    /// A tap for a running app source failed to create: the next sync must try again (the plan is
+    /// computed from `taps` and the live processes, so a retry needs only that the sync runs).
+    tap_missing: bool,
     /// Non-fatal config problems found by the last layout refresh, see [`Engine::warnings`].
     warnings: Vec<String>,
     /// The layout was cut to `MAX_CH` channels (set by the last layout refresh, part of `warnings`).
@@ -544,6 +547,10 @@ fn taps_running(main: IoState, tap: Option<IoState>) -> bool {
     main == IoState::Running && tap.is_none_or(|t| t == IoState::Running)
 }
 
+fn tap_in_layout(lay: &sr_core::mixer::IoLayout, source_id: &str) -> bool {
+    lay.inputs.iter().flatten().any(|(id, _)| id == source_id)
+}
+
 /// One observation of every vdev's taps: is a tapped app playing, and did the taps deliver any signal
 /// since the last pass (the mixer's input meters, drained apart from the window's).
 fn health_pass(g: &mut Inner, now: Duration) {
@@ -557,9 +564,11 @@ fn health_pass(g: &mut Inner, now: Duration) {
             io_state_of(&v.shared),
             v.tapagg.as_ref().map(|t| io_state_of(&t.shared)),
         );
+        // A tap left out of the layout (see `layout::drop_overflowing_taps`) is silent by design.
         let playing = v
             .taps
             .iter()
+            .filter(|t| tap_in_layout(&v.layout, &t.source_id))
             .any(|t| t.objs.iter().any(|&o| health::process_running_output(o)));
         let silent = v.silence.observe(
             now,
@@ -814,6 +823,23 @@ fn current_device_set() -> Vec<(String, u32)> {
             .into_iter()
             .map(|d| (hal::device_uid(d), d)),
     )
+}
+
+/// Whether the worker's device news needs an apply. `now` reads the HAL only for a device event. A set
+/// that differs from `baseline` becomes the new baseline, so an unrelated hot-plug is not compared
+/// against the old set by every later echo (each would run a full apply under the Inner lock).
+fn device_news(
+    released: bool,
+    heard: bool,
+    baseline: &mut Vec<(String, u32)>,
+    now: impl FnOnce() -> Vec<(String, u32)>,
+) -> bool {
+    let now = (released || heard).then(now);
+    let changed = released || now.as_ref().is_some_and(|n| n != baseline);
+    if let Some(n) = now.filter(|_| changed) {
+        *baseline = n;
+    }
+    changed
 }
 
 /// The object ids of the main and sub devices of `spec` as the HAL resolves their uids now.
@@ -1193,7 +1219,7 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
             // Start failures counted while the device was held must not cap the rebuild now.
             g.io_fails.clear();
         }
-        let devs = released || (pending.devs && current_device_set() != g.dev_set);
+        let devs = device_news(released, pending.devs, &mut g.dev_set, current_device_set);
         let Some(op) = retry.choose(devs, pending.wake, !targets.is_empty(), pending.procs) else {
             continue;
         };
@@ -1589,16 +1615,27 @@ fn sync_driver(cfg: &Config, settled: &[String]) -> Result<bool> {
     let old = driver::get_devices(plugin).unwrap_or_default();
     sr_core::trace::stage("sync_driver: list read");
     let changed = old != want;
+    let before = old.clone();
     let removed = push_devices(&want, old, |l| driver::set_devices(plugin, l))?;
     sr_core::trace::stage("sync_driver: list set");
-    let pending: Vec<DriverDevice> = want
-        .into_iter()
-        .filter(|d| !settled.contains(&d.uid))
-        .collect();
+    let pending = unsettled_wants(want, settled, &before);
     if !pending.is_empty() || !removed.is_empty() {
         wait_driver_settled(&pending, &removed)?;
     }
     Ok(changed)
+}
+
+/// The devices of `want` to wait for: not those whose aggregate runs (settled when it was built) *and*
+/// that the driver already listed as wanted. One that left the driver's list since (changed outside,
+/// `sr-cli driver set`) is published afresh and needs the wait even if the engine thinks it runs.
+fn unsettled_wants(
+    want: Vec<DriverDevice>,
+    settled: &[String],
+    old: &[DriverDevice],
+) -> Vec<DriverDevice> {
+    want.into_iter()
+        .filter(|d| !(settled.contains(&d.uid) && old.contains(d)))
+        .collect()
 }
 
 /// Sets `want` even when the driver already has it: an identical list stores and announces nothing, but the
@@ -1782,8 +1819,14 @@ fn keep_in_place(
 /// Whether an edit leaves the taps alone, so it needs no process listing and no tap work: the same app
 /// sources (id, app, mute-original) and no failed sync waiting. An app that starts or stops is a process
 /// event, which re-syncs the taps on its own.
-fn taps_in_sync(old: &VirtualDevice, new: &VirtualDevice, dirty: bool, zombies: usize) -> bool {
-    !dirty && zombies == 0 && app_sources(old).eq(app_sources(new))
+fn taps_in_sync(
+    old: &VirtualDevice,
+    new: &VirtualDevice,
+    dirty: bool,
+    missing: bool,
+    zombies: usize,
+) -> bool {
+    !dirty && !missing && zombies == 0 && app_sources(old).eq(app_sources(new))
 }
 
 /// The process listing is one HAL round trip per process, the slowest step of an apply: it is read on
@@ -1826,7 +1869,7 @@ fn apply_vdev(
                 split,
             )
         {
-            let in_sync = taps_in_sync(&v.dev, dev, v.tap_dirty, v.zombies.len());
+            let in_sync = taps_in_sync(&v.dev, dev, v.tap_dirty, v.tap_missing, v.zombies.len());
             v.dev = dev.clone();
             // Only an edit of the app sources or a failed tap sync needs the process listing: a mute,
             // volume or wire edit is a plan swap and nothing else.
@@ -2047,13 +2090,17 @@ fn sync_taps(v: &mut Vdev, groups: &[AppGroup]) -> Result<()> {
     for &i in plan.remove.iter().rev() {
         v.zombies.push(v.taps.remove(i));
     }
+    v.tap_missing = false;
     for (id, b, objs, mute) in plan.create {
         match create_tap(&id, &b, objs, mute) {
             Ok(t) => {
                 v.taps.push(t);
                 changed = true;
             }
-            Err(e) => log::warn!("tap for '{b}' failed: {e:#}"),
+            Err(e) => {
+                v.tap_missing = true;
+                log::warn!("tap for '{b}' failed: {e:#}");
+            }
         }
     }
     if changed {
@@ -2251,9 +2298,21 @@ fn refresh_layout(v: &mut Vdev) -> Result<()> {
     };
     // A device wider than the mixer (more than MAX_CH channels) degrades to its first MAX_CH channels
     // with a warning rather than failing every route of the vdev.
-    let (lay, width) = layout::clamp_width(layout::build_layout(&spec, &ain, &aout)?);
+    let mut lay = layout::build_layout(&spec, &ain, &aout)?;
+    let tap_ch = v
+        .tapagg
+        .iter()
+        .flat_map(|t| t.bufs.iter())
+        .map(|&c| usize::from(c))
+        .sum();
+    let taps_cut = layout::drop_overflowing_taps(&mut lay, tap_ch);
+    let (lay, width) = layout::clamp_width(lay);
     sr_core::trace::stage("refresh_layout: built");
-    v.width_note = width.map(|w| format!("device '{}': {w}", v.dev.id));
+    v.width_note = [taps_cut, width]
+        .into_iter()
+        .flatten()
+        .reduce(|a, b| format!("{a}; {b}"))
+        .map(|w| format!("device '{}': {w}", v.dev.id));
     v.layout = lay;
     publish_plan(v);
     v.shared
@@ -2319,7 +2378,7 @@ fn apply_plan_only(g: &mut Inner, cfg: &Config) -> bool {
                 matches!(v.io(), IoState::Running)
                     && v.spec.buffer_frames == cfg.buffer_frames
                     && plan_only_change(&v.dev, d)
-                    && taps_in_sync(&v.dev, d, v.tap_dirty, v.zombies.len())
+                    && taps_in_sync(&v.dev, d, v.tap_dirty, v.tap_missing, v.zombies.len())
             })
         })
     {
@@ -2456,6 +2515,7 @@ fn build_vdev(
     let rates = read_rates(&spec);
     sr_core::trace::stage("build: listeners + rates read");
     let mut taps = Vec::new();
+    let mut tap_missing = false;
     for (id, b, mute) in app_sources(dev) {
         let objs = app_objs(groups, b);
         if objs.is_empty() {
@@ -2463,7 +2523,10 @@ fn build_vdev(
         }
         match create_tap(id, b, objs, mute) {
             Ok(t) => taps.push(t),
-            Err(e) => log::warn!("tap for '{b}' failed: {e:#}"),
+            Err(e) => {
+                tap_missing = true;
+                log::warn!("tap for '{b}' failed: {e:#}");
+            }
         }
     }
     let destroy_taps = |taps: &[Tap]| {
@@ -2642,6 +2705,7 @@ fn build_vdev(
         buffer_reset_at: None,
         zombies: parked,
         tap_dirty: false,
+        tap_missing,
         warnings: Vec::new(),
         width_note: None,
         passed_over: Vec::new(),

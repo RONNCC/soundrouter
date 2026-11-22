@@ -64,6 +64,11 @@ All notable changes to this project are documented here. The format follows [Kee
 - Setup, driver and uninstall pop-ups share one macOS-style sheet: dimmed window, rounded card, icon and title, a checklist with status chips, and the default button on the right.
 
 ### Fixed
+- Engine: a process listing that began before a coreaudiod restart (`forget_processes`) no longer writes its pid/bundle cache back; the cache has a generation counter and a listing merges only its new entries, so reused process object ids cannot tap the wrong app.
+- Engine: the device-set baseline moves to the set the worker just read, so after an unrelated hot-plug the Devices and DefaultOutput echoes no longer each run a full apply under the engine lock (frozen meters).
+- Engine: a split device whose app taps would be cut by the 64-channel limit drops all its taps (with the warning "app capture is off for this device") instead of silencing every tap and reporting a missing permission.
+- Engine: the driver-settle wait is no longer skipped for a running device that left the driver's list (changed outside, e.g. `sr-cli driver set`).
+- Engine: a tap that failed to create is retried on the next edit (per-device `tap_missing`, part of the "taps in sync" check) instead of staying missing until a process event.
 - Mixer: vdev channels wired to the same monitor channel (e.g. a stereo device onto a mono output) are averaged instead of summed, so a mono source no longer plays 6 dB louder on a mono output; one wire per channel stays bit-exact. `Meters::clipped_blocks` counts blocks with a vdev output sample over full scale (the output is still unlimited; see ARCHITECTURE "Clipping and monitor downmix").
 - App: an audio engine that fails to start at login (coreaudiod not ready yet) is started again by the worker after 1 s, 2 s, 4 s, then every 10 s, until it runs; the standing banner reads "Audio engine not ready yet. Retrying" meanwhile and goes away on success, with the last config applied to the new engine (was: "Quit and reopen SoundRouter").
 - App: Cmd-Q waits at most 2 s for the worker thread (a HAL call that never returns used to keep the app from quitting); a thread still running then is logged and left to process exit.
