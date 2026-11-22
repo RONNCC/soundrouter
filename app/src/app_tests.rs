@@ -106,7 +106,7 @@ fn window_with(
             let w = Worker::spawn_inline(backend, cc.egui_ctx.clone(), Box::new(|_| None));
             let mut app = App::new(cfg, None, w, toast, false, demo);
             app.setup = Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()))
-                .with_driver_check(|_| Ok(()));
+                .with_driver_check(|_| Ok("ab12".into()));
             app
         });
     wait_published(&mut h);
@@ -1173,7 +1173,7 @@ mod snapshots {
                     let mut app = App::new(demo_config(), None, w, None, false, false);
                     app.setup =
                         Setup::new(runner, Some("/App/Resources/SoundRouter.driver".into()))
-                            .with_driver_check(|_| Ok(()));
+                            .with_driver_check(|_| Ok("ab12".into()));
                     app
                 });
             wait_published(&mut h);

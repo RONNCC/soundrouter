@@ -134,12 +134,29 @@ fn applescript_string(s: &str) -> String {
 /// The modes are forced because `ditto` keeps the source's: a bundle built under a loose umask must not
 /// end up writable by others in a folder coreaudiod loads code from (or unreadable by coreaudiod).
 /// `src` is quoted, so any path is safe (non-UTF-8 bytes are replaced, which makes `ditto` fail loudly).
-pub fn install_script(src: &Path) -> String {
-    let dest = sh_quote(INSTALLED_DRIVER);
+///
+/// The bundle is staged next to its destination (a name coreaudiod does not load), made root-owned, and only
+/// swapped in once its signature is valid and its CDHash is `cdhash`, the one [`DriverCheck`] verified: `src` may
+/// sit in a folder the user can write to, and the password dialog leaves minutes in which it could be replaced
+/// after the check. Any failure removes the stage and leaves the installed driver untouched (no half-copied bundle
+/// for coreaudiod to load at its next start).
+pub fn install_script(src: &Path, cdhash: &str) -> String {
+    install_script_in(HAL_DIR, src, cdhash)
+}
+
+fn install_script_in(hal: &str, src: &Path, cdhash: &str) -> String {
+    let dest = sh_quote(&format!("{hal}/SoundRouter.driver"));
+    let stage = sh_quote(&format!("{hal}/.SoundRouter.driver.install"));
+    let hal = sh_quote(hal);
+    let want = sh_quote(&format!("CDHash={cdhash}"));
     format!(
-        "mkdir -p {hal} && rm -rf {dest} && ditto {src} {dest} && chown -R root:wheel {dest} \
-         && chmod -R go-w,a+rX {dest} && xattr -dr com.apple.quarantine {dest} && killall coreaudiod",
-        hal = sh_quote(HAL_DIR),
+        "rm -rf {stage}; {{ mkdir -p {hal} && chown root:wheel {hal} && chmod 755 {hal} \
+         && ditto {src} {stage} && chown -R root:wheel {stage} && chmod -R go-w,a+rX {stage} \
+         && xattr -dr com.apple.quarantine {stage} && codesign --verify --strict --deep {stage} \
+         && codesign -dvvv {stage} 2>&1 | grep -qxF {want} \
+         && rm -rf {dest} && mv {stage} {dest}; }} \
+         || {{ echo 'The driver was not installed: the copy failed its signature check or could not be completed.' >&2; rm -rf {stage}; exit 1; }}; \
+         killall coreaudiod",
         src = sh_quote(&src.to_string_lossy()),
     )
 }
@@ -202,8 +219,9 @@ pub fn locate_driver() -> Option<PathBuf> {
     .and_then(|p| p.canonicalize().ok())
 }
 
-/// Checks the driver bundle before it is copied as root. Injected so tests need no signed bundle.
-pub type DriverCheck = fn(&Path) -> Result<(), String>;
+/// Checks the driver bundle before it is copied as root and returns its CDHash, which the install script then
+/// requires of the root-owned copy. Injected so tests need no signed bundle.
+pub type DriverCheck = fn(&Path) -> Result<String, String>;
 
 pub const DRIVER_MISMATCH: &str = "The bundled driver does not match this app.";
 const REDOWNLOAD: &str = "Download SoundRouter again and replace this copy.";
@@ -267,7 +285,7 @@ fn codesign_info(path: &Path) -> Result<String, String> {
 }
 
 /// The real [`DriverCheck`]: `driver` has a valid strict signature by the same identity as this app.
-pub fn check_bundled_driver(driver: &Path) -> Result<(), String> {
+pub fn check_bundled_driver(driver: &Path) -> Result<String, String> {
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .map_err(|e| format!("cannot locate this app: {e}"))?;
@@ -275,7 +293,7 @@ pub fn check_bundled_driver(driver: &Path) -> Result<(), String> {
 }
 
 /// [`check_bundled_driver`] for the app whose executable is `exe` (canonical path).
-fn check_driver_for(exe: &Path, driver: &Path) -> Result<(), String> {
+fn check_driver_for(exe: &Path, driver: &Path) -> Result<String, String> {
     let verify = Command::new("/usr/bin/codesign")
         .args(["--verify", "--strict", "--deep"])
         .arg(driver)
@@ -298,11 +316,20 @@ fn check_driver_for(exe: &Path, driver: &Path) -> Result<(), String> {
             .is_ok_and(|d| d.starts_with(b.join("Contents/Resources")))
     });
     let app = codesign_info(bundle.unwrap_or(exe))?;
-    if driver_matches_app(&app, &codesign_info(driver)?, driver_in_app) {
-        Ok(())
-    } else {
-        Err(format!("{DRIVER_MISMATCH} {REDOWNLOAD}"))
+    let info = codesign_info(driver)?;
+    match cdhash(&info) {
+        Some(hash) if driver_matches_app(&app, &info, driver_in_app) => Ok(hash),
+        _ => Err(format!("{DRIVER_MISMATCH} {REDOWNLOAD}")),
     }
+}
+
+/// The `CDHash=` line of `codesign -dvvv` output: what identifies exactly this signed content.
+fn cdhash(codesign: &str) -> Option<String> {
+    codesign
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("CDHash="))
+        .map(str::to_owned)
+        .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,15 +524,14 @@ impl Setup {
         self.error = None;
     }
 
-    /// Run `script` as root; when `driver` is given, only if that driver bundle passes the check.
-    fn spawn(&mut self, ctx: &Context, busy: Busy, script: String, driver: Option<PathBuf>) {
-        let (runner, check) = (self.runner.clone(), self.driver_check);
-        self.rx = Some(off_ui(ctx, move || {
-            if let Some(d) = driver {
-                check(&d).map_err(SetupError::Failed)?;
-            }
-            runner(&script)
-        }));
+    /// Run `job` (it ends in the administrator prompt) off the UI thread.
+    fn spawn(
+        &mut self,
+        ctx: &Context,
+        busy: Busy,
+        job: impl FnOnce() -> Result<(), SetupError> + Send + 'static,
+    ) {
+        self.rx = Some(off_ui(ctx, job));
         self.busy = Some(busy);
         self.error = None;
     }
@@ -557,7 +583,13 @@ impl Setup {
     fn start_install(&mut self, ctx: &Context) {
         self.step = Step::Driver;
         match self.source.clone() {
-            Some(src) => self.spawn(ctx, Busy::Installing, install_script(&src), Some(src)),
+            Some(src) => {
+                let (runner, check) = (self.runner.clone(), self.driver_check);
+                self.spawn(ctx, Busy::Installing, move || {
+                    let cdhash = check(&src).map_err(SetupError::Failed)?;
+                    runner(&install_script(&src, &cdhash))
+                });
+            }
             None => {
                 self.error = Some(format!(
                     "This copy of SoundRouter does not contain its driver (SoundRouter.driver). {REDOWNLOAD}"
@@ -1269,8 +1301,9 @@ impl Setup {
                     |_, _| {},
                     |ui, s| {
                         if button(ui, t, "Uninstall", Kind::Danger) {
-                            let script = uninstall_script(s.confirm == Some(true));
-                            s.spawn(ctx, Busy::Uninstalling, script, None);
+                            let (runner, script) =
+                                (s.runner.clone(), uninstall_script(s.confirm == Some(true)));
+                            s.spawn(ctx, Busy::Uninstalling, move || runner(&script));
                         }
                         if button(ui, t, "Cancel", Kind::Secondary) {
                             s.confirm = None;
@@ -1538,9 +1571,9 @@ mod tests {
     #[test]
     fn install_script_quotes_the_source_and_never_splits_it() {
         for s in NASTY {
-            let script = install_script(Path::new(s));
+            let script = install_script(Path::new(s), "ab12");
             assert!(script.contains(&format!("ditto {} ", sh_quote(s))), "{s}");
-            // the whole script is one command list: only our own `&&` separators, no stray `;`
+            // the whole script is one command list: only our own separators, no stray `;`
             // outside quotes (checked by the shell parsing it as exactly the expected words).
             let probe = script.replace("killall coreaudiod", "true");
             let words = Command::new("/bin/sh")
@@ -1555,16 +1588,175 @@ mod tests {
 
     #[test]
     fn install_script_does_the_documented_steps() {
-        let s = install_script(&PathBuf::from("/x/SoundRouter.driver"));
+        let s = install_script(&PathBuf::from("/x/SoundRouter.driver"), "ab12");
+        let stage = "'/Library/Audio/Plug-Ins/HAL/.SoundRouter.driver.install'";
         for step in [
-            "ditto '/x/SoundRouter.driver' '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'",
-            "chown -R root:wheel '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'",
-            "chmod -R go-w,a+rX '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'",
-            "xattr -dr com.apple.quarantine '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'",
+            &format!("ditto '/x/SoundRouter.driver' {stage}"),
+            &format!("chown -R root:wheel {stage}"),
+            &format!("chmod -R go-w,a+rX {stage}"),
+            &format!("xattr -dr com.apple.quarantine {stage}"),
+            &format!("codesign --verify --strict --deep {stage}"),
+            "grep -qxF 'CDHash=ab12'",
+            "chmod 755 '/Library/Audio/Plug-Ins/HAL'",
+            &format!("mv {stage} '/Library/Audio/Plug-Ins/HAL/SoundRouter.driver'"),
         ] {
             assert!(s.contains(step), "{step}\n{s}");
         }
         assert!(s.ends_with("killall coreaudiod"));
+    }
+
+    /// An ad-hoc signed throw-away driver bundle in `dir`; `marker` is a sealed resource, so two bundles with
+    /// different markers are both validly signed but have different CDHashes.
+    fn signed_bundle(dir: &Path, marker: &str) -> PathBuf {
+        let b = dir.join("SoundRouter.driver");
+        std::fs::create_dir_all(b.join("Contents/MacOS")).unwrap();
+        std::fs::create_dir_all(b.join("Contents/Resources")).unwrap();
+        std::fs::write(
+            b.join("Contents/Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>x</string>
+<key>CFBundleIdentifier</key><string>test.soundrouter.driver</string>
+<key>CFBundlePackageType</key><string>BNDL</string></dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::copy("/usr/bin/true", b.join("Contents/MacOS/x")).unwrap();
+        std::fs::write(b.join("Contents/Resources/marker"), marker).unwrap();
+        let st = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&b)
+            .output()
+            .unwrap();
+        assert!(
+            st.status.success(),
+            "{}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        b
+    }
+
+    /// `install_script_in` against a fake HAL folder holding an old driver. Only `chown` (needs root) and
+    /// `killall` (coreaudiod) are stubs; ditto, codesign, xattr, mv and the rest are the real tools.
+    /// Returns (exit ok, stderr, killall was called, the folder holding HAL/).
+    fn run_install(src: &Path, cdhash: &str) -> (bool, String, bool, tempfile::TempDir) {
+        let t = tempfile::tempdir().unwrap();
+        let (hal, bin) = (t.path().join("HAL"), t.path().join("bin"));
+        std::fs::create_dir_all(hal.join("SoundRouter.driver")).unwrap();
+        std::fs::write(hal.join("SoundRouter.driver/old"), "old driver").unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        for (tool, body) in [
+            ("chown", ":".to_owned()),
+            (
+                "killall",
+                format!("touch '{}'", t.path().join("killed").display()),
+            ),
+        ] {
+            let p = bin.join(tool);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        let script = install_script_in(&hal.to_string_lossy(), src, cdhash);
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+            )
+            .output()
+            .unwrap();
+        let killed = t.path().join("killed").exists();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            killed,
+            t,
+        )
+    }
+
+    fn listed(dir: &Path) -> Vec<String> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn install_swaps_in_the_verified_bundle_and_leaves_no_stage() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = signed_bundle(src_dir.path(), "a");
+        let hash = cdhash(&codesign_info(&src).unwrap()).unwrap();
+        let (ok, err, killed, t) = run_install(&src, &hash);
+        assert!(ok, "{err}");
+        assert!(killed, "coreaudiod is restarted");
+        let hal = t.path().join("HAL");
+        assert_eq!(listed(&hal), ["SoundRouter.driver"], "no stage left behind");
+        assert_eq!(
+            std::fs::read_to_string(hal.join("SoundRouter.driver/Contents/Resources/marker"))
+                .unwrap(),
+            "a"
+        );
+        assert!(
+            !hal.join("SoundRouter.driver/old").exists(),
+            "the old bundle is replaced wholesale"
+        );
+        let mode = std::fs::metadata(hal.join("SoundRouter.driver"))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o022,
+            0,
+            "not group/world-writable"
+        );
+    }
+
+    #[test]
+    fn a_bundle_swapped_in_after_the_check_is_refused_and_the_old_driver_stays() {
+        // The check saw bundle A; during the password dialog a user-writable source became B (also validly signed).
+        let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let verified = cdhash(&codesign_info(&signed_bundle(a_dir.path(), "a")).unwrap()).unwrap();
+        let swapped = signed_bundle(b_dir.path(), "b");
+        let (ok, err, killed, t) = run_install(&swapped, &verified);
+        assert!(!ok, "the swapped bundle was installed");
+        assert!(err.contains("not installed"), "{err}");
+        assert!(!killed);
+        let hal = t.path().join("HAL");
+        assert_eq!(listed(&hal), ["SoundRouter.driver"], "the stage is removed");
+        assert!(
+            hal.join("SoundRouter.driver/old").exists(),
+            "the installed driver is untouched"
+        );
+    }
+
+    #[test]
+    fn a_copy_that_fails_its_signature_leaves_the_old_driver_and_no_partial_bundle() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = signed_bundle(src_dir.path(), "a");
+        let hash = cdhash(&codesign_info(&src).unwrap()).unwrap();
+        std::fs::write(src.join("Contents/Resources/marker"), "tampered").unwrap();
+        let (ok, _, killed, t) = run_install(&src, &hash);
+        assert!(!ok && !killed);
+        let hal = t.path().join("HAL");
+        assert_eq!(listed(&hal), ["SoundRouter.driver"]);
+        assert!(hal.join("SoundRouter.driver/old").exists());
+    }
+
+    #[test]
+    fn cdhash_is_the_codesign_line_and_nothing_else() {
+        let out = "CandidateCDHash sha256=1111\nCDHash=89cceaacfe3ec4d7d708764b2e1879c3be4e6f8e\n";
+        assert_eq!(
+            cdhash(out).as_deref(),
+            Some("89cceaacfe3ec4d7d708764b2e1879c3be4e6f8e")
+        );
+        assert_eq!(cdhash("CandidateCDHash sha256=1111\n"), None);
+        assert_eq!(cdhash("CDHash=\n"), None);
+        assert_eq!(
+            cdhash("CDHash=12'; rm -rf ~\n"),
+            None,
+            "never reaches the shell"
+        );
     }
 
     // `codesign -dvvv` + `codesign -dr -` output, trimmed, from real builds (Developer ID: documented form).
@@ -1643,7 +1835,8 @@ TeamIdentifier=not set
             .expect("build it with packaging/bundle-app.sh or set SR_APP");
         let exe = app.join("Contents/MacOS/SoundRouter");
         let own = app.join("Contents/Resources/SoundRouter.driver");
-        assert_eq!(check_driver_for(&exe, &own), Ok(()));
+        let hash = check_driver_for(&exe, &own).expect("the app accepts its own driver");
+        assert_eq!(cdhash(&codesign_info(&own).unwrap()), Some(hash));
         // A copy outside the bundle keeps the identity of a signed build, but not of an ad-hoc one.
         let dir = tempfile::tempdir().unwrap();
         let copy = dir.path().join("SoundRouter.driver");

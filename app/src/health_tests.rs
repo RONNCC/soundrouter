@@ -339,7 +339,7 @@ mod snapshots {
                         Arc::new(|_| Err(crate::setup::SetupError::Failed("no admin".into())));
                     app.setup =
                         Setup::new(no_admin, Some("/App/Resources/SoundRouter.driver".into()))
-                            .with_driver_check(|_| Ok(()));
+                            .with_driver_check(|_| Ok("ab12".into()));
                     app
                 });
             super::super::tests::wait_published(&mut h);
