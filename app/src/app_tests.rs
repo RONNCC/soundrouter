@@ -3593,27 +3593,29 @@ fn the_gain_slider_and_field_trim_one_cable() {
 }
 
 #[test]
-fn a_gain_out_of_range_is_refused_with_a_message_and_junk_is_ignored() {
+fn a_gain_out_of_range_is_held_to_the_range_and_junk_is_ignored() {
     let mut h = open(demo_config());
-    let before = h.state().cfg.clone();
     chip_node!(h, "Safari", 0, 0).click();
     settle(&mut h);
-    let type_in = |h: &mut Harness<App>, text: &str| {
+    let type_in = |h: &mut Harness<App>, text: &str, key: egui::Key| {
         h.get_by_label("Cable gain value, dB").focus();
         settle(h);
         select_all(h);
         h.get_by_label("Cable gain value, dB").type_text(text);
-        h.key_press(egui::Key::Enter);
+        h.key_press(key);
         settle(h);
     };
-    type_in(&mut h, "30");
-    assert_eq!(h.state().cfg, before, "rolled back");
-    h.get_by_label_contains("That change was not applied");
-    h.get_by_label_contains("must be finite and <= 24");
-    type_in(&mut h, "loud");
-    assert_eq!(h.state().cfg, before);
-    // The field shows the real gain again, not the refused text.
-    assert_eq!(wire0(&h, 0).gain_db, 0.0);
+    type_in(&mut h, "30", egui::Key::Enter);
+    assert_eq!(wire0(&h, 0).gain_db, sr_core::config::MAX_DB);
+    assert!(!has(&h, "That change was not applied"));
+    type_in(&mut h, "-500", egui::Key::Enter);
+    assert_eq!(wire0(&h, 0).gain_db, crate::model::MIN_DB);
+    type_in(&mut h, "loud", egui::Key::Enter);
+    assert_eq!(wire0(&h, 0).gain_db, crate::model::MIN_DB);
+    // Escape cancels: the typed value is dropped and the field shows the real gain again.
+    type_in(&mut h, "-3", egui::Key::Escape);
+    assert_eq!(wire0(&h, 0).gain_db, crate::model::MIN_DB);
+    h.state().cfg.validate().unwrap();
 }
 
 #[test]
@@ -4023,6 +4025,52 @@ fn effects_are_added_reordered_set_and_removed_in_the_inspector() {
     click(&mut h, "Move EQ down");
     assert_eq!(kinds(&h), ["delay", "eq", "mono"]);
     h.state().cfg.validate().unwrap();
+}
+
+/// A typed value commits as the field loses focus; the click that took the focus may remove the
+/// effect above it in the same frame, and the remaining one must keep its own parameters.
+#[test]
+fn a_parameter_typed_as_its_effect_is_removed_does_not_land_on_the_next_one() {
+    use sr_core::config::Fx;
+    let lim = |ceiling_db| Fx::Limiter {
+        ceiling_db,
+        knee_db: 6.0,
+    };
+    let mut cfg = demo_config();
+    cfg.devices[0].nodes[0].fx = vec![lim(-1.0), lim(-3.0)];
+    let mut h = open(cfg);
+    click(&mut h, "Music settings");
+    h.get_all_by_label("Limiter ceiling value, dB")
+        .next()
+        .unwrap()
+        .focus();
+    settle(&mut h);
+    select_all(&mut h);
+    h.get_all_by_label("Limiter ceiling value, dB")
+        .next()
+        .unwrap()
+        .type_text("-10");
+    h.get_all_by_label("Remove Limiter").next().unwrap().click();
+    settle(&mut h);
+    assert_eq!(music(&h).fx, [lim(-3.0)]);
+}
+
+/// Escape gives the keyboard back without taking what was typed.
+#[test]
+fn escape_in_an_inspector_field_discards_the_typing() {
+    use sr_core::config::Fx;
+    let mut h = open(demo_config());
+    click(&mut h, "Music settings");
+    let before = music(&h);
+    let label = "Limiter ceiling value, dB";
+    h.get_by_label(label).focus();
+    settle(&mut h);
+    select_all(&mut h);
+    h.get_by_label(label).type_text("-10");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(music(&h), before);
+    assert!(matches!(music(&h).fx[1], Fx::Limiter { ceiling_db, .. } if ceiling_db == -1.0));
 }
 
 #[test]

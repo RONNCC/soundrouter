@@ -753,20 +753,34 @@ fn remove_node(dev: &mut VirtualDevice, n: usize) {
                     to: b.to.clone(),
                     ..Wire::new(a.source.clone(), a.src_ch, b.out_ch)
                 };
-                let same = |o: &Wire| {
-                    o.source == w.source
-                        && o.src_ch == w.src_ch
-                        && o.to == w.to
-                        && o.out_ch == w.out_ch
-                };
-                if !dev.wires.iter().chain(&joined).any(same) {
-                    joined.push(w);
-                }
+                joined.push(w);
             }
         }
     }
     dev.wires.retain(|w| !into(w) && w.source != node.id);
-    dev.wires.extend(joined);
+    for w in joined {
+        merge_wire(&mut dev.wires, w);
+    }
+}
+
+/// Add `w` to `wires`; a cable with the same ends already there carries both: the two signals add
+/// (linear amplitude, inverted ones subtract), the gain held to `MAX_DB`. Exact cancellation drops both.
+fn merge_wire(wires: &mut Vec<Wire>, w: Wire) {
+    let same = |o: &Wire| {
+        o.source == w.source && o.src_ch == w.src_ch && o.to == w.to && o.out_ch == w.out_ch
+    };
+    let Some(i) = wires.iter().position(same) else {
+        wires.push(w);
+        return;
+    };
+    let amp = |w: &Wire| 10f32.powf(w.gain_db / 20.0) * if w.invert { -1.0 } else { 1.0 };
+    let sum = amp(&wires[i]) + amp(&w);
+    if sum.abs() < 1e-6 {
+        wires.remove(i);
+    } else {
+        wires[i].gain_db = (20.0 * sum.abs().log10()).min(MAX_DB);
+        wires[i].invert = sum < 0.0;
+    }
 }
 
 /// The ends of a device cable as `Wire` names them: source id, its channel, the node id it feeds
@@ -1115,6 +1129,41 @@ pub(crate) mod tests {
         apply(&mut c, Edit::RemoveNode(0, 0));
         assert!(wire_of(&c.devices[0], l).is_none());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn removing_a_mixer_onto_an_existing_cable_adds_the_two_signals() {
+        let l = link(Port::Src { src: 0, ch: 0 }, Port::OutIn { ch: 0 });
+        let with_direct = |direct_db: f32| {
+            let mut c = two_sources();
+            apply(&mut c, Edit::AddNode(0, NewNode::OnCable(l)));
+            // The same ends as the cable through the mixer will have once it is gone.
+            let src = c.devices[0].sources[0].id.clone();
+            c.devices[0].wires.push(Wire {
+                gain_db: direct_db,
+                ..Wire::new(src, 0, 0)
+            });
+            apply(&mut c, Edit::RemoveNode(0, 0));
+            c.validate().unwrap();
+            c
+        };
+        // Two unity signals: +6.02 dB on one cable, not one of them dropped.
+        let c = with_direct(0.0);
+        let d = &c.devices[0];
+        assert_eq!(
+            d.wires
+                .iter()
+                .filter(|w| w.source == d.sources[0].id
+                    && w.src_ch == 0
+                    && w.out_ch == 0
+                    && w.to.is_none())
+                .count(),
+            1
+        );
+        assert!((wire_of(d, l).unwrap().gain_db - 6.0206).abs() < 1e-3);
+        // Past the ceiling it is held there.
+        let c = with_direct(MAX_DB);
+        assert_eq!(wire_of(&c.devices[0], l).unwrap().gain_db, MAX_DB);
     }
 
     #[test]

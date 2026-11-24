@@ -4,9 +4,9 @@ use crate::health;
 use crate::icons::IconTextures;
 use crate::login;
 use crate::model::{
-    Edit, LOW_POWER_HINT, apply, apps_readout, db_to_pct, delay_chip_tip, delay_hint, delay_label,
-    delay_ms, delay_name, delay_option, delay_readout, delay_readout_tip, device_delay_ms,
-    device_tap_ms, low_power_hint_due, pct_to_db,
+    Edit, FxEdit, LOW_POWER_HINT, apply, apps_readout, db_to_pct, delay_chip_tip, delay_hint,
+    delay_label, delay_ms, delay_name, delay_option, delay_readout, delay_readout_tip,
+    device_delay_ms, device_tap_ms, low_power_hint_due, pct_to_db,
 };
 use crate::presets::{self, Presets};
 use crate::settings::{self, Settings};
@@ -852,9 +852,14 @@ impl App {
                 !blank
             })
             .collect();
-        // Every index was read from this frame's config: a device removal applied first would shift
-        // the others (a row rename committed by losing focus to another row's X in the same frame).
-        edits.sort_by_key(|e| matches!(e, Edit::RemoveDevice(_)));
+        // Every index was read from this frame's config: a removal applied first would shift the
+        // others (a row rename committed by losing focus to another row's X in the same frame; an
+        // effect's typed parameter committed as its neighbour is removed or moved). Stable sort.
+        edits.sort_by_key(|e| match e {
+            Edit::NodeFx(_, _, FxEdit::Remove(_) | FxEdit::Move(..)) => 1,
+            Edit::RemoveDevice(_) => 2,
+            _ => 0,
+        });
         if edits.is_empty() {
             if blank_rename {
                 self.toast = Some(BLANK_NAME.into());

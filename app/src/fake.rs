@@ -239,7 +239,7 @@ impl Backend for FakeBackend {
                     }
                     let gain = if n.muted { 0.0 } else { lin(n.gain_db) };
                     rows.iter_mut().for_each(|r| *r *= gain);
-                    ((n.id.clone(), rows), reduction)
+                    ((n.id.clone(), rows), (n.id.clone(), reduction))
                 })
                 .unzip();
             for (id, rows) in &nodes {
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(m.nodes.len(), 1);
         assert_eq!(m.nodes[0].0, "n1");
         assert!(m.nodes[0].1.iter().all(|p| *p > 0.0), "{:?}", m.nodes);
-        assert_eq!(m.limiter_reduction, [0.0]);
+        assert_eq!(m.limiter_reduction, [("n1".to_string(), 0.0)]);
         assert!(b.meters("nope").is_none());
         // A limiter below the signal reports how much it takes off.
         cfg.devices[0].sources[1].volume_db = 12.0;
@@ -345,7 +345,7 @@ mod tests {
         };
         b.apply(&cfg).unwrap();
         let m = b.meters("v1").unwrap();
-        assert!(m.limiter_reduction[0] > 0.0);
+        assert!(m.limiter_reduction[0].1 > 0.0);
         assert!(
             m.nodes[0]
                 .1

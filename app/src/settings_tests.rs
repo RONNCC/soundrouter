@@ -9,7 +9,10 @@ use crate::settings_sheet::{
     MENU_BAR, NEEDS_DRIVER, PERMISSIONS, RESTORE, RESTORE_ASK, SHOW_LOG, SPLIT, SPLIT_NOTE,
     TRIPPED, TRY_AGAIN, UPDATE_DRIVER,
 };
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::{
+    Harness,
+    kittest::{NodeT, Queryable},
+};
 use sr_core::backend::{
     AppInfo, Backend, EngineOptions, EngineStatus, HwDevice, MeterReading, ReadAheadState,
 };
@@ -345,6 +348,10 @@ fn lower_delay_on_shows_its_state_and_the_dropout_count() {
 fn lower_delay_with_an_old_driver_asks_for_the_new_one_and_cannot_be_switched() {
     let mut r = opened(status(ReadAheadState::Unsupported));
     r.h.get_by_label(NEEDS_DRIVER);
+    assert!(
+        r.h.get_by_label(LOWER_DELAY).accesskit_node().is_disabled(),
+        "a disabled control, not a dimmed one"
+    );
     r.click(LOWER_DELAY);
     assert!(!r.settings().engine.read_ahead);
     assert!(r.options().is_empty(), "nothing was sent");

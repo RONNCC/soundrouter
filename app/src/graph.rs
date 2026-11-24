@@ -1896,12 +1896,17 @@ fn trim_popover(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<
             StrokeKind::Inside,
         );
     }
+    // Escape gives the keyboard back without committing; a value past the range is held to it, not
+    // sent on to fail validation and roll the whole frame back.
     if te.lost_focus()
+        && !ui.input(|i| i.key_pressed(egui::Key::Escape))
         && let Ok(typed) = st.trim_text.trim().parse::<f32>()
         && typed.is_finite()
-        && (typed - w.gain_db).abs() > 1e-4
     {
-        edits.push(Edit::WireGain(d, l, typed));
+        let typed = typed.clamp(crate::model::MIN_DB, sr_core::config::MAX_DB);
+        if (typed - w.gain_db).abs() > 1e-4 {
+            edits.push(Edit::WireGain(d, l, typed));
+        }
     }
     ui.painter().text(
         pos2(r.right(), r.center().y),
@@ -2069,6 +2074,16 @@ fn strip_keepout(layout: &Layout, dev: &VirtualDevice) -> Vec<Rect> {
     out
 }
 
+/// What the limiter of `node` took off in the last reading, in dB (<= 0). Looked up by id: the
+/// reading is the engine's, and a node inserted ahead of this one since then shifts the positions.
+fn limiter_db(reading: Option<&MeterReading>, node: &Node) -> f32 {
+    let red = reading
+        .and_then(|rd| rd.limiter_reduction.iter().find(|(id, _)| *id == node.id))
+        .map_or(0.0, |(_, r)| *r)
+        .clamp(0.0, 0.999);
+    20.0 * (1.0 - red).log10()
+}
+
 /// Whether a node shows the limiter line on its strip.
 fn has_limiter(n: &Node) -> bool {
     n.fx.iter().any(|f| matches!(f, Fx::Limiter { .. }))
@@ -2201,13 +2216,7 @@ fn strip(
 
     // How much the limiter takes off, in words (never colour alone).
     if has_limiter(node) {
-        let red = g
-            .reading
-            .and_then(|rd| rd.limiter_reduction.get(n))
-            .copied()
-            .unwrap_or(0.0)
-            .clamp(0.0, 0.999);
-        let db = 20.0 * (1.0 - red).log10();
+        let db = limiter_db(g.reading, node);
         let (text, ink) = if active && db < -0.05 {
             (format!("Limit {} dB", db_text(db)), t.warn_ink)
         } else {
@@ -2381,7 +2390,9 @@ fn field(
             StrokeKind::Inside,
         );
     }
-    let done = te.lost_focus().then(|| text.clone());
+    // Escape cancels: the typing is dropped, not committed.
+    let done =
+        (te.lost_focus() && !ui.input(|i| i.key_pressed(egui::Key::Escape))).then(|| text.clone());
     if te.has_focus() {
         st.field_text = text;
     }
@@ -3072,6 +3083,28 @@ mod tests {
     use crate::model::{apply, bare_config};
     use crate::theme::{install_fonts, tokens};
     use egui_kittest::{Harness, kittest::Queryable};
+
+    /// A mixer inserted ahead of another since the engine's last reading shifts config positions: the
+    /// reduction still belongs to the strip with its id.
+    #[test]
+    fn the_limiter_reduction_follows_the_node_id_not_its_position() {
+        let node = |id: &str| Node {
+            id: id.into(),
+            name: String::new(),
+            channels: 2,
+            gain_db: 0.0,
+            muted: false,
+            fx: Vec::new(),
+        };
+        let reading = MeterReading {
+            limiter_reduction: vec![("n1".into(), 0.5)],
+            ..MeterReading::default()
+        };
+        // Config now reads [n2, n1]; the reading still says [n1].
+        assert!((limiter_db(Some(&reading), &node("n1")) + 6.02).abs() < 0.01);
+        assert_eq!(limiter_db(Some(&reading), &node("n2")), 0.0);
+        assert_eq!(limiter_db(None, &node("n1")), 0.0);
+    }
 
     struct S {
         st: GraphState,

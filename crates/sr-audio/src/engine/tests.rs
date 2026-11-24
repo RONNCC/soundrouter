@@ -926,6 +926,40 @@ fn feedback_through_a_node_is_found_and_a_node_input_is_not_a_vdev_channel() {
     assert_eq!(warnings.len(), 1, "{warnings:?}");
 }
 
+/// Mono averages a channel pair into both rows, so a signal entering row 0 also leaves row 1.
+#[test]
+fn feedback_follows_a_mono_nodes_pair_row() {
+    let w = |out_ch, dst_ch| MonitorWire { out_ch, dst_ch };
+    let mut bh = mon("X", true);
+    bh.wires = vec![w(1, 0)];
+    let mut dev = vdev(
+        vec![src("x", SourceKind::Device { uid: "X".into() })],
+        vec![
+            Wire {
+                to: Some("n1".into()),
+                ..Wire::new("x", 0, 0)
+            },
+            wire("n1", 1, 1),
+        ],
+        vec![bh],
+    );
+    dev.nodes = vec![Node {
+        id: "n1".into(),
+        name: String::new(),
+        channels: 2,
+        gain_db: 0.0,
+        muted: false,
+        fx: vec![Fx::Mono],
+    }];
+    let virt = |u: &str| u == "X";
+    let (clean, warnings) = without_feedback(&dev, &virt);
+    assert!(clean.monitors[0].wires.is_empty(), "{warnings:?}");
+    assert_eq!(warnings.len(), 1);
+    // Without Mono, row 1 never sees the signal.
+    dev.nodes[0].fx.clear();
+    assert_eq!(without_feedback(&dev, &virt).0.monitors[0].wires, [w(1, 0)]);
+}
+
 #[test]
 fn retry_delay_schedule_and_give_up() {
     assert_eq!(retry_delay(0), None);
@@ -2328,6 +2362,27 @@ fn read_ahead_watch_trips_on_growth_while_on_and_stays_tripped() {
     );
     // the flag is reported until options ask again
     assert_eq!(read_ahead_watch(&mut g, None, Off, &grown, &x), (Off, true));
+}
+
+/// The app's "off" (after the trip) and "Try again" can reach the engine as one merged `true`.
+#[test]
+fn asking_for_read_ahead_clears_a_trip_even_without_an_off_in_between() {
+    use ReadAheadState::*;
+    let on = EngineOptions {
+        read_ahead: true,
+        ..EngineOptions::default()
+    };
+    let mut g = Inner::default();
+    g.apply_options(&on);
+    let x = counters(&[("v1", 1)]);
+    read_ahead_watch(&mut g, None, On, &counters(&[("v1", 4)]), &x);
+    assert_eq!(
+        read_ahead_watch(&mut g, None, On, &counters(&[("v1", 5)]), &x),
+        (On, true)
+    );
+    assert!(!g.options.read_ahead, "the trip is our own off");
+    g.apply_options(&on);
+    assert!(!g.read_ahead.tripped && g.want_read_ahead());
 }
 
 #[test]

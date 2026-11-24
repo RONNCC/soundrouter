@@ -28,7 +28,7 @@ use sr_core::backend::{
     AppInfo, Backend, Delay, DeviceState, EngineOptions, EngineStatus, HwDevice, MeterReading,
     ReadAheadState, SelfTest, TccStatus,
 };
-use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice, Wire};
+use sr_core::config::{Config, Fx, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice, Wire};
 use sr_core::driver_proto::{
     COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, ReadAheadGuard, companion_uid,
     read_ahead_repush,
@@ -419,6 +419,16 @@ impl Inner {
     fn want_read_ahead(&self) -> bool {
         self.options.read_ahead && !self.read_ahead.tripped
     }
+
+    /// Take new options; returns the old ones. Asking for read-ahead clears a trip, even when the
+    /// app's "off" and "on" reached us as one merged update (the trip itself cleared `options.read_ahead`,
+    /// but a batch that only carries the last value would not show the change).
+    fn apply_options(&mut self, o: &EngineOptions) -> EngineOptions {
+        if o.read_ahead {
+            self.read_ahead.tripped = false;
+        }
+        std::mem::replace(&mut self.options, o.clone())
+    }
 }
 
 /// Brings the driver's switch in line with the options: reads it, writes only a difference.
@@ -454,6 +464,8 @@ fn read_ahead_watch(
     }
     log::warn!("driver overloads or xruns grew with read-ahead on: switching it off");
     g.read_ahead.tripped = true;
+    // The app turns it off on seeing the trip; keep our own wish consistent with that.
+    g.options.read_ahead = false;
     let Some(plugin) = plugin else {
         return (state, true);
     };
@@ -1617,10 +1629,7 @@ impl Backend for Engine {
 
     fn set_options(&mut self, o: &EngineOptions) -> Result<()> {
         let mut g = lock(&self.inner);
-        let was = std::mem::replace(&mut g.options, o.clone());
-        if o.read_ahead && !was.read_ahead {
-            g.read_ahead.tripped = false;
-        }
+        let was = g.apply_options(o);
         if let Some(plugin) = driver::find_plugin() {
             read_ahead_push(&mut g, plugin);
         }
@@ -2490,11 +2499,24 @@ fn reaches_vdev(dev: &VirtualDevice, uid: &str, ch: u16, out: u16) -> bool {
     while let Some(w) = todo.pop() {
         match &w.to {
             None if w.out_ch == out => return true,
-            Some(n) if seen.insert((n.as_str(), w.out_ch)) => todo.extend(
-                dev.wires
-                    .iter()
-                    .filter(|x| x.source == *n && x.src_ch == w.out_ch),
-            ),
+            Some(n) if seen.insert((n.as_str(), w.out_ch)) => {
+                // Mono averages a channel pair into both of its rows: a signal in row r also leaves row r^1.
+                let node = dev.nodes.iter().find(|x| x.id == *n);
+                let pair = node
+                    .filter(|x| x.fx.contains(&Fx::Mono) && (w.out_ch ^ 1) < x.channels)
+                    .map(|_| w.out_ch ^ 1);
+                for row in std::iter::once(w.out_ch).chain(pair) {
+                    todo.extend(
+                        dev.wires
+                            .iter()
+                            .filter(|x| x.source == *n && x.src_ch == row),
+                    );
+                }
+                // The pair row is a second entry point into the node: follow it once too.
+                if let Some(p) = pair {
+                    seen.insert((n.as_str(), p));
+                }
+            }
             _ => {}
         }
     }
@@ -2505,7 +2527,8 @@ fn reaches_vdev(dev: &VirtualDevice, uid: &str, ch: u16, out: u16) -> bool {
 /// A loopback device (BlackHole and the like: `loopback(uid)`) hands what is written to its output channel
 /// k back on its input channel k. A monitor wire to channel k of such a device, with a Device source of
 /// the same device wired from its channel k to that wire's vdev channel, is a loop whose gain is the
-/// product of the gains on it: a sustained buzz at unity, a runaway above (the mixer has no limiter).
+/// product of the gains on it: a sustained buzz at unity, a runaway above (a node limiter would only cap it
+/// at its ceiling, not end it).
 /// Nothing else rejects it: the same wiring on a real interface is only a headphone monitor.
 fn without_feedback(
     dev: &VirtualDevice,

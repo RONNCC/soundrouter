@@ -26,6 +26,13 @@ pub fn read_ahead_repush(want: bool, live: ReadAheadState) -> Option<bool> {
     }
 }
 
+/// The `srov` sum of a virtual device's visible half and its hidden companion. `None` unless both
+/// halves read: a half that fails once would otherwise look like a counter dip and, on the next good
+/// look, like growth that trips the read-ahead guard. A skipped look is a new baseline, not growth.
+pub fn sum_overloads(visible: Option<i64>, companion: Option<i64>) -> Option<u64> {
+    Some((visible?.max(0) as u64).saturating_add(companion?.max(0) as u64))
+}
+
 /// Counters per device id, e.g. `EngineStatus::xruns`.
 pub type Counters = [(String, u64)];
 type OwnedCounters = Vec<(String, u64)>;
@@ -120,6 +127,20 @@ mod tests {
             &c(&[("a", 1), ("b", 2)])
         ));
         assert!(!counters_grew(&[], &c(&[("a", 1)])));
+    }
+
+    #[test]
+    fn overloads_need_both_halves_so_a_failed_read_is_not_a_dip_then_growth() {
+        assert_eq!(sum_overloads(Some(3), Some(4)), Some(7));
+        assert_eq!(sum_overloads(Some(-1), Some(4)), Some(4));
+        assert_eq!(sum_overloads(Some(3), None), None);
+        assert_eq!(sum_overloads(None, Some(4)), None);
+        assert_eq!(sum_overloads(None, None), None);
+        // The skipped look leaves the id out; the next one is a baseline and trips nothing.
+        let mut g = ReadAheadGuard::default();
+        assert!(!g.tripped(&c(&[("v1", 7)]), &[]));
+        assert!(!g.tripped(&[], &[]));
+        assert!(!g.tripped(&c(&[("v1", 7)]), &[]));
     }
 
     #[test]

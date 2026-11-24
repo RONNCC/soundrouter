@@ -11,6 +11,7 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 use sr_core::backend::ReadAheadState;
 use sr_core::driver_proto::{
     DEVICE_UID_PREFIX, PLUGIN_BUNDLE_ID, PROP_OVERLOADS, PROP_READ_AHEAD, companion_uid,
+    sum_overloads,
 };
 
 pub const SYSTEM: u32 = kAudioObjectSystemObject as u32;
@@ -204,14 +205,11 @@ pub fn set_read_ahead(on: bool) -> Result<ReadAheadState> {
 }
 
 /// The driver's late/short counters (`srov`) of virtual device `id`: its visible device plus its hidden
-/// companion. `None` when the driver publishes neither (or has no counter).
+/// companion. `None` when either half is unreadable (see [`sum_overloads`]).
 pub fn driver_overloads(id: &str) -> Option<u64> {
     let vis = format!("{DEVICE_UID_PREFIX}{id}");
-    [companion_uid(&vis), vis]
-        .iter()
-        .filter_map(|u| get_i64(device_by_uid(u)?, PROP_OVERLOADS))
-        .map(|n| n.max(0) as u64)
-        .reduce(u64::saturating_add)
+    let read = |u: &str| get_i64(device_by_uid(u)?, PROP_OVERLOADS);
+    sum_overloads(read(&vis), read(&companion_uid(&vis)))
 }
 
 pub fn plugin_by_bundle_id(bundle: &str) -> Option<u32> {

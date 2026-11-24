@@ -53,6 +53,14 @@ All notable changes to this project are documented here. The format follows [Kee
 - README: how to route the Mac's microphone into a virtual device.
 
 ### Fixed
+- Engine: the feedback guard for loopback devices follows a Mono effect (a signal in row 0 also leaves row 1), so a loop through a Mono mixer is dropped like any other.
+- Engine: a driver overload counter (`srov`) that fails to read on one half (visible device or its companion) is skipped for that poll instead of reading as a dip and then as growth that trips Lower delay.
+- Engine: asking for read-ahead again clears its trip even when the app's off and on reached the engine as one update, and a trip now clears the engine's own wish, so "Try again" always works.
+- App: typing an effect parameter and removing or moving an effect in the same frame no longer lands the typed value on its neighbour.
+- App: a cable gain typed past the range (above +24 dB, or below -80) is held to it instead of refusing the frame; Escape in a cable or mixer field discards the typing.
+- App: a mixer's limiter reading follows the mixer's id, so inserting a mixer ahead of another no longer shows its reduction on the wrong strip (`MeterReading::limiter_reduction` is now `(id, reduction)` pairs).
+- App: removing a mixer onto a cable that already exists adds the two signals (linear, clamped to +24 dB) instead of dropping one.
+- App: the Lower delay switch is disabled, not just dimmed, when the driver lacks it.
 - Engine: a device another process holds in hog mode when a route is applied made the build fail with "aggregate input shape [2] does not match subdevices [2, 16]", and nothing rebuilt it when the holder let go (the failed vdev had no hog listener). The error now names the device and the holder ("BlackHole 16ch is in exclusive use by hog (pid N); it starts by itself when that is released"), and a hog listener kept on the held device rebuilds the route when it is released. Measured with BlackHole 16ch: the route was running 1.5 s after the release. A device grabbed while the route runs needs no rebuild: the aggregate carries silence while held and resumes about 3 s after the release (one glitch, one trim counted).
 - Example: `soak` prints the glitch, mismatch, tap and xrun counters when it ends.
 

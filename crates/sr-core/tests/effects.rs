@@ -374,18 +374,21 @@ fn the_limiter_reduction_is_metered_per_node_and_resets_on_take() {
     run(&mut m, &ins2(64, |_, _| 1.0), 4, 64); // clipped to 0.5: reduction 0.5
     let r = meters.take(&layout(), &d);
     assert_eq!(r.limiter_reduction.len(), 2);
+    assert_eq!(r.limiter_reduction[0].0, d.nodes[0].id);
+    assert_eq!(r.limiter_reduction[1].0, "quiet");
     assert!(
-        (r.limiter_reduction[0] - 0.4988).abs() < 1e-3,
+        (r.limiter_reduction[0].1 - 0.4988).abs() < 1e-3,
         "{:?}",
         r.limiter_reduction
     );
-    assert_eq!(r.limiter_reduction[1], 0.0);
+    assert_eq!(r.limiter_reduction[1].1, 0.0);
     assert!(
         (r.nodes[0].1[0] - 0.5012).abs() < 1e-3,
         "post effects: {:?}",
         r.nodes
     );
-    assert_eq!(meters.take(&layout(), &d).limiter_reduction, [0.0, 0.0]);
+    let again = meters.take(&layout(), &d).limiter_reduction;
+    assert!(again.iter().all(|(_, r)| *r == 0.0), "{again:?}");
 }
 
 // ---- schema --------------------------------------------------------------------------------------------

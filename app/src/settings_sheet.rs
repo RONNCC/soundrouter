@@ -384,10 +384,8 @@ pub fn show(ctx: &Context, t: &Tokens, state: &mut State, v: &View) -> Vec<Chang
             let unsupported = look == ReadAheadLook::Unsupported;
             let shown_on = matches!(look, ReadAheadLook::On | ReadAheadLook::TurningOn);
             let mut changed = None;
-            ui.scope(|ui| {
-                if unsupported {
-                    ui.set_opacity(0.5);
-                }
+            // Disabled, not just dimmed: it must not take focus or clicks, and says so to screen readers.
+            ui.add_enabled_ui(!unsupported, |ui| {
                 changed = Some(toggle_row(
                     ui,
                     t,

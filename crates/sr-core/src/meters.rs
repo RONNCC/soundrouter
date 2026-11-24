@@ -185,8 +185,11 @@ impl Meters {
                 (n.id.clone(), peaks)
             })
             .collect();
-        let limiter_reduction = (0..dev.nodes.len())
-            .map(|i| self.reductions.get(i).map_or(0.0, take))
+        let limiter_reduction = dev
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.clone(), self.reductions.get(i).map_or(0.0, take)))
             .collect();
         MeterReading {
             sources,
