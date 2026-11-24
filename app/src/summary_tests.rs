@@ -122,11 +122,10 @@ fn the_second_row_carries_the_delay() {
     let h = open(demo_config());
     // the frozen engine reports 512 frames at 48 kHz and 1384 for captured apps
     h.get_by_label("Delay 10.7 ms  Apps 29 ms");
-    // a device without a reading says so instead of showing a stale number
-    let h = with(demo_config(), demo_status());
-    let mut h = h;
+    // a device without a reading shows nothing there, never a stale number or a placeholder
+    let mut h = with(demo_config(), demo_status());
     click(&mut h, "Select Zoom Out");
-    h.get_by_label("No delay reading yet");
+    assert!(!has(&h, "No delay reading yet"));
 }
 
 #[test]

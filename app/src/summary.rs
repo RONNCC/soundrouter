@@ -405,7 +405,7 @@ pub fn show(ui: &mut Ui, card: Rect, t: &Tokens, st: &mut State, f: &Facts, edit
         return;
     }
 
-    // Second row: what the engine measured.
+    // Second row: what the engine measured; nothing until it has measured.
     let cy2 = card.top() + 54.0;
     let x = card.left() + TEXT_X;
     let max_w = (right - x).max(0.0);
@@ -419,17 +419,15 @@ pub fn show(ui: &mut Ui, card: Rect, t: &Tokens, st: &mut State, f: &Facts, edit
                 }
                 (text, delay_readout_tip(f.apps_ms))
             }
-            None => (
-                "No delay reading yet".to_owned(),
-                "Shown once audio runs through this device.".to_owned(),
-            ),
+            // A stale number would mislead; the row stays empty until audio runs.
+            None => return,
         },
     };
     let failed = matches!(f.state, DeviceState::Failed(_)) && dev.enabled;
-    let (font, color) = match (failed, f.delay_ms) {
-        (true, _) => (body(), t.bad_ink),
-        (false, Some(_)) => (num(12.0), t.ink),
-        (false, None) => (body(), t.muted),
+    let (font, color) = if failed {
+        (body(), t.bad_ink)
+    } else {
+        (num(12.0), t.ink)
     };
     text_left(ui, x, cy2, &text, font, color, max_w);
     let hit = ui.interact(
