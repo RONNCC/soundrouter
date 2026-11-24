@@ -122,10 +122,24 @@ pub fn led_color(i: usize, t: &Tokens) -> Color32 {
 
 /// LED ladder in `r`: the segments up to `level` light, the segment at `peak` holds its light.
 pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) {
+    ladder(p, r, level, peak, t, dim, false);
+}
+
+/// `meter` standing up, quietest segment at the bottom: a mixer strip's channel.
+pub fn meter_v(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) {
+    ladder(p, r, level, peak, t, dim, true);
+}
+
+fn ladder(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32, up: bool) {
     let n = LED_SEGMENTS as f32;
-    let gap = (r.width() / n * 0.3).clamp(1.0, 2.0);
-    let w = (r.width() - gap * (n - 1.0)) / n;
-    let round = CornerRadius::same((w.min(r.height()) / 3.0).round().max(1.0) as u8);
+    let (long, short) = if up {
+        (r.height(), r.width())
+    } else {
+        (r.width(), r.height())
+    };
+    let gap = (long / n * 0.3).clamp(1.0, 2.0);
+    let w = (long - gap * (n - 1.0)) / n;
+    let round = CornerRadius::same((w.min(short) / 3.0).round().max(1.0) as u8);
     let lit = led_lit(level);
     let held = if peak > 0.0 {
         led_lit(peak).checked_sub(1)
@@ -133,10 +147,12 @@ pub fn meter(p: &Painter, r: Rect, level: f32, peak: f32, t: &Tokens, dim: f32) 
         None
     };
     for i in 0..LED_SEGMENTS {
-        let seg = Rect::from_min_size(
-            pos2(r.left() + i as f32 * (w + gap), r.top()),
-            vec2(w, r.height()),
-        );
+        let at = i as f32 * (w + gap);
+        let seg = if up {
+            Rect::from_min_size(pos2(r.left(), r.bottom() - at - w), vec2(short, w))
+        } else {
+            Rect::from_min_size(pos2(r.left() + at, r.top()), vec2(w, short))
+        };
         let color = if i < lit || held == Some(i) {
             led_color(i, t).gamma_multiply(dim)
         } else {

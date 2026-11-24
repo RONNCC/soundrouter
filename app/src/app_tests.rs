@@ -226,7 +226,13 @@ fn every_control_of_the_demo_window_has_an_accessible_name() {
         "Loopback Audio volume",
         "Device name",
         "Add source",
-        "Add channel pair",
+        "Output channel options",
+        "Music settings",
+        "Music volume",
+        "Mute Music",
+        "EQ on Music",
+        "Music channel 1 input",
+        "Music channel 2 output",
         "Add monitor",
         "Safari enabled",
         "Safari options",
@@ -542,8 +548,10 @@ fn adding_an_input_device_keeps_its_own_channel_count() {
 fn growing_and_shrinking_channel_pairs() {
     let mut h = open(demo_config());
     assert!(h.query_by_label("Remove channel pair").is_none());
+    click(&mut h, "Output channel options");
     click(&mut h, "Add channel pair");
     assert_eq!(h.state().cfg.devices[0].channels, 4);
+    click(&mut h, "Output channel options");
     click(&mut h, "Remove channel pair");
     assert_eq!(h.state().cfg.devices[0].channels, 2);
 }
@@ -979,6 +987,83 @@ mod snapshots {
         }
     }
 
+    /// `name` at the default window and at its smallest (`name_1000`), dark and light.
+    fn sized(
+        name: &str,
+        cfg: impl Fn() -> Config,
+        f: impl Fn(&mut Harness<App>),
+        results: &mut egui_kittest::SnapshotResults,
+    ) {
+        for theme in [Theme::Dark, Theme::Light] {
+            shot(name, theme, cfg(), None, &f, results);
+            let small = |h: &mut Harness<App>| {
+                minimum(h);
+                f(h);
+            };
+            shot(&format!("{name}_1000"), theme, cfg(), None, small, results);
+        }
+    }
+
+    #[test]
+    fn one_mixer() {
+        let mut results = egui_kittest::SnapshotResults::new();
+        sized("mixers_1", demo_config, |_| {}, &mut results);
+    }
+
+    /// The demo's Music mixer, and one behind Safari and one behind Pass-Thru.
+    #[test]
+    fn three_mixers() {
+        let cfg = || {
+            let mut cfg = demo_config();
+            apply(
+                &mut cfg,
+                Edit::AddNode(0, crate::model::NewNode::ForSource(0)),
+            );
+            apply(
+                &mut cfg,
+                Edit::AddNode(0, crate::model::NewNode::ForSource(2)),
+            );
+            assert_eq!(cfg.devices[0].nodes.len(), 3);
+            cfg
+        };
+        let mut results = egui_kittest::SnapshotResults::new();
+        sized("mixers_3", cfg, |_| {}, &mut results);
+    }
+
+    /// The Music mixer with only `fx`, its chip clicked open.
+    fn effect(name: &str, fx: sr_core::config::Fx, results: &mut egui_kittest::SnapshotResults) {
+        let cfg = || {
+            let mut cfg = demo_config();
+            cfg.devices[0].nodes[0].fx = vec![fx.clone()];
+            cfg
+        };
+        let open = |h: &mut Harness<App>| {
+            h.get_by_label_contains(" on Music").click();
+            settle(h);
+        };
+        sized(name, cfg, open, results);
+    }
+
+    #[test]
+    fn effect_popovers() {
+        use sr_core::config::Fx;
+        let mut results = egui_kittest::SnapshotResults::new();
+        effect("mixer_fx_mono", Fx::Mono, &mut results);
+        let eq = Fx::Eq {
+            low_hz: 120.0,
+            low_db: 3.0,
+            high_hz: 8000.0,
+            high_db: -2.5,
+        };
+        effect("mixer_fx_eq", eq, &mut results);
+        let limiter = Fx::Limiter {
+            ceiling_db: -1.0,
+            knee_db: 6.0,
+        };
+        effect("mixer_fx_limiter", limiter, &mut results);
+        effect("mixer_fx_delay", Fx::Delay { ms: 20.0 }, &mut results);
+    }
+
     #[test]
     fn main_view() {
         both("main", demo_config, None, |_| {});
@@ -1006,18 +1091,27 @@ mod snapshots {
         both("empty", Config::default, None, |_| {});
     }
 
-    /// Safari, Spotify and Pass-Thru into one stereo pair, with trims of every kind on show.
+    /// Safari and Pass-Thru into the stereo pair and Spotify into the Music mixer, with trims of
+    /// every kind on show: one of them on a cable into the mixer.
     fn trimmed() -> Config {
+        use crate::model::{Link, Port};
         let mut cfg = demo_config();
-        let l = |src, ch, out| crate::model::Link {
-            from: crate::model::Port::Src { src, ch },
-            to: crate::model::Port::OutIn { ch: out },
+        let l = |src, ch, out| Link {
+            from: Port::Src { src, ch },
+            to: Port::OutIn { ch: out },
+        };
+        let music = Link {
+            from: Port::Src { src: 1, ch: 1 },
+            to: Port::NodeIn { node: 0, ch: 1 },
         };
         apply(&mut cfg, Edit::WireGain(0, l(0, 0, 0), -6.0));
-        apply(&mut cfg, Edit::WireGain(0, l(1, 1, 1), -3.5));
-        apply(&mut cfg, Edit::WireInvert(0, l(1, 1, 1), true));
+        apply(&mut cfg, Edit::WireGain(0, music, -3.5));
+        apply(&mut cfg, Edit::WireInvert(0, music, true));
         apply(&mut cfg, Edit::WireInvert(0, l(2, 0, 0), true));
         apply(&mut cfg, Edit::WireGain(0, l(2, 1, 1), 2.5));
+        // Every edit landed on a cable that exists.
+        let trims = cfg.devices[0].wires.iter();
+        assert_eq!(trims.filter(|w| w.gain_db != 0.0 || w.invert).count(), 4);
         cfg
     }
 
@@ -2452,7 +2546,10 @@ fn quitting_mid_slider_drag_still_saves_the_change() {
     assert!(h.state().cfg.devices[0].volume_db < 0.0);
     assert!(!path.exists(), "the save waits for the button to come up");
     eframe::App::on_exit(h.state_mut());
-    assert_eq!(store::load(&path).0, h.state().cfg);
+    // The file says the version it needs (2: the demo has a mixer); the rest is the same.
+    let mut want = h.state().cfg.clone();
+    want.version = want.written_version();
+    assert_eq!(store::load(&path).0, want);
 }
 
 /// Remembers the last config the worker applied.
@@ -2814,9 +2911,14 @@ fn switches_and_buttons_work_from_the_keyboard() {
         settle(&mut h);
         assert_ne!(h.state().cfg, before, "{label}");
     }
-    h.get_by_label("Add channel pair").focus();
+    // The Output channels menu opens from the keyboard and its rows answer it too.
+    h.get_by_label("Output channel options").focus();
     settle(&mut h);
     h.key_press(egui::Key::Space);
+    settle(&mut h);
+    h.get_by_label("Add channel pair").focus();
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
     settle(&mut h);
     assert_eq!(h.state().cfg.devices[0].channels, 4);
 }
@@ -3447,7 +3549,7 @@ fn a_cables_chip_opens_its_popover_and_esc_closes_it() {
 #[test]
 fn the_chip_is_reachable_by_keyboard() {
     let mut h = open(demo_config());
-    chip_node!(h, "Spotify", 1, 1).focus();
+    chip_node!(h, "Safari", 1, 1).focus();
     settle(&mut h);
     h.key_press(egui::Key::Enter);
     settle(&mut h);
@@ -3586,9 +3688,16 @@ fn two_cables_into_a_channel_offer_to_balance_them_and_undo_takes_it_back() {
     h.get_by_label("Two cables add up (+6 dB). Trim each by -6 dB.");
     click(&mut h, "Balance cables");
     let d = &h.state().cfg.devices[0];
-    let gains: Vec<_> = d.wires.iter().map(|w| (w.out_ch, w.gain_db)).collect();
-    // Only the cables into the channel that was open; the other channel still has its pair.
+    let gains: Vec<_> = d
+        .wires
+        .iter()
+        .filter(|w| w.to.is_none())
+        .map(|w| (w.out_ch, w.gain_db))
+        .collect();
+    // Only the cables into the channel that was open (Safari's and the Music mixer's); the
+    // other channel still has its pair, and the cables into the mixer keep theirs.
     assert_eq!(gains, [(0, -6.0), (1, 0.0), (0, -6.0), (1, 0.0)]);
+    assert!(d.wires.iter().all(|w| w.to.is_none() || w.gain_db == 0.0));
     // The popover closes; the toast offers the way back.
     assert!(!has(&h, "Balance cables"));
     h.get_by_label("Balanced cables into channel 1 (L)");
@@ -3615,7 +3724,7 @@ fn three_cables_say_how_much_they_add_up_to() {
         h.state().cfg.devices[0]
             .wires
             .iter()
-            .filter(|w| w.out_ch == 0)
+            .filter(|w| w.to.is_none() && w.out_ch == 0)
             .all(|w| w.gain_db == -9.5)
     );
 }
@@ -3623,6 +3732,7 @@ fn three_cables_say_how_much_they_add_up_to() {
 #[test]
 fn a_lone_cable_offers_no_balance() {
     let mut cfg = demo_config();
+    apply(&mut cfg, Edit::RemoveNode(0, 0));
     apply(&mut cfg, Edit::RemoveSource(0, 2));
     apply(&mut cfg, Edit::RemoveSource(0, 1));
     let mut h = open(cfg);
@@ -3689,6 +3799,258 @@ fn an_idle_window_with_a_trimmed_cable_and_an_open_popover_asks_for_no_frames() 
     );
     chip_node!(h, "Safari", 0, 0).click();
     settle(&mut h);
+    h.run_steps(60);
+    assert!(
+        !h.ctx.has_requested_repaint(),
+        "{:?}",
+        h.ctx.repaint_causes()
+    );
+}
+
+// ---- mixers: the strips between Sources and Output Channels --------------------------------
+
+fn music(h: &Harness<App>) -> sr_core::config::Node {
+    h.state().cfg.devices[0].nodes[0].clone()
+}
+
+fn links0(h: &Harness<App>) -> Vec<crate::model::Link> {
+    crate::model::links(&h.state().cfg.devices[0])
+}
+
+fn type_into(h: &mut Harness<App>, label: &str, text: &str) {
+    h.get_by_label(label).focus();
+    settle(h);
+    select_all(h);
+    h.get_by_label(label).type_text(text);
+    h.key_press(egui::Key::Enter);
+    settle(h);
+}
+
+#[test]
+fn the_plus_over_a_cable_inserts_a_mixer_on_it() {
+    use crate::model::{Link, Port};
+    let mut h = open(demo_config());
+    let at = chip_node!(h, "Safari", 0, 0).rect().center();
+    h.hover_at(at);
+    settle(&mut h);
+    let plus = "Insert mixer on cable, Safari, channel 1 (L) to Channel 1 (L)";
+    let p = h.get_by_label(plus).rect().center();
+    tap_at(&mut h, p);
+    let d = &h.state().cfg.devices[0];
+    assert_eq!(d.nodes.len(), 2);
+    assert_eq!(d.nodes[1].name, "Mixer");
+    // One cable in, one cable out, on the side the cable went to.
+    let all = links0(&h);
+    assert!(all.contains(&Link {
+        from: Port::Src { src: 0, ch: 0 },
+        to: Port::NodeIn { node: 1, ch: 0 },
+    }));
+    assert!(all.contains(&Link {
+        from: Port::NodeOut { node: 1, ch: 0 },
+        to: Port::OutIn { ch: 0 },
+    }));
+    h.get_by_label("Mixer settings");
+    h.state().cfg.validate().unwrap();
+}
+
+#[test]
+fn a_mixer_comes_from_the_output_menu_or_a_sources_options() {
+    use crate::model::Port;
+    let mut h = open(one_source());
+    assert!(!has(&h, "Mixer settings"));
+    click(&mut h, "Output channel options");
+    click(&mut h, "Add mixer");
+    assert_eq!(h.state().cfg.devices[0].nodes.len(), 1);
+    h.get_by_label("Mixer settings");
+    // An empty mixer, to wire by hand: nothing goes in or out yet.
+    assert!(
+        links0(&h)
+            .iter()
+            .all(|l| !matches!(l.to, Port::NodeIn { .. }))
+    );
+    click(&mut h, "Safari options");
+    click(&mut h, "Add mixer for Safari");
+    let d = &h.state().cfg.devices[0];
+    assert_eq!(d.nodes[1].name, "Mixer 2");
+    // Safari now reaches the outputs only through it.
+    let all = links0(&h);
+    assert!(
+        all.iter()
+            .filter(|l| matches!(l.from, Port::Src { .. }))
+            .all(|l| l.to
+                == Port::NodeIn {
+                    node: 1,
+                    ch: match l.from {
+                        Port::Src { ch, .. } => ch,
+                        _ => unreachable!(),
+                    }
+                })
+    );
+    h.get_by_label("Mixer 2 settings");
+    h.state().cfg.validate().unwrap();
+}
+
+#[test]
+fn cables_plug_into_and_out_of_a_mixer() {
+    use crate::model::{Link, Port};
+    let mut h = open(demo_config());
+    let row = Port::NodeIn { node: 0, ch: 0 };
+    let safari = Link {
+        from: Port::Src { src: 0, ch: 0 },
+        to: row,
+    };
+    let (a, b) = (
+        center(&h, "Safari channel 1 output"),
+        center(&h, "Music channel 1 input"),
+    );
+    drag(&mut h, a, b);
+    assert!(links0(&h).contains(&safari));
+    // Out of the mixer into another output channel pair.
+    click(&mut h, "Output channel options");
+    click(&mut h, "Add channel pair");
+    let (a, b) = (
+        center(&h, "Music channel 1 output"),
+        center(&h, "Output channel 3 input"),
+    );
+    drag(&mut h, a, b);
+    assert!(links0(&h).contains(&Link {
+        from: Port::NodeOut { node: 0, ch: 0 },
+        to: Port::OutIn { ch: 2 },
+    }));
+    // A click on the mixer's input jack unplugs what comes into that row, nothing else.
+    let before = links0(&h).len();
+    click(&mut h, "Music channel 1 input");
+    let after = links0(&h);
+    assert!(!after.iter().any(|l| l.to == row));
+    assert_eq!(
+        after.len(),
+        before - 2,
+        "Safari's and Spotify's cables into row 1"
+    );
+    h.state().cfg.validate().unwrap();
+}
+
+#[test]
+fn a_strip_mutes_and_fades_from_the_keyboard() {
+    let mut h = open(demo_config());
+    h.get_by_label("Mute Music").focus();
+    settle(&mut h);
+    h.key_press(egui::Key::Space);
+    settle(&mut h);
+    assert!(music(&h).muted);
+    // The state is in words, not only in colour.
+    h.get_by_label("Mute Music");
+    assert!(
+        h.query_by_label("Mute Music")
+            .unwrap()
+            .accesskit_node()
+            .toggled()
+            .is_some()
+    );
+    h.get_by_label("Music volume").focus();
+    settle(&mut h);
+    h.key_press(egui::Key::ArrowLeft);
+    settle(&mut h);
+    assert!(music(&h).gain_db < 0.0);
+    h.state().cfg.validate().unwrap();
+}
+
+#[test]
+fn the_inspector_works_from_the_keyboard_and_esc_closes_it() {
+    use sr_core::config::Fx;
+    let mut h = open(demo_config());
+    assert!(!has(&h, "Mixer name"));
+    h.get_by_label("Music settings").focus();
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    h.get_by_label("Mixer name");
+    // Arrow keys step a slider by 1 % of its range.
+    h.get_by_label("Low shelf gain, dB").focus();
+    settle(&mut h);
+    h.key_press(egui::Key::ArrowRight);
+    settle(&mut h);
+    let Fx::Eq { low_db, .. } = music(&h).fx[0] else {
+        panic!("EQ first")
+    };
+    assert!((low_db - 2.4).abs() < 0.01, "{low_db}");
+    // A typed value is held to the effect's range.
+    type_into(&mut h, "Limiter ceiling value, dB", "-30");
+    assert!(matches!(
+        music(&h).fx[1],
+        Fx::Limiter { ceiling_db, .. } if ceiling_db == -24.0
+    ));
+    type_into(&mut h, "Mixer name", "Tunes");
+    assert_eq!(music(&h).name, "Tunes");
+    h.get_by_label("Tunes settings");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(!has(&h, "Mixer name"));
+    h.state().cfg.validate().unwrap();
+}
+
+#[test]
+fn effects_are_added_reordered_set_and_removed_in_the_inspector() {
+    use sr_core::config::Fx;
+    let mut h = open(demo_config());
+    let kinds = |h: &Harness<App>| {
+        music(h)
+            .fx
+            .iter()
+            .map(|f| match f {
+                Fx::Mono => "mono",
+                Fx::Eq { .. } => "eq",
+                Fx::Limiter { .. } => "limiter",
+                Fx::Delay { .. } => "delay",
+            })
+            .collect::<Vec<_>>()
+    };
+    click(&mut h, "Music settings");
+    click(&mut h, "Add Delay");
+    assert_eq!(kinds(&h), ["eq", "limiter", "delay"]);
+    // The strip shows it, and the inspector says what it costs.
+    h.get_by_label("Delay 0 ms on Music");
+    h.get_by_label("Adds 0 ms");
+    click(&mut h, "Move Delay up");
+    assert_eq!(kinds(&h), ["eq", "delay", "limiter"]);
+    type_into(&mut h, "Delay time value, ms", "12");
+    assert_eq!(music(&h).fx[1], Fx::Delay { ms: 12.0 });
+    h.get_by_label("Adds 12 ms");
+    h.get_by_label("Delay 12 ms on Music");
+    click(&mut h, "Remove Limiter");
+    click(&mut h, "Add Mono");
+    assert_eq!(kinds(&h), ["eq", "delay", "mono"]);
+    click(&mut h, "Move EQ down");
+    assert_eq!(kinds(&h), ["delay", "eq", "mono"]);
+    h.state().cfg.validate().unwrap();
+}
+
+#[test]
+fn removing_a_mixer_joins_its_cables_and_undo_brings_it_back() {
+    use crate::model::{Link, Port};
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    click(&mut h, "Music settings");
+    click(&mut h, "Remove Music");
+    assert!(h.state().cfg.devices[0].nodes.is_empty());
+    // Spotify goes straight to the outputs again.
+    for ch in 0..2 {
+        assert!(links0(&h).contains(&Link {
+            from: Port::Src { src: 1, ch },
+            to: Port::OutIn { ch },
+        }));
+    }
+    h.get_by_label("Removed Music");
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before);
+    h.get_by_label("Music settings");
+}
+
+#[test]
+fn an_idle_window_with_a_mixer_and_its_inspector_open_asks_for_no_frames() {
+    let mut h = open(demo_config());
+    click(&mut h, "Music settings");
+    h.get_by_label("Mixer name");
     h.run_steps(60);
     assert!(
         !h.ctx.has_requested_repaint(),

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cb930805fa7a3c85a3e56a20facb7e05b1b867a8b508666439e800a7a4f07b45 # shrinks to edits = [NewDevice, AddSource(1, Device { uid: "a" }, 0), BalanceCables(1, 0)]

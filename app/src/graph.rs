@@ -4,25 +4,28 @@ use crate::app_icons::{LOOK_AHEAD, Look, PickerIcons, visible_rows, wanted};
 use crate::cables::{Cables, assign};
 use crate::icons::{self, IconTextures};
 use crate::layout::{
-    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, ROW_H as ROW_PITCH, TOP,
-    body_height, wire_distance, wire_mid, wire_points,
+    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, NodeSpec, ROW_H as ROW_PITCH,
+    STRIP_LIMIT_H, STRIP_METER_H, STRIP_ROW_H, TOP, body_height, wire_distance, wire_mid,
+    wire_points,
 };
 use crate::meter::{PeakHold, level};
 use crate::model::{
-    Edit, Link, Port, balance_db, balanced, can_link, ch_label, fan_in, links, pan_of, wire_of,
+    Edit, FxEdit, Link, NewNode, Port, balance_db, balanced, can_add_fx, can_add_node, can_link,
+    ch_label, fan_in, links, node_name, pan_of, wire_of,
 };
 use crate::theme::{Tokens, body, cable_color, caption, label, num, radius, section, tile_tint};
 use crate::widgets::{
-    MIN_HIT, Plug, chevron, darken, hit, hit_rect, jack, loops, menu_hint, meter, name_button,
-    name_widget, plus_circle, slider, switch, tile, trim_glyph, x_button, xmark,
+    MIN_HIT, Plug, chevron, darken, halo, hit, hit_rect, jack, loops, menu_hint, meter, meter_v,
+    name_button, name_widget, plus_circle, plus_glyph, slider, switch, tile, trim_glyph, x_button,
+    xmark,
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Popup, PopupCloseBehavior, Pos2, Rect,
-    Response, Sense, Shape, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo,
+    Response, Sense, Shape, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, Vec2, WidgetInfo,
     epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
 };
 use sr_core::backend::{AppInfo, HwDevice, MeterReading, TccStatus};
-use sr_core::config::{Config, Monitor, Source, SourceKind, VirtualDevice, Wire};
+use sr_core::config::{Config, Fx, Monitor, Node, Source, SourceKind, VirtualDevice, Wire};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -63,6 +66,8 @@ pub struct GraphState {
     trim_hot: Option<Link>,
     /// Text of the open trim popover's gain field while it is being typed in.
     trim_text: String,
+    /// Text of the mixer inspector field that has the keyboard, while it is being typed in.
+    field_text: String,
     /// Filled once by a background scan (started on the first frame), see `sr_audio::apps::installed_apps`.
     pub installed: Arc<OnceLock<Vec<AppInfo>>>,
     pub scan_started: bool,
@@ -148,6 +153,10 @@ pub fn undo_note(
             "Balanced cables into",
             format!("channel {}", ch_label(ch, 0)),
         ),
+        Edit::RemoveNode(d, n) => (
+            "Removed",
+            node_name(cfg.devices.get(d)?.nodes.get(n)?).to_string(),
+        ),
         _ => return None,
     })
 }
@@ -232,6 +241,15 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
             mute_row: false,
         })
         .collect();
+    let node_specs: Vec<NodeSpec> = dev
+        .nodes
+        .iter()
+        .map(|n| NodeSpec {
+            rows: n.channels,
+            fx: n.fx.len(),
+            limiter: has_limiter(n),
+        })
+        .collect();
     let origin = ui.cursor().min;
     let width = ui.available_width();
     let layout = Layout::compute(
@@ -240,6 +258,7 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
         &src_specs,
         usize::from(dev.channels / 2),
         &mon_specs,
+        &node_specs,
     );
     let need = if dev.sources.is_empty() || dev.monitors.is_empty() {
         TOP + EMPTY_H
@@ -254,9 +273,18 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
     column_headers(ui, g, st, &layout, edits);
     empty_columns(ui, g, st, &layout, edits);
     for c in &layout.cards {
-        card(ui, g, st, edits, c, dt, &key);
+        if !matches!(c.id, CardId::Node(_)) {
+            card(ui, g, st, edits, c, dt, &key);
+        }
     }
-    wires_and_ports(ui, g, st, edits, &layout);
+    // Strips go over the cables that pass behind them, under the jacks and the cable controls.
+    wires_and_ports(ui, g, st, edits, &layout, &mut |ui, st, edits| {
+        for c in &layout.cards {
+            if let CardId::Node(n) = c.id {
+                strip(ui, g, st, edits, c, n, dt);
+            }
+        }
+    });
     st.picker.end_frame();
     layout
 }
@@ -284,15 +312,17 @@ fn column_headers(
     ];
     for (i, (title, sub)) in heads.iter().enumerate() {
         let x = layout.origin.x + layout.col_x[i];
-        text_left(
-            ui,
-            x + 2.0,
-            base - 37.0,
-            title,
-            section(),
-            t.ink,
-            layout.card_w - 50.0,
-        );
+        let max_w = layout.card_w - 34.0;
+        // A title a little too wide for narrow cards (beside mixers) steps down a size or two
+        // before it elides.
+        let mut font = section();
+        let w = ui
+            .painter()
+            .layout_no_wrap(title.to_string(), font.clone(), t.ink)
+            .size()
+            .x;
+        font.size *= ((max_w - 6.0) / w).clamp(0.85, 1.0);
+        text_left(ui, x + 2.0, base - 37.0, title, font, t.ink, max_w);
         text_left(
             ui,
             x + 2.0,
@@ -300,7 +330,7 @@ fn column_headers(
             sub,
             caption(),
             t.muted,
-            layout.card_w - 50.0,
+            layout.card_w - 34.0,
         );
         let right = x + layout.card_w;
         let id = Id::unique(("hdr", d, i));
@@ -324,30 +354,18 @@ fn column_headers(
             1 => {
                 let resp = plus_circle(
                     ui,
-                    pos2(right - 12.0, base - 28.0),
+                    pos2(right - 20.0, base - 28.0),
                     id,
                     t,
                     false,
-                    "Add channel pair",
+                    "Output channel options",
                 );
-                if resp.clicked() {
-                    edits.push(Edit::GrowChannels(d));
-                }
-                resp.on_hover_text("Add a channel pair");
-                if dev.channels > 2 {
-                    let resp = plus_circle(
-                        ui,
-                        pos2(right - 44.0, base - 28.0),
-                        id.with("minus"),
-                        t,
-                        true,
-                        "Remove channel pair",
-                    );
-                    if resp.clicked() {
-                        edits.push(Edit::ShrinkChannels(d));
-                    }
-                    resp.on_hover_text("Remove the last channel pair");
-                }
+                menu_hint(
+                    ui.painter(),
+                    pos2(right - 4.0, base - 28.0),
+                    hint_color(&resp, t),
+                );
+                Popup::menu(&resp).show(|ui| output_menu(ui, g, edits));
             }
             _ => {
                 let resp = plus_circle(
@@ -938,6 +956,33 @@ fn monitor_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
         });
 }
 
+/// The Output channels menu: grow or shrink the device by a pair, or add an empty mixer to wire
+/// by hand.
+fn output_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
+    let (dev, t, d) = (g.dev, g.t, g.dev_idx);
+    ui.set_min_width(210.0);
+    let grow = usize::from(dev.channels) + 2 <= sr_core::config::MAX_CH;
+    let mark = |minus| move |p: &egui::Painter, r: Rect| plus_glyph(p, r.center(), t.muted, minus);
+    if menu_row(ui, t, grow, "Add channel pair", "", mark(false)) {
+        edits.push(Edit::GrowChannels(d));
+    }
+    if menu_row(
+        ui,
+        t,
+        dev.channels > 2,
+        "Remove channel pair",
+        "",
+        mark(true),
+    ) {
+        edits.push(Edit::ShrinkChannels(d));
+    }
+    ui.separator();
+    let mixer = |p: &egui::Painter, r: Rect| trim_glyph(p, r.center(), t.muted);
+    if menu_row(ui, t, can_add_node(dev, 2), "Add mixer", "", mixer) {
+        edits.push(Edit::AddNode(d, NewNode::Empty));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn card(
     ui: &mut Ui,
@@ -963,6 +1008,7 @@ fn card(
                 key(&s.id),
             )
         }
+        CardId::Node(_) => unreachable!("strips are drawn by `strip`"),
         CardId::Out(p) => (
             format!("Channels {} & {}", p * 2 + 1, p * 2 + 2),
             String::new(),
@@ -989,7 +1035,7 @@ fn card(
             let uid = &dev.monitors[i].device_uid;
             (!g.hw.iter().any(|h| &h.uid == uid)).then_some(NOT_CONNECTED)
         }
-        CardId::Out(_) => None,
+        CardId::Out(_) | CardId::Node(_) => None,
     };
     // An unplugged monitor plays nothing, whatever reaches the output channels.
     let active = on.unwrap_or(true) && dev.enabled && note != Some(NOT_CONNECTED);
@@ -1027,13 +1073,16 @@ fn card(
             }
             _ => 0.0,
         };
+    // A narrow card (beside mixers at a small window) gives the "On"/"Off" word's room to the
+    // title; the switch still shows its state by its knob.
+    let word = note.is_some() || r.width() >= 200.0;
     let title_w = r.right()
         - 14.0
         - title_x
-        - if on.is_some() {
-            94.0 + note_w.max(0.0)
-        } else {
-            0.0
+        - match (on.is_some(), word) {
+            (false, _) => 0.0,
+            (true, true) => 94.0 + note_w.max(0.0),
+            (true, false) => 70.0,
         };
     text_left(
         ui,
@@ -1053,7 +1102,7 @@ fn card(
         let (label, edit) = match c.id {
             CardId::Src(i) => ("Remove", Edit::RemoveSource(d, i)),
             CardId::Mon(i) => ("Remove", Edit::RemoveMonitor(d, i)),
-            CardId::Out(_) => unreachable!(),
+            CardId::Out(_) | CardId::Node(_) => unreachable!(),
         };
         let at = pos2(r.right() - 14.0 - 8.0, r.top() + HEAD_H / 2.0);
         let x = x_button(
@@ -1076,7 +1125,7 @@ fn card(
             vec2(32.0, 18.0),
         );
         let mut reach = sw.expand2(vec2(6.0, 0.0));
-        if note.is_none() {
+        if note.is_none() && word {
             reach.min.x -= 6.0 + 28.0;
         }
         let new = switch(
@@ -1088,18 +1137,20 @@ fn card(
             t,
             &format!("{title} enabled"),
         );
-        painter.text(
-            pos2(sw.left() - 6.0, sw.center().y),
-            Align2::RIGHT_CENTER,
-            note.unwrap_or(if new { "On" } else { "Off" }),
-            caption(),
-            if note.is_some() { t.warn_ink } else { t.muted },
-        );
+        if word {
+            painter.text(
+                pos2(sw.left() - 6.0, sw.center().y),
+                Align2::RIGHT_CENTER,
+                note.unwrap_or(if new { "On" } else { "Off" }),
+                caption(),
+                if note.is_some() { t.warn_ink } else { t.muted },
+            );
+        }
         if new != on_now {
             edits.push(match c.id {
                 CardId::Src(i) => Edit::SourceOn(d, i, new),
                 CardId::Mon(i) => Edit::MonitorOn(d, i, new),
-                CardId::Out(_) => unreachable!(),
+                CardId::Out(_) | CardId::Node(_) => unreachable!(),
             });
         }
     }
@@ -1247,7 +1298,7 @@ fn card(
         edits.push(match c.id {
             CardId::Src(i) => Edit::SourceVolume(d, i, v),
             CardId::Mon(i) => Edit::MonitorVolume(d, i, v),
-            CardId::Out(_) => unreachable!(),
+            CardId::Out(_) | CardId::Node(_) => unreachable!(),
         });
     }
     let mut rm_y = y0 + FOOT_H + MIN_HIT;
@@ -1270,19 +1321,22 @@ fn card(
             rm_y += MUTE_H;
         }
     }
-    let rm = Rect::from_min_size(pos2(r.left() + 14.0, rm_y), vec2(120.0, MIN_HIT));
-    let resp = hit(ui, rm, Id::unique(("rm", d, c.id)));
     let (label, edit) = match c.id {
         CardId::Src(i) => ("Remove Source", Edit::RemoveSource(d, i)),
         CardId::Mon(i) => ("Remove Monitor", Edit::RemoveMonitor(d, i)),
-        CardId::Out(_) => return,
+        CardId::Out(_) | CardId::Node(_) => return,
     };
+    // The word is "Remove" on the card, as everywhere; the reader hears what goes.
+    let words = painter.layout_no_wrap("Remove".into(), caption(), Color32::PLACEHOLDER);
+    let rm = Rect::from_min_size(
+        pos2(r.left() + 14.0, rm_y),
+        vec2(words.size().x + 8.0, MIN_HIT),
+    );
+    let resp = hit(ui, rm, Id::unique(("rm", d, c.id)));
     name_button(&resp, &format!("{label} {title}"));
-    painter.text(
-        rm.left_center(),
-        Align2::LEFT_CENTER,
-        label,
-        caption(),
+    painter.galley(
+        pos2(rm.left(), rm.center().y - words.size().y / 2.0),
+        words,
         if resp.hovered() {
             t.bad_ink
         } else {
@@ -1291,6 +1345,26 @@ fn card(
     );
     if resp.clicked() && !resp.double_clicked() {
         edits.push(edit);
+    }
+    // A source can be routed through a new mixer from here.
+    if let CardId::Src(i) = c.id
+        && can_add_node(dev, dev.sources[i].channels.min(8))
+    {
+        let words = painter.layout_no_wrap("Add mixer".into(), caption(), Color32::PLACEHOLDER);
+        let w = words.size().x + 8.0;
+        let at = Rect::from_min_size(pos2(r.right() - 14.0 - w, rm_y), vec2(w, MIN_HIT));
+        let resp = hit(ui, at, Id::unique(("add_mixer", d, c.id)));
+        name_button(&resp, &format!("Add mixer for {title}"));
+        halo(ui, &resp, t);
+        painter.galley(
+            pos2(at.left() + 4.0, at.center().y - words.size().y / 2.0),
+            words,
+            t.accent_ink,
+        );
+        if resp.clicked() {
+            edits.push(Edit::AddNode(d, NewNode::ForSource(i)));
+        }
+        resp.on_hover_text("Route this source through a new mixer");
     }
 }
 
@@ -1322,6 +1396,15 @@ fn row_level(g: &GraphCtx, id: CardId, row: u16) -> f32 {
                 .fold(0.0f32, |a, b| a.max(*b))
                 * gain
         }
+        CardId::Node(i) => {
+            let n = &g.dev.nodes[i];
+            rd.nodes
+                .iter()
+                .find(|(id, _)| *id == n.id)
+                .and_then(|(_, v)| v.get(usize::from(row)))
+                .copied()
+                .unwrap_or(0.0)
+        }
     }
 }
 
@@ -1340,12 +1423,14 @@ fn source_color(dev: &VirtualDevice, i: usize) -> Color32 {
 }
 
 /// The source whose signal passes through a port: its own for a source port, else whatever feeds
-/// the port first, followed back through the output channels.
+/// the port first, followed back through the output channels and mixer rows. `None` for a port
+/// nothing reaches (a mixer with no source behind it).
 fn feeding_source(all: &[Link], p: Port) -> Option<usize> {
     match p {
         Port::Src { src, .. } => Some(src),
         Port::OutOut { ch } => feeding_source(all, Port::OutIn { ch }),
-        Port::OutIn { .. } | Port::Mon { .. } => all
+        Port::NodeOut { node, ch } => feeding_source(all, Port::NodeIn { node, ch }),
+        Port::OutIn { .. } | Port::Mon { .. } | Port::NodeIn { .. } => all
             .iter()
             .find(|l| l.to == p)
             .and_then(|l| feeding_source(all, l.from)),
@@ -1353,10 +1438,11 @@ fn feeding_source(all: &[Link], p: Port) -> Option<usize> {
 }
 
 /// The output channel a port stands for, which colours its ring while it is open: a device
-/// channel's own number, a monitor row's own number. A source port has none and stays neutral.
+/// channel's own number, a monitor row's own number. Source and mixer ports have none and stay
+/// neutral.
 fn port_channel(p: Port) -> Option<u16> {
     match p {
-        Port::Src { .. } => None,
+        Port::Src { .. } | Port::NodeIn { .. } | Port::NodeOut { .. } => None,
         Port::OutIn { ch } | Port::OutOut { ch } | Port::Mon { ch, .. } => Some(ch),
     }
 }
@@ -1386,6 +1472,10 @@ fn jack_plug(all: &[Link], slots: &[u8], p: Port, t: &Tokens) -> Plug {
 
 /// "Safari, channel 1 (L) to Channel 3 (L)": what a cable joins, for its tooltip.
 fn link_tip(g: &GraphCtx, l: Link) -> String {
+    let node = |node: usize, ch: u16| {
+        let n = &g.dev.nodes[node];
+        format!("{}, channel {}", node_name(n), ch_label(ch, n.channels))
+    };
     let from = match l.from {
         Port::Src { src, ch } => {
             let s = &g.dev.sources[src];
@@ -1393,7 +1483,8 @@ fn link_tip(g: &GraphCtx, l: Link) -> String {
             format!("{name}, channel {}", ch_label(ch, s.channels))
         }
         Port::OutOut { ch } => format!("Output channel {}", ch_label(ch, 0)),
-        Port::OutIn { .. } | Port::Mon { .. } => String::new(),
+        Port::NodeOut { node: n, ch } => node(n, ch),
+        Port::OutIn { .. } | Port::Mon { .. } | Port::NodeIn { .. } => String::new(),
     };
     let to = match l.to {
         Port::OutIn { ch } => format!("Channel {}", ch_label(ch, 0)),
@@ -1405,7 +1496,8 @@ fn link_tip(g: &GraphCtx, l: Link) -> String {
                 ch_label(ch, mon_rows(m, g.hw))
             )
         }
-        Port::Src { .. } | Port::OutOut { .. } => String::new(),
+        Port::NodeIn { node: n, ch } => node(n, ch),
+        Port::Src { .. } | Port::OutOut { .. } | Port::NodeOut { .. } => String::new(),
     };
     format!("{from} to {to}")
 }
@@ -1435,6 +1527,16 @@ fn port_label(g: &GraphCtx, p: Port) -> String {
             monitor_title(&g.dev.monitors[mon], g.hw),
             ch + 1
         ),
+        Port::NodeIn { node, ch } => {
+            format!("{} channel {} input", node_name(&g.dev.nodes[node]), ch + 1)
+        }
+        Port::NodeOut { node, ch } => {
+            format!(
+                "{} channel {} output",
+                node_name(&g.dev.nodes[node]),
+                ch + 1
+            )
+        }
     }
 }
 
@@ -1450,13 +1552,16 @@ fn draw_cable(p: &egui::Painter, pts: [Pos2; 4], color: Color32, width: f32) {
     }
 }
 
-/// A source cable's trim control: a chip on its middle, always there so the keyboard can reach
+/// A device cable's trim control: a chip on its middle, always there so the keyboard can reach
 /// it. It shows the cable's gain and polarity when they are set, and opens the trim popover.
 struct Trim {
     mid: Pos2,
-    /// Where the x sits relative to `mid` while the cable is hot: above or below the chip, in
-    /// whichever slot no other cable's chip is in.
-    x_dy: f32,
+    /// Where the x sits relative to `mid` while the cable is hot, in a slot beside the chip that
+    /// nothing else is in; `None` when every slot is taken.
+    x_off: Option<Vec2>,
+    /// Where the + that inserts a mixer sits, in the next free slot; `None` when the device has
+    /// no room for another mixer or no slot is free.
+    plus_off: Option<Vec2>,
     chip: Rect,
     /// "-6 dB" and "inv", one per line, only while the cable is trimmed.
     badge: Vec<String>,
@@ -1469,6 +1574,16 @@ const CHIP_H: f32 = 16.0;
 const LINE_H: f32 = 12.0;
 /// How far the hovered cable's x sits from its chip: clear of the chip's own `MIN_HIT` target.
 const X_LIFT: f32 = 28.0;
+/// Slots for the x and the + beside a chip, best first: straight above or below it, then
+/// diagonally off it (clear of neighbours' chips in a dense stack of straight cables).
+const SLOTS: [Vec2; 6] = [
+    vec2(0.0, -X_LIFT),
+    vec2(0.0, X_LIFT),
+    vec2(-32.0, -X_LIFT),
+    vec2(32.0, -X_LIFT),
+    vec2(-32.0, X_LIFT),
+    vec2(32.0, X_LIFT),
+];
 /// Along the cable, where the chip may sit: the middle, else as near to it as keeps it off
 /// the chips of the cables beside it.
 const CHIP_AT: [f32; 7] = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74];
@@ -1477,29 +1592,41 @@ const TRIM_W: f32 = 280.0;
 /// Lowest gain the trim slider reaches; a typed value goes lower.
 const TRIM_MIN_DB: f32 = -40.0;
 
+/// The `MIN_HIT` target of a small glyph button at `at`.
+fn zone(at: Pos2) -> Rect {
+    hit_rect(Rect::from_center_size(at, vec2(8.0, 8.0)))
+}
+
 impl Trim {
-    fn x_at(&self) -> Pos2 {
-        self.mid + vec2(0.0, self.x_dy)
+    fn x_at(&self) -> Option<Pos2> {
+        self.x_off.map(|o| self.mid + o)
     }
 
-    /// The x button's target.
-    fn x_zone(&self) -> Rect {
-        hit_rect(Rect::from_center_size(self.x_at(), vec2(8.0, 8.0)))
+    fn plus_at(&self) -> Option<Pos2> {
+        self.plus_off.map(|o| self.mid + o)
     }
 
-    /// The chip, and when the cable is hot a capsule joining it to its x.
+    /// The chip with its x and + while the cable is hot: one capsule, so the pointer can travel
+    /// from the chip to either button without the cable going cold.
+    fn capsule(&self) -> Rect {
+        let chip = Rect::from_center_size(
+            self.mid,
+            vec2(
+                self.chip.width().max(MIN_HIT) + 4.0,
+                self.chip.height() + 6.0,
+            ),
+        );
+        self.plus_at()
+            .into_iter()
+            .chain(self.x_at())
+            .fold(chip, |r, at| r.union(zone(at)))
+    }
+
+    /// The chip, and when the cable is hot the capsule joining it to its x and +.
     fn paint(&self, p: &egui::Painter, t: &Tokens, hot: bool) {
         if hot {
-            let w = self.chip.width().max(MIN_HIT) + 4.0;
-            let (top, bottom) = (
-                (self.chip.top() - 3.0).min(self.x_at().y - 14.0),
-                (self.chip.bottom() + 3.0).max(self.x_at().y + 14.0),
-            );
             p.rect(
-                Rect::from_min_max(
-                    pos2(self.mid.x - w / 2.0, top),
-                    pos2(self.mid.x + w / 2.0, bottom),
-                ),
+                self.capsule(),
                 CornerRadius::same(radius::STRIP),
                 t.raised,
                 Stroke::new(1.0, t.hairline),
@@ -1586,7 +1713,23 @@ fn trim_controls(
     all: &[Link],
 ) -> Vec<Option<Trim>> {
     let (dev, t, d) = (g.dev, g.t, g.dev_idx);
-    let mut taken: Vec<Rect> = Vec::new();
+    // Cards and jacks take the clicks at the cables' ends and a strip's controls the clicks on
+    // it: chips keep off all of them where they can.
+    let jacks = layout
+        .ports()
+        .into_iter()
+        .filter_map(|p| layout.port_pos(p))
+        .map(|at| Rect::from_center_size(at, vec2(MIN_HIT, ROW_PITCH)));
+    let cards = layout
+        .cards
+        .iter()
+        .filter(|c| !matches!(c.id, CardId::Node(_)))
+        .map(|c| c.rect);
+    let mut taken: Vec<Rect> = strip_keepout(layout, dev)
+        .into_iter()
+        .chain(cards)
+        .chain(jacks)
+        .collect();
     let mut trims: Vec<Option<Trim>> = all
         .iter()
         .map(|l| {
@@ -1607,9 +1750,14 @@ fn trim_controls(
                 CHIP_H + LINE_H * badge.len().saturating_sub(1) as f32,
             );
             let at = |t: f32| Rect::from_center_size(wire_at(pts, t), size);
+            // `CHIP_AT` first, then every 1 % out to the ends (the short runs beside a strip):
+            // the first clear spot, else the least crowded one.
+            let fine =
+                (1..=45u8).flat_map(|k| [0.5 - f32::from(k) / 100.0, 0.5 + f32::from(k) / 100.0]);
             let t_at = CHIP_AT
                 .into_iter()
-                .find(|&t| !taken.iter().any(|r| crowd(*r, hit_rect(at(t)))))
+                .chain(fine)
+                .min_by_key(|&t| taken.iter().filter(|r| crowd(**r, hit_rect(at(t)))).count())
                 .unwrap_or(CHIP_AT[0]);
             let chip = at(t_at);
             taken.push(hit_rect(chip));
@@ -1626,7 +1774,8 @@ fn trim_controls(
             );
             Some(Trim {
                 mid: chip.center(),
-                x_dy: -X_LIFT,
+                x_off: None,
+                plus_off: None,
                 chip,
                 badge,
                 resp,
@@ -1634,22 +1783,21 @@ fn trim_controls(
             })
         })
         .collect();
-    // The x goes above or below its chip, in the first slot no chip is in; with none free, the
-    // one that crowds least.
+    // The x goes in the first slot beside its chip that nothing else is in, and the + in the
+    // next. Where neighbours leave no slot free (a dense stack of straight cables) neither
+    // shows, so a click never lands on a neighbour's chip: the popover still inserts a mixer and
+    // the cable still comes out by its input jack.
+    let room = can_add_node(dev, 2);
     for tr in trims.iter_mut().flatten() {
-        let crowded = |dy: f32| {
-            let zone = hit_rect(Rect::from_center_size(
-                tr.mid + vec2(0.0, dy),
-                vec2(8.0, 8.0),
-            ));
-            taken.iter().filter(|r| crowd(**r, zone)).count()
-        };
+        let mid = tr.mid;
+        let free = |off: Vec2| !taken.iter().any(|r| crowd(*r, zone(mid + off)));
         // The cable's own chip is in `taken` once and clear of every slot by construction.
-        let dy = [-X_LIFT, X_LIFT, -2.0 * X_LIFT, 2.0 * X_LIFT]
-            .into_iter()
-            .min_by_key(|&dy| crowded(dy))
-            .unwrap_or(-X_LIFT);
-        tr.x_dy = dy;
+        tr.x_off = SLOTS.into_iter().find(|&o| free(o));
+        tr.plus_off = tr.x_off.and_then(|x| {
+            SLOTS
+                .into_iter()
+                .find(|&o| room && free(o) && !crowd(zone(mid + x), zone(mid + o)))
+        });
     }
     for (l, tr) in all.iter().zip(trims.iter_mut()) {
         let Some(tr) = tr else { continue };
@@ -1677,9 +1825,6 @@ fn trim_popover(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<
     let (dev, t, d) = (g.dev, g.t, g.dev_idx);
     let Some(w) = wire_of(dev, l) else {
         ui.close();
-        return;
-    };
-    let Port::OutIn { ch: out_ch } = l.to else {
         return;
     };
     ui.set_width(TRIM_W);
@@ -1738,8 +1883,8 @@ fn trim_popover(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<
         field,
         egui::TextEdit::singleline(&mut st.trim_text)
             .id(id)
-            .frame(egui::Frame::NONE)
-            .margin(egui::Margin::symmetric(6, 4))
+            // egui ignores `margin` once a frame is set: the frame carries it.
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(6, 4)))
             .align(Align2::RIGHT_CENTER),
     );
     name_widget(ui, &te, "Cable gain value, dB");
@@ -1819,8 +1964,14 @@ fn trim_popover(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<
     }
 
     // Cables that meet in one output channel add up.
-    let n = fan_in(dev, out_ch);
-    if n >= 2 {
+    let out_ch = match l.to {
+        Port::OutIn { ch } => Some(ch),
+        _ => None,
+    };
+    let n = out_ch.map_or(0, |ch| fan_in(dev, ch));
+    if let Some(out_ch) = out_ch
+        && n >= 2
+    {
         ui.separator();
         let each = balance_db(n);
         let text = if balanced(dev, out_ch) {
@@ -1838,43 +1989,746 @@ fn trim_popover(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<
         };
         ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(t.ink)).wrap());
         if !balanced(dev, out_ch) {
-            let r = ui
-                .allocate_exact_size(vec2(TRIM_W, MIN_HIT), Sense::hover())
-                .0;
-            let btn = Rect::from_min_size(r.min, vec2(130.0, MIN_HIT)).shrink2(vec2(0.0, 2.0));
-            let resp = hit(ui, btn, Id::unique(("trim_balance", d, out_ch)));
-            name_button(&resp, "Balance cables");
-            ui.painter().rect(
-                btn,
-                CornerRadius::same(radius::INPUT),
-                if resp.hovered() {
-                    t.muted.gamma_multiply(0.12)
-                } else {
-                    Color32::TRANSPARENT
-                },
-                Stroke::new(
-                    if resp.has_focus() { 2.0 } else { 1.0 },
-                    if resp.has_focus() {
-                        t.focus
-                    } else {
-                        t.hairline
-                    },
-                ),
-                StrokeKind::Inside,
-            );
-            ui.painter().text(
-                btn.center(),
-                Align2::CENTER_CENTER,
-                "Balance cables",
-                body(),
-                t.ink,
-            );
-            if resp.clicked() {
+            let r = row(ui);
+            let id = Id::unique(("trim_balance", d, out_ch));
+            if text_button(ui, t, r.min, id, "Balance cables", "Balance cables").clicked() {
                 edits.push(Edit::BalanceCables(d, out_ch));
                 // Done: the toast offers Undo, and a click there would only close this first.
                 ui.close();
             }
         }
+    }
+    // What the + over the cable does, for the keyboard and where the + finds no room.
+    if can_add_node(dev, 2) {
+        ui.separator();
+        let r = row(ui);
+        let id = Id::unique(("trim_insert", d, l.from, l.to));
+        if text_button(ui, t, r.min, id, "Insert mixer", "Insert mixer").clicked() {
+            edits.push(Edit::AddNode(d, NewNode::OnCable(l)));
+            ui.close();
+        }
+    }
+}
+
+/// A quiet outlined button that says `text` (and `name` to a screen reader), at `at` (left top),
+/// one row tall.
+fn text_button(ui: &mut Ui, t: &Tokens, at: Pos2, id: Id, text: &str, name: &str) -> Response {
+    let words = ui.painter().layout_no_wrap(text.to_string(), body(), t.ink);
+    let btn = Rect::from_min_size(at, vec2(words.size().x + 28.0, MIN_HIT)).shrink2(vec2(0.0, 2.0));
+    let resp = hit(ui, btn, id);
+    name_button(&resp, name);
+    ui.painter().rect(
+        btn,
+        CornerRadius::same(radius::INPUT),
+        if resp.hovered() {
+            t.muted.gamma_multiply(0.12)
+        } else {
+            Color32::TRANSPARENT
+        },
+        Stroke::new(
+            if resp.has_focus() { 2.0 } else { 1.0 },
+            if resp.has_focus() {
+                t.focus
+            } else {
+                t.hairline
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(btn.center() - words.size() / 2.0, words, t.ink);
+    resp
+}
+
+/// The quiet middle of a strip (its channel rows, meters and limiter line), where the cables
+/// behind it show through; above it the title and below it the fader, mute and effect chips.
+fn strip_quiet(c: &CardLayout, node: &Node) -> Rect {
+    let r = c.rect;
+    let limit = if has_limiter(node) {
+        STRIP_LIMIT_H
+    } else {
+        0.0
+    };
+    let bottom = r.top() + HEAD_H + ROW_PITCH * f32::from(c.rows) + STRIP_METER_H + limit;
+    Rect::from_min_max(pos2(r.left(), r.top() + HEAD_H), pos2(r.right(), bottom))
+}
+
+/// The parts of each strip that hold its controls: cable chips keep off them, and the pointer
+/// there is on the strip, not on a cable behind it.
+fn strip_keepout(layout: &Layout, dev: &VirtualDevice) -> Vec<Rect> {
+    let mut out = Vec::new();
+    for c in &layout.cards {
+        if let CardId::Node(n) = c.id
+            && let Some(node) = dev.nodes.get(n)
+        {
+            let (r, q) = (c.rect, strip_quiet(c, node));
+            out.push(Rect::from_min_max(r.min, pos2(r.right(), q.top())));
+            out.push(Rect::from_min_max(pos2(r.left(), q.bottom()), r.max));
+        }
+    }
+    out
+}
+
+/// Whether a node shows the limiter line on its strip.
+fn has_limiter(n: &Node) -> bool {
+    n.fx.iter().any(|f| matches!(f, Fx::Limiter { .. }))
+}
+
+/// An effect's name, as its chip, its inspector heading and the Add effect row say it.
+fn fx_name(fx: &Fx) -> &'static str {
+    match fx {
+        Fx::Mono => "Mono",
+        Fx::Eq { .. } => "EQ",
+        Fx::Limiter { .. } => "Limiter",
+        Fx::Delay { .. } => "Delay",
+    }
+}
+
+/// A number as the fields and readouts print it: whole when it is whole, else one decimal.
+fn short_num(x: f32) -> String {
+    let r = (x * 10.0).round() / 10.0 + 0.0; // + 0.0 turns -0.0 into 0.0
+    if r.fract() == 0.0 {
+        format!("{r:.0}")
+    } else {
+        format!("{r:.1}")
+    }
+}
+
+/// What an effect's chip says: its name, and for a delay the time it adds.
+fn fx_chip(fx: &Fx) -> String {
+    match fx {
+        Fx::Delay { ms } => format!("Delay {} ms", short_num(*ms)),
+        _ => fx_name(fx).to_string(),
+    }
+}
+
+/// A mixer strip in the gutter: the title (opens the inspector), the channel rows with their
+/// jacks on the edges, one standing meter per channel, the limiter line, the fader, the mute and
+/// one chip per effect (each opens the inspector too).
+fn strip(
+    ui: &mut Ui,
+    g: &GraphCtx,
+    st: &mut GraphState,
+    edits: &mut Vec<Edit>,
+    c: &CardLayout,
+    n: usize,
+    dt: f32,
+) {
+    let (dev, t, d) = (g.dev, g.t, g.dev_idx);
+    let node = &dev.nodes[n];
+    let name = node_name(node);
+    let r = c.rect;
+    let dim = if node.muted { 0.45 } else { 1.0 };
+    let painter = ui.painter().clone();
+    let popover = |st: &mut GraphState, edits: &mut Vec<Edit>, anchor: &Response| {
+        Popup::menu(anchor)
+            .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| inspector(ui, g, st, edits, n));
+    };
+
+    // Title: the button that opens the inspector.
+    let head = Rect::from_min_max(
+        pos2(r.left() + 4.0, r.top() + 3.0),
+        pos2(r.right() - 4.0, r.top() + HEAD_H - 3.0),
+    );
+    let title = hit(ui, head, Id::unique(("strip_title", d, n)));
+    name_button(&title, &format!("{name} settings"));
+    halo(ui, &title, t);
+    text_left(
+        ui,
+        head.left() + 6.0,
+        head.center().y,
+        name,
+        label(),
+        t.ink,
+        head.width() - 24.0,
+    );
+    menu_hint(
+        &painter,
+        pos2(head.right() - 9.0, head.center().y),
+        hint_color(&title, t),
+    );
+    if title.has_focus() {
+        painter.rect_stroke(
+            head,
+            CornerRadius::same(radius::INPUT),
+            Stroke::new(2.0, t.focus),
+            StrokeKind::Inside,
+        );
+    }
+    popover(st, edits, &title);
+    painter.hline(r.x_range(), r.top() + HEAD_H, Stroke::new(1.0, t.hairline));
+
+    // Channel rows: the jacks sit on the edges, the row's name between them.
+    for row in 0..c.rows {
+        painter.text(
+            pos2(r.center().x, Layout::row_y(c, row)),
+            Align2::CENTER_CENTER,
+            ch_label(row, node.channels),
+            num(10.0),
+            t.muted.gamma_multiply(dim),
+        );
+    }
+
+    // One standing ladder per channel, after the fader.
+    let top = r.top() + HEAD_H + ROW_PITCH * f32::from(c.rows);
+    let block = Rect::from_min_max(
+        pos2(r.left() + 12.0, top + 6.0),
+        pos2(r.right() - 12.0, top + STRIP_METER_H - 6.0),
+    );
+    let k = f32::from(c.rows.max(1));
+    let w = ((block.width() - 3.0 * (k - 1.0)) / k).min(8.0);
+    let x0 = block.center().x - (k * w + 3.0 * (k - 1.0)) / 2.0;
+    let active = dev.enabled && !node.muted;
+    for row in 0..c.rows {
+        let lin = if active { row_level(g, c.id, row) } else { 0.0 };
+        let lv = level(lin);
+        let pk = st.peaks.entry((c.id, row)).or_default().update(lv, dt);
+        if pk > lv {
+            ui.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+        let at = pos2(x0 + f32::from(row) * (w + 3.0), block.top());
+        meter_v(
+            &painter,
+            Rect::from_min_size(at, vec2(w, block.height())),
+            lv,
+            pk,
+            t,
+            dim,
+        );
+    }
+    let mut y = top + STRIP_METER_H;
+
+    // How much the limiter takes off, in words (never colour alone).
+    if has_limiter(node) {
+        let red = g
+            .reading
+            .and_then(|rd| rd.limiter_reduction.get(n))
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 0.999);
+        let db = 20.0 * (1.0 - red).log10();
+        let (text, ink) = if active && db < -0.05 {
+            (format!("Limit {} dB", db_text(db)), t.warn_ink)
+        } else {
+            ("Limit 0 dB".to_string(), t.muted)
+        };
+        painter.text(
+            pos2(r.center().x, y + STRIP_LIMIT_H / 2.0),
+            Align2::CENTER_CENTER,
+            text,
+            caption(),
+            ink,
+        );
+        y += STRIP_LIMIT_H;
+    }
+
+    // Fader.
+    let fr = Rect::from_min_size(
+        pos2(r.left() + 8.0, y + 2.0),
+        vec2(r.width() - 16.0, MIN_HIT),
+    );
+    let before = node.gain_db.clamp(-60.0, 12.0);
+    let mut v = before;
+    slider(
+        ui,
+        fr,
+        Id::unique(("strip_vol", d, n)),
+        &format!("{name} volume"),
+        &mut v,
+        -60.0..=12.0,
+        0.0,
+        t,
+    );
+    let moved = (v - before).abs() > 1e-4;
+    if moved {
+        edits.push(Edit::NodeVolume(d, n, (v * 10.0).round() / 10.0));
+    }
+    y += STRIP_ROW_H;
+
+    // Mute, which says its state in words, and the fader's dB.
+    let mr = Rect::from_min_size(pos2(r.left() + 8.0, y + 6.0), vec2(42.0, 20.0));
+    let mute = hit(ui, mr, Id::unique(("strip_mute", d, n)));
+    let muted = node.muted;
+    mute.widget_info(|| {
+        WidgetInfo::selected(egui::Role::CheckBox, true, muted, format!("Mute {name}"))
+    });
+    let pill = CornerRadius::same(radius::PILL);
+    let (fill, ink) = if muted {
+        (t.selected, t.warn_ink)
+    } else if mute.hovered() {
+        (t.muted.gamma_multiply(0.12), t.ink)
+    } else {
+        (Color32::TRANSPARENT, t.muted)
+    };
+    painter.rect(
+        mr,
+        pill,
+        fill,
+        Stroke::new(1.0, if muted { t.warn_ink } else { t.hairline }),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        mr.center(),
+        Align2::CENTER_CENTER,
+        if muted { "Muted" } else { "Mute" },
+        caption(),
+        ink,
+    );
+    if mute.has_focus() {
+        painter.rect_stroke(mr, pill, Stroke::new(2.0, t.focus), StrokeKind::Outside);
+    }
+    if mute.clicked() {
+        edits.push(Edit::NodeMute(d, n, !muted));
+    }
+    painter.text(
+        pos2(r.right() - 8.0, mr.center().y),
+        Align2::RIGHT_CENTER,
+        db_text(if moved { v } else { node.gain_db }),
+        num(10.0),
+        t.muted,
+    );
+    y += STRIP_ROW_H;
+
+    // One chip per effect, in the order they run.
+    for (i, fx) in node.fx.iter().enumerate() {
+        let cr = Rect::from_min_size(
+            pos2(r.left() + 8.0, y + 4.0),
+            vec2(r.width() - 16.0, STRIP_ROW_H - 8.0),
+        );
+        let chip = hit(ui, cr, Id::unique(("strip_fx", d, n, i)));
+        name_button(&chip, &format!("{} on {name}", fx_chip(fx)));
+        painter.rect(
+            cr,
+            pill,
+            t.canvas,
+            Stroke::new(1.0, if chip.hovered() { t.muted } else { t.hairline }),
+            StrokeKind::Inside,
+        );
+        let room = cr.width() - 16.0;
+        let mut text = fx_chip(fx);
+        // "Delay 200 ms" overflows a slim strip: the chip keeps the time, its name says the rest.
+        if let Fx::Delay { ms } = fx
+            && ui
+                .painter()
+                .layout_no_wrap(text.clone(), caption(), t.ink)
+                .size()
+                .x
+                > room
+        {
+            text = format!("+{} ms", short_num(*ms));
+        }
+        text_left(
+            ui,
+            cr.left() + 10.0,
+            cr.center().y,
+            &text,
+            caption(),
+            t.ink.gamma_multiply(dim),
+            room,
+        );
+        if chip.has_focus() {
+            painter.rect_stroke(cr, pill, Stroke::new(2.0, t.focus), StrokeKind::Outside);
+        }
+        popover(st, edits, &chip);
+        y += STRIP_ROW_H;
+    }
+}
+
+/// Width of the mixer inspector.
+const INSPECTOR_W: f32 = 300.0;
+
+/// A text field in `r` named `name` for screen readers, showing `value` until it is typed in;
+/// returns what was typed when the field lets go of the keyboard. One field types at a time, so
+/// one buffer serves them all.
+#[allow(clippy::too_many_arguments)]
+fn field(
+    ui: &mut Ui,
+    st: &mut GraphState,
+    t: &Tokens,
+    r: Rect,
+    id: Id,
+    name: &str,
+    value: String,
+    align: Align2,
+) -> Option<String> {
+    let had = ui.memory(|m| m.has_focus(id));
+    let mut text = if had {
+        std::mem::take(&mut st.field_text)
+    } else {
+        value
+    };
+    ui.painter().rect(
+        r,
+        CornerRadius::same(radius::INPUT),
+        t.canvas,
+        Stroke::new(1.0, t.hairline),
+        StrokeKind::Inside,
+    );
+    let te = ui.put(
+        r,
+        egui::TextEdit::singleline(&mut text)
+            .id(id)
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(6, 4)))
+            .align(align),
+    );
+    name_widget(ui, &te, name);
+    if te.has_focus() {
+        ui.painter().rect_stroke(
+            te.rect,
+            CornerRadius::same(radius::INPUT),
+            Stroke::new(2.0, t.focus),
+            StrokeKind::Inside,
+        );
+    }
+    let done = te.lost_focus().then(|| text.clone());
+    if te.has_focus() {
+        st.field_text = text;
+    }
+    done
+}
+
+/// One effect parameter: what it is, a slider, a field to type a value in, and its unit.
+struct Param {
+    /// What the row says ("Low gain") and what a screen reader hears ("Low shelf gain, dB").
+    label: &'static str,
+    name: &'static str,
+    unit: &'static str,
+    value: f32,
+    lo: f32,
+    hi: f32,
+    reset: f32,
+}
+
+/// Draws `p`'s row; returns its new value when the slider moved or a value was typed (clamped
+/// to the range, as `Config::validate` wants it).
+fn param_row(ui: &mut Ui, st: &mut GraphState, t: &Tokens, id: Id, p: &Param) -> Option<f32> {
+    let r = ui
+        .allocate_exact_size(vec2(INSPECTOR_W, MIN_HIT), Sense::hover())
+        .0;
+    ui.painter().text(
+        pos2(r.left(), r.center().y),
+        Align2::LEFT_CENTER,
+        p.label,
+        caption(),
+        t.muted,
+    );
+    let before = p.value.clamp(p.lo, p.hi);
+    let mut v = before;
+    let rail = Rect::from_x_y_ranges((r.left() + 72.0)..=(r.right() - 88.0), r.y_range());
+    slider(
+        ui,
+        rail,
+        id.with("slider"),
+        &format!("{}, {}", p.name, p.unit),
+        &mut v,
+        p.lo..=p.hi,
+        p.reset,
+        t,
+    );
+    // Whole hertz, tenths of the rest.
+    let round = |x: f32| {
+        if p.unit == "Hz" {
+            x.round()
+        } else {
+            (x * 10.0).round() / 10.0
+        }
+    };
+    let mut out = ((v - before).abs() > 1e-4).then(|| round(v));
+    let fr = Rect::from_x_y_ranges((r.right() - 80.0)..=(r.right() - 26.0), r.y_range())
+        .shrink2(vec2(0.0, 2.0));
+    let name = format!("{} value, {}", p.name, p.unit);
+    let typed = field(
+        ui,
+        st,
+        t,
+        fr,
+        id.with("field"),
+        &name,
+        short_num(p.value),
+        Align2::RIGHT_CENTER,
+    );
+    if let Some(x) = typed.and_then(|s| s.trim().parse::<f32>().ok())
+        && x.is_finite()
+        && (x - p.value).abs() > 1e-4
+    {
+        out = Some(round(x.clamp(p.lo, p.hi)));
+    }
+    ui.painter().text(
+        pos2(r.right(), r.center().y),
+        Align2::RIGHT_CENTER,
+        p.unit,
+        caption(),
+        t.muted,
+    );
+    out
+}
+
+/// The parameters of an effect, and the effect rebuilt with parameter `k` set to `x`.
+fn fx_params(fx: &Fx) -> Vec<Param> {
+    let p = |label, name, unit, value, lo, hi, reset| Param {
+        label,
+        name,
+        unit,
+        value,
+        lo,
+        hi,
+        reset,
+    };
+    match *fx {
+        Fx::Mono => Vec::new(),
+        Fx::Eq {
+            low_hz,
+            low_db,
+            high_hz,
+            high_db,
+        } => vec![
+            p(
+                "Low shelf",
+                "Low shelf frequency",
+                "Hz",
+                low_hz,
+                20.0,
+                2000.0,
+                120.0,
+            ),
+            p("Low gain", "Low shelf gain", "dB", low_db, -18.0, 18.0, 0.0),
+            p(
+                "High shelf",
+                "High shelf frequency",
+                "Hz",
+                high_hz,
+                1000.0,
+                20000.0,
+                8000.0,
+            ),
+            p(
+                "High gain",
+                "High shelf gain",
+                "dB",
+                high_db,
+                -18.0,
+                18.0,
+                0.0,
+            ),
+        ],
+        Fx::Limiter {
+            ceiling_db,
+            knee_db,
+        } => vec![
+            p(
+                "Ceiling",
+                "Limiter ceiling",
+                "dB",
+                ceiling_db,
+                -24.0,
+                0.0,
+                -1.0,
+            ),
+            p("Knee", "Limiter knee", "dB", knee_db, 0.0, 12.0, 6.0),
+        ],
+        Fx::Delay { ms } => vec![p(
+            "Time",
+            "Delay time",
+            "ms",
+            ms,
+            0.0,
+            sr_core::config::MAX_DELAY_MS,
+            0.0,
+        )],
+    }
+}
+
+fn with_param(fx: &Fx, k: usize, x: f32) -> Fx {
+    let mut fx = fx.clone();
+    match &mut fx {
+        Fx::Mono => {}
+        Fx::Eq {
+            low_hz,
+            low_db,
+            high_hz,
+            high_db,
+        } => *[low_hz, low_db, high_hz, high_db][k] = x,
+        Fx::Limiter {
+            ceiling_db,
+            knee_db,
+        } => *[ceiling_db, knee_db][k] = x,
+        Fx::Delay { ms } => *ms = x,
+    }
+    fx
+}
+
+/// What an effect does, in one line under its heading.
+fn fx_note(fx: &Fx) -> String {
+    match fx {
+        Fx::Mono => "Folds each left and right pair to mono.".into(),
+        Fx::Eq { .. } => "Two shelves: lift or cut the lows and the highs.".into(),
+        Fx::Limiter { .. } => "Soft clip with no look-ahead: it adds no delay.".into(),
+        Fx::Delay { ms } => format!("Adds {} ms", short_num(*ms)),
+    }
+}
+
+/// A small arrow button that moves an effect up or down the list.
+fn arrow_button(ui: &mut Ui, t: &Tokens, at: Pos2, id: Id, up: bool, name: &str) -> Response {
+    let resp = hit(ui, Rect::from_center_size(at, vec2(10.0, 10.0)), id);
+    name_button(&resp, name);
+    halo(ui, &resp, t);
+    let c = if resp.hovered() { t.ink } else { t.muted };
+    let s = if up { -1.0 } else { 1.0 };
+    let tip = at + vec2(0.0, 3.5 * s);
+    for side in [-1.0, 1.0] {
+        ui.painter()
+            .line_segment([at + vec2(4.0 * side, -2.0 * s), tip], Stroke::new(1.4, c));
+    }
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            resp.rect.shrink(2.0),
+            CornerRadius::same(radius::INPUT),
+            Stroke::new(2.0, t.focus),
+            StrokeKind::Inside,
+        );
+    }
+    resp
+}
+
+/// The mixer inspector: its name, its effects with their parameters (move, remove), the Add
+/// effect row and Remove mixer.
+fn inspector(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>, n: usize) {
+    let (dev, t, d) = (g.dev, g.t, g.dev_idx);
+    let Some(node) = dev.nodes.get(n) else {
+        ui.close();
+        return;
+    };
+    let name = node_name(node);
+    ui.set_width(INSPECTOR_W);
+    let row = |ui: &mut Ui| {
+        ui.allocate_exact_size(vec2(INSPECTOR_W, MIN_HIT), Sense::hover())
+            .0
+    };
+    let note = |ui: &mut Ui, text: &str| {
+        ui.add(egui::Label::new(egui::RichText::new(text).size(11.0).color(t.muted)).wrap());
+    };
+
+    // Name.
+    let r = row(ui);
+    ui.painter().text(
+        pos2(r.left(), r.center().y),
+        Align2::LEFT_CENTER,
+        "Name",
+        caption(),
+        t.muted,
+    );
+    let fr =
+        Rect::from_x_y_ranges((r.left() + 72.0)..=r.right(), r.y_range()).shrink2(vec2(0.0, 2.0));
+    let id = Id::unique(("insp_name", d, n));
+    if let Some(typed) = field(
+        ui,
+        st,
+        t,
+        fr,
+        id,
+        "Mixer name",
+        name.to_string(),
+        Align2::LEFT_CENTER,
+    ) && !typed.trim().is_empty()
+        && typed.trim() != name
+    {
+        edits.push(Edit::RenameNode(d, n, typed));
+    }
+
+    // Effects, in the order they run.
+    for (i, fx) in node.fx.iter().enumerate() {
+        ui.separator();
+        let what = fx_name(fx);
+        let r = row(ui);
+        ui.painter().text(
+            pos2(r.left(), r.center().y),
+            Align2::LEFT_CENTER,
+            what,
+            label(),
+            t.ink,
+        );
+        let key = |s: &str| Id::unique(("insp_fx", d, n, i, s.to_string()));
+        let x = x_button(
+            ui,
+            pos2(r.right() - 14.0, r.center().y),
+            key("remove"),
+            t,
+            &format!("Remove {what}"),
+        );
+        if x.clicked() {
+            edits.push(Edit::NodeFx(d, n, FxEdit::Remove(i)));
+        }
+        if i + 1 < node.fx.len() {
+            let down = format!("Move {what} down");
+            let at = pos2(r.right() - 46.0, r.center().y);
+            if arrow_button(ui, t, at, key("down"), false, &down).clicked() {
+                edits.push(Edit::NodeFx(d, n, FxEdit::Move(i, i + 1)));
+            }
+        }
+        if i > 0 {
+            let up = format!("Move {what} up");
+            let at = pos2(r.right() - 78.0, r.center().y);
+            if arrow_button(ui, t, at, key("up"), true, &up).clicked() {
+                edits.push(Edit::NodeFx(d, n, FxEdit::Move(i, i - 1)));
+            }
+        }
+        note(ui, &fx_note(fx));
+        for (k, p) in fx_params(fx).iter().enumerate() {
+            if let Some(x) = param_row(ui, st, t, key(p.name), p) {
+                edits.push(Edit::NodeFx(d, n, FxEdit::Set(i, with_param(fx, k, x))));
+            }
+        }
+    }
+
+    // Add effect: one button per kind that still fits.
+    ui.separator();
+    let room = can_add_fx(dev, n);
+    let kinds = [
+        Fx::Mono,
+        Fx::Eq {
+            low_hz: 120.0,
+            low_db: 0.0,
+            high_hz: 8000.0,
+            high_db: 0.0,
+        },
+        Fx::Limiter {
+            ceiling_db: -1.0,
+            knee_db: 6.0,
+        },
+        Fx::Delay { ms: 0.0 },
+    ];
+    let r = row(ui);
+    ui.painter().text(
+        pos2(r.left(), r.center().y),
+        Align2::LEFT_CENTER,
+        "Add effect",
+        caption(),
+        t.muted,
+    );
+    let r = row(ui);
+    let mut x = r.left();
+    for fx in kinds.into_iter().filter(|fx| room(fx)) {
+        let what = fx_name(&fx);
+        let id = Id::unique(("insp_add", d, n, what));
+        let resp = text_button(ui, t, pos2(x, r.top()), id, what, &format!("Add {what}"));
+        x = resp.rect.right() + 4.0;
+        if resp.clicked() {
+            edits.push(Edit::NodeFx(d, n, FxEdit::Add(fx)));
+        }
+    }
+    if node.fx.len() >= sr_core::config::MAX_FX {
+        note(ui, "A mixer holds four effects at most.");
+    }
+
+    // Remove: the cables around it join up again; the toast offers Undo.
+    ui.separator();
+    let r = row(ui);
+    let id = Id::unique(("insp_remove", d, n));
+    let resp = text_button(ui, t, r.min, id, "Remove mixer", &format!("Remove {name}"));
+    if resp.clicked() {
+        edits.push(Edit::RemoveNode(d, n));
+        ui.close();
     }
 }
 
@@ -1884,6 +2738,7 @@ fn wires_and_ports(
     st: &mut GraphState,
     edits: &mut Vec<Edit>,
     layout: &Layout,
+    strips: &mut dyn FnMut(&mut Ui, &mut GraphState, &mut Vec<Edit>),
 ) {
     let (dev, t, d) = (g.dev, g.t, g.dev_idx);
     let ports = layout.ports();
@@ -1918,7 +2773,19 @@ fn wires_and_ports(
         }
     }
     let pointer = ui.input(|i| i.pointer.hover_pos());
-    let hover = pointer.and_then(|pos| layout.hit_port(pos, 11.0, |_| true));
+    // The x and + of the hot cable win over a jack beside them.
+    let on_buttons = |pos: Pos2| {
+        all.iter().zip(&trims).any(|(l, tr)| {
+            st.trim_hot == Some(*l)
+                && tr.as_ref().is_some_and(|tr| {
+                    tr.x_at().is_some_and(|x| zone(x).contains(pos))
+                        || tr.plus_at().is_some_and(|p| zone(p).contains(pos))
+                })
+        })
+    };
+    let hover = pointer
+        .filter(|&pos| !on_buttons(pos))
+        .and_then(|pos| layout.hit_port(pos, 11.0, |_| true));
     let target = match (st.drag, pointer) {
         (Some(from), Some(pos)) => layout.hit_port(pos, 16.0, |p| can_link(from, p)),
         _ => None,
@@ -1933,7 +2800,7 @@ fn wires_and_ports(
     }
 
     let painter = ui.painter().clone();
-    let slots = st.cables.slots(dev, &all);
+    let slots = st.cables.slots(dev, &all).to_vec();
     let now = ui.input(|i| i.time);
     // A wire seen for the first time pops its destination jack. The first frame of a device only
     // learns the wires it already has.
@@ -1956,25 +2823,25 @@ fn wires_and_ports(
     {
         ui.request_repaint();
     }
-    let pop = |p: Port| {
-        all.iter()
-            .filter(|l| l.to == p)
-            .filter_map(|l| st.plugs.get(&(l.from, l.to)))
-            .map(|t0| pop_scale(now - t0))
-            .fold(1.0, f32::max)
-    };
-    // A muted source or a disabled device fades its cables and jacks into the canvas.
-    let fade = |c: Color32, src: Option<usize>| {
-        if dev.enabled && src.is_none_or(|s| !dev.sources[s].muted) {
-            c
-        } else {
+    // A muted source, a muted mixer or a disabled device fades its cables and jacks into the
+    // canvas.
+    let fade = |c: Color32, p: Port| {
+        let quiet = !dev.enabled
+            || feeding_source(&all, p).is_some_and(|s| dev.sources[s].muted)
+            || matches!(p, Port::NodeOut { node, .. } if dev.nodes[node].muted);
+        if quiet {
             c.lerp_to_gamma(t.canvas, 0.65)
+        } else {
+            c
         }
     };
     // Only the graph's own layer: never a wire under an open menu or the setup sheet.
     let on_graph = |pos| ui.ctx().layer_id_at(pos).is_none_or(|l| l == ui.layer_id());
-    // A source cable is hovered over its trim chip, or its x while that was showing, else
-    // anywhere along it; a monitor cable anywhere along it.
+    // The pointer on a strip's controls is on the strip, not on a cable behind it.
+    let keepout = strip_keepout(layout, dev);
+    let on_strip = |pos: Pos2| keepout.iter().any(|r| r.contains(pos));
+    // A device cable is hovered over its trim chip, or its x or + while those were showing,
+    // else anywhere along it; a monitor cable anywhere along it.
     let hovered_wire = match (hover, pointer, st.drag) {
         (None, Some(pos), None) if on_graph(pos) => trims
             .iter()
@@ -1984,25 +2851,28 @@ fn wires_and_ports(
                     st.trim_hot == Some(*l)
                         && trims[n]
                             .as_ref()
-                            .is_some_and(|tr| tr.x_zone().contains(pos))
+                            .is_some_and(|tr| tr.capsule().contains(pos))
                 })
             })
             .or_else(|| {
-                all.iter()
-                    .position(|l| match (layout.port_pos(l.from), layout.port_pos(l.to)) {
-                        (Some(a), Some(b)) => wire_distance(&wire_points(a, b), pos) < 7.0,
-                        _ => false,
-                    })
+                all.iter().position(|l| {
+                    !on_strip(pos)
+                        && match (layout.port_pos(l.from), layout.port_pos(l.to)) {
+                            (Some(a), Some(b)) => wire_distance(&wire_points(a, b), pos) < 7.0,
+                            _ => false,
+                        }
+                })
             }),
         _ => None,
     };
-    // The x also stays while the chip or the x itself has the keyboard.
+    // The x also stays while the chip, the x or the + has the keyboard.
     let x_id = |l: &Link| Id::unique(("unplug", d, l.from, l.to));
+    let plus_id = |l: &Link| Id::unique(("insert", d, l.from, l.to));
     st.trim_hot = hovered_wire
         .or_else(|| {
             all.iter().enumerate().position(|(n, l)| {
                 trims[n].as_ref().is_some_and(|tr| tr.resp.has_focus())
-                    || ui.memory(|m| m.has_focus(x_id(l)))
+                    || ui.memory(|m| m.has_focus(x_id(l)) || m.has_focus(plus_id(l)))
             })
         })
         .map(|n| all[n]);
@@ -2041,18 +2911,51 @@ fn wires_and_ports(
             if lit(l, n) != top {
                 continue;
             }
-            let c = fade(
-                t.channel(usize::from(slots[n])),
-                feeding_source(&all, l.from),
-            );
+            // A mixer with nothing behind it sends nothing: its cables are grey.
+            let c = if matches!(l.from, Port::NodeOut { .. })
+                && feeding_source(&all, l.from).is_none()
+            {
+                t.muted
+            } else {
+                t.channel(usize::from(slots[n]))
+            };
             draw_cable(
                 &painter,
                 wire_points(a, b),
-                step_back(c, top),
+                step_back(fade(c, l.from), top),
                 if top { 4.5 } else { 3.0 },
             );
         }
     }
+    // Strips stand in front of the cables that pass behind them, which show through faintly so
+    // their chips (on the strip's quiet parts) still sit on a cable.
+    for c in &layout.cards {
+        let CardId::Node(i) = c.id else { continue };
+        painter.rect(
+            c.rect,
+            CornerRadius::same(radius::STRIP),
+            t.raised,
+            Stroke::new(1.0, t.hairline),
+            StrokeKind::Inside,
+        );
+        let quiet = strip_quiet(c, &dev.nodes[i]).shrink2(vec2(1.0, 0.0));
+        let behind = painter.with_clip_rect(quiet.intersect(painter.clip_rect()));
+        for (n, l) in all.iter().enumerate() {
+            if let (Some(a), Some(b)) = (layout.port_pos(l.from), layout.port_pos(l.to)) {
+                let c = t
+                    .channel(usize::from(slots[n]))
+                    .lerp_to_gamma(t.raised, 0.6);
+                let w = if lit(l, n) { 3.0 } else { 2.0 };
+                behind.add(CubicBezierShape::from_points_stroke(
+                    wire_points(a, b),
+                    false,
+                    Color32::TRANSPARENT,
+                    Stroke::new(w, c),
+                ));
+            }
+        }
+    }
+    strips(ui, st, edits);
     // The cable in flight shows the colour it will take where it lands: the slot of the cable
     // that is already there, else the one the colouring would give the new cable.
     let landing = st.drag.zip(target).map(|(from, to)| {
@@ -2078,11 +2981,18 @@ fn wires_and_ports(
             jack(&painter, end, Plug::One(c), 1.0, false, t);
         }
     }
+    let pop = |p: Port| {
+        all.iter()
+            .filter(|l| l.to == p)
+            .filter_map(|l| st.plugs.get(&(l.from, l.to)))
+            .map(|t0| pop_scale(now - t0))
+            .fold(1.0, f32::max)
+    };
     for &p in &ports {
         let Some(pos) = layout.port_pos(p) else {
             continue;
         };
-        let mut plug = jack_plug(&all, slots, p, t);
+        let mut plug = jack_plug(&all, &slots, p, t);
         if target == Some(p)
             && let Some(c) = landing
         {
@@ -2093,7 +3003,7 @@ fn wires_and_ports(
             .enumerate()
             .any(|(n, l)| (l.from == p || l.to == p) && lit(l, n));
         let hot = lights || hover == Some(p) || target == Some(p) || st.drag == Some(p);
-        let plug = plug.map(|c| step_back(fade(c, feeding_source(&all, p)), hot));
+        let plug = plug.map(|c| step_back(fade(c, p), hot));
         let grow = if hot { 1.25 } else { 1.0 };
         jack(&painter, pos, plug, grow * pop(p), hot, t);
     }
@@ -2102,18 +3012,30 @@ fn wires_and_ports(
     for (n, l) in all.iter().enumerate() {
         let hot = hovered_wire == Some(n);
         if let Some(tr) = &trims[n] {
-            let hot = hot || tr.open || tr.resp.has_focus() || ui.memory(|m| m.has_focus(x_id(l)));
+            let focused = tr.resp.has_focus()
+                || ui.memory(|m| m.has_focus(x_id(l)) || m.has_focus(plus_id(l)));
+            let hot = hot || tr.open || focused;
             tr.paint(&painter, t, hot);
             if hot {
-                let x = x_button(
-                    ui,
-                    tr.x_at(),
-                    x_id(l),
-                    t,
-                    &format!("Unplug cable, {}", link_tip(g, *l)),
-                );
-                if x.clicked() {
-                    edits.push(Edit::Unlink(d, *l));
+                if let Some(at) = tr.x_at() {
+                    let x = x_button(
+                        ui,
+                        at,
+                        x_id(l),
+                        t,
+                        &format!("Unplug cable, {}", link_tip(g, *l)),
+                    );
+                    if x.clicked() {
+                        edits.push(Edit::Unlink(d, *l));
+                    }
+                }
+                if let Some(at) = tr.plus_at() {
+                    let tip = format!("Insert mixer on cable, {}", link_tip(g, *l));
+                    let plus = plus_circle(ui, at, plus_id(l), t, false, &tip);
+                    if plus.clicked() {
+                        edits.push(Edit::AddNode(d, NewNode::OnCable(*l)));
+                    }
+                    plus.on_hover_text("Insert mixer");
                 }
             }
         } else if hot && let (Some(a), Some(b)) = (layout.port_pos(l.from), layout.port_pos(l.to)) {
@@ -2796,6 +3718,7 @@ mod tests {
                 let mut dev = populated();
                 dev.sources.clear();
                 dev.wires.clear();
+                dev.nodes.clear();
                 dev.monitors.clear();
                 let mut h = harness(theme, dev, false, false);
                 h.run_steps(3);
@@ -2811,6 +3734,8 @@ mod tests {
             apply(&mut c, Edit::GrowChannels(0));
             let dev = &mut c.devices[0];
             let ids: Vec<String> = dev.sources.iter().map(|s| s.id.clone()).collect();
+            // Only the cables between sources and channels: no mixer.
+            dev.nodes.clear();
             dev.wires = [
                 (0, 0, 0),
                 (0, 1, 1),
@@ -2839,6 +3764,7 @@ mod tests {
                 let mut c = demo_config();
                 apply(&mut c, Edit::AddMonitor(0, "USBHeadset".into(), 2));
                 let dev = &mut c.devices[0];
+                dev.nodes.clear();
                 dev.wires = (0..3)
                     .flat_map(|s| (0..2).map(move |ch| (s, ch)))
                     .map(|(s, ch)| sr_core::config::Wire::new(dev.sources[s].id.clone(), ch, ch))
@@ -2910,6 +3836,7 @@ mod tests {
             ] {
                 let mut dev = populated();
                 dev.wires.clear();
+                dev.nodes.clear();
                 let mut h = harness(theme, dev, true, false);
                 h.run_steps(3);
                 let from = h

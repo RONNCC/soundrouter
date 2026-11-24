@@ -1,10 +1,11 @@
 //! In-app backend for `--demo`: synthetic meters, fake apps and hardware.
-use crate::model::{Edit, apply, default_config};
+use crate::model::{Edit, FxEdit, NewNode, apply, default_config};
 use sr_core::backend::{
     AppInfo, Backend, Delay, EngineOptions, EngineStatus, HwDevice, MeterReading, ReadAheadState,
     SelfTest, TccStatus,
 };
-use sr_core::config::{Config, SourceKind};
+use sr_core::config::{Config, Fx, SourceKind};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Driver version the fake reports; the GUI treats it as "no real driver to test or uninstall".
@@ -179,7 +180,9 @@ impl Backend for FakeBackend {
         let t = self
             .frozen
             .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
-        let mut channels = vec![0.0f32; usize::from(dev.channels)];
+        let lin = |db: f32| 10f32.powf(db / 20.0);
+        // What leaves each source channel (after its volume) and each node row (after its fader).
+        let mut leaves: HashMap<&str, Vec<f32>> = HashMap::new();
         let mut sources = Vec::new();
         for (i, s) in dev.sources.iter().enumerate() {
             let levels: Vec<f32> = (0..s.channels)
@@ -197,24 +200,62 @@ impl Backend for FakeBackend {
             } else {
                 levels
             };
-            let gain = 10f32.powf(s.volume_db / 20.0);
-            for w in dev.wires.iter().filter(|w| w.source == s.id) {
-                let l = levels[usize::from(w.src_ch)] * gain;
-                let out = &mut channels[usize::from(w.out_ch)];
-                *out = out.max(l);
-            }
+            let gain = lin(s.volume_db);
+            leaves.insert(&s.id, levels.iter().map(|l| l * gain).collect());
             sources.push((s.id.clone(), levels));
         }
-        let gain = if dev.muted {
-            0.0
-        } else {
-            10f32.powf(dev.volume_db / 20.0)
+        // Peak of the cables into `to` (`None`: the device), per channel, as a max like a meter.
+        let into = |leaves: &HashMap<&str, Vec<f32>>, to: Option<&str>, n: u16| {
+            let mut rows = vec![0.0f32; usize::from(n)];
+            for w in dev.wires.iter().filter(|w| w.to.as_deref() == to) {
+                let l = leaves
+                    .get(w.source.as_str())
+                    .and_then(|v| v.get(usize::from(w.src_ch)))
+                    .map_or(0.0, |l| l * lin(w.gain_db));
+                if let Some(r) = rows.get_mut(usize::from(w.out_ch)) {
+                    *r = r.max(l);
+                }
+            }
+            rows
         };
+        let mut nodes = Vec::new();
+        let mut limiter_reduction = Vec::new();
+        // Nodes only feed forward: one pass per node settles every chain.
+        for _ in 0..dev.nodes.len() {
+            (nodes, limiter_reduction) = dev
+                .nodes
+                .iter()
+                .map(|n| {
+                    let mut rows = into(&leaves, Some(&n.id), n.channels);
+                    let peak = rows.iter().copied().fold(0.0, f32::max);
+                    let mut reduction = 0.0;
+                    for fx in &n.fx {
+                        if let Fx::Limiter { ceiling_db, .. } = fx
+                            && peak > lin(*ceiling_db)
+                        {
+                            reduction = 1.0 - lin(*ceiling_db) / peak;
+                            rows.iter_mut().for_each(|r| *r = r.min(lin(*ceiling_db)));
+                        }
+                    }
+                    let gain = if n.muted { 0.0 } else { lin(n.gain_db) };
+                    rows.iter_mut().for_each(|r| *r *= gain);
+                    ((n.id.clone(), rows), reduction)
+                })
+                .unzip();
+            for (id, rows) in &nodes {
+                if let Some(n) = dev.nodes.iter().find(|n| &n.id == id) {
+                    leaves.insert(&n.id, rows.clone());
+                }
+            }
+        }
+        let gain = if dev.muted { 0.0 } else { lin(dev.volume_db) };
+        let mut channels = into(&leaves, None, dev.channels);
         channels.iter_mut().for_each(|c| *c *= gain);
         Some(MeterReading {
             sources,
             channels,
-            ..Default::default()
+            nodes,
+            limiter_reduction,
         })
     }
 }
@@ -230,6 +271,23 @@ pub fn demo_config() -> Config {
     apply(&mut cfg, Edit::AddSource(0, app("com.apple.Safari"), 2));
     apply(&mut cfg, Edit::AddSource(0, app("com.spotify.client"), 2));
     apply(&mut cfg, Edit::AddSource(0, SourceKind::PassThru, 2));
+    // Spotify runs through a "Music" mixer, so the demo shows the middle of the graph.
+    apply(&mut cfg, Edit::AddNode(0, NewNode::ForSource(1)));
+    apply(&mut cfg, Edit::RenameNode(0, 0, "Music".into()));
+    for fx in [
+        Fx::Eq {
+            low_hz: 120.0,
+            low_db: 2.0,
+            high_hz: 8000.0,
+            high_db: 0.0,
+        },
+        Fx::Limiter {
+            ceiling_db: -1.0,
+            knee_db: 6.0,
+        },
+    ] {
+        apply(&mut cfg, Edit::NodeFx(0, 0, FxEdit::Add(fx)));
+    }
     apply(
         &mut cfg,
         Edit::AddMonitor(0, "BuiltInSpeakerDevice".into(), 2),
@@ -258,19 +316,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demo_config_is_valid() {
-        demo_config().validate().unwrap();
+    fn demo_config_is_valid_and_has_a_mixer() {
+        let cfg = demo_config();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.devices[0].nodes.len(), 1);
+        assert_eq!(cfg.devices[0].nodes[0].name, "Music");
     }
 
     #[test]
     fn fake_meters_follow_wires_and_mute() {
-        let mut b = FakeBackend::new();
+        let mut b = FakeBackend::frozen(1.5);
         let mut cfg = demo_config();
         b.apply(&cfg).unwrap();
         let m = b.meters("v1").unwrap();
         assert_eq!(m.sources.len(), 3);
         assert_eq!(m.channels.len(), 2);
+        // The Music mixer reads what Spotify sends it.
+        assert_eq!(m.nodes.len(), 1);
+        assert_eq!(m.nodes[0].0, "n1");
+        assert!(m.nodes[0].1.iter().all(|p| *p > 0.0), "{:?}", m.nodes);
+        assert_eq!(m.limiter_reduction, [0.0]);
         assert!(b.meters("nope").is_none());
+        // A limiter below the signal reports how much it takes off.
+        cfg.devices[0].sources[1].volume_db = 12.0;
+        cfg.devices[0].nodes[0].fx[1] = Fx::Limiter {
+            ceiling_db: -24.0,
+            knee_db: 6.0,
+        };
+        b.apply(&cfg).unwrap();
+        let m = b.meters("v1").unwrap();
+        assert!(m.limiter_reduction[0] > 0.0);
+        assert!(
+            m.nodes[0]
+                .1
+                .iter()
+                .all(|p| *p <= 10f32.powf(-24.0 / 20.0) + 1e-6)
+        );
+        cfg.devices[0].nodes[0].muted = true;
+        b.apply(&cfg).unwrap();
+        assert!(b.meters("v1").unwrap().nodes[0].1.iter().all(|p| *p == 0.0));
         cfg.devices[0].muted = true;
         b.apply(&cfg).unwrap();
         assert!(b.meters("v1").unwrap().channels.iter().all(|c| *c == 0.0));

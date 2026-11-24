@@ -39,45 +39,58 @@ fn mix(mut h: u64) -> u64 {
 
 fn ch(p: Port) -> u16 {
     match p {
-        Port::Src { ch, .. } | Port::OutIn { ch } | Port::OutOut { ch } | Port::Mon { ch, .. } => {
-            ch
-        }
+        Port::Src { ch, .. }
+        | Port::OutIn { ch }
+        | Port::OutOut { ch }
+        | Port::Mon { ch, .. }
+        | Port::NodeIn { ch, .. }
+        | Port::NodeOut { ch, .. } => ch,
     }
 }
 
-/// The card a port sits on: sources, output-channel pairs, monitors.
+/// The card a port sits on: sources, output-channel pairs, monitors, mixer strips.
 fn card(p: Port) -> (u8, usize) {
     match p {
         Port::Src { src, .. } => (0, src),
         Port::OutIn { ch } | Port::OutOut { ch } => (1, usize::from(ch / 2)),
         Port::Mon { mon, .. } => (2, mon),
+        Port::NodeIn { node, .. } | Port::NodeOut { node, .. } => (3, node),
     }
 }
 
-/// What names a cable across sessions and edits: its stage, the source id or monitor device,
-/// and the channel at each end.
+/// What names a cable across sessions and edits: its stage, the source id, node id or monitor
+/// device, and the channel at each end (plus the node it feeds, for a cable into a mixer).
 pub fn key(dev: &VirtualDevice, l: Link) -> u64 {
+    let node_id = |node: usize| dev.nodes.get(node).map_or("", |n| n.id.as_str());
     let (tag, id) = match (l.from, l.to) {
         (Port::Src { src, .. }, _) => (b's', dev.sources.get(src).map_or("", |s| &s.id)),
+        (Port::NodeOut { node, .. }, _) => (b'n', node_id(node)),
         (_, Port::Mon { mon, .. }) => (b'm', dev.monitors.get(mon).map_or("", |m| &m.device_uid)),
         _ => (b'?', ""),
     };
     let h = fnv(fnv(FNV0, &[tag]), id.as_bytes());
     let h = fnv(h, &[0xff]);
-    mix(fnv(
-        fnv(h, &ch(l.from).to_le_bytes()),
-        &ch(l.to).to_le_bytes(),
-    ))
+    let h = fnv(fnv(h, &ch(l.from).to_le_bytes()), &ch(l.to).to_le_bytes());
+    // Cables into output channels keep the keys they had before mixers existed.
+    mix(match l.to {
+        Port::NodeIn { node, .. } => fnv(fnv(h, b">"), node_id(node).as_bytes()),
+        _ => h,
+    })
 }
 
 /// How much two cables meet: 0 when they share no card, else 2 for the card, plus 2 for a shared
-/// jack, 2 when one ends at the output channel the other starts from, 1 for neighbouring rows.
+/// jack, 2 when one ends at the output channel or mixer row the other starts from, 1 for
+/// neighbouring rows.
 fn relation(a: Link, b: Link) -> u32 {
     let (ca, cb) = ([card(a.from), card(a.to)], [card(b.from), card(b.to)]);
     if !ca.iter().any(|c| cb.contains(c)) {
         return 0;
     }
-    let through = |x: Link, y: Link| matches!((x.to, y.from), (Port::OutIn { ch: i }, Port::OutOut { ch: o }) if i == o);
+    let through = |x: Link, y: Link| match (x.to, y.from) {
+        (Port::OutIn { ch: i }, Port::OutOut { ch: o }) => i == o,
+        (Port::NodeIn { node: m, ch: i }, Port::NodeOut { node: n, ch: o }) => m == n && i == o,
+        _ => false,
+    };
     let next = |p: Port, q: Port| card(p) == card(q) && ch(p).abs_diff(ch(q)) == 1;
     2 + 2 * u32::from(a.from == b.from || a.to == b.to)
         + 2 * u32::from(through(a, b) || through(b, a))

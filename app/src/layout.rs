@@ -16,6 +16,16 @@ pub const GAP: f32 = 16.0;
 /// Space above the first card for the column headers.
 pub const TOP: f32 = 54.0;
 pub const SIDE: f32 = 24.0;
+/// Width of a mixer strip, which sits in the gutter between Sources and Output Channels.
+pub const STRIP_W: f32 = 84.0;
+/// The gutters while a device has mixers: a strip and a cable's run on each side of it.
+const NODE_GUTTER: f32 = 124.0;
+/// Mixer strip parts below its channel rows: the vertical meters, the limiter line, one row
+/// (fader, mute, each effect chip) and the padding at the foot.
+pub const STRIP_METER_H: f32 = 64.0;
+pub const STRIP_LIMIT_H: f32 = 16.0;
+pub const STRIP_ROW_H: f32 = 32.0;
+const STRIP_PAD: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CardId {
@@ -23,6 +33,8 @@ pub enum CardId {
     /// Channel pair index (0 = channels 1 & 2).
     Out(usize),
     Mon(usize),
+    /// A mixer strip (`VirtualDevice::nodes`).
+    Node(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +55,23 @@ pub struct CardSpec {
     pub expanded: bool,
     /// App source: its options carry the mute row.
     pub mute_row: bool,
+}
+
+/// What sizes a mixer strip: its channel rows, its effects, and whether it shows a limiter line.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeSpec {
+    pub rows: u16,
+    pub fx: usize,
+    pub limiter: bool,
+}
+
+pub fn strip_height(s: NodeSpec) -> f32 {
+    HEAD_H
+        + ROW_H * f32::from(s.rows)
+        + STRIP_METER_H
+        + if s.limiter { STRIP_LIMIT_H } else { 0.0 }
+        + STRIP_ROW_H * (2 + s.fx) as f32
+        + STRIP_PAD
 }
 
 #[derive(Debug)]
@@ -72,19 +101,33 @@ pub fn card_height(rows: u16, options: bool, expanded: bool, icon: bool, mute_ro
 }
 
 impl Layout {
-    /// `width` is the pane width; `origin` the top-left of the graph area.
+    /// `width` is the pane width; `origin` the top-left of the graph area. While the device has
+    /// mixers the gutters widen to hold them and the cards narrow (150 px at the 1000 px window).
     pub fn compute(
         origin: Pos2,
         width: f32,
         sources: &[CardSpec],
         out_pairs: usize,
         monitors: &[CardSpec],
+        nodes: &[NodeSpec],
     ) -> Layout {
-        let card_w = ((width - 2.0 * SIDE - 2.0 * 64.0) / 3.0).clamp(180.0, 250.0);
+        // With mixers: 150 px cards and 124 px gutters at the 750 px pane of the 1000 px window;
+        // a fifth of every pixel past that goes to each card and the rest to the gutters, so the
+        // cables beside a strip get room to bend.
+        let (card_w, reach) = if nodes.is_empty() {
+            (
+                ((width - 2.0 * SIDE - 2.0 * 64.0) / 3.0).clamp(180.0, 250.0),
+                40.0,
+            )
+        } else {
+            let card_w = (150.0 + 0.2 * (width - 750.0)).clamp(150.0, 250.0);
+            let gutter = ((width - 2.0 * SIDE - 3.0 * card_w) / 2.0).max(NODE_GUTTER);
+            (card_w, gutter)
+        };
         let col_x = [
             SIDE,
-            ((width - card_w) / 2.0).max(SIDE + card_w + 40.0),
-            (width - SIDE - card_w).max(SIDE + 2.0 * card_w + 80.0),
+            ((width - card_w) / 2.0).max(SIDE + card_w + reach),
+            (width - SIDE - card_w).max(SIDE + 2.0 * card_w + 2.0 * reach),
         ];
         let mut cards = Vec::new();
         let mut height = TOP;
@@ -133,6 +176,22 @@ impl Layout {
                 .enumerate()
                 .map(|(i, s)| (CardId::Mon(i), *s, true)),
         );
+        // Strips stack in the middle of the gutter between Sources and Output Channels.
+        let x = SIDE + card_w + (col_x[1] - SIDE - card_w - STRIP_W) / 2.0;
+        let mut y = TOP;
+        for (i, s) in nodes.iter().enumerate() {
+            let h = strip_height(*s);
+            cards.push(CardLayout {
+                id: CardId::Node(i),
+                rect: Rect::from_min_size(origin + vec2(x, y), vec2(STRIP_W, h)),
+                rows: s.rows,
+                options: false,
+                expanded: false,
+                icon: false,
+            });
+            y += h + GAP;
+        }
+        height = height.max(y);
         Layout {
             origin,
             cards,
@@ -170,6 +229,15 @@ impl Layout {
                 let c = self.card(CardId::Mon(mon))?;
                 (ch < c.rows).then(|| pos2(c.rect.left(), Self::row_y(c, ch)))
             }
+            Port::NodeIn { node, ch } | Port::NodeOut { node, ch } => {
+                let c = self.card(CardId::Node(node))?;
+                let x = if p.is_output() {
+                    c.rect.right()
+                } else {
+                    c.rect.left()
+                };
+                (ch < c.rows).then(|| pos2(x, Self::row_y(c, ch)))
+            }
         }
     }
 
@@ -186,6 +254,10 @@ impl Layout {
                         v.push(Port::OutOut { ch });
                     }
                     CardId::Mon(mon) => v.push(Port::Mon { mon, ch: r }),
+                    CardId::Node(node) => {
+                        v.push(Port::NodeIn { node, ch: r });
+                        v.push(Port::NodeOut { node, ch: r });
+                    }
                 }
             }
         }
@@ -211,7 +283,9 @@ const SAG_MAX: f32 = 36.0;
 /// them down in proportion to the horizontal run (capped), so a long cable hangs lower.
 pub fn wire_points(a: Pos2, b: Pos2) -> [Pos2; 4] {
     let run = (b.x - a.x).abs();
-    let dx = (run * 0.5).max(40.0);
+    // A short forward run (a source into a mixer beside it) bends within its own gap instead of
+    // overshooting into the cards; longer and backward runs keep the 40 px handle.
+    let dx = (run * 0.5).max(if b.x > a.x { run.min(40.0) } else { 40.0 });
     let sag = vec2(0.0, (run * 0.16).min(SAG_MAX));
     [a, a + vec2(dx, 0.0) + sag, b - vec2(dx, 0.0) + sag, b]
 }
@@ -252,7 +326,7 @@ mod tests {
             expanded: false,
             mute_row: false,
         };
-        Layout::compute(pos2(100.0, 50.0), 900.0, &[s, s], 1, &[s])
+        Layout::compute(pos2(100.0, 50.0), 900.0, &[s, s], 1, &[s], &[])
     }
 
     #[test]
@@ -280,7 +354,7 @@ mod tests {
             expanded: false,
             mute_row: false,
         };
-        let l = Layout::compute(Pos2::ZERO, 900.0, &[c, n], 1, &[]);
+        let l = Layout::compute(Pos2::ZERO, 900.0, &[c, n], 1, &[], &[]);
         let a = l.card(CardId::Src(0)).unwrap().rect;
         let b = l.card(CardId::Src(1)).unwrap().rect;
         assert_eq!(a.height() - b.height(), OPTIONS_H);
@@ -315,6 +389,7 @@ mod tests {
             }],
             1,
             &[],
+            &[],
         );
         let c = l.card(CardId::Src(0)).unwrap();
         assert_eq!(c.rect.height(), HEAD_H + ICON_BODY + FOOT_H);
@@ -331,12 +406,56 @@ mod tests {
             expanded: false,
             mute_row: false,
         };
-        let l = Layout::compute(Pos2::ZERO, 900.0, &[s], 2, &[]);
+        let l = Layout::compute(Pos2::ZERO, 900.0, &[s], 2, &[], &[]);
         let p = l.port_pos(Port::OutIn { ch: 3 }).unwrap();
         assert_eq!(
             p.y,
             l.card(CardId::Out(1)).unwrap().rect.top() + HEAD_H + ROW_H * 1.5
         );
+    }
+
+    #[test]
+    fn mixer_strips_fit_the_gutter_at_the_minimum_window() {
+        let s = CardSpec {
+            rows: 2,
+            expanded: false,
+            mute_row: false,
+        };
+        let n = NodeSpec {
+            rows: 2,
+            fx: 1,
+            limiter: true,
+        };
+        // 750 px: the graph pane of the 1000 px window.
+        let l = Layout::compute(Pos2::ZERO, 750.0, &[s], 1, &[s], &[n, n]);
+        assert!((150.0..152.0).contains(&l.card_w), "{}", l.card_w);
+        let src = l.card(CardId::Src(0)).unwrap().rect;
+        let out = l.card(CardId::Out(0)).unwrap().rect;
+        let mon = l.card(CardId::Mon(0)).unwrap().rect;
+        assert!(mon.right() <= 750.0 - SIDE + 0.5, "{mon:?}");
+        let (a, b) = (
+            l.card(CardId::Node(0)).unwrap().rect,
+            l.card(CardId::Node(1)).unwrap().rect,
+        );
+        assert_eq!(a.width(), STRIP_W);
+        // Centred in the gutter with room for a cable on each side, stacked with GAP.
+        assert!((a.left() - src.right() - (out.left() - a.right())).abs() < 0.5);
+        assert!(a.left() - src.right() >= 19.0, "{a:?} {src:?}");
+        assert!((b.top() - a.bottom() - GAP).abs() < 1e-3);
+        assert_eq!(a.height(), strip_height(n));
+        assert_eq!(
+            l.port_pos(Port::NodeIn { node: 1, ch: 1 }).unwrap().x,
+            b.left()
+        );
+        assert_eq!(
+            l.port_pos(Port::NodeOut { node: 0, ch: 0 }).unwrap().x,
+            a.right()
+        );
+        assert!(l.port_pos(Port::NodeOut { node: 0, ch: 2 }).is_none());
+        assert!(l.size.y >= b.bottom());
+        // Without mixers the cards keep their width.
+        let plain = Layout::compute(Pos2::ZERO, 750.0, &[s], 1, &[s], &[]);
+        assert!(plain.card_w > 190.0);
     }
 
     #[test]

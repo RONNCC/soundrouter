@@ -2,13 +2,15 @@
 //! drawing: it emits `Edit`s, and `apply` runs them after the frame.
 use sr_core::backend::{AppInfo, EngineStatus, HwDevice};
 use sr_core::config::{
-    Config, MAX_CH, MAX_DB, Monitor, MonitorWire, Source, SourceKind, VirtualDevice, Wire,
+    Config, Fx, MAX_CH, MAX_DB, MAX_DELAY_CH, MAX_FX, MAX_NAME_CHARS, MAX_NODE_CH,
+    MAX_NODE_CH_TOTAL, MAX_NODES, Monitor, MonitorWire, Node, Source, SourceKind, VirtualDevice,
+    Wire,
 };
 
 /// Lowest volume the GUI writes (0 % on the slider).
 pub const MIN_DB: f32 = -80.0;
 
-/// A connection endpoint in the graph. Indices refer to `VirtualDevice::{sources, monitors}`.
+/// A connection endpoint in the graph. Indices refer to `VirtualDevice::{sources, monitors, nodes}`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Port {
     /// Output port of a source channel.
@@ -19,11 +21,18 @@ pub enum Port {
     OutOut { ch: u16 },
     /// Input port of a monitor channel.
     Mon { mon: usize, ch: u16 },
+    /// Input row of a mixer node.
+    NodeIn { node: usize, ch: u16 },
+    /// Output row of a mixer node.
+    NodeOut { node: usize, ch: u16 },
 }
 
 impl Port {
     pub fn is_output(self) -> bool {
-        matches!(self, Port::Src { .. } | Port::OutOut { .. })
+        matches!(
+            self,
+            Port::Src { .. } | Port::OutOut { .. } | Port::NodeOut { .. }
+        )
     }
 }
 
@@ -33,16 +42,37 @@ pub struct Link {
     pub to: Port,
 }
 
-pub fn links(dev: &VirtualDevice) -> Vec<Link> {
-    let mut out = Vec::new();
-    for w in &dev.wires {
-        if let Some(src) = dev.sources.iter().position(|s| s.id == w.source) {
-            out.push(Link {
-                from: Port::Src { src, ch: w.src_ch },
-                to: Port::OutIn { ch: w.out_ch },
-            });
-        }
+/// The port a wire starts from: a source channel or a node's output row.
+fn wire_from(dev: &VirtualDevice, w: &Wire) -> Option<Port> {
+    if let Some(src) = dev.sources.iter().position(|s| s.id == w.source) {
+        return Some(Port::Src { src, ch: w.src_ch });
     }
+    let node = dev.nodes.iter().position(|n| n.id == w.source)?;
+    Some(Port::NodeOut { node, ch: w.src_ch })
+}
+
+/// The port a wire ends at: an output channel, or a node's input row (`Wire::to`).
+fn wire_to(dev: &VirtualDevice, w: &Wire) -> Option<Port> {
+    match &w.to {
+        None => Some(Port::OutIn { ch: w.out_ch }),
+        Some(id) => Some(Port::NodeIn {
+            node: dev.nodes.iter().position(|n| &n.id == id)?,
+            ch: w.out_ch,
+        }),
+    }
+}
+
+pub fn links(dev: &VirtualDevice) -> Vec<Link> {
+    let mut out: Vec<Link> = dev
+        .wires
+        .iter()
+        .filter_map(|w| {
+            Some(Link {
+                from: wire_from(dev, w)?,
+                to: wire_to(dev, w)?,
+            })
+        })
+        .collect();
     for (mon, m) in dev.monitors.iter().enumerate() {
         for w in &m.wires {
             out.push(Link {
@@ -52,6 +82,15 @@ pub fn links(dev: &VirtualDevice) -> Vec<Link> {
         }
     }
     out
+}
+
+/// What a mixer node is called on screen: its name, or "Mixer" while it has none.
+pub fn node_name(n: &Node) -> &str {
+    if n.name.trim().is_empty() {
+        "Mixer"
+    } else {
+        &n.name
+    }
 }
 
 /// Slider percent (0..=100) <-> dB.
@@ -207,6 +246,39 @@ pub enum Edit {
     WirePan(usize, Link, f32),
     /// Trim every cable into one output channel so they sum back to unity (`balance_db`).
     BalanceCables(usize, u16),
+    /// A new mixer node, see `NewNode`.
+    AddNode(usize, NewNode),
+    /// Remove a node and splice it out: each cable into its row k is joined to each cable out
+    /// of row k (gains added, polarities combined); a muted node takes its cables with it.
+    RemoveNode(usize, usize),
+    RenameNode(usize, usize, String),
+    /// Fader of a node in dB (`Node::gain_db`).
+    NodeVolume(usize, usize, f32),
+    NodeMute(usize, usize, bool),
+    NodeFx(usize, usize, FxEdit),
+}
+
+/// Where a new node goes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NewNode {
+    /// A stereo node with no cables, to wire by hand.
+    Empty,
+    /// On this cable: a unity cable feeds the node (the row on the destination's side, L or R)
+    /// and the cable itself now leaves from the node, keeping its trim.
+    OnCable(Link),
+    /// Behind this source: channel for channel, every cable of the source leaves from the node.
+    ForSource(usize),
+}
+
+/// A change to a node's insert list.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FxEdit {
+    Add(Fx),
+    Remove(usize),
+    /// Move the effect at the first index to the second.
+    Move(usize, usize),
+    /// New parameters for the effect at this index (same kind).
+    Set(usize, Fx),
 }
 
 pub fn new_device(cfg: &mut Config) {
@@ -264,12 +336,17 @@ fn set_channels(dev: &mut VirtualDevice, n: u16) {
             s.channels = n;
         }
     }
-    let sources = &dev.sources;
+    // A wire into a node keeps its row whatever the device's width; one from a node stays while
+    // the node has that row.
+    let (sources, nodes) = (&dev.sources, &dev.nodes);
     dev.wires.retain(|w| {
-        w.out_ch < n
-            && sources
+        (w.to.is_some() || w.out_ch < n)
+            && (sources
                 .iter()
                 .any(|s| s.id == w.source && w.src_ch < s.channels)
+                || nodes
+                    .iter()
+                    .any(|x| x.id == w.source && w.src_ch < x.channels))
     });
     for m in &mut dev.monitors {
         m.wires.retain(|w| w.out_ch < n);
@@ -286,9 +363,14 @@ fn auto_wire_source(dev: &mut VirtualDevice, id: &str, ch: u16) {
     }
 }
 
+/// Whether `id` names a source or a node of `dev`.
+fn id_taken(dev: &VirtualDevice, id: &str) -> bool {
+    dev.sources.iter().any(|s| s.id == id) || dev.nodes.iter().any(|n| n.id == id)
+}
+
 fn next_source_id(dev: &VirtualDevice) -> String {
     let n = (1..)
-        .find(|n| !dev.sources.iter().any(|s| s.id == format!("s{n}")))
+        .find(|n| !id_taken(dev, &format!("s{n}")))
         .unwrap_or(1);
     format!("s{n}")
 }
@@ -329,7 +411,13 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
         | Edit::WireGain(d, ..)
         | Edit::WireInvert(d, ..)
         | Edit::WirePan(d, ..)
-        | Edit::BalanceCables(d, _) => *d,
+        | Edit::BalanceCables(d, _)
+        | Edit::AddNode(d, _)
+        | Edit::RemoveNode(d, _)
+        | Edit::RenameNode(d, ..)
+        | Edit::NodeVolume(d, ..)
+        | Edit::NodeMute(d, ..)
+        | Edit::NodeFx(d, ..) => *d,
     };
     if let Edit::RemoveDevice(_) = edit {
         if d < cfg.devices.len() {
@@ -465,7 +553,14 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
         Edit::Connect(_, Link { from, to }) => connect(dev, from, to),
         Edit::Unlink(_, link) => unlink(dev, link),
         Edit::Disconnect(_, port) => match port {
-            Port::OutIn { ch } => dev.wires.retain(|w| w.out_ch != ch),
+            // Only the device channel: a node's input row of the same number is another jack.
+            Port::OutIn { ch } => dev.wires.retain(|w| w.to.is_some() || w.out_ch != ch),
+            Port::NodeIn { node, ch } => {
+                if let Some(id) = dev.nodes.get(node).map(|n| n.id.clone()) {
+                    dev.wires
+                        .retain(|w| !(w.to.as_deref() == Some(&id) && w.out_ch == ch));
+                }
+            }
             Port::Mon { mon, ch } => {
                 if let Some(m) = dev.monitors.get_mut(mon) {
                     m.wires.retain(|w| w.dst_ch != ch);
@@ -473,85 +568,324 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
             }
             _ => {}
         },
+        Edit::AddNode(_, at) => add_node(dev, at),
+        Edit::RemoveNode(_, n) => remove_node(dev, n),
+        Edit::RenameNode(_, n, name) => {
+            let name: String = name.trim().chars().take(MAX_NAME_CHARS).collect();
+            if let Some(n) = dev.nodes.get_mut(n)
+                && !name.is_empty()
+            {
+                n.name = name;
+            }
+        }
+        Edit::NodeVolume(_, n, db) => {
+            if let Some(n) = dev.nodes.get_mut(n) {
+                n.gain_db = db;
+            }
+        }
+        Edit::NodeMute(_, n, m) => {
+            if let Some(n) = dev.nodes.get_mut(n) {
+                n.muted = m;
+            }
+        }
+        Edit::NodeFx(_, n, fx) => {
+            let room = can_add_fx(dev, n);
+            let Some(n) = dev.nodes.get_mut(n) else {
+                return;
+            };
+            match fx {
+                FxEdit::Add(fx) => {
+                    if room(&fx) {
+                        n.fx.push(fx);
+                    }
+                }
+                FxEdit::Remove(i) => {
+                    if i < n.fx.len() {
+                        n.fx.remove(i);
+                    }
+                }
+                FxEdit::Move(i, j) => {
+                    if i < n.fx.len() && j < n.fx.len() {
+                        let fx = n.fx.remove(i);
+                        n.fx.insert(j, fx);
+                    }
+                }
+                FxEdit::Set(i, fx) => {
+                    if let Some(old) = n.fx.get_mut(i)
+                        && std::mem::discriminant(old) == std::mem::discriminant(&fx)
+                    {
+                        *old = fx;
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Whether node `n` takes one more effect of a kind: under `MAX_FX`, and a delay only while the
+/// device's delay lines stay within `MAX_DELAY_CH` channels.
+pub fn can_add_fx(dev: &VirtualDevice, n: usize) -> impl Fn(&Fx) -> bool + use<> {
+    let (len, ch) = dev
+        .nodes
+        .get(n)
+        .map_or((MAX_FX, 0), |n| (n.fx.len(), usize::from(n.channels)));
+    // Each delay holds a line per channel of its node, as `Config::validate` counts them.
+    let delay_ch: usize = dev
+        .nodes
+        .iter()
+        .map(|n| {
+            n.fx.iter()
+                .filter(|f| matches!(f, Fx::Delay { .. }))
+                .count()
+                * usize::from(n.channels)
+        })
+        .sum();
+    move |fx| len < MAX_FX && (!matches!(fx, Fx::Delay { .. }) || delay_ch + ch <= MAX_DELAY_CH)
+}
+
+/// Whether one more node of `channels` rows fits the device (`MAX_NODES`, `MAX_NODE_CH_TOTAL`).
+pub fn can_add_node(dev: &VirtualDevice, channels: u16) -> bool {
+    let total: usize = dev.nodes.iter().map(|n| usize::from(n.channels)).sum();
+    dev.nodes.len() < MAX_NODES && total + usize::from(channels) <= MAX_NODE_CH_TOTAL
+}
+
+fn add_node(dev: &mut VirtualDevice, at: NewNode) {
+    let channels = match &at {
+        NewNode::ForSource(s) => match dev.sources.get(*s) {
+            Some(s) => s.channels.clamp(1, MAX_NODE_CH as u16),
+            None => return,
+        },
+        NewNode::Empty | NewNode::OnCable(_) => 2,
+    };
+    if !can_add_node(dev, channels) {
+        return;
+    }
+    let n = (1..)
+        .find(|n| !id_taken(dev, &format!("n{n}")))
+        .unwrap_or(1);
+    let id = format!("n{n}");
+    // Numbered like a device: "Mixer", "Mixer 2", ... skipping names already worn.
+    let name = (1..)
+        .map(|k| {
+            if k == 1 {
+                "Mixer".to_string()
+            } else {
+                format!("Mixer {k}")
+            }
+        })
+        .find(|name| !dev.nodes.iter().any(|n| node_name(n) == name))
+        .unwrap_or_default();
+    let node = Node {
+        id: id.clone(),
+        name,
+        channels,
+        gain_db: 0.0,
+        muted: false,
+        fx: Vec::new(),
+    };
+    match at {
+        NewNode::Empty => dev.nodes.push(node),
+        NewNode::OnCable(l) => {
+            let Some(i) = wire_index(dev, l) else {
+                return;
+            };
+            let w = dev.wires[i].clone();
+            let row = w.out_ch % 2;
+            // Ahead of a node it feeds, so node-to-node cables keep running to later nodes.
+            let at = match l.to {
+                Port::NodeIn { node, .. } => node,
+                _ => dev.nodes.len(),
+            };
+            dev.nodes.insert(at, node);
+            dev.wires[i].source.clone_from(&id);
+            dev.wires[i].src_ch = row;
+            dev.wires.push(Wire {
+                to: Some(id),
+                ..Wire::new(w.source, w.src_ch, row)
+            });
+        }
+        NewNode::ForSource(s) => {
+            let src = dev.sources[s].id.clone();
+            // Ahead of every node the source feeds, as for a cable.
+            let at = dev
+                .wires
+                .iter()
+                .filter(|w| w.source == src)
+                .filter_map(|w| dev.nodes.iter().position(|n| Some(&n.id) == w.to.as_ref()))
+                .min()
+                .unwrap_or(dev.nodes.len());
+            dev.nodes.insert(at, node);
+            for w in dev
+                .wires
+                .iter_mut()
+                .filter(|w| w.source == src && w.src_ch < channels)
+            {
+                w.source.clone_from(&id);
+            }
+            for ch in 0..channels {
+                dev.wires.push(Wire {
+                    to: Some(id.clone()),
+                    ..Wire::new(src.clone(), ch, ch)
+                });
+            }
+        }
+    }
+}
+
+fn remove_node(dev: &mut VirtualDevice, n: usize) {
+    if n >= dev.nodes.len() {
+        return;
+    }
+    let node = dev.nodes.remove(n);
+    let into = |w: &Wire| w.to.as_deref() == Some(node.id.as_str());
+    let mut joined: Vec<Wire> = Vec::new();
+    // A muted node passes nothing; joining around it would make it heard.
+    if !node.muted {
+        for a in dev.wires.iter().filter(|w| into(w)) {
+            for b in dev
+                .wires
+                .iter()
+                .filter(|b| b.source == node.id && b.src_ch == a.out_ch)
+            {
+                let w = Wire {
+                    gain_db: (a.gain_db + b.gain_db + node.gain_db).min(MAX_DB),
+                    invert: a.invert != b.invert,
+                    to: b.to.clone(),
+                    ..Wire::new(a.source.clone(), a.src_ch, b.out_ch)
+                };
+                let same = |o: &Wire| {
+                    o.source == w.source
+                        && o.src_ch == w.src_ch
+                        && o.to == w.to
+                        && o.out_ch == w.out_ch
+                };
+                if !dev.wires.iter().chain(&joined).any(same) {
+                    joined.push(w);
+                }
+            }
+        }
+    }
+    dev.wires.retain(|w| !into(w) && w.source != node.id);
+    dev.wires.extend(joined);
+}
+
+/// The ends of a device cable as `Wire` names them: source id, its channel, the node id it feeds
+/// (`None`: an output channel), the channel there.
+fn ends(dev: &VirtualDevice, l: Link) -> Option<(&str, u16, Option<&str>, u16)> {
+    let (src, src_ch, src_n) = match l.from {
+        Port::Src { src, ch } => (
+            dev.sources.get(src)?.id.as_str(),
+            ch,
+            dev.sources[src].channels,
+        ),
+        Port::NodeOut { node, ch } => {
+            let n = dev.nodes.get(node)?;
+            (n.id.as_str(), ch, n.channels)
+        }
+        _ => return None,
+    };
+    let (to, out_ch, to_n) = match l.to {
+        Port::OutIn { ch } => (None, ch, dev.channels),
+        Port::NodeIn { node, ch } => {
+            let n = dev.nodes.get(node)?;
+            (Some(n.id.as_str()), ch, n.channels)
+        }
+        _ => return None,
+    };
+    (src_ch < src_n && out_ch < to_n).then_some((src, src_ch, to, out_ch))
+}
+
+/// Whether node `from` feeds node `to`, directly or through other nodes.
+fn reaches(dev: &VirtualDevice, from: &str, to: &str) -> bool {
+    let mut seen = vec![from];
+    let mut i = 0;
+    while let Some(&at) = seen.get(i) {
+        if at == to {
+            return true;
+        }
+        for w in dev.wires.iter().filter(|w| w.source == at) {
+            if let Some(next) = w.to.as_deref()
+                && !seen.contains(&next)
+            {
+                seen.push(next);
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn connect(dev: &mut VirtualDevice, from: Port, to: Port) {
-    match (from, to) {
-        (Port::Src { src, ch }, Port::OutIn { ch: out_ch }) => {
-            let Some(s) = dev.sources.get(src) else {
-                return;
-            };
-            if ch >= s.channels || out_ch >= dev.channels {
-                return;
-            }
-            let same = |w: &Wire| {
-                w.to.is_none() && w.source == s.id && w.src_ch == ch && w.out_ch == out_ch
-            };
-            // A cable keeps its trim when it is plugged in again: match by ends, not by value.
-            if !dev.wires.iter().any(same) {
-                dev.wires.push(Wire::new(s.id.clone(), ch, out_ch));
-            }
+    if !can_link(from, to) {
+        return;
+    }
+    if let Port::Mon { mon, ch } = to {
+        let Port::OutOut { ch: out_ch } = from else {
+            return;
+        };
+        if out_ch >= dev.channels {
+            return;
         }
-        (Port::OutOut { ch: out_ch }, Port::Mon { mon, ch }) => {
-            if out_ch >= dev.channels {
-                return;
-            }
-            let Some(m) = dev.monitors.get_mut(mon) else {
-                return;
-            };
-            let w = MonitorWire { out_ch, dst_ch: ch };
-            if !m.wires.contains(&w) {
-                m.wires.push(w);
-            }
+        let Some(m) = dev.monitors.get_mut(mon) else {
+            return;
+        };
+        let w = MonitorWire { out_ch, dst_ch: ch };
+        if !m.wires.contains(&w) {
+            m.wires.push(w);
         }
-        _ => {}
+        return;
+    }
+    let Some((src, src_ch, to_id, out_ch)) = ends(dev, Link { from, to }) else {
+        return;
+    };
+    // Nodes only feed forward: no cable that would close a loop.
+    if let Some(t) = to_id
+        && reaches(dev, t, src)
+    {
+        return;
+    }
+    // A cable keeps its trim when it is plugged in again: match by ends, not by value.
+    if wire_index(dev, Link { from, to }).is_none() {
+        let w = Wire {
+            to: to_id.map(str::to_string),
+            ..Wire::new(src, src_ch, out_ch)
+        };
+        dev.wires.push(w);
     }
 }
 
-fn unlink(dev: &mut VirtualDevice, Link { from, to }: Link) {
-    match (from, to) {
-        (Port::Src { src, ch }, Port::OutIn { ch: out_ch }) => {
-            if let Some(id) = dev.sources.get(src).map(|s| s.id.clone()) {
-                dev.wires
-                    .retain(|w| !(w.source == id && w.src_ch == ch && w.out_ch == out_ch));
-            }
+fn unlink(dev: &mut VirtualDevice, l: Link) {
+    if let (Port::OutOut { ch: out_ch }, Port::Mon { mon, ch }) = (l.from, l.to) {
+        if let Some(m) = dev.monitors.get_mut(mon) {
+            m.wires.retain(|w| !(w.out_ch == out_ch && w.dst_ch == ch));
         }
-        (Port::OutOut { ch: out_ch }, Port::Mon { mon, ch }) => {
-            if let Some(m) = dev.monitors.get_mut(mon) {
-                m.wires.retain(|w| !(w.out_ch == out_ch && w.dst_ch == ch));
-            }
-        }
-        _ => {}
+    } else if let Some(i) = wire_index(dev, l) {
+        dev.wires.remove(i);
     }
 }
 
-/// The cable of `dev` that `l` draws, if it is a source cable.
+/// The device cable that `l` draws (a monitor cable has none).
 pub fn wire_of(dev: &VirtualDevice, l: Link) -> Option<&Wire> {
     wire_index(dev, l).map(|i| &dev.wires[i])
 }
 
 fn wire_index(dev: &VirtualDevice, l: Link) -> Option<usize> {
-    let (Port::Src { src, ch }, Port::OutIn { ch: out_ch }) = (l.from, l.to) else {
-        return None;
-    };
-    let id = &dev.sources.get(src)?.id;
-    dev.wires
-        .iter()
-        .position(|w| w.to.is_none() && &w.source == id && w.src_ch == ch && w.out_ch == out_ch)
+    let (src, src_ch, to, out_ch) = ends(dev, l)?;
+    dev.wires.iter().position(|w| {
+        w.source == src && w.src_ch == src_ch && w.to.as_deref() == to && w.out_ch == out_ch
+    })
 }
 
 fn wire_mut(dev: &mut VirtualDevice, l: Link) -> Option<&mut Wire> {
     wire_index(dev, l).map(|i| &mut dev.wires[i])
 }
 
-/// Indices of the cables that end at output channel `ch` (their source exists).
+/// Indices of the cables that end at output channel `ch` (from a source or a node that exists).
 fn wires_into(dev: &VirtualDevice, ch: u16) -> Vec<usize> {
     (0..dev.wires.len())
         .filter(|&i| {
-            dev.wires[i].to.is_none()
-                && dev.wires[i].out_ch == ch
-                && dev.sources.iter().any(|s| s.id == dev.wires[i].source)
+            let w = &dev.wires[i];
+            w.to.is_none() && w.out_ch == ch && wire_from(dev, w).is_some()
         })
         .collect()
 }
@@ -584,10 +918,9 @@ const PAN_FLOOR_DB: f32 = -80.0;
 pub fn pan_pair(dev: &VirtualDevice, l: Link) -> Option<[usize; 2]> {
     let i = wire_index(dev, l)?;
     let w = &dev.wires[i];
-    let other = dev
-        .wires
-        .iter()
-        .position(|o| o.source == w.source && o.src_ch == w.src_ch && o.out_ch == w.out_ch ^ 1)?;
+    let other = dev.wires.iter().position(|o| {
+        o.source == w.source && o.src_ch == w.src_ch && o.to == w.to && o.out_ch == w.out_ch ^ 1
+    })?;
     Some(if w.out_ch.is_multiple_of(2) {
         [i, other]
     } else {
@@ -617,12 +950,15 @@ pub fn pan_of(dev: &VirtualDevice, l: Link) -> Option<f32> {
     Some((t / std::f32::consts::FRAC_PI_4 - 1.0).clamp(-1.0, 1.0))
 }
 
-/// Valid drop target for a drag that started at `from`.
+/// Valid drop target for a drag that started at `from`. Nodes only feed later nodes, so cables
+/// never close a loop.
 pub fn can_link(from: Port, to: Port) -> bool {
-    matches!(
-        (from, to),
-        (Port::Src { .. }, Port::OutIn { .. }) | (Port::OutOut { .. }, Port::Mon { .. })
-    )
+    match (from, to) {
+        (Port::NodeOut { node: a, .. }, Port::NodeIn { node: b, .. }) => b > a,
+        (Port::Src { .. } | Port::NodeOut { .. }, Port::OutIn { .. } | Port::NodeIn { .. })
+        | (Port::OutOut { .. }, Port::Mon { .. }) => true,
+        _ => false,
+    }
 }
 
 /// Channel row label: `1 (L)` / `2 (R)` for a stereo pair, the number otherwise.
@@ -687,6 +1023,204 @@ pub(crate) mod tests {
             ),
         );
         c
+    }
+
+    fn link(from: Port, to: Port) -> Link {
+        Link { from, to }
+    }
+
+    /// Safari (s1) wired 1->1, 2->2 and a mic (s2) into both channels, as the app builds them.
+    fn two_sources() -> Config {
+        let mut c = cfg_with_dev();
+        apply(
+            &mut c,
+            Edit::AddSource(0, SourceKind::Device { uid: "mic".into() }, 1),
+        );
+        c
+    }
+
+    #[test]
+    fn a_mixer_on_a_cable_takes_it_in_and_passes_it_on_with_its_trim() {
+        let mut c = two_sources();
+        let l = link(Port::Src { src: 0, ch: 1 }, Port::OutIn { ch: 1 });
+        apply(&mut c, Edit::WireGain(0, l, -6.0));
+        apply(&mut c, Edit::AddNode(0, NewNode::OnCable(l)));
+        c.validate().unwrap();
+        let d = &c.devices[0];
+        assert_eq!(d.nodes.len(), 1);
+        assert_eq!(
+            (d.nodes[0].id.as_str(), node_name(&d.nodes[0])),
+            ("n1", "Mixer")
+        );
+        assert_eq!(d.nodes[0].channels, 2);
+        let all = links(d);
+        // Into the node's right row (the destination's side), then on to channel 2 with the trim.
+        let into = link(Port::Src { src: 0, ch: 1 }, Port::NodeIn { node: 0, ch: 1 });
+        let out = link(Port::NodeOut { node: 0, ch: 1 }, Port::OutIn { ch: 1 });
+        assert!(all.contains(&into) && all.contains(&out), "{all:?}");
+        assert!(!all.contains(&l));
+        assert_eq!(wire_of(d, into).unwrap().gain_db, 0.0);
+        assert_eq!(wire_of(d, out).unwrap().gain_db, -6.0);
+        // A second mixer, on the cable into the first, goes ahead of it.
+        apply(&mut c, Edit::AddNode(0, NewNode::OnCable(into)));
+        c.validate().unwrap();
+        let d = &c.devices[0];
+        assert_eq!(
+            d.nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            ["Mixer 2", "Mixer"]
+        );
+        assert!(links(d).contains(&link(
+            Port::NodeOut { node: 0, ch: 1 },
+            Port::NodeIn { node: 1, ch: 1 }
+        )));
+    }
+
+    #[test]
+    fn a_mixer_for_a_source_carries_every_cable_of_it_channel_for_channel() {
+        let mut c = two_sources();
+        // The mono mic feeds both channels: one row in, both cables out of that row.
+        apply(&mut c, Edit::AddNode(0, NewNode::ForSource(1)));
+        c.validate().unwrap();
+        let d = &c.devices[0];
+        assert_eq!(d.nodes[0].channels, 1);
+        let all = links(d);
+        let mic = Port::Src { src: 1, ch: 0 };
+        assert_eq!(all.iter().filter(|l| l.from == mic).count(), 1);
+        assert!(all.contains(&link(mic, Port::NodeIn { node: 0, ch: 0 })));
+        for ch in 0..2 {
+            assert!(all.contains(&link(Port::NodeOut { node: 0, ch: 0 }, Port::OutIn { ch })));
+        }
+    }
+
+    #[test]
+    fn removing_a_mixer_joins_its_cables_again_with_their_gains_added() {
+        let mut c = two_sources();
+        let l = link(Port::Src { src: 0, ch: 0 }, Port::OutIn { ch: 0 });
+        apply(&mut c, Edit::WireInvert(0, l, true));
+        apply(&mut c, Edit::AddNode(0, NewNode::OnCable(l)));
+        let into = link(Port::Src { src: 0, ch: 0 }, Port::NodeIn { node: 0, ch: 0 });
+        apply(&mut c, Edit::WireGain(0, into, -3.0));
+        apply(&mut c, Edit::NodeVolume(0, 0, -2.5));
+        let before = c.devices[0].wires.len();
+        apply(&mut c, Edit::RemoveNode(0, 0));
+        c.validate().unwrap();
+        let d = &c.devices[0];
+        assert!(d.nodes.is_empty());
+        assert_eq!(d.wires.len(), before - 1);
+        let w = wire_of(d, l).unwrap();
+        assert_eq!((w.gain_db, w.invert), (-5.5, true));
+        // A muted mixer passed nothing: its cables go with it.
+        apply(&mut c, Edit::AddNode(0, NewNode::OnCable(l)));
+        apply(&mut c, Edit::NodeMute(0, 0, true));
+        apply(&mut c, Edit::RemoveNode(0, 0));
+        assert!(wire_of(&c.devices[0], l).is_none());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn output_disconnect_and_shrinking_keep_the_cables_into_a_mixer() {
+        let mut c = two_sources();
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        let row1 = link(Port::Src { src: 0, ch: 1 }, Port::NodeIn { node: 0, ch: 1 });
+        apply(&mut c, Edit::Connect(0, row1));
+        apply(&mut c, Edit::GrowChannels(0));
+        let out3 = link(Port::NodeOut { node: 0, ch: 1 }, Port::OutIn { ch: 3 });
+        apply(&mut c, Edit::Connect(0, out3));
+        assert!(links(&c.devices[0]).contains(&out3));
+        // Output channel 2's jack is not the mixer's row 2.
+        apply(&mut c, Edit::Disconnect(0, Port::OutIn { ch: 1 }));
+        assert!(links(&c.devices[0]).contains(&row1));
+        // Shrinking drops the cable to channel 4 but keeps the one into the mixer.
+        apply(&mut c, Edit::ShrinkChannels(0));
+        let all = links(&c.devices[0]);
+        assert!(all.contains(&row1) && !all.contains(&out3), "{all:?}");
+        apply(&mut c, Edit::Disconnect(0, Port::NodeIn { node: 0, ch: 1 }));
+        assert!(!links(&c.devices[0]).contains(&row1));
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn mixers_only_feed_later_mixers_and_never_close_a_loop() {
+        let mut c = two_sources();
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        let fwd = link(
+            Port::NodeOut { node: 0, ch: 0 },
+            Port::NodeIn { node: 1, ch: 0 },
+        );
+        let back = link(
+            Port::NodeOut { node: 1, ch: 0 },
+            Port::NodeIn { node: 0, ch: 0 },
+        );
+        assert!(can_link(fwd.from, fwd.to) && !can_link(back.from, back.to));
+        apply(&mut c, Edit::Connect(0, fwd));
+        apply(&mut c, Edit::Connect(0, back));
+        let all = links(&c.devices[0]);
+        assert!(all.contains(&fwd) && !all.contains(&back));
+        // A hand-made backward cable (still forward in the graph) does not let a loop in either.
+        c.devices[0].wires.retain(|w| w.to.is_none());
+        c.devices[0].wires.push(Wire {
+            to: Some("n1".into()),
+            ..Wire::new("n2", 0, 0)
+        });
+        c.validate().unwrap();
+        apply(&mut c, Edit::Connect(0, fwd));
+        assert!(!links(&c.devices[0]).contains(&fwd));
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn effects_add_move_set_and_stay_within_the_caps() {
+        let mut c = two_sources();
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        let fx = |c: &Config| c.devices[0].nodes[0].fx.clone();
+        let eq = Fx::Eq {
+            low_hz: 120.0,
+            low_db: 0.0,
+            high_hz: 8000.0,
+            high_db: 0.0,
+        };
+        for f in [
+            Fx::Mono,
+            eq.clone(),
+            Fx::Delay { ms: 12.0 },
+            Fx::Mono,
+            Fx::Mono,
+        ] {
+            apply(&mut c, Edit::NodeFx(0, 0, FxEdit::Add(f)));
+        }
+        assert_eq!(fx(&c).len(), MAX_FX, "a fifth is refused");
+        apply(&mut c, Edit::NodeFx(0, 0, FxEdit::Move(1, 0)));
+        assert_eq!(fx(&c)[0], eq);
+        // A new value of the same kind replaces it; another kind is refused.
+        let louder = Fx::Eq {
+            low_hz: 120.0,
+            low_db: 6.0,
+            high_hz: 8000.0,
+            high_db: 0.0,
+        };
+        apply(&mut c, Edit::NodeFx(0, 0, FxEdit::Set(0, louder.clone())));
+        apply(&mut c, Edit::NodeFx(0, 0, FxEdit::Set(0, Fx::Mono)));
+        assert_eq!(fx(&c)[0], louder);
+        apply(&mut c, Edit::NodeFx(0, 0, FxEdit::Remove(3)));
+        assert_eq!(fx(&c).len(), 3);
+        c.validate().unwrap();
+        // Delay lines: 8 channels over the device. Three more stereo delays fit, a fourth not.
+        for _ in 0..3 {
+            apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+            let n = c.devices[0].nodes.len() - 1;
+            apply(
+                &mut c,
+                Edit::NodeFx(0, n, FxEdit::Add(Fx::Delay { ms: 0.0 })),
+            );
+        }
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        apply(
+            &mut c,
+            Edit::NodeFx(0, 4, FxEdit::Add(Fx::Delay { ms: 0.0 })),
+        );
+        assert!(c.devices[0].nodes[4].fx.is_empty());
+        c.validate().unwrap();
     }
 
     #[test]
@@ -1201,9 +1735,54 @@ pub(crate) mod tests {
         fn port() -> impl Strategy<Value = Port> {
             prop_oneof![
                 (0usize..4, 0u16..70).prop_map(|(src, ch)| Port::Src { src, ch }),
+                (0usize..4, 0u16..3).prop_map(|(src, ch)| Port::Src { src, ch }),
                 (0u16..70).prop_map(|ch| Port::OutIn { ch }),
+                (0u16..4).prop_map(|ch| Port::OutIn { ch }),
                 (0u16..70).prop_map(|ch| Port::OutOut { ch }),
                 (0usize..4, 0u16..70).prop_map(|(mon, ch)| Port::Mon { mon, ch }),
+                (0usize..4, 0u16..9).prop_map(|(node, ch)| Port::NodeIn { node, ch }),
+                (0usize..4, 0u16..9).prop_map(|(node, ch)| Port::NodeOut { node, ch }),
+            ]
+        }
+
+        /// An effect with parameters in their ranges (the inspector clamps what is typed).
+        fn fx() -> impl Strategy<Value = Fx> {
+            prop_oneof![
+                Just(Fx::Mono),
+                (
+                    20.0f32..=2000.0,
+                    -18.0f32..=18.0,
+                    1000.0f32..=20000.0,
+                    -18.0f32..=18.0
+                )
+                    .prop_map(|(low_hz, low_db, high_hz, high_db)| Fx::Eq {
+                        low_hz,
+                        low_db,
+                        high_hz,
+                        high_db
+                    }),
+                (-24.0f32..=0.0, 0.0f32..=12.0).prop_map(|(ceiling_db, knee_db)| Fx::Limiter {
+                    ceiling_db,
+                    knee_db
+                }),
+                (0.0f32..=200.0).prop_map(|ms| Fx::Delay { ms }),
+            ]
+        }
+
+        fn fx_edit() -> impl Strategy<Value = FxEdit> {
+            prop_oneof![
+                fx().prop_map(FxEdit::Add),
+                (0usize..5).prop_map(FxEdit::Remove),
+                (0usize..5, 0usize..5).prop_map(|(i, j)| FxEdit::Move(i, j)),
+                (0usize..5, fx()).prop_map(|(i, f)| FxEdit::Set(i, f)),
+            ]
+        }
+
+        fn new_node() -> impl Strategy<Value = NewNode> {
+            prop_oneof![
+                Just(NewNode::Empty),
+                (port(), port()).prop_map(|(from, to)| NewNode::OnCable(Link { from, to })),
+                (0usize..4).prop_map(NewNode::ForSource),
             ]
         }
 
@@ -1251,7 +1830,17 @@ pub(crate) mod tests {
                     .prop_map(|(d, from, to, b)| Edit::WireInvert(d, Link { from, to }, b)),
                 (d.clone(), port(), port(), -2.0f32..2.0)
                     .prop_map(|(d, from, to, p)| Edit::WirePan(d, Link { from, to }, p)),
-                (d, 0u16..70).prop_map(|(d, ch)| Edit::BalanceCables(d, ch)),
+                (d.clone(), 0u16..70).prop_map(|(d, ch)| Edit::BalanceCables(d, ch)),
+                (d.clone(), new_node()).prop_map(|(d, at)| Edit::AddNode(d, at)),
+                (d.clone(), new_node()).prop_map(|(d, at)| Edit::AddNode(d, at)),
+                (d.clone(), i.clone()).prop_map(|(d, n)| Edit::RemoveNode(d, n)),
+                (d.clone(), i.clone(), "[ -~]{0,6}")
+                    .prop_map(|(d, n, s)| Edit::RenameNode(d, n, s)),
+                (d.clone(), i.clone(), -100.0f32..12.0)
+                    .prop_map(|(d, n, v)| Edit::NodeVolume(d, n, v)),
+                (d.clone(), i.clone(), any::<bool>()).prop_map(|(d, n, b)| Edit::NodeMute(d, n, b)),
+                (d.clone(), i.clone(), fx_edit()).prop_map(|(d, n, f)| Edit::NodeFx(d, n, f)),
+                (d, i, fx_edit()).prop_map(|(d, n, f)| Edit::NodeFx(d, n, f)),
             ]
         }
 
@@ -1275,6 +1864,8 @@ pub(crate) mod tests {
                     prop_assert!(cfg.validate().is_ok());
                 }
                 let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+                // The file says the version its content needs; `version` is what was read.
+                cfg.version = cfg.written_version();
                 prop_assert_eq!(back, cfg);
             }
 

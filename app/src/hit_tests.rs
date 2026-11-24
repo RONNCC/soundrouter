@@ -328,9 +328,10 @@ fn the_card_options_slider_and_remove_button_take_edge_clicks() {
     tap(&mut h, at);
     let v = rect(&h, "Safari volume");
     assert!(v.height() >= MIN_HIT, "{v:?}");
+    // Well left of the knob (at 0 dB), so the press lands on the rail, not on the knob.
     tap(
         &mut h,
-        egui::pos2(v.left() + v.width() * 0.5, v.center().y - 12.0),
+        egui::pos2(v.left() + v.width() * 0.25, v.center().y - 12.0),
     );
     assert!(h.state().cfg.devices[0].sources[0].volume_db < 0.0);
     let rm = rect(&h, "Remove Source Safari");
@@ -524,7 +525,7 @@ fn a_cable_chip_takes_a_click_at_every_corner_of_its_target_in_both_window_sizes
                 h.get_by_label("Safari, channel 1 (L) to Channel 1 (L)");
                 assert_eq!(
                     h.state().cfg.devices[0].wires.len(),
-                    6,
+                    demo_config().devices[0].wires.len(),
                     "{size:?} {db} corner {n}: a chip click trims, never unplugs"
                 );
             }
@@ -534,28 +535,47 @@ fn a_cable_chip_takes_a_click_at_every_corner_of_its_target_in_both_window_sizes
 
 #[test]
 fn the_x_over_a_cable_takes_a_click_at_every_corner_and_never_overlaps_the_chip() {
-    for size in [vec2(1180.0, 700.0), vec2(1000.0, 520.0)] {
-        for n in 0..4 {
-            let mut h = with_trim(size, -6.0);
-            let chip = h.get_by_label_contains(CHIP).rect();
-            h.hover_at(chip.center());
-            settle(&mut h);
-            let x = rect(&h, UNPLUG);
-            assert!(x.width() >= MIN_HIT && x.height() >= MIN_HIT, "{x:?}");
-            assert!(x.bottom() <= chip.top() + 0.5, "x {x:?} over chip {chip:?}");
-            // The pointer travels from the chip up to the x without the x going away.
-            for step in 1..=4 {
-                h.hover_at(chip.center() + (x.center() - chip.center()) * (step as f32 / 4.0));
-                h.step();
-            }
-            tap(&mut h, corners(x)[n]);
-            assert_eq!(
-                h.state().cfg.devices[0].wires.len(),
-                5,
-                "{size:?} corner {n}"
-            );
+    for n in 0..4 {
+        let mut h = with_trim(vec2(1180.0, 700.0), -6.0);
+        let chip = h.get_by_label_contains(CHIP).rect();
+        h.hover_at(chip.center());
+        settle(&mut h);
+        let x = rect(&h, UNPLUG);
+        assert!(x.width() >= MIN_HIT && x.height() >= MIN_HIT, "{x:?}");
+        assert!(
+            !x.shrink(0.5).intersects(chip),
+            "x {x:?} over chip {chip:?}"
+        );
+        // The pointer travels from the chip to the x without the x going away.
+        for step in 1..=4 {
+            h.hover_at(chip.center() + (x.center() - chip.center()) * (step as f32 / 4.0));
+            h.step();
         }
+        tap(&mut h, corners(x)[n]);
+        assert_eq!(
+            h.state().cfg.devices[0].wires.len(),
+            demo_config().devices[0].wires.len() - 1,
+            "corner {n}"
+        );
     }
+}
+
+/// At the smallest window the cables beside the Music strip stack so close that no slot beside
+/// Safari's chip is free: no x or + appears there (a click could land on a neighbour's chip),
+/// and the chip's popover still inserts a mixer.
+#[test]
+fn a_crowded_chip_shows_no_x_and_its_popover_still_inserts_a_mixer() {
+    let mut h = with_trim(vec2(1000.0, 520.0), -6.0);
+    let chip = h.get_by_label_contains(CHIP).rect();
+    h.hover_at(chip.center());
+    settle(&mut h);
+    assert!(h.query_by_label(UNPLUG).is_none());
+    assert!(h.query_by_label_contains("Insert mixer on cable").is_none());
+    tap(&mut h, chip.center());
+    click_label(&mut h, "Insert mixer");
+    let d = &h.state().cfg.devices[0];
+    assert_eq!(d.nodes.len(), 2);
+    h.state().cfg.validate().unwrap();
 }
 
 #[test]
