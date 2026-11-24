@@ -118,9 +118,8 @@ fn an_error_is_spelled_out_on_the_second_row() {
 }
 
 #[test]
-fn the_second_row_carries_the_delay_and_the_counts() {
+fn the_second_row_carries_the_delay() {
     let h = open(demo_config());
-    h.get_by_label("3 sources, 2 outputs, 1 monitor");
     // the frozen engine reports 512 frames at 48 kHz and 1384 for captured apps
     h.get_by_label("Delay 10.7 ms  Apps 29 ms");
     // a device without a reading says so instead of showing a stale number
@@ -136,7 +135,7 @@ fn the_chevron_folds_the_card_into_a_strip_and_the_choice_stays_for_the_session(
     let full = h.get_by_label("Mute device").rect().center().y;
     click(&mut h, "Collapse device summary");
     assert!(h.state().summary.collapsed);
-    assert!(!has(&h, "3 sources, 2 outputs, 1 monitor"));
+    assert!(!has(&h, "Delay 10.7 ms  Apps 29 ms"));
     assert!(has(&h, "Expand device summary"));
     for label in [
         "Master volume",
@@ -154,7 +153,7 @@ fn the_chevron_folds_the_card_into_a_strip_and_the_choice_stays_for_the_session(
     assert!(has(&h, "Expand device summary"));
     click(&mut h, "Expand device summary");
     assert!(!h.state().summary.collapsed);
-    h.get_by_label("2 sources, 2 outputs, 0 monitors");
+    h.get_by_label("Delay 10.7 ms");
 }
 
 #[test]

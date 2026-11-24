@@ -13,7 +13,7 @@ use crate::theme::{Tokens, body, label, num, radius};
 use crate::widgets::{chevron, fader, halo, hit as hit_target, meter, speaker};
 use eframe::egui::{
     self, Align2, CornerRadius, Id, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, WidgetInfo,
-    accesskit::Role, pos2, text::LayoutJob, text::TextFormat, vec2,
+    accesskit::Role, pos2, vec2,
 };
 use sr_core::backend::{DeviceState, MeterReading};
 use sr_core::config::VirtualDevice;
@@ -175,24 +175,6 @@ pub fn db_readout(db: f32) -> String {
     } else {
         format!("{db:.1} dB")
     }
-}
-
-fn noun(n: usize, one: &'static str, many: &'static str) -> &'static str {
-    if n == 1 { one } else { many }
-}
-
-/// "2 sources, 2 outputs, 1 monitor" as (count, word) parts.
-pub fn counts(dev: &VirtualDevice) -> [(usize, &'static str); 3] {
-    let (s, o, m) = (
-        dev.sources.len(),
-        usize::from(dev.channels),
-        dev.monitors.len(),
-    );
-    [
-        (s, noun(s, "source", "sources")),
-        (o, noun(o, "output", "outputs")),
-        (m, noun(m, "monitor", "monitors")),
-    ]
 }
 
 fn pair_title(p: usize) -> String {
@@ -423,32 +405,10 @@ pub fn show(ui: &mut Ui, card: Rect, t: &Tokens, st: &mut State, f: &Facts, edit
         return;
     }
 
-    // Second row: what the engine measured, and what the device is made of.
+    // Second row: what the engine measured.
     let cy2 = card.top() + 54.0;
-    let mut job = LayoutJob::default();
-    let nums = TextFormat::simple(num(12.0), t.ink);
-    let words = TextFormat::simple(body(), t.muted);
-    let list = counts(dev);
-    for (i, (n, w)) in list.iter().enumerate() {
-        if i > 0 {
-            job.append(", ", 0.0, words.clone());
-        }
-        job.append(&n.to_string(), 0.0, nums.clone());
-        job.append(&format!(" {w}"), 0.0, words.clone());
-    }
-    let summary = list
-        .iter()
-        .map(|(n, w)| format!("{n} {w}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let g = p.layout_job(job);
-    let at = Rect::from_min_size(pos2(right - g.size().x, cy2 - g.size().y / 2.0), g.size());
-    p.galley(at.min, g, t.muted);
-    let sum_hit = ui.interact(at.expand(2.0), Id::unique("summary_counts"), Sense::hover());
-    sum_hit.widget_info(|| WidgetInfo::labeled(Role::Label, true, &summary));
-
     let x = card.left() + TEXT_X;
-    let max_w = (at.left() - 16.0 - x).max(0.0);
+    let max_w = (right - x).max(0.0);
     let (text, tip) = match f.state {
         DeviceState::Failed(e) if dev.enabled => (e.clone(), e.clone()),
         _ => match f.delay_ms {
@@ -484,7 +444,6 @@ pub fn show(ui: &mut Ui, card: Rect, t: &Tokens, st: &mut State, f: &Facts, edit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::demo_config;
 
     #[test]
     fn chip_says_the_state_in_words() {
@@ -575,20 +534,6 @@ mod tests {
         assert_eq!(db_readout(-6.04), "-6.0 dB");
         assert_eq!(db_readout(MIN_DB), "-inf dB");
         assert_eq!(db_readout(-200.0), "-inf dB");
-    }
-
-    #[test]
-    fn counts_agree_with_the_graph_columns() {
-        let cfg = demo_config();
-        let words = |d: &VirtualDevice| {
-            counts(d)
-                .iter()
-                .map(|(n, w)| format!("{n} {w}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        assert_eq!(words(&cfg.devices[0]), "3 sources, 2 outputs, 1 monitor");
-        assert_eq!(words(&cfg.devices[1]), "2 sources, 2 outputs, 0 monitors");
     }
 
     #[test]
