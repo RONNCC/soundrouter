@@ -3937,8 +3937,11 @@ fn the_processing_column_offers_a_module_and_removing_it_restores_the_cables() {
         &h,
         "No processing. Sound goes straight to the outputs."
     ));
-    // Removing it puts the direct cables back.
+    // Its inspector has no remove button; the x on the card removes it.
     click(&mut h, "EQ module, processing Channels 1 & 2");
+    assert!(!has(&h, "Remove module"));
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
     click(&mut h, "Remove EQ module");
     assert_eq!(links0(&h), before);
     h.get_by_label("No processing. Sound goes straight to the outputs.");
@@ -4174,6 +4177,10 @@ fn removing_a_mixer_joins_its_cables_and_undo_brings_it_back() {
     let mut h = open(demo_config());
     let before = h.state().cfg.clone();
     click(&mut h, MUSIC);
+    // The inspector no longer carries a remove button: the card's x does it.
+    assert!(!has(&h, "Remove module"));
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
     click(&mut h, "Remove Music module");
     assert!(h.state().cfg.devices[0].nodes.is_empty());
     // Spotify goes straight to the outputs again.

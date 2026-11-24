@@ -2187,10 +2187,14 @@ fn strip(
             .show(|ui| inspector(ui, g, st, edits, n));
     };
 
-    // Title: the button that opens the inspector.
+    // Title: the button that opens the inspector; the card's x sits to its right, 4 px between
+    // the two targets, where a source card keeps its own.
     let head = Rect::from_min_max(
         pos2(r.left() + 4.0, r.top() + 3.0),
-        pos2(r.right() - 4.0, r.top() + HEAD_H - 3.0),
+        pos2(
+            r.right() - 22.0 - MIN_HIT / 2.0 - 4.0,
+            r.top() + HEAD_H - 3.0,
+        ),
     );
     let title = hit(ui, head, Id::unique(("strip_title", d, n)));
     name_button(&title, &format!("{name} module, {}", module_scope(g, n)));
@@ -2218,6 +2222,19 @@ fn strip(
         );
     }
     popover(st, edits, &title);
+    // Remove: the cables around it join up again; the toast offers Undo.
+    let x = x_button(
+        ui,
+        pos2(r.right() - 14.0 - 8.0, r.top() + HEAD_H / 2.0),
+        Id::unique(("strip_x", d, n)),
+        t,
+        &format!("Remove {name} module"),
+    );
+    // A double-click's second click would remove the card that moved up under the pointer.
+    if x.clicked() && !x.double_clicked() {
+        edits.push(Edit::RemoveNode(d, n));
+    }
+    x.on_hover_text(format!("Remove {name} module"));
     painter.hline(r.x_range(), r.top() + HEAD_H, Stroke::new(1.0, t.hairline));
 
     // Channel rows: the jacks sit on the edges, the row's name between them.
@@ -2648,8 +2665,8 @@ fn arrow_button(ui: &mut Ui, t: &Tokens, at: Pos2, id: Id, up: bool, name: &str)
     resp
 }
 
-/// The mixer inspector: its name, its effects with their parameters (move, remove), the Add
-/// effect row and Remove mixer.
+/// The mixer inspector: its name, its effects with their parameters (move, remove) and the Add
+/// effect row.
 fn inspector(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>, n: usize) {
     let (dev, t, d) = (g.dev, g.t, g.dev_idx);
     let Some(node) = dev.nodes.get(n) else {
@@ -2763,23 +2780,6 @@ fn inspector(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edi
     }
     if node.fx.len() >= sr_core::config::MAX_FX {
         note(ui, "A module holds four effects at most.");
-    }
-
-    // Remove: the cables around it join up again; the toast offers Undo.
-    ui.separator();
-    let r = row(ui);
-    let id = Id::unique(("insp_remove", d, n));
-    let resp = text_button(
-        ui,
-        t,
-        r.min,
-        id,
-        "Remove module",
-        &format!("Remove {name} module"),
-    );
-    if resp.clicked() {
-        edits.push(Edit::RemoveNode(d, n));
-        ui.close();
     }
 }
 

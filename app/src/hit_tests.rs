@@ -345,6 +345,19 @@ fn the_card_options_slider_and_remove_button_take_edge_clicks() {
 }
 
 #[test]
+fn a_module_cards_x_clears_its_title_and_takes_corner_clicks_at_the_minimum_window() {
+    let mut h = open(demo_config());
+    h.set_size(vec2(1000.0, 520.0));
+    settle(&mut h);
+    let title = rect(&h, "Music module, processing Channels 1 & 2");
+    let x = rect(&h, "Remove Music module");
+    assert!(x.width() >= MIN_HIT && x.height() >= MIN_HIT, "{x:?}");
+    assert!(x.left() - title.right() >= 4.0, "{title:?} {x:?}");
+    tap(&mut h, corners(x)[1]);
+    assert!(h.state().cfg.devices[0].nodes.is_empty());
+}
+
+#[test]
 fn the_footer_and_header_buttons_are_at_least_a_target_tall() {
     let h = open(demo_config());
     for label in [NEW_DEVICE, "Presets", "Audio delay: Balanced"] {
