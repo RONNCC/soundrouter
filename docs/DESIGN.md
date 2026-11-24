@@ -152,6 +152,17 @@ What the engine says about its own health (`EngineStatus::tap_silent`, `hogged`,
 
 "Permissions" in the footer's "…" menu and in the menu-bar item opens a review sheet: System Audio Recording (apps), Microphone (inputs), Audio driver and Start at login, each with a status chip, a one-line why and, where something can be done, a secondary button ("Allow microphone", "Open System Settings", "Turn on", "Turn off"). The first two rows are the setup walkthrough's own rows, so their words and buttons are identical; the sheet has one primary button, "Done", and closing it does not count as finishing setup.
 
+### Settings sheet
+
+"Settings…" opens one `sheet::modal` (Cmd-comma, the footer "…" menu above Permissions, the menu-bar item): one scrolling body, four section headings in the strong role (General, Audio, Capture, Advanced) over a hairline, one primary "Done" (Esc presses it). Every control applies at once and saves to `settings.json`, so Done and Esc only close the sheet. A row is a painted label (the switch is its accessible name), a note in `muted` under it and the switch on the right; the whole row is the click target (28 px or more tall). Choices are radio rows (a dot, the text, a number in the `Num` face on the right).
+
+- **General.** Start at login (the same `login::set_enabled` seam as the Permissions row and the menu-bar checkbox; the LaunchAgent file is the only record), Show in menu bar (creates or drops the item), Keep routing audio when the window is closed (off: the note turns `warn_ink` and says "Closing the window stops all routing."; the close button then quits), Permissions….
+- **Audio.** The Audio delay radios send the footer menu's own `Edit::BufferFrames`. **Lower delay (experimental)** is the driver's loop read-ahead, off by default; the line under it reads Off, On, "Needs the newer audio driver" with an "Update driver" button (the driver install step, with a Cancel), or "Turned itself off after driver dropouts" with "Try again". While on it adds "Driver dropouts since on: N". The switch is dimmed and inert with an old driver.
+- **Capture** (a real engine only). "Split app capture from the main path" says what it trades (mics and pass-thru stay fast, captured apps take their own path; off is about 20 ms slower) and that changing it pauses audio briefly. "App capture safety margin" is 1 buffer (default) or 2 buffers (fewer dropouts, adds one buffer of delay); never 0.
+- **Advanced.** Copy diagnostics (the setup text plus the settings, the read-ahead state and the driver counters), Show log in Finder, and Restore default settings, which asks first ("Your routing and presets are not changed") and resets `settings.json` only.
+- **Not offered:** the apply-timing trace, a margin of 0, drift quality, and the driver and engine test hooks. They stay environment variables or fixed, because each either removes a safety margin or only makes sense to a developer.
+- **Notice.** When the safety net turns lower delay off, the health banner says "Lower delay turned itself off after N driver dropouts." with a "Settings" button. It ranks below every engine problem, is closable, and the trip is saved: the next launch starts with lower delay off until "Try again".
+
 ### Sheets and welcome
 
 Checklist rows are lighter: the group is an inset `canvas` fill with no outline, the title is the strong role (15), the detail is body size (13). Every primary button is `Kind::Primary`; row actions are secondary, so one button per sheet answers Return.

@@ -8,14 +8,16 @@ use crate::widgets::{name_button, xmark};
 use eframe::egui::{
     self, CornerRadius, Id, Rect, Sense, Stroke, WidgetInfo, accesskit::Role, pos2, vec2,
 };
-use sr_core::backend::{EngineStatus, HogInfo, TccStatus};
+use sr_core::backend::{EngineStatus, HogInfo, ReadAheadState, TccStatus};
 use sr_core::config::{SourceKind, VirtualDevice};
 use std::collections::{HashMap, HashSet};
 
 /// A dropout counts as "now" for this long after the engine's counter last grew.
 pub const RECENT_SECS: f64 = 10.0;
-/// The banner's button; it opens the Audio Recording pane of System Settings directly.
+/// The banner's button for `Fix::Privacy`; it opens the Audio Recording pane of System Settings directly.
 pub const PRIVACY: &str = "Open Privacy settings";
+/// The banner's button for `Fix::Settings`.
+pub const SETTINGS: &str = "Settings";
 /// Banner height for one line of text; more lines make it taller.
 const MIN_H: f32 = 44.0;
 
@@ -23,6 +25,17 @@ const MIN_H: f32 = 44.0;
 pub enum Fix {
     /// Open the System Audio Recording pane (`setup::AUDIO_CAPTURE_SETTINGS`).
     Privacy,
+    /// Open the Settings sheet.
+    Settings,
+}
+
+impl Fix {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Privacy => PRIVACY,
+            Self::Settings => SETTINGS,
+        }
+    }
 }
 
 /// One thing worth telling the user, with the key that dismissing it is remembered by.
@@ -137,6 +150,11 @@ impl Dismissed {
         self.0.insert(key.to_owned());
     }
 
+    /// A notice that happens again shows again after it was closed.
+    pub fn forget(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+
     /// The banner to show, and how many more are waiting behind it.
     pub fn pick<'a>(&self, issues: &'a [Issue]) -> Option<(&'a Issue, usize)> {
         let mut open = issues.iter().filter(|i| !self.0.contains(&i.key));
@@ -185,6 +203,107 @@ impl Dropouts {
 
     pub fn any_growing(&self, now: f64) -> bool {
         self.seen.keys().any(|id| self.growing(id, now).is_some())
+    }
+}
+
+/// Key of the banner that says read-ahead turned itself off.
+pub const TRIP_KEY: &str = "read-ahead-trip";
+
+/// "Lower delay turned itself off after 3 driver dropouts." Ranked below every engine problem:
+/// nothing is wrong now, a feature just stopped. The caller appends it to `issues`.
+pub fn trip_issue(dropouts: u64) -> Issue {
+    Issue {
+        key: TRIP_KEY.into(),
+        text: format!(
+            "Lower delay turned itself off after {dropouts} driver dropout{}.",
+            if dropouts == 1 { "" } else { "s" }
+        ),
+        fix: Some(Fix::Settings),
+    }
+}
+
+/// The safety net of "Lower delay" (read-ahead): while the driver reports it On, any growth of a
+/// device's driver overload counter or xrun counter between two status polls means the loop ran dry or
+/// late, and it must be switched off. The overload counter also counts late writes, so a false alarm
+/// is possible; the price is an experimental feature turning itself off, which is acceptable.
+/// No clock: every decision compares two polls, so time never enters.
+#[derive(Default)]
+pub struct ReadAheadGuard {
+    overloads: HashMap<String, u64>,
+    xruns: HashMap<String, u64>,
+    /// Growth seen since read-ahead turned on.
+    overload_total: u64,
+    xrun_total: u64,
+    /// Already fired for this run of "On"; the next poll may still report On.
+    fired: bool,
+    /// The engine's own flag was seen clear since the user asked for read-ahead, so a flag still set
+    /// from an earlier run is not mistaken for a new trip.
+    engine_quiet: bool,
+}
+
+/// Sum of the increases of `now` over `seen`, which then becomes `now`. A device seen for the first
+/// time sets its baseline; a counter that fell was reset by a rebuild and starts over.
+fn growth(seen: &mut HashMap<String, u64>, now: &[(String, u64)]) -> u64 {
+    seen.retain(|id, _| now.iter().any(|(n, _)| n == id));
+    let mut grew = 0;
+    for (id, n) in now {
+        if let Some(before) = seen.insert(id.clone(), *n) {
+            grew += n.saturating_sub(before);
+        }
+    }
+    grew
+}
+
+impl ReadAheadGuard {
+    /// Feed one status poll. `wanted` is whether the user's settings ask for read-ahead. Returns the
+    /// number of dropouts to report when it must be turned off now, once per run of "On".
+    pub fn observe(&mut self, status: &EngineStatus, wanted: bool) -> Option<u64> {
+        if !wanted {
+            self.engine_quiet = false;
+        } else if !status.read_ahead_tripped {
+            self.engine_quiet = true;
+        }
+        // The engine has a net of its own; when it fired first, the window follows it.
+        let engine_tripped = wanted && self.engine_quiet && status.read_ahead_tripped;
+        // Not wanted: the driver may still say On for a poll or two while it is being turned off.
+        if !wanted || status.read_ahead != ReadAheadState::On {
+            let n = self.since_on().max(1);
+            *self = Self {
+                engine_quiet: self.engine_quiet,
+                ..Self::default()
+            };
+            return engine_tripped.then_some(n);
+        }
+        if self.fired {
+            return None;
+        }
+        let overloads = growth(&mut self.overloads, &status.driver_overloads);
+        let xruns = growth(&mut self.xruns, &status.xruns);
+        self.overload_total += overloads;
+        self.xrun_total += xruns;
+        if overloads + xruns > 0 || engine_tripped {
+            self.fired = true;
+            return Some(self.since_on().max(1));
+        }
+        None
+    }
+
+    /// Driver overloads counted since read-ahead turned on ("Driver dropouts since on").
+    pub fn overloads_since_on(&self) -> u64 {
+        self.overload_total
+    }
+
+    fn since_on(&self) -> u64 {
+        self.overload_total + self.xrun_total
+    }
+
+    /// A guard that has counted `n` overloads, for snapshots of the sheet's "since on" line.
+    #[cfg(test)]
+    pub fn with_overloads(n: u64) -> Self {
+        Self {
+            overload_total: n,
+            ..Self::default()
+        }
     }
 }
 
@@ -241,7 +360,7 @@ pub fn banner(ui: &mut egui::Ui, t: &Tokens, issue: &Issue, more: usize) -> Clic
         right -= w + 8.0;
     }
     let fix = issue.fix.map(|f| {
-        let w = setup::footer_width(ui, PRIVACY);
+        let w = setup::footer_width(ui, f.label());
         right -= w + 8.0;
         (f, w)
     });
@@ -295,7 +414,7 @@ pub fn banner(ui: &mut egui::Ui, t: &Tokens, issue: &Issue, more: usize) -> Clic
     }
     if let Some((f, w)) = fix {
         let btn = Rect::from_center_size(pos2(at - 8.0 - w / 2.0, r.center().y), vec2(w, BTN_H));
-        if setup::footer_button(ui, btn, "health_fix", PRIVACY, t).clicked() {
+        if setup::footer_button(ui, btn, "health_fix", f.label(), t).clicked() {
             out.fix = Some(f);
         }
     }
@@ -337,6 +456,197 @@ mod tests {
             pid,
             process_name: name.map(Into::into),
         }
+    }
+
+    fn counters(list: &[(&str, u64)]) -> Vec<(String, u64)> {
+        list.iter().map(|(id, n)| ((*id).into(), *n)).collect()
+    }
+
+    /// A status poll: the driver's read-ahead state, its overload counters and the xruns.
+    fn poll(
+        state: ReadAheadState,
+        overloads: &[(&str, u64)],
+        xruns: &[(&str, u64)],
+    ) -> EngineStatus {
+        EngineStatus {
+            read_ahead: state,
+            driver_overloads: counters(overloads),
+            xruns: counters(xruns),
+            ..EngineStatus::default()
+        }
+    }
+
+    const ON: ReadAheadState = ReadAheadState::On;
+    const OFF: ReadAheadState = ReadAheadState::Off;
+
+    /// (polls, expected result of each) for one run of the guard with read-ahead wanted.
+    #[test]
+    fn the_guard_trips_on_growth_between_two_polls_while_on_and_never_otherwise() {
+        type Poll = (
+            ReadAheadState,
+            Vec<(&'static str, u64)>,
+            Vec<(&'static str, u64)>,
+        );
+        let p = |s, o: &[(&'static str, u64)], x: &[(&'static str, u64)]| -> Poll {
+            (s, o.to_vec(), x.to_vec())
+        };
+        type Case = (&'static str, Vec<(Poll, Option<u64>)>);
+        let table: Vec<Case> = vec![
+            (
+                "flat counters never trip, however high the baseline",
+                vec![
+                    (p(ON, &[("v1", 40)], &[("v1", 9)]), None),
+                    (p(ON, &[("v1", 40)], &[("v1", 9)]), None),
+                    (p(ON, &[("v1", 40)], &[("v1", 9)]), None),
+                ],
+            ),
+            (
+                "an overload between two polls trips with its size",
+                vec![
+                    (p(ON, &[("v1", 0)], &[]), None),
+                    (p(ON, &[("v1", 3)], &[]), Some(3)),
+                ],
+            ),
+            (
+                "an xrun alone trips",
+                vec![
+                    (p(ON, &[("v1", 0)], &[("v1", 5)]), None),
+                    (p(ON, &[("v1", 0)], &[("v1", 6)]), Some(1)),
+                ],
+            ),
+            (
+                "any device counts, and both counters add up",
+                vec![
+                    (p(ON, &[("v1", 0), ("v2", 0)], &[("v2", 1)]), None),
+                    (p(ON, &[("v1", 0), ("v2", 2)], &[("v2", 4)]), Some(5)),
+                ],
+            ),
+            (
+                "growth while read-ahead is off is nobody's business",
+                vec![
+                    (p(OFF, &[("v1", 0)], &[("v1", 0)]), None),
+                    (p(OFF, &[("v1", 50)], &[("v1", 50)]), None),
+                    (p(ReadAheadState::Unsupported, &[], &[]), None),
+                ],
+            ),
+            (
+                "growth before it turned on is not counted: the first On poll is the baseline",
+                vec![
+                    (p(OFF, &[("v1", 0)], &[("v1", 0)]), None),
+                    (p(ON, &[("v1", 7)], &[("v1", 7)]), None),
+                    (p(ON, &[("v1", 7)], &[("v1", 7)]), None),
+                    (p(ON, &[("v1", 8)], &[("v1", 7)]), Some(1)),
+                ],
+            ),
+            (
+                "a rebuilt device starts its counters over without a trip",
+                vec![
+                    (p(ON, &[("v1", 9)], &[("v1", 9)]), None),
+                    (p(ON, &[("v1", 0)], &[("v1", 0)]), None),
+                    (p(ON, &[("v1", 1)], &[("v1", 0)]), Some(1)),
+                ],
+            ),
+            (
+                "a device that appears while on sets its baseline",
+                vec![
+                    (p(ON, &[("v1", 0)], &[]), None),
+                    (p(ON, &[("v1", 0), ("v2", 12)], &[("v2", 3)]), None),
+                    (p(ON, &[("v1", 0), ("v2", 12)], &[("v2", 3)]), None),
+                ],
+            ),
+            (
+                "it fires once per run of On, and again after On, Off, On",
+                vec![
+                    (p(ON, &[("v1", 0)], &[]), None),
+                    (p(ON, &[("v1", 1)], &[]), Some(1)),
+                    (p(ON, &[("v1", 5)], &[]), None),
+                    (p(OFF, &[("v1", 5)], &[]), None),
+                    (p(ON, &[("v1", 5)], &[]), None),
+                    (p(ON, &[("v1", 6)], &[]), Some(1)),
+                ],
+            ),
+        ];
+        for (name, polls) in table {
+            let mut g = ReadAheadGuard::default();
+            for (i, ((state, o, x), want)) in polls.into_iter().enumerate() {
+                let status = poll(state, &o, &x);
+                assert_eq!(g.observe(&status, true), want, "{name}: poll {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_guard_counts_overloads_since_on_for_the_sheet() {
+        let mut g = ReadAheadGuard::default();
+        assert_eq!(g.observe(&poll(ON, &[("v1", 2)], &[]), true), None);
+        assert_eq!(g.overloads_since_on(), 0);
+        assert_eq!(g.observe(&poll(ON, &[("v1", 4)], &[]), true), Some(2));
+        assert_eq!(g.overloads_since_on(), 2);
+        g.observe(&poll(OFF, &[("v1", 4)], &[]), true);
+        assert_eq!(
+            g.overloads_since_on(),
+            0,
+            "turning off starts the count over"
+        );
+    }
+
+    #[test]
+    fn the_guard_ignores_a_driver_that_is_still_on_after_the_user_turned_it_off() {
+        let mut g = ReadAheadGuard::default();
+        g.observe(&poll(ON, &[("v1", 0)], &[]), true);
+        assert_eq!(g.observe(&poll(ON, &[("v1", 9)], &[]), false), None);
+    }
+
+    #[test]
+    fn the_guard_follows_the_engines_own_trip_but_not_a_stale_one() {
+        let tripped = |state| EngineStatus {
+            read_ahead_tripped: true,
+            ..poll(state, &[], &[])
+        };
+        // A flag left from an earlier run, set when the user asks again: not a new trip.
+        let mut g = ReadAheadGuard::default();
+        assert_eq!(g.observe(&tripped(OFF), true), None);
+        assert_eq!(g.observe(&tripped(ON), true), None);
+        // Once the engine cleared it, a new trip counts, even though the driver already says Off.
+        let mut g = ReadAheadGuard::default();
+        assert_eq!(g.observe(&poll(ON, &[], &[]), true), None);
+        assert_eq!(g.observe(&tripped(OFF), true), Some(1));
+        // Not wanted: nothing to turn off.
+        assert_eq!(g.observe(&tripped(OFF), false), None);
+    }
+
+    #[test]
+    fn the_trip_banner_names_the_dropouts_and_leads_to_settings() {
+        let one = trip_issue(1);
+        assert_eq!(
+            one.text,
+            "Lower delay turned itself off after 1 driver dropout."
+        );
+        assert_eq!(one.fix, Some(Fix::Settings));
+        assert_eq!(Fix::Settings.label(), "Settings");
+        assert_eq!(
+            trip_issue(7).text,
+            "Lower delay turned itself off after 7 driver dropouts."
+        );
+        // Ranked below every engine problem: the app appends it after `issues`, so a silent capture
+        // or a denied permission is the banner picked first.
+        let mut list = issues(
+            &EngineStatus {
+                tcc: TccStatus::Denied,
+                ..EngineStatus::default()
+            },
+            true,
+            |_| String::new(),
+        );
+        list.push(trip_issue(2));
+        let mut d = Dismissed::default();
+        assert_eq!(d.pick(&list).unwrap().0.key, "capture-denied");
+        d.dismiss("capture-denied");
+        assert_eq!(d.pick(&list).unwrap().0.key, TRIP_KEY);
+        d.dismiss(TRIP_KEY);
+        assert!(d.pick(&list).is_none());
+        d.forget(TRIP_KEY);
+        assert_eq!(d.pick(&list).unwrap().0.key, TRIP_KEY);
     }
 
     fn all_four() -> EngineStatus {

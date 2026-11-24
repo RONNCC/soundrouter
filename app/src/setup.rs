@@ -424,6 +424,9 @@ pub struct Setup {
     marker: Option<PathBuf>,
     /// Brand-new install (no marker file yet): the welcome sheet comes before anything else.
     intro: bool,
+    /// "Update driver" from Settings: the Driver step shows although a driver is installed, with a
+    /// way out; it ends in the Permissions step like a first install.
+    reinstall: bool,
 }
 
 impl Setup {
@@ -452,6 +455,7 @@ impl Setup {
             seen: false,
             marker: None,
             intro: false,
+            reinstall: false,
         }
     }
 
@@ -512,6 +516,14 @@ impl Setup {
     pub fn open_access(&mut self) {
         self.step = Step::Access;
         self.open = true;
+    }
+
+    /// "Update driver" in Settings: the install step for a driver that is there but too old.
+    pub fn open_update(&mut self) {
+        self.step = Step::Driver;
+        self.open = true;
+        self.reinstall = true;
+        self.error = None;
     }
 
     /// The Permissions sheet is up and needs to know whether Start at login is on.
@@ -639,11 +651,14 @@ impl Setup {
                         .into(),
                 );
             }
-        } else if matches!(self.step, Step::Welcome | Step::Driver) {
+        } else if matches!(self.step, Step::Welcome | Step::Driver)
+            && (!self.reinstall || self.deadline.is_some())
+        {
             // `open`: the driver blinked (a coreaudiod restart) while the sheet was up.
             if self.deadline.take().is_some() || v.missing || self.open {
                 self.step = Step::Permissions;
                 self.open = true;
+                self.reinstall = false;
             } else {
                 self.step = Step::Welcome;
             }
@@ -756,6 +771,7 @@ impl Setup {
 
     fn close(&mut self) {
         self.open = false;
+        self.reinstall = false;
         self.step = Step::Welcome;
         self.test_since = None;
         self.ask_after_mic = false;
@@ -770,6 +786,7 @@ impl Setup {
     /// says anything about the walkthrough.
     fn close_quiet(&mut self) {
         self.open = false;
+        self.reinstall = false;
         self.step = Step::Welcome;
     }
 
@@ -833,6 +850,12 @@ impl Setup {
                         "Install the audio driver",
                         "The driver is installed. macOS is loading it.",
                     )
+                } else if self.reinstall {
+                    (
+                        Glyph::App,
+                        "Update the audio driver",
+                        "Installs the driver that came with this version of SoundRouter. macOS asks for your password.",
+                    )
                 } else {
                     (
                         Glyph::Warn,
@@ -873,7 +896,7 @@ impl Setup {
                             ui,
                             s,
                             |ui, s| {
-                                if button(ui, t, "Try the demo", Kind::Secondary) {
+                                if !s.reinstall && button(ui, t, "Try the demo", Kind::Secondary) {
                                     s.demo = true;
                                     action = Some(Action::Demo);
                                 }
@@ -882,6 +905,9 @@ impl Setup {
                             |ui, s| {
                                 if button(ui, t, "Install driver", Kind::Primary) {
                                     s.start_install(ctx);
+                                }
+                                if s.reinstall && button(ui, t, "Cancel", Kind::Secondary) {
+                                    s.close_quiet();
                                 }
                             },
                         );

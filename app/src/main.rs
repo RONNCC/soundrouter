@@ -14,6 +14,8 @@ mod login;
 mod meter;
 mod model;
 mod presets;
+mod settings;
+mod settings_sheet;
 mod setup;
 mod sheet;
 mod store;
@@ -138,6 +140,11 @@ fn main() -> eframe::Result {
             #[cfg(not(target_os = "macos"))]
             let vibrancy = false;
 
+            // The app's own preferences; demo mode keeps defaults in memory and saves nothing.
+            let settings_path = if demo { None } else { settings::default_path() };
+            let (settings, settings_msg) = settings_path
+                .as_deref()
+                .map_or_else(|| (settings::Settings::default(), None), settings::load);
             let (cfg, path, toast, engine): (_, _, _, Result<Box<dyn Backend + Send>, String>) =
                 if demo {
                     (
@@ -165,22 +172,26 @@ fn main() -> eframe::Result {
                 // The agent plist points at the executable that enabled it; follow the app if it moved.
                 let _ = login::set_enabled(true);
             }
-            let tray = tray::Tray::new(&cc.egui_ctx, login::is_enabled())
-                .inspect_err(|e| log::warn!("menu-bar item unavailable: {e}"))
-                .ok();
+            let tray = settings
+                .show_in_menu_bar
+                .then(|| {
+                    tray::Tray::new(&cc.egui_ctx, login::is_enabled())
+                        .inspect_err(|e| log::warn!("menu-bar item unavailable: {e}"))
+                        .ok()
+                })
+                .flatten();
             if !tray::install_reopen_hook(&cc.egui_ctx) {
                 log::warn!("Dock-click reopen hook not installed");
             }
             let win = tray::WinState {
                 hint_seen: demo || tray::hint_seen(),
                 quitting: false,
+                close_quits: !settings.keep_running_on_close,
             };
             Ok(Box::new(
-                app::App::new(cfg, path, worker, toast, vibrancy, demo).background(
-                    tray,
-                    win,
-                    args.background,
-                ),
+                app::App::new(cfg, path, worker, toast.or(settings_msg), vibrancy, demo)
+                    .with_settings(settings, settings_path)
+                    .background(tray, win, args.background),
             ))
         }),
     )

@@ -22,6 +22,8 @@ pub struct WinState {
     pub hint_seen: bool,
     /// Quit was requested: the next close request must go through.
     pub quitting: bool,
+    /// "Keep routing audio when the window is closed" is off: closing the window quits.
+    pub close_quits: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +53,13 @@ pub enum Action {
 pub fn step(s: WinState, e: Event) -> (WinState, Action) {
     match e {
         Event::CloseRequested if s.quitting => (s, Action::Nothing),
+        Event::CloseRequested if s.close_quits => (
+            WinState {
+                quitting: true,
+                ..s
+            },
+            Action::Quit,
+        ),
         Event::CloseRequested => (
             WinState {
                 hint_seen: true,
@@ -97,6 +106,8 @@ pub enum Cmd {
     SavePreset,
     /// "Permissions": open the window on its permissions sheet.
     Permissions,
+    /// "Settings…": open the window on its Settings sheet.
+    Settings,
 }
 
 pub struct Tray {
@@ -109,6 +120,7 @@ pub struct Tray {
     preset_rows: Vec<(MenuItem, String)>,
     save_preset_id: MenuId,
     permissions_id: MenuId,
+    settings_id: MenuId,
     preset_names: Vec<String>,
     open_id: MenuId,
     quit_id: MenuId,
@@ -173,6 +185,7 @@ impl Tray {
         let login = CheckMenuItem::new("Start at Login", true, login_enabled, None);
         let quit = MenuItem::new("Quit SoundRouter", true, None);
         let permissions = MenuItem::new("Permissions", true, None);
+        let settings = MenuItem::new("Settings…", true, None);
         let presets = Submenu::new("Presets", true);
         let save_preset = MenuItem::new("Save current as…", true, None);
         presets.append(&save_preset).map_err(|e| e.to_string())?;
@@ -182,6 +195,7 @@ impl Tray {
             &status,
             &PredefinedMenuItem::separator(),
             &presets,
+            &settings,
             &permissions,
             &login,
             &PredefinedMenuItem::separator(),
@@ -211,6 +225,7 @@ impl Tray {
             preset_rows: Vec::new(),
             save_preset_id: save_preset.id().clone(),
             permissions_id: permissions.id().clone(),
+            settings_id: settings.id().clone(),
             preset_names: Vec::new(),
             open_id: open.id().clone(),
             quit_id: quit.id().clone(),
@@ -236,6 +251,8 @@ impl Tray {
                     Some(Cmd::Login(self.login.is_checked()))
                 } else if id == self.save_preset_id {
                     Some(Cmd::SavePreset)
+                } else if id == self.settings_id {
+                    Some(Cmd::Settings)
                 } else if id == self.permissions_id {
                     Some(Cmd::Permissions)
                 } else {
@@ -397,7 +414,7 @@ mod tests {
     fn hint_seen_in_an_earlier_launch_is_not_repeated() {
         let s = WinState {
             hint_seen: true,
-            quitting: false,
+            ..WinState::default()
         };
         assert_eq!(
             step(s, Event::CloseRequested).1,
@@ -417,6 +434,28 @@ mod tests {
         let (s, a) = step(fresh(), Event::Quit);
         assert_eq!(a, Action::Quit);
         assert_eq!(step(s, Event::CloseRequested).1, Action::Nothing);
+    }
+
+    #[test]
+    fn with_keep_running_off_closing_the_window_quits_and_never_shows_the_hint() {
+        let s = WinState {
+            close_quits: true,
+            ..fresh()
+        };
+        let (s, a) = step(s, Event::CloseRequested);
+        assert_eq!(a, Action::Quit);
+        assert!(s.quitting && !s.hint_seen);
+        // The close the quit itself causes goes through.
+        assert_eq!(step(s, Event::CloseRequested).1, Action::Nothing);
+    }
+
+    #[test]
+    fn with_keep_running_off_the_menu_still_shows_the_window() {
+        let s = WinState {
+            close_quits: true,
+            ..fresh()
+        };
+        assert_eq!(step(s, Event::Open), (s, Action::Show));
     }
 
     #[test]

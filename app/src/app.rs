@@ -9,6 +9,8 @@ use crate::model::{
     device_tap_ms, low_power_hint_due, pct_to_db,
 };
 use crate::presets::{self, Presets};
+use crate::settings::{self, Settings};
+use crate::settings_sheet;
 use crate::setup::{self, AUDIO_CAPTURE_SETTINGS, Action as SetupAction, OPEN_SETTINGS, Setup};
 use crate::store;
 use crate::summary;
@@ -21,8 +23,8 @@ use crate::widgets::{
 };
 use crate::worker::Worker;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, Id, Margin, Rect, Sense, Stroke, TextEdit, Theme,
-    UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
+    self, Align2, Color32, CornerRadius, Id, Key, KeyboardShortcut, Margin, Modifiers, Rect, Sense,
+    Stroke, TextEdit, Theme, UiBuilder, WidgetInfo, accesskit::Role, pos2, vec2,
 };
 use sr_core::backend::{DeviceState, EngineStatus, TccStatus};
 use sr_core::config::{BUFFER_FRAMES, Config, MAX_NAME_CHARS, SourceKind};
@@ -90,6 +92,15 @@ pub struct App {
     dropouts: health::Dropouts,
     /// The device summary card above the graph: collapsed or not, and its meters' peak holds.
     summary: summary::State,
+    /// The app's own preferences (`settings.json`), and the file; `None` in demo mode and tests.
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    settings_sheet: settings_sheet::State,
+    /// Watches the driver counters while "Lower delay" is on, and the notice after it turned itself off.
+    guard: health::ReadAheadGuard,
+    trip_notice: Option<u64>,
+    #[cfg(test)]
+    tray_cmds: Vec<tray::Cmd>,
     os: Os,
 }
 
@@ -102,7 +113,11 @@ struct Os {
     open_url: Arc<dyn Fn(&str) + Send + Sync>,
     /// macOS "Reduce motion": the switch knob and the sheets then jump instead of sliding and fading.
     reduce_motion: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// The menu-bar item, when Settings turns it back on; `None` if the system refused.
+    new_tray: NewTray,
 }
+
+type NewTray = Arc<dyn Fn(&egui::Context) -> Option<Tray> + Send + Sync>;
 
 impl Os {
     fn system() -> Self {
@@ -111,6 +126,11 @@ impl Os {
             set_login: Arc::new(login::set_enabled),
             open_url: Arc::new(setup::open_url),
             reduce_motion: Arc::new(system_reduces_motion),
+            new_tray: Arc::new(|ctx| {
+                Tray::new(ctx, login::is_enabled())
+                    .inspect_err(|e| log::warn!("menu-bar item unavailable: {e}"))
+                    .ok()
+            }),
         }
     }
 }
@@ -327,6 +347,13 @@ impl App {
             dismissed: health::Dismissed::default(),
             dropouts: health::Dropouts::default(),
             summary: summary::State::default(),
+            settings: Settings::default(),
+            settings_path: None,
+            settings_sheet: settings_sheet::State::default(),
+            guard: health::ReadAheadGuard::default(),
+            trip_notice: None,
+            #[cfg(test)]
+            tray_cmds: Vec::new(),
             os: Os::system(),
         }
     }
@@ -339,11 +366,21 @@ impl App {
         self
     }
 
+    /// The loaded settings: the engine gets their options before its first config, and `path` is
+    /// where every change is saved.
+    pub fn with_settings(mut self, settings: Settings, path: Option<PathBuf>) -> Self {
+        self.worker.set_options(&settings.engine);
+        self.settings = settings;
+        self.settings_path = path;
+        self
+    }
+
     fn handle_window(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         let mut presets_wanted = Vec::new();
         let mut save_wanted = false;
         let mut access_wanted = false;
+        let mut settings_wanted = false;
         if self.hide_in > 0 {
             self.hide_in -= 1;
             if self.hide_in == 0 {
@@ -362,22 +399,30 @@ impl App {
             .iter()
             .filter(|(_, s)| *s == DeviceState::Running)
             .count();
+        let mut cmds = Vec::new();
         if let Some(t) = &mut self.tray {
             t.set_status(tray::status_text(running));
             self.presets.refresh();
             t.set_presets(&self.presets.names());
-            for cmd in t.poll() {
-                match cmd {
-                    tray::Cmd::Open => events.push(Event::Open),
-                    tray::Cmd::Quit => events.push(Event::Quit),
-                    tray::Cmd::Preset(name) => presets_wanted.push(name),
-                    tray::Cmd::SavePreset => save_wanted = true,
-                    tray::Cmd::Permissions => access_wanted = true,
-                    tray::Cmd::Login(on) => {
-                        if let Err(e) = login::set_enabled(on) {
+            cmds = t.poll();
+        }
+        // A `Tray` needs the real menu bar; tests queue what a click would have sent.
+        #[cfg(test)]
+        cmds.append(&mut self.tray_cmds);
+        for cmd in cmds {
+            match cmd {
+                tray::Cmd::Open => events.push(Event::Open),
+                tray::Cmd::Quit => events.push(Event::Quit),
+                tray::Cmd::Preset(name) => presets_wanted.push(name),
+                tray::Cmd::SavePreset => save_wanted = true,
+                tray::Cmd::Permissions => access_wanted = true,
+                tray::Cmd::Settings => settings_wanted = true,
+                tray::Cmd::Login(on) => {
+                    if let Err(e) = login::set_enabled(on) {
+                        if let Some(t) = &self.tray {
                             t.set_login_checked(!on);
-                            self.toast = Some(format!("Start at Login did not change: {e}"));
                         }
+                        self.toast = Some(format!("Start at Login did not change: {e}"));
                     }
                 }
             }
@@ -420,6 +465,161 @@ impl App {
         if access_wanted {
             show_window(ctx);
             self.setup.open_access();
+        }
+        if settings_wanted {
+            show_window(ctx);
+            self.settings_sheet.open();
+        }
+    }
+
+    /// Write settings.json; a failure is shown, the change holds until quit.
+    fn save_settings(&mut self) {
+        if let Some(p) = &self.settings_path
+            && let Err(e) = settings::save(p, &self.settings)
+        {
+            self.toast = Some(format!(
+                "Could not save your settings: {e}. Changes last until you quit."
+            ));
+        }
+    }
+
+    /// The engine options changed: tell the worker, then save.
+    fn options_changed(&mut self) {
+        self.worker.set_options(&self.settings.engine);
+        self.save_settings();
+    }
+
+    /// Start at login, from the Permissions sheet or Settings; the menu-bar item follows.
+    fn set_login(&mut self, on: bool) {
+        match (self.os.set_login)(on) {
+            Ok(()) => {
+                if let Some(t) = &self.tray {
+                    t.set_login_checked(on);
+                }
+            }
+            Err(e) => self.toast = Some(format!("Start at Login did not change: {e}")),
+        }
+    }
+
+    /// Make the window and the menu-bar item match `settings` (after "Restore default settings").
+    fn settings_replaced(&mut self, ctx: &egui::Context) {
+        self.win.close_quits = !self.settings.keep_running_on_close;
+        if !self.settings.show_in_menu_bar {
+            self.tray = None;
+        } else if self.tray.is_none() {
+            self.tray = (self.os.new_tray)(ctx);
+        }
+        self.trip_notice = None;
+        self.options_changed();
+    }
+
+    /// The safety net fired: lower delay goes off now, and stays off across launches.
+    fn trip_read_ahead(&mut self, dropouts: u64) {
+        log::warn!("lower delay turned itself off after {dropouts} driver dropout(s)");
+        self.settings.trip();
+        self.trip_notice = Some(dropouts);
+        self.dismissed.forget(health::TRIP_KEY);
+        self.options_changed();
+    }
+
+    fn apply_change(&mut self, ctx: &egui::Context, change: settings_sheet::Change) {
+        use settings_sheet::Change;
+        match change {
+            Change::Login(on) => self.set_login(on),
+            Change::MenuBar(on) => {
+                self.settings.show_in_menu_bar = on;
+                if !on {
+                    self.tray = None;
+                } else if self.tray.is_none() {
+                    self.tray = (self.os.new_tray)(ctx);
+                    if self.tray.is_none() {
+                        self.toast = Some("The menu-bar item could not be created.".into());
+                    }
+                }
+                self.save_settings();
+            }
+            Change::KeepRunning(on) => {
+                self.settings.keep_running_on_close = on;
+                self.win.close_quits = !on;
+                self.save_settings();
+            }
+            Change::Permissions => {
+                self.settings_sheet.open = false;
+                self.setup.open_access();
+            }
+            Change::BufferFrames(n) => self.commit(vec![Edit::BufferFrames(n)]),
+            Change::ReadAhead(on) => {
+                self.settings.set_read_ahead(on);
+                self.trip_notice = self.trip_notice.filter(|_| !on);
+                self.options_changed();
+            }
+            Change::TryAgain => {
+                self.settings.set_read_ahead(true);
+                self.trip_notice = None;
+                self.options_changed();
+            }
+            Change::UpdateDriver => {
+                self.settings_sheet.open = false;
+                self.setup.open_update();
+            }
+            Change::TapSplit(on) => {
+                self.settings.engine.tap_split = on;
+                self.options_changed();
+            }
+            Change::Cushion(blocks) => {
+                self.settings.engine.tap_cushion_blocks = blocks.clamp(1, 2);
+                self.options_changed();
+            }
+            Change::CopyDiagnostics => {
+                let (status, test, apply_error) = {
+                    let s = self.worker.shared.lock().unwrap();
+                    (s.status.clone(), s.self_test.clone(), s.apply_error.clone())
+                };
+                let text = format!(
+                    "{}\n{}",
+                    setup::diagnostics(
+                        &sr_audio::os_version(),
+                        &status,
+                        &test,
+                        apply_error.as_deref(),
+                        self.cfg.devices.len(),
+                        self.setup.source(),
+                    ),
+                    settings::diagnostics(&self.settings, &status, self.guard.overloads_since_on()),
+                );
+                ctx.copy_text(text);
+            }
+            Change::ShowLog => {
+                if let Some(dir) = crate::logging::log_path()
+                    .as_deref()
+                    .and_then(std::path::Path::parent)
+                {
+                    (self.os.open_url)(&dir.to_string_lossy());
+                }
+            }
+            Change::Restore => {
+                self.settings = Settings::default();
+                self.settings_replaced(ctx);
+            }
+        }
+    }
+
+    /// The Settings sheet, when open (and no setup sheet is on top of it).
+    fn drive_settings(&mut self, ctx: &egui::Context, t: &Tokens) {
+        if !self.settings_sheet.open || self.setup.shown() {
+            return;
+        }
+        let status = self.engine_status();
+        let view = settings_sheet::View {
+            settings: &self.settings,
+            status: &status,
+            login: (self.os.login_is_on)(),
+            buffer_frames: self.cfg.buffer_frames,
+            split_available: !self.demo && status.driver_version.is_some(),
+            overloads_since_on: self.guard.overloads_since_on(),
+        };
+        for change in settings_sheet::show(ctx, t, &mut self.settings_sheet, &view) {
+            self.apply_change(ctx, change);
         }
     }
 
@@ -611,17 +811,11 @@ impl App {
                 self.worker.use_demo();
                 self.worker.apply(&self.cfg);
             }
-            Some(SetupAction::Login(on)) => match (self.os.set_login)(on) {
-                Ok(()) => {
-                    if let Some(t) = &self.tray {
-                        t.set_login_checked(on);
-                    }
-                }
-                Err(e) => self.toast = Some(format!("Start at Login did not change: {e}")),
-            },
+            Some(SetupAction::Login(on)) => self.set_login(on),
             Some(SetupAction::SettingsDeleted) => {
                 // The settings folder is gone: stop writing it back with every edit.
                 self.path = None;
+                self.settings_path = None;
                 self.presets = Presets::load(None).0;
                 self.save_pending = false;
             }
@@ -1114,6 +1308,9 @@ impl App {
                     resp.clone().on_hover_text("More actions");
                     egui::Popup::menu(&resp).show(|ui| {
                         ui.set_min_width(140.0);
+                        if ui.button("Settings…").clicked() {
+                            self.settings_sheet.open();
+                        }
                         if ui.button("Permissions").clicked() {
                             self.setup.open_access();
                         }
@@ -1251,13 +1448,15 @@ impl App {
             .filter(|d| d.enabled)
             .flat_map(|d| &d.sources)
             .any(|s| matches!(s.kind, SourceKind::App { .. }));
-        let list = health::issues(&status, app_source, |id| {
+        let mut list = health::issues(&status, app_source, |id| {
             self.cfg
                 .devices
                 .iter()
                 .find(|d| d.id == id)
                 .map_or_else(|| id.to_owned(), health::subject)
         });
+        // Below every engine problem: nothing is wrong now, a feature just stopped.
+        list.extend(self.trip_notice.map(health::trip_issue));
         if let Some((issue, more)) = self.dismissed.pick(&list)
             && !self.demo
         {
@@ -1271,6 +1470,9 @@ impl App {
             }
             if clicked.fix == Some(health::Fix::Privacy) {
                 (self.os.open_url)(AUDIO_CAPTURE_SETTINGS);
+            }
+            if clicked.fix == Some(health::Fix::Settings) {
+                self.settings_sheet.open();
             }
         }
 
@@ -1431,6 +1633,10 @@ impl eframe::App for App {
         let visible = ctx.input(|i| i.viewport().visible().unwrap_or(true));
         self.worker.set_visible(visible);
         self.first_apply();
+        let status = self.engine_status();
+        if let Some(n) = self.guard.observe(&status, self.settings.engine.read_ahead) {
+            self.trip_read_ahead(n);
+        }
         self.handle_window(ctx);
     }
 
@@ -1463,6 +1669,10 @@ impl eframe::App for App {
         crate::theme::apply_input(&ctx);
         // Frames come from the worker (meters changed) and from animations; nothing polls here.
         self.now = ctx.input(|i| i.time);
+        let open_settings = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
+        if ctx.input_mut(|i| i.consume_shortcut(&open_settings)) && !self.setup.shown() {
+            self.settings_sheet.open();
+        }
         if self.undo.as_ref().is_some_and(|u| self.now > u.until) {
             self.undo = None;
         }
@@ -1502,6 +1712,7 @@ impl eframe::App for App {
             self.apply_preset(&ctx, &name);
         }
         self.drive_setup(&ctx);
+        self.drive_settings(&ctx, &t);
         let out = self.presets.show(&ctx, &t, &self.cfg);
         if let Some(msg) = out.toast {
             self.toast = Some(msg);
@@ -1544,3 +1755,7 @@ mod health_tests;
 #[cfg(test)]
 #[path = "summary_tests.rs"]
 mod summary_tests;
+
+#[cfg(test)]
+#[path = "settings_tests.rs"]
+mod settings_tests;

@@ -55,6 +55,7 @@ fn machine(h: &mut Harness<App>, login_on: bool) -> Machine {
         }),
         open_url: Arc::new(move |u| opened.lock().unwrap().push(u.to_owned())),
         reduce_motion: Arc::new(|| false),
+        new_tray: Arc::new(|_| None),
     };
     m
 }

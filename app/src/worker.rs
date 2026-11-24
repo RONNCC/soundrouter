@@ -3,7 +3,9 @@
 use crate::fake::FakeBackend;
 use crate::icons::{self, IconResolver};
 use eframe::egui::{ColorImage, Context};
-use sr_core::backend::{AppInfo, Backend, EngineStatus, HwDevice, MeterReading, SelfTest};
+use sr_core::backend::{
+    AppInfo, Backend, EngineOptions, EngineStatus, HwDevice, MeterReading, SelfTest,
+};
 use sr_core::config::{Config, SourceKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -36,6 +38,16 @@ fn retry_delay(failures: u32) -> Duration {
         2 => Duration::from_secs(2),
         3 => Duration::from_secs(4),
         _ => Duration::from_secs(10),
+    }
+}
+
+/// Give `backend` the window's options (before its first config). A failure is logged: the engine
+/// keeps its previous options and the next change tries again.
+fn push_options(backend: &mut dyn Backend, options: Option<&EngineOptions>) {
+    if let Some(o) = options
+        && let Err(e) = backend.set_options(o)
+    {
+        log::warn!("engine options not applied: {e:#}");
     }
 }
 
@@ -122,6 +134,8 @@ enum Msg {
     Apply(Config),
     SelfTest(String),
     MeasureDelay(String),
+    /// New engine options; the worker keeps the latest and gives them to every engine it starts.
+    Options(EngineOptions),
     /// Replace the backend with the synthetic one.
     Demo,
     /// Only to end a wait: the window was shown or hidden.
@@ -197,6 +211,7 @@ impl Core {
 #[derive(Default)]
 struct Batch {
     cfg: Option<Config>,
+    options: Option<EngineOptions>,
     tests: Vec<String>,
     measures: Vec<String>,
     demo: bool,
@@ -210,6 +225,7 @@ fn drain_latest(rx: &Receiver<Msg>, first: Option<Msg>) -> Batch {
     {
         match m {
             Msg::Apply(c) => b.cfg = Some(c),
+            Msg::Options(o) => b.options = Some(o),
             Msg::SelfTest(id) => {
                 if !b.tests.contains(&id) {
                     b.tests.push(id);
@@ -269,6 +285,8 @@ struct Pump {
     retry: Option<Retry>,
     /// A config reached the backend: only then is there one to give an engine that starts late.
     applied: bool,
+    /// The latest options from the window; `None` until it sent any (the engine keeps its defaults).
+    options: Option<EngineOptions>,
 }
 
 impl Pump {
@@ -280,6 +298,14 @@ impl Pump {
             self.next_refresh = now;
             self.retry = None;
             snap.lock().unwrap().engine_error = None;
+        }
+        // Before the config: a device the config builds then starts with the new options.
+        let new_options = b.options.is_some();
+        if b.options.is_some() {
+            self.options = b.options;
+        }
+        if new_options || b.demo {
+            push_options(&mut *self.backend, self.options.as_ref());
         }
         let mut changed = self.tick(b.cfg, now, snap) || b.demo;
         for id in b.tests {
@@ -387,11 +413,13 @@ impl Pump {
         r.failures = r.failures.saturating_add(1);
         r.next = now + retry_delay(r.failures);
         match (r.start)() {
-            Ok(engine) => {
+            Ok(mut engine) => {
                 log::info!(
                     "audio engine started after {} failed attempt(s)",
                     r.failures
                 );
+                // Before the config `tick` gives it: a restarted engine must not fall back to defaults.
+                push_options(&mut *engine, self.options.as_ref());
                 self.retry = None;
                 self.backend = engine;
                 self.next_refresh = now;
@@ -496,6 +524,7 @@ impl Worker {
                 next: now + retry_delay(1),
             }),
             applied: false,
+            options: None,
         };
         let core = Core {
             pump,
@@ -600,6 +629,12 @@ impl Worker {
         self.send(Msg::Wake);
     }
 
+    /// New engine options (Settings). They reach the backend before the next config, and every
+    /// engine the worker starts later.
+    pub fn set_options(&self, o: &EngineOptions) {
+        self.send(Msg::Options(o.clone()));
+    }
+
     pub fn apply(&self, cfg: &Config) {
         sr_core::trace::stage("worker: apply message sent");
         self.send(Msg::Apply(cfg.clone()));
@@ -676,6 +711,7 @@ mod tests {
     use super::*;
     use crate::model::default_config;
     use eframe::egui::Color32;
+    use sr_core::backend::ReadAheadState;
     use sr_core::config::Config;
 
     #[derive(Default)]
@@ -686,6 +722,8 @@ mod tests {
         panic: bool,
         /// Snapshot lock was free during every backend call.
         lock_free: bool,
+        /// What the backend was asked, in order: "options" (with the read-ahead flag) and "apply".
+        order: Vec<String>,
     }
 
     struct Rec {
@@ -707,11 +745,20 @@ mod tests {
             let (fail, boom) = {
                 let mut l = self.log.lock().unwrap();
                 l.applied.push(cfg.clone());
+                l.order.push("apply".into());
                 (l.fail, l.panic)
             };
             // After the guard is gone: a panic under it would poison the log for the test.
             assert!(!boom, "engine bug");
             anyhow::ensure!(!fail, "tap denied");
+            Ok(())
+        }
+        fn set_options(&mut self, o: &EngineOptions) -> anyhow::Result<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .order
+                .push(format!("options read_ahead={}", o.read_ahead));
             Ok(())
         }
         fn hardware(&self) -> Vec<HwDevice> {
@@ -768,6 +815,7 @@ mod tests {
             visible: true,
             retry: None,
             applied: false,
+            options: None,
         };
         (pump, log, snap)
     }
@@ -1148,6 +1196,126 @@ mod tests {
             s.status.driver_version.as_deref(),
             Some(crate::fake::DEMO_DRIVER)
         );
+    }
+
+    fn read_ahead(on: bool) -> EngineOptions {
+        EngineOptions {
+            read_ahead: on,
+            ..EngineOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_burst_of_options_collapses_to_the_latest() {
+        let (tx, rx) = mpsc::channel();
+        for on in [true, false, true, false] {
+            tx.send(Msg::Options(read_ahead(on))).unwrap();
+        }
+        tx.send(Msg::Apply(default_config())).unwrap();
+        let first = rx.recv().ok();
+        let batch = drain_latest(&rx, first);
+        assert_eq!(batch.options, Some(read_ahead(false)));
+        assert!(batch.cfg.is_some());
+        let (mut pump, log, snap) = setup();
+        pump.run(batch, Instant::now(), &snap);
+        assert_eq!(
+            log.lock().unwrap().order,
+            ["options read_ahead=false", "apply"]
+        );
+    }
+
+    #[test]
+    fn options_reach_the_backend_before_the_config_of_the_same_batch() {
+        let (mut pump, log, snap) = setup();
+        pump.run(
+            Batch {
+                cfg: Some(default_config()),
+                options: Some(read_ahead(true)),
+                ..Batch::default()
+            },
+            Instant::now(),
+            &snap,
+        );
+        assert_eq!(
+            log.lock().unwrap().order,
+            ["options read_ahead=true", "apply"]
+        );
+        // A later config alone does not repeat them.
+        pump.run(
+            Batch {
+                cfg: Some(default_config()),
+                ..Batch::default()
+            },
+            Instant::now(),
+            &snap,
+        );
+        assert_eq!(log.lock().unwrap().order.len(), 3);
+    }
+
+    #[test]
+    fn an_engine_that_starts_late_gets_the_options_before_its_first_config() {
+        let (mut pump, first, snap) = setup();
+        let second = Arc::new(Mutex::new(Log {
+            lock_free: true,
+            ..Log::default()
+        }));
+        let engine = Rec {
+            log: second.clone(),
+            snap: snap.clone(),
+        };
+        let (start, _) = fails_then_starts(1, engine);
+        let t0 = Instant::now();
+        pump.retry = Some(Retry {
+            start,
+            failures: 1,
+            next: t0 + secs(1),
+        });
+        pump.run(
+            Batch {
+                cfg: Some(default_config()),
+                options: Some(read_ahead(true)),
+                ..Batch::default()
+            },
+            t0,
+            &snap,
+        );
+        assert_eq!(
+            first.lock().unwrap().order,
+            ["options read_ahead=true", "apply"]
+        );
+        // The first attempt fails, the second starts the engine: options, then the config.
+        pump.tick(None, t0 + secs(1), &snap);
+        pump.tick(None, t0 + secs(3), &snap);
+        assert!(pump.retry.is_none());
+        assert_eq!(
+            second.lock().unwrap().order,
+            ["options read_ahead=true", "apply"]
+        );
+    }
+
+    #[test]
+    fn the_demo_backend_gets_the_options_too() {
+        let (mut pump, _log, snap) = setup();
+        let now = Instant::now();
+        pump.run(
+            Batch {
+                options: Some(read_ahead(true)),
+                ..Batch::default()
+            },
+            now,
+            &snap,
+        );
+        pump.run(
+            Batch {
+                demo: true,
+                cfg: Some(crate::fake::demo_config()),
+                ..Batch::default()
+            },
+            now,
+            &snap,
+        );
+        // `FakeBackend` reports what `set_options` gave it.
+        assert_eq!(snap.lock().unwrap().status.read_ahead, ReadAheadState::On);
     }
 
     /// The one test of the real thread. `stop` joins it, and a hung-up channel still yields what
