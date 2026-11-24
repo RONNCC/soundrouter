@@ -8,13 +8,14 @@ pub const ICON_BODY: f32 = 48.0;
 pub const ROW_H: f32 = 24.0;
 /// Strip under the channel rows that holds the options chevron.
 pub const FOOT_H: f32 = 16.0;
-pub const OPTIONS_H: f32 = 60.0;
+/// Extra height of an expanded card: the volume row.
+pub const OPTIONS_H: f32 = 32.0;
 /// Extra height of an expanded app card: the "Mute in original output" row.
 pub const MUTE_H: f32 = 28.0;
 pub const OUT_PAD: f32 = 10.0;
 pub const GAP: f32 = 16.0;
-/// Space above the first card for the column headers.
-pub const TOP: f32 = 54.0;
+/// Space above the first card for the column titles.
+pub const TOP: f32 = 40.0;
 pub const SIDE: f32 = 24.0;
 /// Narrowest the Processing column gets (the 1000 px window); it widens to `PROC_W_MAX`.
 pub const PROC_W_MIN: f32 = 120.0;
@@ -25,8 +26,8 @@ pub const PROC_EMPTY_H: f32 = 96.0;
 const GUTTERS: [f32; 3] = [40.0, 40.0, 52.0];
 /// 2 SIDE + 3 cards + processing column + gutters at the minimum pane.
 const MIN_PANE: f32 = 750.0;
-/// Mixer strip parts below its channel rows: the vertical meters, the limiter line, one row
-/// (fader, mute, each effect chip) and the padding at the foot.
+/// Module card parts below its channel rows: the vertical meters, the limiter line, one row
+/// each for the fader, every effect and Add effect, and the padding at the foot.
 pub const STRIP_METER_H: f32 = 64.0;
 pub const STRIP_LIMIT_H: f32 = 16.0;
 pub const STRIP_ROW_H: f32 = 32.0;
@@ -62,12 +63,14 @@ pub struct CardSpec {
     pub mute_row: bool,
 }
 
-/// What sizes a mixer strip: its channel rows, its effects, and whether it shows a limiter line.
+/// What sizes a module card: its channel rows, its effects, whether it shows a limiter line, and
+/// the height of the effect opened in it (0 when none is).
 #[derive(Clone, Copy, Debug)]
 pub struct NodeSpec {
     pub rows: u16,
     pub fx: usize,
     pub limiter: bool,
+    pub open: f32,
 }
 
 pub fn strip_height(s: NodeSpec) -> f32 {
@@ -76,6 +79,7 @@ pub fn strip_height(s: NodeSpec) -> f32 {
         + STRIP_METER_H
         + if s.limiter { STRIP_LIMIT_H } else { 0.0 }
         + STRIP_ROW_H * (2 + s.fx) as f32
+        + s.open
         + STRIP_PAD
 }
 
@@ -441,6 +445,7 @@ mod tests {
             rows: 2,
             fx: 1,
             limiter: true,
+            open: 0.0,
         }
     }
 

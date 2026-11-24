@@ -322,7 +322,7 @@ fn a_card_switch_toggles_from_its_on_label_and_its_x_from_its_corners() {
 }
 
 #[test]
-fn the_card_options_slider_and_remove_button_take_edge_clicks() {
+fn the_card_options_slider_takes_edge_clicks_and_clears_the_mute_row() {
     let mut h = open(demo_config());
     let at = rect(&h, "Safari options").center();
     tap(&mut h, at);
@@ -334,25 +334,31 @@ fn the_card_options_slider_and_remove_button_take_edge_clicks() {
         egui::pos2(v.left() + v.width() * 0.25, v.center().y - 12.0),
     );
     assert!(h.state().cfg.devices[0].sources[0].volume_db < 0.0);
-    let rm = rect(&h, "Remove Source Safari");
-    assert!(rm.height() >= MIN_HIT, "{rm:?}");
+    let m = rect(&h, "Safari mute in original output");
     assert!(
-        rm.top() >= v.bottom() - 0.5,
-        "target overlaps the slider: {rm:?} {v:?}"
+        m.top() >= v.bottom() - 0.5,
+        "target overlaps the slider: {m:?} {v:?}"
     );
-    tap(&mut h, corners(rm)[2]);
-    assert_eq!(h.state().cfg.devices[0].sources.len(), 2);
+    // The card ends below the mute row, above the next card.
+    let next = rect(&h, "Spotify enabled");
+    assert!(m.bottom() < next.top(), "{m:?} {next:?}");
 }
 
 #[test]
-fn a_module_cards_x_clears_its_title_and_takes_corner_clicks_at_the_minimum_window() {
+fn a_module_cards_header_targets_clear_each_other_at_the_minimum_window() {
     let mut h = open(demo_config());
     h.set_size(vec2(1000.0, 520.0));
     settle(&mut h);
     let title = rect(&h, "Music module, processing Channels 1 & 2");
+    let on = rect(&h, "Music enabled");
     let x = rect(&h, "Remove Music module");
-    assert!(x.width() >= MIN_HIT && x.height() >= MIN_HIT, "{x:?}");
-    assert!(x.left() - title.right() >= 4.0, "{title:?} {x:?}");
+    for r in [on, x] {
+        assert!(r.width() >= MIN_HIT && r.height() >= MIN_HIT, "{r:?}");
+    }
+    assert!(on.left() - title.right() >= 4.0, "{title:?} {on:?}");
+    assert!(x.left() - on.right() >= 4.0, "{on:?} {x:?}");
+    tap(&mut h, corners(on)[0]);
+    assert!(h.state().cfg.devices[0].nodes[0].muted);
     tap(&mut h, corners(x)[1]);
     assert!(h.state().cfg.devices[0].nodes.is_empty());
 }

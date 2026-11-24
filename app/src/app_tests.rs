@@ -230,7 +230,8 @@ fn every_control_of_the_demo_window_has_an_accessible_name() {
         "Add processing module",
         MUSIC,
         "Music volume",
-        "Mute Music",
+        "Music enabled",
+        "Add effect to Music",
         "EQ on Music",
         "Music input 1 (L)",
         "Music output 2 (R)",
@@ -450,7 +451,7 @@ fn source_on_switch_mutes_and_unmutes_it() {
 }
 
 #[test]
-fn options_disclosure_opens_closes_and_removes_the_source() {
+fn options_disclosure_opens_and_closes_one_card_and_the_x_removes_the_source() {
     let mut h = open(demo_config());
     assert!(h.query_by_label("Safari volume").is_none());
     click(&mut h, "Safari options");
@@ -459,16 +460,12 @@ fn options_disclosure_opens_closes_and_removes_the_source() {
         h.query_by_label("Spotify volume").is_none(),
         "one card only"
     );
+    // The header's x is the one way to remove a source: the options carry no Remove link.
+    assert!(!has(&h, "Remove Source Safari"));
     click(&mut h, "Safari options");
     assert!(h.query_by_label("Safari volume").is_none());
-    click(&mut h, "Safari options");
-    click(&mut h, "Remove Source Safari");
-    let names: Vec<_> = h.state().cfg.devices[0]
-        .sources
-        .iter()
-        .map(|s| s.kind.clone())
-        .collect();
-    assert_eq!(names.len(), 2);
+    click(&mut h, "Remove Safari");
+    assert_eq!(h.state().cfg.devices[0].sources.len(), 2);
     assert!(h.query_by_label("Safari enabled").is_none());
 }
 
@@ -3338,13 +3335,6 @@ fn a_double_click_on_a_remove_button_removes_one_thing_only() {
     two_clicks(&mut h, "Remove Safari");
     assert_eq!(h.state().cfg.devices[0].sources.len(), sources - 1);
     h.get_by_label("Spotify enabled");
-    // Same for the Remove Source link of two open Options panes.
-    let mut h = open(demo_config());
-    click(&mut h, "Safari options");
-    click(&mut h, "Spotify options");
-    two_clicks(&mut h, "Remove Source Safari");
-    assert_eq!(h.state().cfg.devices[0].sources.len(), sources - 1);
-    h.get_by_label("Remove Source Spotify");
 }
 
 #[test]
@@ -3937,11 +3927,8 @@ fn the_processing_column_offers_a_module_and_removing_it_restores_the_cables() {
         &h,
         "No processing. Sound goes straight to the outputs."
     ));
-    // Its inspector has no remove button; the x on the card removes it.
-    click(&mut h, "EQ module, processing Channels 1 & 2");
-    assert!(!has(&h, "Remove module"));
-    h.key_press(egui::Key::Escape);
-    settle(&mut h);
+    // Its header carries the on switch and the x, like a source card's; the x removes it.
+    h.get_by_label("EQ enabled");
     click(&mut h, "Remove EQ module");
     assert_eq!(links0(&h), before);
     h.get_by_label("No processing. Sound goes straight to the outputs.");
@@ -3949,35 +3936,38 @@ fn the_processing_column_offers_a_module_and_removing_it_restores_the_cables() {
 }
 
 #[test]
-fn the_add_module_menu_applies_to_a_source_or_adds_an_unwired_mixer() {
+fn the_add_module_menu_lists_modules_per_output_pair_and_an_unwired_mixer() {
     use crate::model::Port;
     let mut h = open(demo_config());
     let nodes = |h: &Harness<App>| h.state().cfg.devices[0].nodes.clone();
+    // One output pair: a plain list, no "Apply to" choice.
     click(&mut h, "Add processing module");
-    click(&mut h, "Safari only");
+    assert!(!has(&h, "Safari only"));
+    assert!(!has(&h, "All sources (Channels 1 & 2)"));
     click(&mut h, "Add module: Limiter");
     let n = nodes(&h);
     let lim = n.iter().position(|n| n.name == "Limiter").unwrap();
-    // Safari's cables all go into it; the other sources are left alone.
+    // Everything into channels 1 and 2 now passes through it.
     let all = links0(&h);
     assert!(
         all.iter()
-            .filter(|l| matches!(l.from, Port::Src { src: 0, .. }))
-            .all(|l| matches!(l.to, Port::NodeIn { node, .. } if node == lim))
+            .filter(|l| matches!(l.to, Port::OutIn { .. }))
+            .all(|l| matches!(l.from, Port::NodeOut { node, .. } if node == lim))
     );
-    assert!(
-        all.iter()
-            .any(|l| matches!(l.from, Port::Src { src: 2, .. })
-                && matches!(l.to, Port::OutIn { .. }))
-    );
-    // The menu remembers the target; Gain is a plain node, Mixer an unwired one.
+    // Two pairs: each module once per pair.
+    click(&mut h, "Output channel options");
+    click(&mut h, "Add channel pair");
     click(&mut h, "Add processing module");
-    click(&mut h, "Add module: Gain");
-    assert!(
-        nodes(&h)
-            .iter()
-            .any(|n| n.name == "Gain" && n.fx.is_empty())
-    );
+    assert!(!has(&h, "Add module: Gain"));
+    click(&mut h, "Add module: Gain on Channels 3 & 4");
+    let n = nodes(&h);
+    let gain = n.iter().position(|n| n.name == "Gain").unwrap();
+    assert!(n[gain].fx.is_empty());
+    assert!(links0(&h).iter().any(|l| {
+        matches!(l.from, Port::NodeOut { node, .. } if node == gain)
+            && l.to == Port::OutIn { ch: 2 }
+    }));
+    // Mixer is an unwired one.
     click(&mut h, "Add processing module");
     click(&mut h, "Add module: Mixer");
     let n = nodes(&h);
@@ -4031,21 +4021,17 @@ fn cables_plug_into_and_out_of_a_mixer() {
 }
 
 #[test]
-fn a_strip_mutes_and_fades_from_the_keyboard() {
+fn a_module_card_turns_off_and_fades_from_the_keyboard() {
     let mut h = open(demo_config());
-    h.get_by_label("Mute Music").focus();
+    h.get_by_label("Music enabled").focus();
     settle(&mut h);
     h.key_press(egui::Key::Space);
     settle(&mut h);
     assert!(music(&h).muted);
-    // The state is in words, not only in colour.
-    h.get_by_label("Mute Music");
-    assert!(
-        h.query_by_label("Mute Music")
-            .unwrap()
-            .accesskit_node()
-            .toggled()
-            .is_some()
+    // The switch says its state to a screen reader, not only in colour.
+    assert_eq!(
+        h.get_by_label("Music enabled").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
     );
     h.get_by_label("Music volume").focus();
     settle(&mut h);
@@ -4056,15 +4042,52 @@ fn a_strip_mutes_and_fades_from_the_keyboard() {
 }
 
 #[test]
-fn the_inspector_works_from_the_keyboard_and_esc_closes_it() {
-    use sr_core::config::Fx;
+fn a_module_card_header_has_its_switch_and_x_and_no_menu() {
+    let h = open(demo_config());
+    let title = h.get_by_label(MUSIC).rect();
+    let switch = h.get_by_label("Music enabled").rect();
+    let x = h.get_by_label("Remove Music module").rect();
+    assert!((title.center().y - switch.center().y).abs() < 1.0);
+    assert!(title.right() <= switch.left() && switch.right() <= x.left());
+    // The name is no button that opens a menu: nothing pops up from it.
+    assert!(!has(&h, "Module name"));
+}
+
+#[test]
+fn the_module_name_renames_in_its_header_and_esc_cancels() {
     let mut h = open(demo_config());
     assert!(!has(&h, "Module name"));
     h.get_by_label(MUSIC).focus();
     settle(&mut h);
     h.key_press(egui::Key::Enter);
     settle(&mut h);
-    h.get_by_label("Module name");
+    type_into(&mut h, "Module name", "Tunes");
+    assert_eq!(music(&h).name, "Tunes");
+    h.get_by_label("Tunes module, processing Channels 1 & 2");
+    assert!(!has(&h, "Module name"));
+    // A double-click opens it too; Escape leaves the name as it was.
+    two_clicks(&mut h, "Tunes module, processing Channels 1 & 2");
+    h.get_by_label("Module name").type_text("Noise");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(!has(&h, "Module name"));
+    assert_eq!(music(&h).name, "Tunes");
+    h.state().cfg.validate().unwrap();
+}
+
+#[test]
+fn an_effect_row_opens_its_parameters_inside_the_card() {
+    use sr_core::config::Fx;
+    let mut h = open(demo_config());
+    assert!(!has(&h, "Low shelf gain, dB"));
+    click(&mut h, "EQ on Music");
+    let card = h.get_by_label(MUSIC).rect();
+    let x = h.get_by_label("Remove Music module").rect();
+    let gain = h.get_by_label("Low shelf gain, dB").rect();
+    assert!(
+        gain.left() >= card.left() && gain.right() <= x.right(),
+        "{gain:?}"
+    );
     // Arrow keys step a slider by 1 % of its range.
     h.get_by_label("Low shelf gain, dB").focus();
     settle(&mut h);
@@ -4074,23 +4097,21 @@ fn the_inspector_works_from_the_keyboard_and_esc_closes_it() {
         panic!("EQ first")
     };
     assert!((low_db - 2.4).abs() < 0.01, "{low_db}");
-    // A typed value is held to the effect's range.
+    // One effect opens at a time; a typed value is held to the effect's range.
+    click(&mut h, "Limiter on Music");
+    assert!(!has(&h, "Low shelf gain, dB"));
     type_into(&mut h, "Limiter ceiling value, dB", "-30");
     assert!(matches!(
         music(&h).fx[1],
         Fx::Limiter { ceiling_db, .. } if ceiling_db == -24.0
     ));
-    type_into(&mut h, "Module name", "Tunes");
-    assert_eq!(music(&h).name, "Tunes");
-    h.get_by_label("Tunes module, processing Channels 1 & 2");
-    h.key_press(egui::Key::Escape);
-    settle(&mut h);
-    assert!(!has(&h, "Module name"));
+    click(&mut h, "Limiter on Music");
+    assert!(!has(&h, "Limiter ceiling value, dB"));
     h.state().cfg.validate().unwrap();
 }
 
 #[test]
-fn effects_are_added_reordered_set_and_removed_in_the_inspector() {
+fn effects_are_added_reordered_set_and_removed_in_the_card() {
     use sr_core::config::Fx;
     let mut h = open(demo_config());
     let kinds = |h: &Harness<App>| {
@@ -4105,23 +4126,31 @@ fn effects_are_added_reordered_set_and_removed_in_the_inspector() {
             })
             .collect::<Vec<_>>()
     };
-    click(&mut h, MUSIC);
+    click(&mut h, "Add effect to Music");
     click(&mut h, "Add Delay");
     assert_eq!(kinds(&h), ["eq", "limiter", "delay"]);
-    // The strip shows it, and the inspector says what it costs.
+    // Its row says what it costs, and it opens so its time is at hand.
     h.get_by_label("Delay 0 ms on Music");
-    h.get_by_label("Adds 0 ms");
     click(&mut h, "Move Delay up");
     assert_eq!(kinds(&h), ["eq", "delay", "limiter"]);
     type_into(&mut h, "Delay time value, ms", "12");
     assert_eq!(music(&h).fx[1], Fx::Delay { ms: 12.0 });
-    h.get_by_label("Adds 12 ms");
     h.get_by_label("Delay 12 ms on Music");
     click(&mut h, "Remove Limiter");
+    click(&mut h, "Add effect to Music");
     click(&mut h, "Add Mono");
     assert_eq!(kinds(&h), ["eq", "delay", "mono"]);
+    click(&mut h, "EQ on Music");
     click(&mut h, "Move EQ down");
     assert_eq!(kinds(&h), ["delay", "eq", "mono"]);
+    // Full: Add effect stays in place but offers nothing. (EQ folds first, so the card fits the
+    // test window and the row is in view.)
+    click(&mut h, "EQ on Music");
+    click(&mut h, "Add effect to Music");
+    click(&mut h, "Add Limiter");
+    assert_eq!(music(&h).fx.len(), sr_core::config::MAX_FX);
+    click(&mut h, "Add effect to Music");
+    assert!(!has(&h, "Add EQ"));
     h.state().cfg.validate().unwrap();
 }
 
@@ -4137,17 +4166,15 @@ fn a_parameter_typed_as_its_effect_is_removed_does_not_land_on_the_next_one() {
     let mut cfg = demo_config();
     cfg.devices[0].nodes[0].fx = vec![lim(-1.0), lim(-3.0)];
     let mut h = open(cfg);
-    click(&mut h, MUSIC);
-    h.get_all_by_label("Limiter ceiling value, dB")
+    h.get_all_by_label("Limiter on Music")
         .next()
         .unwrap()
-        .focus();
+        .click();
+    settle(&mut h);
+    h.get_by_label("Limiter ceiling value, dB").focus();
     settle(&mut h);
     select_all(&mut h);
-    h.get_all_by_label("Limiter ceiling value, dB")
-        .next()
-        .unwrap()
-        .type_text("-10");
+    h.get_by_label("Limiter ceiling value, dB").type_text("-10");
     h.get_all_by_label("Remove Limiter").next().unwrap().click();
     settle(&mut h);
     assert_eq!(music(&h).fx, [lim(-3.0)]);
@@ -4155,10 +4182,10 @@ fn a_parameter_typed_as_its_effect_is_removed_does_not_land_on_the_next_one() {
 
 /// Escape gives the keyboard back without taking what was typed.
 #[test]
-fn escape_in_an_inspector_field_discards_the_typing() {
+fn escape_in_a_parameter_field_discards_the_typing() {
     use sr_core::config::Fx;
     let mut h = open(demo_config());
-    click(&mut h, MUSIC);
+    click(&mut h, "Limiter on Music");
     let before = music(&h);
     let label = "Limiter ceiling value, dB";
     h.get_by_label(label).focus();
@@ -4176,11 +4203,6 @@ fn removing_a_mixer_joins_its_cables_and_undo_brings_it_back() {
     use crate::model::{Link, Port};
     let mut h = open(demo_config());
     let before = h.state().cfg.clone();
-    click(&mut h, MUSIC);
-    // The inspector no longer carries a remove button: the card's x does it.
-    assert!(!has(&h, "Remove module"));
-    h.key_press(egui::Key::Escape);
-    settle(&mut h);
     click(&mut h, "Remove Music module");
     assert!(h.state().cfg.devices[0].nodes.is_empty());
     // Spotify goes straight to the outputs again.
@@ -4197,14 +4219,22 @@ fn removing_a_mixer_joins_its_cables_and_undo_brings_it_back() {
 }
 
 #[test]
-fn an_idle_window_with_a_mixer_and_its_inspector_open_asks_for_no_frames() {
+fn an_idle_window_with_an_effect_open_asks_for_no_frames() {
     let mut h = open(demo_config());
-    click(&mut h, MUSIC);
-    h.get_by_label("Module name");
+    click(&mut h, "EQ on Music");
+    h.get_by_label("Low shelf gain, dB");
     h.run_steps(60);
     assert!(
         !h.ctx.has_requested_repaint(),
         "{:?}",
         h.ctx.repaint_causes()
     );
+}
+
+#[test]
+fn the_column_titles_carry_no_subtitles() {
+    let h = open(demo_config());
+    for gone in ["Optional", "2 apps, Pass-Thru", "2 channels", "1 device"] {
+        assert!(!has(&h, gone), "{gone}");
+    }
 }

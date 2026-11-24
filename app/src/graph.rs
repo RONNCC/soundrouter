@@ -5,8 +5,8 @@ use crate::app_icons::{LOOK_AHEAD, Look, PickerIcons, visible_rows, wanted};
 use crate::cables::{Cables, assign};
 use crate::icons::{self, IconTextures};
 use crate::layout::{
-    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, MUTE_H, NodeSpec, ROW_H as ROW_PITCH,
-    SAG_MAX, STRIP_LIMIT_H, STRIP_METER_H, STRIP_ROW_H, TOP, body_height, wire_distance, wire_mid,
+    CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, NodeSpec, ROW_H as ROW_PITCH, SAG_MAX,
+    STRIP_LIMIT_H, STRIP_METER_H, STRIP_ROW_H, TOP, body_height, wire_distance, wire_mid,
     wire_points,
 };
 use crate::meter::{PeakHold, level};
@@ -67,7 +67,8 @@ pub struct GraphState {
     trim_hot: Option<Link>,
     /// Text of the open trim popover's gain field while it is being typed in.
     trim_text: String,
-    /// Text of the mixer inspector field that has the keyboard, while it is being typed in.
+    /// Text of the graph field that has the keyboard (a parameter, a module's name), while it is
+    /// being typed in.
     field_text: String,
     /// Filled once by a background scan (started on the first frame), see `sr_audio::apps::installed_apps`.
     pub installed: Arc<OnceLock<Vec<AppInfo>>>,
@@ -81,8 +82,10 @@ pub struct GraphState {
     filter_owner: Option<Id>,
     /// Icons of the Choose App… list, loaded for the rows in view only.
     pub picker: PickerIcons,
-    /// What the Add module menu applies a module to, as last chosen there.
-    module_at: Option<NewNode>,
+    /// The effect shown open in each module card, by `node_key`.
+    open_fx: HashMap<String, usize>,
+    /// The module whose name is being typed in its card's header, by `node_key`.
+    renaming: Option<String>,
 }
 
 /// A row per hardware output channel, and for every wired channel past them (a headset that
@@ -164,32 +167,10 @@ pub fn undo_note(
     })
 }
 
-fn sources_summary(dev: &VirtualDevice) -> String {
-    let apps = dev
-        .sources
-        .iter()
-        .filter(|s| matches!(s.kind, SourceKind::App { .. }))
-        .count();
-    let devs = dev
-        .sources
-        .iter()
-        .filter(|s| matches!(s.kind, SourceKind::Device { .. }))
-        .count();
-    let mut parts = Vec::new();
-    if apps > 0 {
-        parts.push(format!("{apps} app{}", if apps == 1 { "" } else { "s" }));
-    }
-    if devs > 0 {
-        parts.push(format!("{devs} device{}", if devs == 1 { "" } else { "s" }));
-    }
-    if dev.sources.iter().any(|s| s.kind == SourceKind::PassThru) {
-        parts.push("Pass-Thru".into());
-    }
-    if parts.is_empty() {
-        "No sources".into()
-    } else {
-        parts.join(", ")
-    }
+/// What keys a module card's own state (open effect, renaming): the device and the node's id,
+/// which outlive moves and removals of other nodes.
+fn node_key(dev: &VirtualDevice, node: &Node) -> String {
+    format!("{}/{}", dev.id, node.id)
 }
 
 /// Single-line text that ends in an ellipsis instead of overflowing `max_w`.
@@ -251,6 +232,7 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
             rows: n.channels,
             fx: n.fx.len(),
             limiter: has_limiter(n),
+            open: open_height(n, st.open_fx.get(&node_key(dev, n)).copied()),
         })
         .collect();
     let origin = ui.cursor().min;
@@ -313,7 +295,7 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
             );
             Popup::menu(&resp)
                 .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
-                .show(|ui| module_menu(ui, g, st, edits));
+                .show(|ui| module_menu(ui, g, edits));
         }
         for c in &layout.cards {
             if let CardId::Node(n) = c.id {
@@ -335,28 +317,17 @@ fn column_headers(
     layout: &Layout,
     edits: &mut Vec<Edit>,
 ) {
-    let (dev, t, d) = (g.dev, g.t, g.dev_idx);
-    let base = layout.origin.y + TOP;
-    let heads: [(&str, String); 4] = [
-        ("Sources", sources_summary(dev)),
-        ("Processing", "Optional".to_string()),
-        ("Output channels", format!("{} channels", dev.channels)),
-        (
-            "Monitors",
-            match dev.monitors.len() {
-                0 => "No devices".to_string(),
-                1 => "1 device".to_string(),
-                n => format!("{n} devices"),
-            },
-        ),
-    ];
+    let (t, d) = (g.t, g.dev_idx);
+    // The titles' line, centred above the first cards.
+    let cy = layout.origin.y + TOP - 22.0;
+    let heads = ["Sources", "Processing", "Output channels", "Monitors"];
     // Every title takes one size: the largest at which the widest fits its column (a step or two
     // down at the minimum window), never eliding.
     let max_w = |i: usize| (if i == 1 { layout.proc_w } else { layout.card_w }) - 34.0;
     let scale = heads
         .iter()
         .enumerate()
-        .map(|(i, (title, _))| {
+        .map(|(i, title)| {
             let w = ui
                 .painter()
                 .layout_no_wrap(title.to_string(), section(), t.ink)
@@ -366,13 +337,12 @@ fn column_headers(
         })
         .fold(1.0_f32, f32::min)
         .max(0.7);
-    for (i, (title, sub)) in heads.iter().enumerate() {
+    for (i, title) in heads.iter().enumerate() {
         let x = layout.origin.x + layout.cols[i];
         let w = if i == 1 { layout.proc_w } else { layout.card_w };
         let mut font = section();
         font.size *= scale;
-        text_left(ui, x + 2.0, base - 37.0, title, font, t.ink, max_w(i));
-        text_left(ui, x + 2.0, base - 14.0, sub, caption(), t.muted, max_w(i));
+        text_left(ui, x + 2.0, cy, title, font, t.ink, max_w(i));
         let right = x + w;
         let name = [
             "Add source",
@@ -382,23 +352,19 @@ fn column_headers(
         ][i];
         let resp = plus_circle(
             ui,
-            pos2(right - 20.0, base - 28.0),
+            pos2(right - 20.0, cy),
             Id::unique(("hdr", d, i)),
             t,
             false,
             name,
         );
-        menu_hint(
-            ui.painter(),
-            pos2(right - 4.0, base - 28.0),
-            hint_color(&resp, t),
-        );
+        menu_hint(ui.painter(), pos2(right - 4.0, cy), hint_color(&resp, t));
         match i {
             0 => source_popup(g, st, edits, &resp),
             1 => {
                 Popup::menu(&resp)
                     .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| module_menu(ui, g, st, edits));
+                    .show(|ui| module_menu(ui, g, edits));
             }
             2 => {
                 Popup::menu(&resp).show(|ui| output_menu(ui, g, edits));
@@ -1029,55 +995,53 @@ fn output_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
     }
 }
 
-/// The Add module menu: what the module works on (an output pair, which every source into it
-/// then passes through, or one source), then what it is. A Mixer goes in unwired, to wire by
-/// hand.
-fn module_menu(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>) {
+/// The Add module menu: each module goes in front of an output pair, so every source into the
+/// pair passes through it; a device with several pairs lists each module once per pair. A Mixer
+/// goes in unwired, to wire by hand.
+fn module_menu(ui: &mut Ui, g: &GraphCtx, edits: &mut Vec<Edit>) {
     let (dev, t, d) = (g.dev, g.t, g.dev_idx);
     ui.set_width(250.0);
-    let heading = |ui: &mut Ui, text: &str| {
-        ui.label(egui::RichText::new(text).size(11.0).color(t.muted));
-    };
-    heading(ui, "Apply to");
-    let targets: Vec<(NewNode, String)> = (0..dev.channels / 2)
-        .map(|p| {
-            let text = format!("All sources (Channels {} & {})", 2 * p + 1, 2 * p + 2);
-            (NewNode::ForOutputs(2 * p), text)
-        })
-        .chain(dev.sources.iter().enumerate().map(|(i, s)| {
-            let name = source_title(g.hw, g.apps, g.installed, s).0;
-            (NewNode::ForSource(i), format!("{name} only"))
-        }))
-        .collect();
-    let mut at = st
-        .module_at
-        .clone()
-        .filter(|a| targets.iter().any(|(x, _)| x == a))
-        .unwrap_or(NewNode::ForOutputs(0));
-    for (target, text) in &targets {
-        ui.radio_value(&mut at, target.clone(), text);
-    }
-    let mut row = |ui: &mut Ui, at: NewNode, m: Module, detail: &str| {
-        let name = m.name();
-        let enabled = can_add_node(dev, &at, &m);
-        let glyph = |p: &egui::Painter, r: Rect| trim_glyph(p, r.center(), t.muted);
-        let resp = menu_item(ui, t, enabled, name, detail, glyph);
-        resp.widget_info(|| {
-            WidgetInfo::labeled(egui::Role::Button, enabled, format!("Add module: {name}"))
+    let row =
+        |ui: &mut Ui, edits: &mut Vec<Edit>, at: NewNode, m: Module, text: &str, detail: &str| {
+            let enabled = can_add_node(dev, &at, &m);
+            let glyph = |p: &egui::Painter, r: Rect| trim_glyph(p, r.center(), t.muted);
+            let resp = menu_item(ui, t, enabled, text, detail, glyph);
+            resp.widget_info(|| {
+                WidgetInfo::labeled(egui::Role::Button, enabled, format!("Add module: {text}"))
+            });
+            if enabled && resp.clicked() {
+                edits.push(Edit::AddNode(d, at, m));
+                ui.close();
+            }
+        };
+    let pairs = dev.channels / 2;
+    let room = ui.ctx().content_rect().bottom() - ui.cursor().top() - 60.0;
+    egui::ScrollArea::vertical()
+        .max_height(room.clamp(140.0, 480.0))
+        .show(ui, |ui| {
+            for p in 0..pairs {
+                if p > 0 {
+                    ui.separator();
+                }
+                for m in fx_kinds().into_iter().map(Module::Fx).chain([Module::Gain]) {
+                    let text = if pairs > 1 {
+                        format!("{} on Channels {} & {}", m.name(), 2 * p + 1, 2 * p + 2)
+                    } else {
+                        m.name().to_string()
+                    };
+                    row(ui, edits, NewNode::ForOutputs(2 * p), m, &text, "");
+                }
+            }
         });
-        if enabled && resp.clicked() {
-            edits.push(Edit::AddNode(d, at, m));
-            ui.close();
-        }
-    };
     ui.separator();
-    heading(ui, "Module");
-    for m in fx_kinds().into_iter().map(Module::Fx).chain([Module::Gain]) {
-        row(ui, at.clone(), m, "");
-    }
-    ui.separator();
-    row(ui, NewNode::Empty, Module::Mixer, "Wire by hand");
-    st.module_at = Some(at);
+    row(
+        ui,
+        edits,
+        NewNode::Empty,
+        Module::Mixer,
+        "Mixer",
+        "Wire by hand",
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1318,7 +1282,7 @@ fn card(
         );
     }
 
-    // Options disclosure: a quiet chevron at the foot of the card while it is hot.
+    // Options disclosure: a quiet chevron at the foot of the card.
     if !c.options {
         return;
     }
@@ -1332,15 +1296,12 @@ fn card(
     let resp = hit(ui, strip, Id::unique(("opt", d, c.id)));
     name_button(&resp, &format!("{title} options"));
     let aimed = resp.hovered() || resp.has_focus();
-    if c.expanded || aimed || ui.rect_contains_pointer(r) {
-        let col = if aimed { t.ink } else { t.muted };
-        chevron(
-            &painter,
-            pos2(r.center().x, y0 + FOOT_H / 2.0),
-            c.expanded,
-            col,
-        );
-    }
+    chevron(
+        &painter,
+        pos2(r.center().x, y0 + FOOT_H / 2.0),
+        c.expanded,
+        if aimed { t.ink } else { t.muted },
+    );
     if resp.has_focus() {
         painter.rect_stroke(
             strip,
@@ -1398,12 +1359,14 @@ fn card(
             CardId::Out(_) | CardId::Node(_) => unreachable!(),
         });
     }
-    let mut rm_y = y0 + FOOT_H + MIN_HIT;
+    let mute_y = y0 + FOOT_H + MIN_HIT;
     if let CardId::Src(i) = c.id {
         let s = &dev.sources[i];
         if matches!(s.kind, SourceKind::App { .. }) {
-            let row =
-                Rect::from_min_size(pos2(r.left() + 14.0, rm_y), vec2(r.width() - 28.0, MIN_HIT));
+            let row = Rect::from_min_size(
+                pos2(r.left() + 14.0, mute_y),
+                vec2(r.width() - 28.0, MIN_HIT),
+            );
             let mut m = s.mute_original;
             let cb = ui.scope_builder(UiBuilder::new().max_rect(row), |ui| {
                 ui.checkbox(
@@ -1415,33 +1378,7 @@ fn card(
             if m != s.mute_original {
                 edits.push(Edit::SourceMuteOriginal(d, i, m));
             }
-            rm_y += MUTE_H;
         }
-    }
-    let (label, edit) = match c.id {
-        CardId::Src(i) => ("Remove Source", Edit::RemoveSource(d, i)),
-        CardId::Mon(i) => ("Remove Monitor", Edit::RemoveMonitor(d, i)),
-        CardId::Out(_) | CardId::Node(_) => return,
-    };
-    // The word is "Remove" on the card, as everywhere; the reader hears what goes.
-    let words = painter.layout_no_wrap("Remove".into(), caption(), Color32::PLACEHOLDER);
-    let rm = Rect::from_min_size(
-        pos2(r.left() + 14.0, rm_y),
-        vec2(words.size().x + 8.0, MIN_HIT),
-    );
-    let resp = hit(ui, rm, Id::unique(("rm", d, c.id)));
-    name_button(&resp, &format!("{label} {title}"));
-    painter.galley(
-        pos2(rm.left(), rm.center().y - words.size().y / 2.0),
-        words,
-        if resp.hovered() {
-            t.bad_ink
-        } else {
-            t.bad_ink.gamma_multiply(0.75)
-        },
-    );
-    if resp.clicked() && !resp.double_clicked() {
-        edits.push(edit);
     }
 }
 
@@ -2163,9 +2100,31 @@ fn module_scope(g: &GraphCtx, n: usize) -> String {
     }
 }
 
-/// A module card in the Processing column: the title (opens the inspector), the channel rows
-/// with their jacks on the edges, one standing meter per channel, the limiter line, the fader,
-/// the mute and one chip per effect (each opens the inspector too).
+/// Whether effect `i` of `node` opens in its card: it has parameters, or there are other effects
+/// to move it among.
+fn opens(node: &Node, i: usize) -> bool {
+    node.fx
+        .get(i)
+        .is_some_and(|fx| !fx_params(fx).is_empty() || node.fx.len() > 1)
+}
+
+/// Height of the open effect `open` below its row: a block per parameter, the Move row when the
+/// module holds other effects, and a little room at the foot. 0 when none is open.
+fn open_height(node: &Node, open: Option<usize>) -> f32 {
+    match open {
+        Some(i) if opens(node, i) => {
+            PARAM_H * fx_params(&node.fx[i]).len() as f32
+                + if node.fx.len() > 1 { MIN_HIT } else { 0.0 }
+                + 4.0
+        }
+        _ => 0.0,
+    }
+}
+
+/// A module card in the Processing column: the header (the name, which a double-click renames,
+/// the on switch and the x, as on a source card), the channel rows with their jacks on the edges,
+/// one standing meter per channel, the limiter line, the fader, one row per effect (a click opens
+/// its parameters inside the card) and Add effect.
 fn strip(
     ui: &mut Ui,
     g: &GraphCtx,
@@ -2178,54 +2137,91 @@ fn strip(
     let (dev, t, d) = (g.dev, g.t, g.dev_idx);
     let node = &dev.nodes[n];
     let name = node_name(node);
+    let nkey = node_key(dev, node);
     let r = c.rect;
     let dim = if node.muted { 0.45 } else { 1.0 };
     let painter = ui.painter().clone();
-    let popover = |st: &mut GraphState, edits: &mut Vec<Edit>, anchor: &Response| {
-        Popup::menu(anchor)
-            .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
-            .show(|ui| inspector(ui, g, st, edits, n));
-    };
+    let pill = CornerRadius::same(radius::PILL);
 
-    // Title: the button that opens the inspector; the card's x sits to its right, 4 px between
-    // the two targets, where a source card keeps its own.
+    // Header. Tighter than a source card's, to leave the name room in the narrow column: the x's
+    // target reaches the card's edge, the switch's sits 4 px from it, the name's 4 px further.
+    let cy = r.top() + HEAD_H / 2.0;
+    let x_at = pos2(r.right() - MIN_HIT / 2.0, cy);
+    let sw = Rect::from_center_size(pos2(x_at.x - MIN_HIT - 4.0, cy), vec2(28.0, 16.0));
     let head = Rect::from_min_max(
         pos2(r.left() + 4.0, r.top() + 3.0),
-        pos2(
-            r.right() - 22.0 - MIN_HIT / 2.0 - 4.0,
-            r.top() + HEAD_H - 3.0,
-        ),
+        pos2(sw.center().x - MIN_HIT / 2.0 - 4.0, r.top() + HEAD_H - 3.0),
     );
-    let title = hit(ui, head, Id::unique(("strip_title", d, n)));
-    name_button(&title, &format!("{name} module, {}", module_scope(g, n)));
-    halo(ui, &title, t);
-    text_left(
-        ui,
-        head.left() + 6.0,
-        head.center().y,
-        name,
-        label(),
-        t.ink,
-        head.width() - 24.0,
-    );
-    menu_hint(
-        &painter,
-        pos2(head.right() - 9.0, head.center().y),
-        hint_color(&title, t),
-    );
-    if title.has_focus() {
-        painter.rect_stroke(
+    let fid = Id::unique(("strip_name", d, n));
+    if st.renaming.as_deref() == Some(nkey.as_str()) {
+        if let Some(typed) = field(
+            ui,
+            st,
+            t,
             head,
-            CornerRadius::same(radius::INPUT),
-            Stroke::new(2.0, t.focus),
-            StrokeKind::Inside,
+            fid,
+            "Module name",
+            name.to_string(),
+            Align2::LEFT_CENTER,
+            label(),
+        ) && !typed.trim().is_empty()
+            && typed.trim() != name
+        {
+            edits.push(Edit::RenameNode(d, n, typed));
+        }
+        if !ui.memory(|m| m.has_focus(fid)) {
+            st.renaming = None;
+        }
+    } else {
+        let title = ui.interact(head, Id::unique(("strip_title", d, n)), Sense::click());
+        name_button(&title, &format!("{name} module, {}", module_scope(g, n)));
+        text_left(
+            ui,
+            head.left() + 6.0,
+            cy,
+            name,
+            label(),
+            t.ink,
+            head.width() - 6.0,
         );
+        if title.has_focus() {
+            painter.rect_stroke(
+                head,
+                CornerRadius::same(radius::INPUT),
+                Stroke::new(2.0, t.focus),
+                StrokeKind::Inside,
+            );
+        }
+        // Enter or Space on the focused name renames it too.
+        let keyed = title.has_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
+        if title.double_clicked() || (title.clicked() && keyed) {
+            // The field shows from the next frame: this frame's click or key would take its
+            // focus straight away.
+            st.field_text = name.to_string();
+            ui.memory_mut(|m| m.request_focus(fid));
+            st.renaming = Some(nkey.clone());
+            ui.ctx().request_repaint();
+        }
+        title.on_hover_text("Double-click to rename");
     }
-    popover(st, edits, &title);
+    let on = !node.muted;
+    let new = switch(
+        ui,
+        sw,
+        sw,
+        Id::unique(("strip_on", d, n)),
+        on,
+        t,
+        &format!("{name} enabled"),
+    );
+    if new != on {
+        edits.push(Edit::NodeMute(d, n, !new));
+    }
     // Remove: the cables around it join up again; the toast offers Undo.
     let x = x_button(
         ui,
-        pos2(r.right() - 14.0 - 8.0, r.top() + HEAD_H / 2.0),
+        x_at,
         Id::unique(("strip_x", d, n)),
         t,
         &format!("Remove {name} module"),
@@ -2233,22 +2229,12 @@ fn strip(
     // A double-click's second click would remove the card that moved up under the pointer.
     if x.clicked() && !x.double_clicked() {
         edits.push(Edit::RemoveNode(d, n));
+        st.open_fx.remove(&nkey);
     }
     x.on_hover_text(format!("Remove {name} module"));
     painter.hline(r.x_range(), r.top() + HEAD_H, Stroke::new(1.0, t.hairline));
 
-    // Channel rows: the jacks sit on the edges, the row's name between them.
-    for row in 0..c.rows {
-        painter.text(
-            pos2(r.center().x, Layout::row_y(c, row)),
-            Align2::CENTER_CENTER,
-            ch_label(row, node.channels),
-            num(10.0),
-            t.muted.gamma_multiply(dim),
-        );
-    }
-
-    // One standing ladder per channel, after the fader.
+    // One standing ladder per channel, under the channel rows (their jacks say which is which).
     let top = r.top() + HEAD_H + ROW_PITCH * f32::from(c.rows);
     let block = Rect::from_min_max(
         pos2(r.left() + 12.0, top + 6.0),
@@ -2295,10 +2281,10 @@ fn strip(
         y += STRIP_LIMIT_H;
     }
 
-    // Fader.
+    // Fader and its dB.
     let fr = Rect::from_min_size(
         pos2(r.left() + 8.0, y + 2.0),
-        vec2(r.width() - 16.0, MIN_HIT),
+        vec2(r.width() - 16.0 - 42.0, MIN_HIT),
     );
     let before = node.gain_db.clamp(-60.0, 12.0);
     let mut v = before;
@@ -2316,73 +2302,58 @@ fn strip(
     if moved {
         edits.push(Edit::NodeVolume(d, n, (v * 10.0).round() / 10.0));
     }
-    y += STRIP_ROW_H;
-
-    // Mute, which says its state in words, and the fader's dB.
-    let mr = Rect::from_min_size(pos2(r.left() + 8.0, y + 6.0), vec2(42.0, 20.0));
-    let mute = hit(ui, mr, Id::unique(("strip_mute", d, n)));
-    let muted = node.muted;
-    mute.widget_info(|| {
-        WidgetInfo::selected(egui::Role::CheckBox, true, muted, format!("Mute {name}"))
-    });
-    let pill = CornerRadius::same(radius::PILL);
-    let (fill, ink) = if muted {
-        (t.selected, t.warn_ink)
-    } else if mute.hovered() {
-        (t.muted.gamma_multiply(0.12), t.ink)
-    } else {
-        (Color32::TRANSPARENT, t.muted)
-    };
-    painter.rect(
-        mr,
-        pill,
-        fill,
-        Stroke::new(1.0, if muted { t.warn_ink } else { t.hairline }),
-        StrokeKind::Inside,
-    );
     painter.text(
-        mr.center(),
-        Align2::CENTER_CENTER,
-        if muted { "Muted" } else { "Mute" },
-        caption(),
-        ink,
-    );
-    if mute.has_focus() {
-        painter.rect_stroke(mr, pill, Stroke::new(2.0, t.focus), StrokeKind::Outside);
-    }
-    if mute.clicked() {
-        edits.push(Edit::NodeMute(d, n, !muted));
-    }
-    painter.text(
-        pos2(r.right() - 8.0, mr.center().y),
+        pos2(r.right() - 8.0, fr.center().y),
         Align2::RIGHT_CENTER,
-        db_text(if moved { v } else { node.gain_db }),
+        format!("{} dB", db_text(if moved { v } else { node.gain_db })),
         num(10.0),
         t.muted,
     );
     y += STRIP_ROW_H;
 
-    // One chip per effect, in the order they run.
+    // One row per effect, in the order they run; a click opens its parameters below it.
+    let open = st.open_fx.get(&nkey).copied();
     for (i, fx) in node.fx.iter().enumerate() {
+        let what = fx_name(fx);
         let cr = Rect::from_min_size(
             pos2(r.left() + 8.0, y + 4.0),
             vec2(r.width() - 16.0, STRIP_ROW_H - 8.0),
         );
-        let chip = hit(ui, cr, Id::unique(("strip_fx", d, n, i)));
-        name_button(&chip, &format!("{} on {name}", fx_chip(fx)));
+        let x_at = pos2(cr.right() - 10.0, cr.center().y);
+        let expands = opens(node, i);
+        let is_open = expands && open == Some(i);
+        let hit_r = Rect::from_x_y_ranges(cr.left()..=(x_at.x - MIN_HIT / 2.0 - 4.0), cr.y_range());
+        let row_id = Id::unique(("strip_fx", d, n, i));
+        let row = if expands {
+            hit(ui, hit_r, row_id)
+        } else {
+            ui.interact(hit_r, row_id, Sense::hover())
+        };
+        let said = format!("{} on {name}", fx_chip(fx));
+        let role = if expands {
+            egui::Role::Button
+        } else {
+            egui::Role::Label
+        };
+        row.widget_info(|| WidgetInfo::labeled(role, true, &said));
+        let hot = expands && row.hovered();
         painter.rect(
             cr,
             pill,
             t.canvas,
-            Stroke::new(1.0, if chip.hovered() { t.muted } else { t.hairline }),
+            Stroke::new(1.0, if hot { t.muted } else { t.hairline }),
             StrokeKind::Inside,
         );
-        let room = cr.width() - 16.0;
+        if expands {
+            let at = pos2(cr.left() + 10.0, cr.center().y);
+            chevron(&painter, at, is_open, if hot { t.ink } else { t.muted });
+        }
+        let tx = cr.left() + 18.0;
+        let room = x_at.x - 8.0 - tx;
         let mut text = fx_chip(fx);
-        // "Delay 200 ms" overflows a slim strip: the chip keeps the time, its name says the rest.
+        // "Delay 200 ms" overflows a slim card: the row keeps the time, its name says the rest.
         if let Fx::Delay { ms } = fx
-            && ui
-                .painter()
+            && painter
                 .layout_no_wrap(text.clone(), caption(), t.ink)
                 .size()
                 .x
@@ -2392,23 +2363,149 @@ fn strip(
         }
         text_left(
             ui,
-            cr.left() + 10.0,
+            tx,
             cr.center().y,
             &text,
             caption(),
             t.ink.gamma_multiply(dim),
             room,
         );
-        if chip.has_focus() {
+        if row.has_focus() {
             painter.rect_stroke(cr, pill, Stroke::new(2.0, t.focus), StrokeKind::Outside);
         }
-        popover(st, edits, &chip);
+        if expands && row.clicked() {
+            if is_open {
+                st.open_fx.remove(&nkey);
+            } else {
+                st.open_fx.insert(nkey.clone(), i);
+            }
+        }
+        row.on_hover_text(fx_note(fx));
+        let x = x_button(
+            ui,
+            x_at,
+            Id::unique(("strip_fx_x", d, n, i)),
+            t,
+            &format!("Remove {what}"),
+        );
+        if x.clicked() && !x.double_clicked() {
+            edits.push(Edit::NodeFx(d, n, FxEdit::Remove(i)));
+            // The open effect stays open: it moves up when one above it goes.
+            match open {
+                Some(o) if o == i => _ = st.open_fx.remove(&nkey),
+                Some(o) if o > i => _ = st.open_fx.insert(nkey.clone(), o - 1),
+                _ => {}
+            }
+        }
         y += STRIP_ROW_H;
+        if !is_open {
+            continue;
+        }
+        for (k, p) in fx_params(fx).iter().enumerate() {
+            let pr = Rect::from_min_size(pos2(r.left() + 7.0, y), vec2(r.width() - 14.0, PARAM_H));
+            let id = Id::unique(("strip_param", d, n, i, k));
+            if let Some(x) = param_row(ui, st, t, pr, id, p) {
+                edits.push(Edit::NodeFx(d, n, FxEdit::Set(i, with_param(fx, k, x))));
+            }
+            y += PARAM_H;
+        }
+        if node.fx.len() > 1 {
+            let mr = Rect::from_min_size(pos2(r.left() + 9.0, y), vec2(r.width() - 18.0, MIN_HIT));
+            painter.text(
+                pos2(mr.left(), mr.center().y),
+                Align2::LEFT_CENTER,
+                "Move",
+                caption(),
+                t.muted,
+            );
+            let moves = [
+                (true, i.checked_sub(1), mr.right() - 8.0 - MIN_HIT - 4.0),
+                (
+                    false,
+                    Some(i + 1).filter(|&j| j < node.fx.len()),
+                    mr.right() - 8.0,
+                ),
+            ];
+            for (up, to, x) in moves {
+                let Some(j) = to else { continue };
+                let words = format!("Move {what} {}", if up { "up" } else { "down" });
+                let id = Id::unique(("strip_move", d, n, i, up));
+                if arrow_button(ui, t, pos2(x, mr.center().y), id, up, &words).clicked() {
+                    edits.push(Edit::NodeFx(d, n, FxEdit::Move(i, j)));
+                    st.open_fx.insert(nkey.clone(), j);
+                }
+            }
+            y += MIN_HIT;
+        }
+        y += 4.0;
     }
-}
 
-/// Width of the mixer inspector.
-const INSPECTOR_W: f32 = 300.0;
+    // Add effect: always there, a menu of the effects that still fit.
+    let ar = Rect::from_min_size(
+        pos2(r.left() + 8.0, y + 4.0),
+        vec2(r.width() - 16.0, STRIP_ROW_H - 8.0),
+    );
+    let fits = can_add_fx(dev, n);
+    let kinds: Vec<Fx> = fx_kinds().into_iter().filter(|fx| fits(fx)).collect();
+    let can = !kinds.is_empty();
+    let add = hit(ui, ar, Id::unique(("strip_add", d, n)));
+    add.widget_info(|| {
+        WidgetInfo::labeled(egui::Role::Button, can, format!("Add effect to {name}"))
+    });
+    let ink = if !can {
+        t.muted.gamma_multiply(0.5)
+    } else if add.hovered() {
+        t.ink
+    } else {
+        t.muted
+    };
+    painter.extend(Shape::dashed_line(
+        &rounded_path(ar, ar.height() / 2.0),
+        Stroke::new(1.0, t.muted.gamma_multiply(0.5)),
+        4.0,
+        3.0,
+    ));
+    // A bare plus, where an effect row has its chevron.
+    let at = pos2(ar.left() + 10.0, ar.center().y);
+    for arm in [vec2(3.5, 0.0), vec2(0.0, 3.5)] {
+        painter.line_segment([at - arm, at + arm], Stroke::new(1.4, ink));
+    }
+    text_left(
+        ui,
+        ar.left() + 18.0,
+        ar.center().y,
+        "Add effect",
+        caption(),
+        ink,
+        ar.width() - 24.0,
+    );
+    if add.has_focus() {
+        painter.rect_stroke(ar, pill, Stroke::new(2.0, t.focus), StrokeKind::Outside);
+    }
+    if !can {
+        add.on_hover_text("A module holds four effects at most.");
+        return;
+    }
+    Popup::menu(&add)
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(160.0);
+            for fx in kinds {
+                let what = fx_name(&fx);
+                let glyph = |p: &egui::Painter, r: Rect| trim_glyph(p, r.center(), t.muted);
+                let resp = menu_item(ui, t, true, what, "", glyph);
+                resp.widget_info(|| {
+                    WidgetInfo::labeled(egui::Role::Button, true, format!("Add {what}"))
+                });
+                if resp.clicked() {
+                    // The new effect opens, so its parameters are at hand.
+                    st.open_fx.insert(nkey.clone(), node.fx.len());
+                    edits.push(Edit::NodeFx(d, n, FxEdit::Add(fx)));
+                    ui.close();
+                }
+            }
+        });
+}
 
 /// A text field in `r` named `name` for screen readers, showing `value` until it is typed in;
 /// returns what was typed when the field lets go of the keyboard. One field types at a time, so
@@ -2423,6 +2520,7 @@ fn field(
     name: &str,
     value: String,
     align: Align2,
+    font: FontId,
 ) -> Option<String> {
     let had = ui.memory(|m| m.has_focus(id));
     let mut text = if had {
@@ -2441,7 +2539,14 @@ fn field(
         r,
         egui::TextEdit::singleline(&mut text)
             .id(id)
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(6, 4)))
+            // Text sits low in an evenly padded field; a deeper foot centres it by eye.
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                left: 3,
+                right: 3,
+                top: 0,
+                bottom: 4,
+            }))
+            .font(font)
             .align(align),
     );
     name_widget(ui, &te, name);
@@ -2464,7 +2569,7 @@ fn field(
 
 /// One effect parameter: what it is, a slider, a field to type a value in, and its unit.
 struct Param {
-    /// What the row says ("Low gain") and what a screen reader hears ("Low shelf gain, dB").
+    /// What the card says ("Low gain") and what a screen reader hears ("Low shelf gain, dB").
     label: &'static str,
     name: &'static str,
     unit: &'static str,
@@ -2474,31 +2579,45 @@ struct Param {
     reset: f32,
 }
 
-/// Draws `p`'s row; returns its new value when the slider moved or a value was typed (clamped
-/// to the range, as `Config::validate` wants it).
-fn param_row(ui: &mut Ui, st: &mut GraphState, t: &Tokens, id: Id, p: &Param) -> Option<f32> {
-    let r = ui
-        .allocate_exact_size(vec2(INSPECTOR_W, MIN_HIT), Sense::hover())
-        .0;
-    ui.painter().text(
-        pos2(r.left(), r.center().y),
-        Align2::LEFT_CENTER,
+/// Height of one parameter of an open effect: its name and value field, then its slider.
+const PARAM_H: f32 = 50.0;
+/// Height of the line with a parameter's name and value field.
+const PARAM_LINE_H: f32 = 22.0;
+
+/// Draws `p` in `r` (`PARAM_H` tall): its name, a field to type a value in and its unit over a
+/// slider. Returns its new value when the slider moved or a value was typed (clamped to the
+/// range, as `Config::validate` wants it).
+fn param_row(
+    ui: &mut Ui,
+    st: &mut GraphState,
+    t: &Tokens,
+    r: Rect,
+    id: Id,
+    p: &Param,
+) -> Option<f32> {
+    let cy = r.top() + PARAM_LINE_H / 2.0;
+    let unit_w = ui
+        .painter()
+        .text(
+            pos2(r.right(), cy),
+            Align2::RIGHT_CENTER,
+            p.unit,
+            caption(),
+            t.muted,
+        )
+        .width();
+    let fr = Rect::from_x_y_ranges(
+        (r.right() - unit_w - 40.0)..=(r.right() - unit_w - 2.0),
+        (r.top() + 1.0)..=(r.top() + PARAM_LINE_H - 1.0),
+    );
+    text_left(
+        ui,
+        r.left(),
+        cy,
         p.label,
         caption(),
         t.muted,
-    );
-    let before = p.value.clamp(p.lo, p.hi);
-    let mut v = before;
-    let rail = Rect::from_x_y_ranges((r.left() + 72.0)..=(r.right() - 88.0), r.y_range());
-    slider(
-        ui,
-        rail,
-        id.with("slider"),
-        &format!("{}, {}", p.name, p.unit),
-        &mut v,
-        p.lo..=p.hi,
-        p.reset,
-        t,
+        fr.left() - 3.0 - r.left(),
     );
     // Whole hertz, tenths of the rest.
     let round = |x: f32| {
@@ -2508,9 +2627,6 @@ fn param_row(ui: &mut Ui, st: &mut GraphState, t: &Tokens, id: Id, p: &Param) ->
             (x * 10.0).round() / 10.0
         }
     };
-    let mut out = ((v - before).abs() > 1e-4).then(|| round(v));
-    let fr = Rect::from_x_y_ranges((r.right() - 80.0)..=(r.right() - 26.0), r.y_range())
-        .shrink2(vec2(0.0, 2.0));
     let name = format!("{} value, {}", p.name, p.unit);
     let typed = field(
         ui,
@@ -2521,20 +2637,28 @@ fn param_row(ui: &mut Ui, st: &mut GraphState, t: &Tokens, id: Id, p: &Param) ->
         &name,
         short_num(p.value),
         Align2::RIGHT_CENTER,
+        caption(),
     );
+    let before = p.value.clamp(p.lo, p.hi);
+    let mut v = before;
+    let rail = Rect::from_x_y_ranges(r.x_range(), (r.top() + PARAM_LINE_H)..=r.bottom());
+    slider(
+        ui,
+        rail,
+        id.with("slider"),
+        &format!("{}, {}", p.name, p.unit),
+        &mut v,
+        p.lo..=p.hi,
+        p.reset,
+        t,
+    );
+    let mut out = ((v - before).abs() > 1e-4).then(|| round(v));
     if let Some(x) = typed.and_then(|s| s.trim().parse::<f32>().ok())
         && x.is_finite()
         && (x - p.value).abs() > 1e-4
     {
         out = Some(round(x.clamp(p.lo, p.hi)));
     }
-    ui.painter().text(
-        pos2(r.right(), r.center().y),
-        Align2::RIGHT_CENTER,
-        p.unit,
-        caption(),
-        t.muted,
-    );
     out
 }
 
@@ -2558,7 +2682,7 @@ fn fx_params(fx: &Fx) -> Vec<Param> {
             high_db,
         } => vec![
             p(
-                "Low shelf",
+                "Low",
                 "Low shelf frequency",
                 "Hz",
                 low_hz,
@@ -2568,7 +2692,7 @@ fn fx_params(fx: &Fx) -> Vec<Param> {
             ),
             p("Low gain", "Low shelf gain", "dB", low_db, -18.0, 18.0, 0.0),
             p(
-                "High shelf",
+                "High",
                 "High shelf frequency",
                 "Hz",
                 high_hz,
@@ -2663,124 +2787,6 @@ fn arrow_button(ui: &mut Ui, t: &Tokens, at: Pos2, id: Id, up: bool, name: &str)
         );
     }
     resp
-}
-
-/// The mixer inspector: its name, its effects with their parameters (move, remove) and the Add
-/// effect row.
-fn inspector(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>, n: usize) {
-    let (dev, t, d) = (g.dev, g.t, g.dev_idx);
-    let Some(node) = dev.nodes.get(n) else {
-        ui.close();
-        return;
-    };
-    let name = node_name(node);
-    ui.set_width(INSPECTOR_W);
-    let row = |ui: &mut Ui| {
-        ui.allocate_exact_size(vec2(INSPECTOR_W, MIN_HIT), Sense::hover())
-            .0
-    };
-    let note = |ui: &mut Ui, text: &str| {
-        ui.add(egui::Label::new(egui::RichText::new(text).size(11.0).color(t.muted)).wrap());
-    };
-
-    // Name.
-    let r = row(ui);
-    ui.painter().text(
-        pos2(r.left(), r.center().y),
-        Align2::LEFT_CENTER,
-        "Name",
-        caption(),
-        t.muted,
-    );
-    let fr =
-        Rect::from_x_y_ranges((r.left() + 72.0)..=r.right(), r.y_range()).shrink2(vec2(0.0, 2.0));
-    let id = Id::unique(("insp_name", d, n));
-    if let Some(typed) = field(
-        ui,
-        st,
-        t,
-        fr,
-        id,
-        "Module name",
-        name.to_string(),
-        Align2::LEFT_CENTER,
-    ) && !typed.trim().is_empty()
-        && typed.trim() != name
-    {
-        edits.push(Edit::RenameNode(d, n, typed));
-    }
-
-    // Effects, in the order they run.
-    for (i, fx) in node.fx.iter().enumerate() {
-        ui.separator();
-        let what = fx_name(fx);
-        let r = row(ui);
-        ui.painter().text(
-            pos2(r.left(), r.center().y),
-            Align2::LEFT_CENTER,
-            what,
-            label(),
-            t.ink,
-        );
-        let key = |s: &str| Id::unique(("insp_fx", d, n, i, s.to_string()));
-        let x = x_button(
-            ui,
-            pos2(r.right() - 14.0, r.center().y),
-            key("remove"),
-            t,
-            &format!("Remove {what}"),
-        );
-        if x.clicked() {
-            edits.push(Edit::NodeFx(d, n, FxEdit::Remove(i)));
-        }
-        if i + 1 < node.fx.len() {
-            let down = format!("Move {what} down");
-            let at = pos2(r.right() - 46.0, r.center().y);
-            if arrow_button(ui, t, at, key("down"), false, &down).clicked() {
-                edits.push(Edit::NodeFx(d, n, FxEdit::Move(i, i + 1)));
-            }
-        }
-        if i > 0 {
-            let up = format!("Move {what} up");
-            let at = pos2(r.right() - 78.0, r.center().y);
-            if arrow_button(ui, t, at, key("up"), true, &up).clicked() {
-                edits.push(Edit::NodeFx(d, n, FxEdit::Move(i, i - 1)));
-            }
-        }
-        note(ui, &fx_note(fx));
-        for (k, p) in fx_params(fx).iter().enumerate() {
-            if let Some(x) = param_row(ui, st, t, key(p.name), p) {
-                edits.push(Edit::NodeFx(d, n, FxEdit::Set(i, with_param(fx, k, x))));
-            }
-        }
-    }
-
-    // Add effect: one button per kind that still fits.
-    ui.separator();
-    let room = can_add_fx(dev, n);
-    let kinds = fx_kinds();
-    let r = row(ui);
-    ui.painter().text(
-        pos2(r.left(), r.center().y),
-        Align2::LEFT_CENTER,
-        "Add effect",
-        caption(),
-        t.muted,
-    );
-    let r = row(ui);
-    let mut x = r.left();
-    for fx in kinds.into_iter().filter(|fx| room(fx)) {
-        let what = fx_name(&fx);
-        let id = Id::unique(("insp_add", d, n, what));
-        let resp = text_button(ui, t, pos2(x, r.top()), id, what, &format!("Add {what}"));
-        x = resp.rect.right() + 4.0;
-        if resp.clicked() {
-            edits.push(Edit::NodeFx(d, n, FxEdit::Add(fx)));
-        }
-    }
-    if node.fx.len() >= sr_core::config::MAX_FX {
-        note(ui, "A module holds four effects at most.");
-    }
 }
 
 fn wires_and_ports(
