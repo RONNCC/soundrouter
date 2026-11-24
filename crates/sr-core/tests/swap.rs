@@ -48,10 +48,12 @@ fn device(c: &Cfg) -> VirtualDevice {
         .collect();
     d.wires = (0..SRCS * 2 * NCH)
         .filter(|&k| c.wires[k])
-        .map(|k| Wire {
-            source: format!("s{}", k / (2 * NCH)),
-            src_ch: ((k / NCH) % 2) as u16,
-            out_ch: (k % NCH) as u16,
+        .map(|k| {
+            Wire::new(
+                format!("s{}", k / (2 * NCH)),
+                ((k / NCH) % 2) as u16,
+                (k % NCH) as u16,
+            )
         })
         .collect();
     d.monitors = c

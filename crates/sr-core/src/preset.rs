@@ -5,9 +5,11 @@
 //! changes that needs (new, turned-on or resized virtual devices); applying never changes the
 //! driver's device list by itself, so the caller asks first when `Plan::changes` is not empty.
 use crate::config::{Config, DEFAULT_BUFFER_FRAMES, MAX_NAME_CHARS, VirtualDevice};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
-pub const PRESETS_VERSION: u32 = 1;
+/// Highest `version` this build reads; the file is written at the lowest one that holds its content,
+/// by the same rule as [`Config::written_version`] (a preset's devices are whole `VirtualDevice`s).
+pub const PRESETS_VERSION: u32 = 2;
 
 fn default_buffer() -> u32 {
     DEFAULT_BUFFER_FRAMES
@@ -24,17 +26,45 @@ pub struct Preset {
 
 /// The contents of `presets.json`. Unknown fields are ignored on load (and dropped on the next
 /// save; a file with a newer `version` is never overwritten, see `preset_store`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct PresetFile {
     pub version: u32,
     pub presets: Vec<Preset>,
 }
 
+impl PresetFile {
+    /// The lowest version that can hold these presets.
+    pub fn written_version(&self) -> u32 {
+        let v2 = self
+            .presets
+            .iter()
+            .flat_map(|p| &p.devices)
+            .any(VirtualDevice::needs_v2);
+        1 + u32::from(v2)
+    }
+}
+
+impl Serialize for PresetFile {
+    /// Writes `version` as [`PresetFile::written_version`], not the field.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Out<'a> {
+            version: u32,
+            presets: &'a [Preset],
+        }
+        Out {
+            version: self.written_version(),
+            presets: &self.presets,
+        }
+        .serialize(s)
+    }
+}
+
 impl Default for PresetFile {
     fn default() -> Self {
         PresetFile {
-            version: PRESETS_VERSION,
+            version: 1,
             presets: Vec::new(),
         }
     }
@@ -322,11 +352,7 @@ mod tests {
                 mute_original: false,
                 name: String::new(),
             }],
-            wires: vec![Wire {
-                source: "s1".into(),
-                src_ch: 0,
-                out_ch: 0,
-            }],
+            wires: vec![Wire::new("s1", 0, 0)],
             monitors: vec![],
         }
     }

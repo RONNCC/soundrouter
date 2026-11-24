@@ -105,11 +105,7 @@ impl Model {
             wires = self
                 .wires
                 .iter()
-                .map(|&(s, o)| Wire {
-                    source: "a".into(),
-                    src_ch: s,
-                    out_ch: o,
-                })
+                .map(|&(s, o)| Wire::new("a", s, o))
                 .collect();
         }
         let monitors = match (self.mon, bh_uid) {

@@ -177,15 +177,48 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Presets with no trim are written as version 1 exactly as before; a trim in any preset makes it 2.
+    #[test]
+    fn the_file_is_written_at_the_lowest_version_that_holds_its_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+        let mut f = PresetFile::default();
+        f.save_as("Plain", &scene()).unwrap();
+        save(&path, &f).unwrap();
+        assert_eq!(file_version(&std::fs::read(&path).unwrap()), Some(1));
+        let mut trimmed = scene();
+        trimmed.devices[0].sources.push(crate::config::Source {
+            id: "s".into(),
+            kind: crate::config::SourceKind::PassThru,
+            channels: 2,
+            volume_db: 0.0,
+            muted: false,
+            mute_original: false,
+            name: String::new(),
+        });
+        trimmed.devices[0].wires = vec![crate::config::Wire {
+            gain_db: -6.0,
+            ..crate::config::Wire::new("s", 0, 0)
+        }];
+        f.save_as("Trimmed", &trimmed).unwrap();
+        save(&path, &f).unwrap();
+        assert_eq!(file_version(&std::fs::read(&path).unwrap()), Some(2));
+        let (back, msg) = load(&path);
+        assert_eq!((msg, &back.presets), (None, &f.presets));
+        f.delete("Trimmed");
+        save(&path, &f).unwrap();
+        assert_eq!(file_version(&std::fs::read(&path).unwrap()), Some(1));
+    }
+
     #[test]
     fn newer_version_is_ignored_kept_and_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("presets.json");
-        let text = r#"{"version":2,"presets":[],"shiny":{"a":1}}"#;
+        let text = r#"{"version":3,"presets":[],"shiny":{"a":1}}"#;
         std::fs::write(&path, text).unwrap();
         let (f, msg) = load(&path);
         assert_eq!(f, PresetFile::default());
-        assert!(msg.unwrap().contains("version 2"));
+        assert!(msg.unwrap().contains("version 3"));
         let err = save(&path, &f).unwrap_err();
         assert!(err.to_string().contains("newer"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);

@@ -14,13 +14,7 @@ fn wide(ch: u16) -> (VirtualDevice, IoLayout) {
     let mut d = dev();
     d.channels = ch;
     d.sources = vec![src("s1", ch, 0.0, false)];
-    d.wires = (0..ch)
-        .map(|i| Wire {
-            source: "s1".into(),
-            src_ch: i,
-            out_ch: i,
-        })
-        .collect();
+    d.wires = (0..ch).map(|i| Wire::new("s1", i, i)).collect();
     let mut m = mon("spk", true, -3.0);
     m.wires = (0..ch)
         .map(|i| MonitorWire {

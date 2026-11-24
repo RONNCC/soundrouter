@@ -495,11 +495,11 @@ fn preset_apply_never_overwrites_a_config_from_a_newer_version() {
     let home = home_with_config("v1", -6.0);
     preset(home.path(), &["save", "Quiet"]).code(0);
     let path = support(home.path()).join("config.json");
-    let newer = r#"{"version":2,"devices":[],"future":{"x":1}}"#;
+    let newer = r#"{"version":3,"devices":[],"future":{"x":1}}"#;
     std::fs::write(&path, newer).unwrap();
     preset(home.path(), &["apply", "Quiet", "--add-devices"])
         .code(1)
-        .stderr(predicate::str::contains("version 2"));
+        .stderr(predicate::str::contains("version 3"));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
 }
 

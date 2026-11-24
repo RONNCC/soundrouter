@@ -26,18 +26,7 @@ pub fn dev() -> VirtualDevice {
         volume_db: 0.0,
         muted: false,
         sources: vec![src("s1", 2, 0.0, false)],
-        wires: vec![
-            Wire {
-                source: "s1".into(),
-                src_ch: 0,
-                out_ch: 0,
-            },
-            Wire {
-                source: "s1".into(),
-                src_ch: 1,
-                out_ch: 1,
-            },
-        ],
+        wires: vec![Wire::new("s1", 0, 0), Wire::new("s1", 1, 1)],
         monitors: vec![],
     }
 }

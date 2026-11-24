@@ -46,11 +46,7 @@ pub fn probe_config(cfg: &Config, id: &str) -> Option<Config> {
     src.muted = false;
     let source = src.id.clone();
     dev.wires = (0..dev.channels)
-        .map(|ch| Wire {
-            source: source.clone(),
-            src_ch: ch,
-            out_ch: ch,
-        })
+        .map(|ch| Wire::new(source.clone(), ch, ch))
         .collect();
     for m in &mut dev.monitors {
         m.wires.clear();
@@ -202,11 +198,7 @@ mod tests {
                 mute_original: true,
                 name: String::new(),
             }],
-            wires: vec![Wire {
-                source: "zoom".into(),
-                src_ch: 0,
-                out_ch: 1,
-            }],
+            wires: vec![Wire::new("zoom", 0, 1)],
             monitors: vec![Monitor {
                 device_uid: "BuiltInSpeakerDevice".into(),
                 enabled: true,

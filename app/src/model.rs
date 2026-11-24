@@ -269,18 +269,10 @@ fn set_channels(dev: &mut VirtualDevice, n: u16) {
 /// Default wiring for a new source: channel i -> output i, mono -> both of a pair.
 fn auto_wire_source(dev: &mut VirtualDevice, id: &str, ch: u16) {
     for i in 0..ch.min(dev.channels) {
-        dev.wires.push(Wire {
-            source: id.to_string(),
-            src_ch: i,
-            out_ch: i,
-        });
+        dev.wires.push(Wire::new(id.to_string(), i, i));
     }
     if ch == 1 && dev.channels >= 2 {
-        dev.wires.push(Wire {
-            source: id.to_string(),
-            src_ch: 0,
-            out_ch: 1,
-        });
+        dev.wires.push(Wire::new(id.to_string(), 0, 1));
     }
 }
 
@@ -454,11 +446,7 @@ fn connect(dev: &mut VirtualDevice, from: Port, to: Port) {
             if ch >= s.channels || out_ch >= dev.channels {
                 return;
             }
-            let w = Wire {
-                source: s.id.clone(),
-                src_ch: ch,
-                out_ch,
-            };
+            let w = Wire::new(s.id.clone(), ch, out_ch);
             if !dev.wires.contains(&w) {
                 dev.wires.push(w);
             }

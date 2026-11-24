@@ -27,6 +27,8 @@ Time for one `Mixer::process` call, measured here (best of 5 rounds, 3 runs, wor
 | 128 | 2667 us | 0.21 us | 0.008 % | 9.9 us | 0.37 % |
 | 256 | 5333 us | 0.40 us | 0.007 % | 17.0 us | 0.32 % |
 
+Per-wire trim (NODES step 1) gives each tap a second ramped gain, `g.cur * s0 * wire.cur`; measured against the commit before it, same machine, back to back: stereo 114 vs 114 ns, 64-channel mix 7.6 vs 7.7 us at 64 frames, 8.3-9.7 vs 8.3 us at 128, 16.1 vs 16.4 us at 256, so within run-to-run noise.
+
 The device asks for one buffer every period on its own clock and plays what we hand back at the next period. Work only has to finish before that deadline. Finishing at 17 us or at 0.017 us (1000x faster) delivers the same buffer at the same sample time: latency = buffer count x buffer length + fixed safety offsets, with no compute term. Even the worst case here uses under 1 % of the deadline, so the only thing faster math buys is headroom, as the changelog for e7d390d says ("0 ms by design").
 
 ## 3. Vectorization

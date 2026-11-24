@@ -2086,17 +2086,11 @@ mod tests {
         let mut dev = c.devices.remove(0);
         dev.wires.clear();
         for s in 0..3 {
-            dev.wires.push(sr_core::config::Wire {
-                source: dev.sources[s].id.clone(),
-                src_ch: 0,
-                out_ch: 0,
-            });
+            dev.wires
+                .push(sr_core::config::Wire::new(dev.sources[s].id.clone(), 0, 0));
         }
-        dev.wires.push(sr_core::config::Wire {
-            source: dev.sources[0].id.clone(),
-            src_ch: 1,
-            out_ch: 1,
-        });
+        dev.wires
+            .push(sr_core::config::Wire::new(dev.sources[0].id.clone(), 1, 1));
         let all = links(&dev);
         let slots = crate::cables::assign(&dev, &all);
         let distinct: HashSet<u8> = slots.iter().copied().collect();
@@ -2158,11 +2152,10 @@ mod tests {
             h.ctx.repaint_causes()
         );
         let source = h.state().dev.sources[0].id.clone();
-        h.state_mut().dev.wires.push(sr_core::config::Wire {
-            source,
-            src_ch: 0,
-            out_ch: 0,
-        });
+        h.state_mut()
+            .dev
+            .wires
+            .push(sr_core::config::Wire::new(source, 0, 0));
         h.step();
         assert!(h.ctx.has_requested_repaint());
         h.run_steps(6); // 0.3 s
@@ -2335,11 +2328,7 @@ mod tests {
                 (2, 0, 2),
                 (2, 0, 3),
             ]
-            .map(|(s, src_ch, out_ch)| sr_core::config::Wire {
-                source: ids[s].clone(),
-                src_ch,
-                out_ch,
-            })
+            .map(|(s, src_ch, out_ch)| sr_core::config::Wire::new(ids[s].clone(), src_ch, out_ch))
             .to_vec();
             c.devices.remove(0)
         }
@@ -2358,11 +2347,7 @@ mod tests {
                 let dev = &mut c.devices[0];
                 dev.wires = (0..3)
                     .flat_map(|s| (0..2).map(move |ch| (s, ch)))
-                    .map(|(s, ch)| sr_core::config::Wire {
-                        source: dev.sources[s].id.clone(),
-                        src_ch: ch,
-                        out_ch: ch,
-                    })
+                    .map(|(s, ch)| sr_core::config::Wire::new(dev.sources[s].id.clone(), ch, ch))
                     .collect();
                 let mut h = harness(theme, c.devices.remove(0), true, false);
                 h.run_steps(30);

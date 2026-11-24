@@ -23,11 +23,7 @@ fn src(id: &str, kind: SourceKind) -> Source {
 
 fn cfg(enabled: bool, volume_db: f32, with_app: bool) -> Config {
     let mut sources = vec![src("pt", SourceKind::PassThru)];
-    let mut wires = vec![Wire {
-        source: "pt".into(),
-        src_ch: 0,
-        out_ch: 0,
-    }];
+    let mut wires = vec![Wire::new("pt", 0, 0)];
     if with_app {
         // A running audio process is not needed: an App source with no matching process just waits.
         sources.push(src(
@@ -36,11 +32,7 @@ fn cfg(enabled: bool, volume_db: f32, with_app: bool) -> Config {
                 bundle_id: "com.apple.Safari".into(),
             },
         ));
-        wires.push(Wire {
-            source: "a".into(),
-            src_ch: 0,
-            out_ch: 1,
-        });
+        wires.push(Wire::new("a", 0, 1));
     }
     Config {
         devices: vec![VirtualDevice {
@@ -120,11 +112,7 @@ fn tap_cfg(with_app: bool, player: &str) -> Config {
                 bundle_id: format!("path:{player}"),
             },
         ));
-        c.devices[0].wires.push(Wire {
-            source: "a".into(),
-            src_ch: 0,
-            out_ch: 1,
-        });
+        c.devices[0].wires.push(Wire::new("a", 0, 1));
     }
     let mut v2 = c.devices[0].clone();
     (v2.id, v2.name, v2.sources, v2.wires) = ("v2".into(), "Player".into(), vec![], vec![]);

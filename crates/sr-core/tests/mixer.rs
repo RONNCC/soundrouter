@@ -81,21 +81,9 @@ fn fan_out_and_sum() {
     let mut d = dev();
     d.sources.push(src("s2", 1, 0.0, false));
     d.wires = vec![
-        Wire {
-            source: "s1".into(),
-            src_ch: 0,
-            out_ch: 0,
-        },
-        Wire {
-            source: "s2".into(),
-            src_ch: 0,
-            out_ch: 0,
-        },
-        Wire {
-            source: "s2".into(),
-            src_ch: 0,
-            out_ch: 1,
-        },
+        Wire::new("s1", 0, 0),
+        Wire::new("s2", 0, 0),
+        Wire::new("s2", 0, 1),
     ];
     let mut l = layout();
     l.inputs.push(Some(("s2".into(), 0)));
@@ -172,11 +160,7 @@ fn plan_swap_applies_next_block() {
     let o = run(&mut m, &ones(8), 4, 8);
     assert!(o[0].iter().all(|x| *x == 1.0));
     let mut d = dev();
-    d.wires = vec![Wire {
-        source: "s1".into(),
-        src_ch: 1,
-        out_ch: 0,
-    }]; // different routing
+    d.wires = vec![Wire::new("s1", 1, 0)]; // different routing
     h.set_plan(MixPlan::compile(&d, &layout()));
     // The new routing is crossfaded in over this block (a step would click) and is exact after it.
     let o = run(&mut m, &ones(8), 4, 8);
@@ -442,11 +426,7 @@ fn a_long_ramp_spans_exactly_the_first_chunk() {
 #[test]
 fn a_wire_to_a_channel_past_the_device_is_dropped_not_indexed() {
     let mut d = dev();
-    d.wires.push(Wire {
-        source: "s1".into(),
-        src_ch: 0,
-        out_ch: 2,
-    }); // the device has channels 0 and 1
+    d.wires.push(Wire::new("s1", 0, 2)); // the device has channels 0 and 1
     let (mut m, _h, _) = setup(&d, &layout());
     let o = run(&mut m, &ones(8), 4, 8);
     assert!(o[0].iter().all(|x| close(*x, 1.0)) && o[1].iter().all(|x| close(*x, 0.5)));
@@ -723,4 +703,158 @@ fn clipped_blocks_count_blocks_with_a_vdev_sample_over_full_scale() {
     h.set_plan(MixPlan::compile(&d, &layout()));
     run(&mut m, &[vec![1.5; 16], vec![1.5; 16]], 4, 16);
     assert_eq!(meters.clipped_blocks(), 4);
+}
+
+// ---- wire trim ----------------------------------------------------------------------------------------
+
+fn trim(d: &mut VirtualDevice, wire: usize, gain_db: f32, invert: bool) {
+    d.wires[wire].gain_db = gain_db;
+    d.wires[wire].invert = invert;
+}
+
+#[test]
+fn a_wire_trim_scales_that_cable_only() {
+    let mut d = dev();
+    trim(&mut d, 0, -6.0, false);
+    let (mut m, _h, _) = setup(&d, &layout());
+    let o = run(&mut m, &ones(16), 4, 16);
+    assert!((o[0][15] - 0.501).abs() < 1e-3, "{}", o[0][15]);
+    assert!(
+        o[1].iter().all(|x| *x == 0.5),
+        "the other wire is untouched"
+    );
+}
+
+#[test]
+fn invert_flips_polarity_bit_exactly() {
+    let mut d = dev();
+    trim(&mut d, 0, 0.0, true);
+    let (mut m, _h, _) = setup(&d, &layout());
+    let o = run(&mut m, &ones(16), 4, 16);
+    assert!(o[0].iter().all(|x| x.to_bits() == (-1.0f32).to_bits()));
+    assert!(o[1].iter().all(|x| *x == 0.5));
+}
+
+/// The case the trim exists for: two mono sources onto one output channel add +6 dB; -6.0206 dB each fixes it.
+#[test]
+fn fan_in_trim_brings_two_sources_back_to_unity() {
+    let mut d = dev();
+    d.channels = 2;
+    d.sources = vec![src("a", 1, 0.0, false), src("b", 1, 0.0, false)];
+    d.wires = vec![Wire::new("a", 0, 0), Wire::new("b", 0, 0)];
+    let l = IoLayout {
+        inputs: vec![Some(("a".into(), 0)), Some(("b".into(), 0))],
+        outputs: vec![Some(OutPort::Device(0)), Some(OutPort::Device(1))],
+    };
+    let ins = vec![vec![0.5; 8], vec![0.5; 8]];
+    let (mut m, _h, _) = setup(&d, &l);
+    assert_eq!(run(&mut m, &ins, 2, 8)[0][7], 1.0, "untrimmed fan-in sums");
+    let half = 20.0 * 0.5f32.log10();
+    trim(&mut d, 0, half, false);
+    trim(&mut d, 1, half, false);
+    let (mut m, _h, _) = setup(&d, &l);
+    assert!((run(&mut m, &ins, 2, 8)[0][7] - 0.5).abs() < 1e-6);
+}
+
+/// A trim of 0 dB must not change one bit, also with several sources per channel in their tap order.
+#[test]
+fn neutral_trims_leave_every_sample_bit_identical() {
+    let mut d = dev();
+    d.sources = vec![
+        src("a", 2, -3.3, false),
+        src("b", 2, 2.7, false),
+        src("c", 2, 0.0, false),
+    ];
+    d.wires = ["a", "b", "c"]
+        .iter()
+        .flat_map(|s| [Wire::new(*s, 0, 0), Wire::new(*s, 1, 1)])
+        .collect();
+    d.volume_db = -1.9;
+    let l = IoLayout {
+        inputs: ["a", "b", "c"]
+            .iter()
+            .flat_map(|s| [Some((s.to_string(), 0)), Some((s.to_string(), 1))])
+            .collect(),
+        outputs: vec![Some(OutPort::Device(0)), Some(OutPort::Device(1))],
+    };
+    let ins: Vec<Vec<f32>> = (0..6)
+        .map(|c| {
+            (0..300)
+                .map(|i| ((i * 37 + c * 11) % 199) as f32 / 99.5 - 1.0)
+                .collect()
+        })
+        .collect();
+    let (mut m, _h, _) = setup(&d, &l);
+    let got = run(&mut m, &ins, 2, 300);
+    let g = |db: f32| 10f32.powf(db / 20.0);
+    for (ch, row) in got.iter().enumerate() {
+        for (i, x) in row.iter().enumerate() {
+            let mut acc = 0.0f32;
+            for (k, db) in [-3.3f32, 2.7, 0.0].iter().enumerate() {
+                acc += ins[k * 2 + ch][i] * g(*db);
+            }
+            acc *= g(-1.9);
+            assert_eq!(x.to_bits(), acc.to_bits(), "ch {ch} frame {i}");
+        }
+    }
+}
+
+/// A trim edit is a new plan with the same route; its gain continues from where the old one stood.
+#[test]
+fn a_trim_edit_ramps_and_never_steps() {
+    let mut d = dev();
+    trim(&mut d, 0, -6.0, false);
+    let (mut m, mut h, _) = setup(&d, &layout());
+    let ins = vec![vec![1.0; 64], vec![1.0; 64]];
+    let before = run(&mut m, &ins, 4, 64)[0][63];
+    trim(&mut d, 0, -12.0, false);
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    let o = run(&mut m, &ins, 4, 64);
+    let reach = 64.0 / 480.0; // slew moves at most 1/480 per frame
+    assert!((o[0][63] - (before - reach)).abs() < 1e-3, "{}", o[0][63]);
+    assert!(o[0].windows(2).all(|w| (w[1] - w[0]).abs() < 3e-3));
+    // settles at the new trim
+    let mut last = 0.0;
+    for _ in 0..20 {
+        last = run(&mut m, &ins, 4, 64)[0][63];
+    }
+    assert!((last - 0.2512).abs() < 1e-3, "{last}");
+}
+
+/// Flipping polarity ramps through zero (|-1 - 1| = 2 units, 20 ms at 48 kHz), not a step.
+#[test]
+fn a_polarity_flip_crosses_zero_in_twenty_ms() {
+    let mut d = dev();
+    let (mut m, mut h, _) = setup(&d, &layout());
+    let ins = vec![vec![1.0; 480], vec![1.0; 480]];
+    run(&mut m, &ins, 4, 480);
+    trim(&mut d, 0, 0.0, true);
+    h.set_plan(MixPlan::compile(&d, &layout()));
+    let first = run(&mut m, &ins, 4, 480)[0].clone();
+    assert!(first.windows(2).all(|w| (w[1] - w[0]).abs() < 3e-3));
+    assert!(first[479].abs() < 1e-3, "half way is zero: {}", first[479]);
+    let second = run(&mut m, &ins, 4, 480)[0].clone();
+    assert_eq!(second[479], -1.0);
+}
+
+#[test]
+fn a_nan_trim_is_silence_and_an_over_range_trim_clamps() {
+    let mut d = dev();
+    trim(&mut d, 0, f32::NAN, false);
+    trim(&mut d, 1, 1000.0, false);
+    let (mut m, _h, _) = setup(&d, &layout());
+    let o = run(&mut m, &ones(16), 4, 16);
+    assert!(o[0].iter().all(|x| *x == 0.0));
+    assert!(o[1].iter().all(|x| x.is_finite() && *x < 0.5 * 15.9));
+}
+
+/// A wire listed twice is one wire: the first, trim included.
+#[test]
+fn a_duplicate_wire_keeps_the_first_trim() {
+    let mut d = dev();
+    d.wires.push(d.wires[0].clone());
+    trim(&mut d, 0, -6.0, false);
+    let (mut m, _h, _) = setup(&d, &layout());
+    let o = run(&mut m, &ones(16), 4, 16);
+    assert!((o[0][15] - 0.501).abs() < 1e-3);
 }

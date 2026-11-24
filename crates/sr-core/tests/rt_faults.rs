@@ -25,13 +25,7 @@ fn a_plan_swap_does_not_fault_pages_in_on_the_audio_thread() {
         let mut d = dev();
         d.channels = n as u16;
         d.sources = vec![src("s1", n as u16, 0.0, false)];
-        d.wires = (0..n as u16)
-            .map(|i| Wire {
-                source: "s1".into(),
-                src_ch: i,
-                out_ch: i,
-            })
-            .collect();
+        d.wires = (0..n as u16).map(|i| Wire::new("s1", i, i)).collect();
         let l = IoLayout {
             inputs: (0..n as u16).map(|c| Some(("s1".into(), c))).collect(),
             outputs: (0..n as u16).map(|c| Some(OutPort::Device(c))).collect(),

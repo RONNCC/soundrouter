@@ -9,7 +9,7 @@ pub fn default_path() -> Option<PathBuf> {
 }
 
 /// Highest config `version` this build understands.
-const SUPPORTED_VERSION: u64 = 1;
+const SUPPORTED_VERSION: u64 = 2;
 
 fn future_version_msg(v: u64) -> String {
     format!(
@@ -257,11 +257,11 @@ mod tests {
         let dir = tmpdir("future");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
-        let text = r#"{"version":2,"devices":[],"new_field":{"a":1}}"#;
+        let text = r#"{"version":3,"devices":[],"new_field":{"a":1}}"#;
         std::fs::write(&path, text).unwrap();
         let (cfg, msg) = load(&path);
         assert_eq!(cfg, default_config());
-        assert!(msg.unwrap().contains("version 2"));
+        assert!(msg.unwrap().contains("version 3"));
         let err = save(&path, &cfg).unwrap_err();
         assert!(err.to_string().contains("newer"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);

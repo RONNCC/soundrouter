@@ -66,12 +66,21 @@ impl Gain {
             self.cur = o.cur;
         }
     }
+    /// The same gain with its polarity flipped; a slew across the flip passes through zero.
+    fn inverted(mut self) -> Gain {
+        self.cur = -self.cur;
+        self.target = -self.target;
+        self.next = -self.next;
+        self
+    }
 }
 
 struct Tap {
     in_idx: usize,
     vch: usize,
     src: usize,
+    /// This cable's own trim and polarity, keyed by (source, src_ch, out_ch); 1.0 for a plain wire.
+    wire: Gain,
     /// Index into `MixPlan::apps` for an app source: its level also follows V's system volume (`SysGain`).
     app: Option<usize>,
 }
@@ -125,6 +134,9 @@ pub struct MixPlan {
     nch: usize,
     srcs: Vec<Gain>,
     taps: Vec<Tap>,
+    /// `(wire key, index into taps)` sorted by key, so `inherit` joins two plans' wire gains in one pass
+    /// on the audio thread instead of searching.
+    tap_keys: Vec<(u64, usize)>,
     dev_gain: Gain,
     /// App sources, see [`AppSys`].
     apps: Vec<AppSys>,
@@ -140,8 +152,9 @@ pub struct MixPlan {
 }
 
 /// Taps into one vdev channel up to which `acc` stays finite: each tap adds at most
-/// `SAMPLE_LIMIT` x 15.85 (+24 dB source gain) and the device stage multiplies by at most
-/// 15.85 more, so 2^16 x 1e30 x 15.85^2 = 1.6e37 < f32::MAX (3.4e38). Valid configs have <= 64.
+/// `SAMPLE_LIMIT` x 15.85 (+24 dB source gain) x 15.85 (+24 dB wire trim) and the device stage
+/// multiplies by at most 15.85 more, so 2^16 x 1e30 x 15.85^3 = 2.6e38 < f32::MAX (3.4e38).
+/// Valid configs have <= 64.
 const MAX_FINITE_TAPS: usize = 1 << 16;
 
 /// Finite samples are clamped here so that even 64 taps through three +24 dB stages (x15.85 each) cannot overflow to inf.
@@ -242,10 +255,15 @@ impl MixPlan {
                     && *id == w.source
                     && *ch == w.src_ch
                 {
+                    let mut wire = Gain::new((&w.source, w.src_ch, w.out_ch), w.gain_db, false);
+                    if w.invert {
+                        wire = wire.inverted();
+                    }
                     taps.push(Tap {
                         in_idx,
                         vch,
                         src,
+                        wire,
                         app: apps.iter().position(|a| a.id == dev.sources[src].id),
                     });
                 }
@@ -300,6 +318,12 @@ impl MixPlan {
             .collect();
         let acc_finite =
             (0..nch).all(|c| taps.iter().filter(|t| t.vch == c).count() <= MAX_FINITE_TAPS);
+        let mut tap_keys: Vec<(u64, usize)> = taps
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.wire.key, i))
+            .collect();
+        tap_keys.sort_unstable();
         let mut h = DefaultHasher::new();
         for t in &taps {
             (t.in_idx, t.vch, srcs[t.src].key).hash(&mut h);
@@ -317,6 +341,7 @@ impl MixPlan {
             nch,
             srcs,
             taps,
+            tap_keys,
             dev_gain: Gain::new("dev", dev.volume_db, dev.muted),
             apps,
             dev_out,
@@ -331,6 +356,18 @@ impl MixPlan {
     /// Continue gain ramps from what `old` last applied.
     fn inherit(&mut self, old: &MixPlan) {
         self.srcs.iter_mut().for_each(|g| g.inherit(&old.srcs));
+        let (mut i, mut j) = (0, 0);
+        while let (Some(&(ki, ti)), Some(&(kj, tj))) = (self.tap_keys.get(i), old.tap_keys.get(j)) {
+            match ki.cmp(&kj) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    self.taps[ti].wire.cur = old.taps[tj].wire.cur;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
         self.dev_gain.cur = old.dev_gain.cur;
         for a in &mut self.apps {
             if let Some(o) = old.apps.iter().find(|o| o.key == a.key) {
@@ -368,17 +405,20 @@ impl MixPlan {
         for c in 0..self.nch {
             self.acc[c * MAX_FRAMES..][..n].fill(0.0);
         }
-        for t in &self.taps {
+        for t in &mut self.taps {
             let g = &self.srcs[t.src];
             let (s0, s1) = t
                 .app
                 .map_or((1.0, 1.0), |i| (self.apps[i].cur, self.apps[i].next));
+            t.wire.next = slew(t.wire.cur, t.wire.target, n);
+            // x * 1.0 is exact, so a plain wire sums bit for bit as it did before wires had a trim.
             ramp_add(
                 &mut self.acc[t.vch * MAX_FRAMES..][..n],
                 &inputs[t.in_idx][off..end],
-                g.cur * s0,
-                g.next * s1,
+                g.cur * s0 * t.wire.cur,
+                g.next * s1 * t.wire.next,
             );
+            t.wire.cur = t.wire.next;
         }
         for a in &mut self.apps {
             a.cur = a.next;
@@ -613,5 +653,88 @@ fn crossfade(
         for (k, (y, o)) in new[..n].iter_mut().zip(old.iter()).enumerate() {
             *y = *o + (*y - *o) * ((k + 1) as f32 * inv);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{VirtualDevice, Wire};
+
+    fn dev(wires: Vec<Wire>) -> VirtualDevice {
+        let src = |id: &str| crate::config::Source {
+            id: id.into(),
+            kind: SourceKind::PassThru,
+            channels: 2,
+            volume_db: 0.0,
+            muted: false,
+            mute_original: false,
+            name: String::new(),
+        };
+        VirtualDevice {
+            id: "v".into(),
+            name: "V".into(),
+            enabled: true,
+            channels: 2,
+            volume_db: 0.0,
+            muted: false,
+            sources: vec![src("a"), src("b")],
+            wires,
+            monitors: vec![],
+        }
+    }
+
+    fn layout() -> IoLayout {
+        IoLayout {
+            inputs: ["a", "b"]
+                .iter()
+                .flat_map(|s| (0..2).map(move |c| Some((s.to_string(), c))))
+                .collect(),
+            outputs: vec![Some(OutPort::Device(0)), Some(OutPort::Device(1))],
+        }
+    }
+
+    fn trimmed(source: &str, src_ch: u16, out_ch: u16, gain_db: f32) -> Wire {
+        Wire {
+            gain_db,
+            ..Wire::new(source, src_ch, out_ch)
+        }
+    }
+
+    /// Wire gains are matched by key whatever the tap order and whichever wires came or went.
+    #[test]
+    fn inherit_joins_wire_gains_by_key_across_reordered_and_removed_wires() {
+        let mut old = MixPlan::compile(
+            &dev(vec![
+                trimmed("a", 0, 0, -6.0),
+                trimmed("a", 1, 1, -12.0),
+                trimmed("b", 0, 0, -18.0),
+                trimmed("b", 1, 1, 6.0),
+            ]),
+            &layout(),
+        );
+        for (t, cur) in old.taps.iter_mut().zip([0.5f32, 0.25, 0.125, 2.0]) {
+            t.wire.cur = cur;
+        }
+        let mut new = MixPlan::compile(
+            &dev(vec![
+                trimmed("b", 1, 1, 0.0),
+                trimmed("a", 0, 0, 0.0),
+                trimmed("c", 0, 0, 0.0), // unknown source: no tap at all
+                trimmed("b", 0, 0, 0.0),
+            ]),
+            &layout(),
+        );
+        new.inherit(&old);
+        let cur: Vec<f32> = new.taps.iter().map(|t| t.wire.cur).collect();
+        assert_eq!(
+            cur,
+            [2.0, 0.5, 0.125],
+            "b1, a0, b0 follow the old plan, a1 is gone"
+        );
+        assert_eq!(
+            new.taps.iter().map(|t| t.wire.target).collect::<Vec<_>>(),
+            [1.0; 3]
+        );
     }
 }

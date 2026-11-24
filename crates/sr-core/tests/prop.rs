@@ -34,11 +34,17 @@ fn arb_source() -> impl Strategy<Value = Source> {
 }
 
 fn arb_device() -> impl Strategy<Value = VirtualDevice> {
-    let wire =
-        ("[a-z0-9]{0,4}", any::<u16>(), any::<u16>()).prop_map(|(source, src_ch, out_ch)| Wire {
-            source,
-            src_ch,
-            out_ch,
+    let wire = (
+        "[a-z0-9]{0,4}",
+        any::<u16>(),
+        any::<u16>(),
+        db(),
+        any::<bool>(),
+    )
+        .prop_map(|(source, src_ch, out_ch, gain_db, invert)| Wire {
+            gain_db,
+            invert,
+            ..Wire::new(source, src_ch, out_ch)
         });
     let mon = (
         "\\PC{0,10}",
@@ -124,13 +130,14 @@ fn arb_world() -> impl Strategy<Value = World> {
                     (0..s.channels).flat_map(move |c| (0..nch as u16).map(move |o| (i, c, o)))
                 })
                 .collect();
-            prop::collection::vec(prop::sample::select(all), 0..12).prop_map(move |ws| {
+            let trim = (prop_oneof![Just(0.0f32), -40.0f32..=12.0], any::<bool>());
+            prop::collection::vec((prop::sample::select(all), trim), 0..12).prop_map(move |ws| {
                 let wires = ws
                     .into_iter()
-                    .map(|(i, src_ch, out_ch)| Wire {
-                        source: format!("s{i}"),
-                        src_ch,
-                        out_ch,
+                    .map(|((i, src_ch, out_ch), (gain_db, invert))| Wire {
+                        gain_db,
+                        invert,
+                        ..Wire::new(format!("s{i}"), src_ch, out_ch)
                     })
                     .collect();
                 let layout_in = sources
@@ -172,8 +179,10 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
     #[test]
-    fn config_json_round_trips(devices in prop::collection::vec(arb_device(), 0..3), version in any::<u32>(), buffer_frames in any::<u32>()) {
-        let cfg = Config { version, devices, buffer_frames };
+    fn config_json_round_trips(devices in prop::collection::vec(arb_device(), 0..3), buffer_frames in any::<u32>()) {
+        // The writer picks the version from the content, so that is what comes back.
+        let mut cfg = Config { version: 1, devices, buffer_frames };
+        cfg.version = cfg.written_version();
         let json = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&cfg, &back);
@@ -245,10 +254,10 @@ proptest! {
         let ins: Vec<Vec<f32>> = data[..w.layout_in.len()].iter().map(|v| v[..n].to_vec()).collect();
         let o = run(&mut m, &ins, w.nch, n);
         let dev_gain = if w.dev.muted { 0.0 } else { lin(w.dev.volume_db) };
-        // a wire listed twice is one wire
+        // a wire listed twice is one wire, the first one (its trim included)
         let mut wires: Vec<&Wire> = Vec::new();
         for wire in &w.dev.wires {
-            if !wires.contains(&wire) {
+            if !wires.iter().any(|x| (&x.source, x.src_ch, x.out_ch) == (&wire.source, wire.src_ch, wire.out_ch)) {
                 wires.push(wire);
             }
         }
@@ -259,7 +268,8 @@ proptest! {
                     let s = w.dev.sources.iter().find(|s| s.id == wire.source).unwrap();
                     let slot = w.layout_in.iter().position(|(id, ch)| *id == wire.source && *ch == wire.src_ch).unwrap();
                     let g = if s.muted { 0.0 } else { lin(s.volume_db) };
-                    want += g * ins[slot][i];
+                    let trim = if wire.invert { -lin(wire.gain_db) } else { lin(wire.gain_db) };
+                    want += g * trim * ins[slot][i];
                 }
                 want *= dev_gain;
                 prop_assert!((got[i] - want).abs() <= 1e-4 * (1.0 + want.abs()), "ch {c} i {i}: {} vs {want}", got[i]);

@@ -188,11 +188,7 @@ mod tests {
 
     fn wire(d: &mut VirtualDevice, s: usize, src_ch: u16, out_ch: u16) {
         let source = d.sources[s].id.clone();
-        d.wires.push(Wire {
-            source,
-            src_ch,
-            out_ch,
-        });
+        d.wires.push(Wire::new(source, src_ch, out_ch));
     }
 
     /// Every cable's slot by its key: what a person sees, whatever the indices are.

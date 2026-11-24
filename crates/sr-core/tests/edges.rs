@@ -75,11 +75,7 @@ fn max_width_and_max_block() {
     d.sources = vec![src("s1", N as u16, 0.0, false)];
     // reverse permutation: input i -> output N-1-i
     d.wires = (0..N as u16)
-        .map(|i| Wire {
-            source: "s1".into(),
-            src_ch: i,
-            out_ch: N as u16 - 1 - i,
-        })
+        .map(|i| Wire::new("s1", i, N as u16 - 1 - i))
         .collect();
     let l = IoLayout {
         inputs: (0..N as u16).map(|c| Some(("s1".into(), c))).collect(),
@@ -109,11 +105,7 @@ fn non_finite_input_cannot_poison_the_device() {
     let mut d = dev();
     d.monitors.push(mon("spk", true, 0.0));
     d.sources.push(src("bad", 1, 0.0, false));
-    d.wires.push(Wire {
-        source: "bad".into(),
-        src_ch: 0,
-        out_ch: 0,
-    });
+    d.wires.push(Wire::new("bad", 0, 0));
     let mut l = layout();
     l.inputs.push(Some(("bad".into(), 0)));
     let (mut m, mut h, meters) = setup(&d, &l);
@@ -233,8 +225,9 @@ fn version_rules() {
     let json = |v: &str| format!(r#"{{"version":{v},"devices":[]}}"#);
     let parse = |v: &str| serde_json::from_str::<Config>(&json(v));
     assert!(parse("1").unwrap().validate().is_ok());
+    assert!(parse("2").unwrap().validate().is_ok());
     assert!(
-        parse("2")
+        parse("3")
             .unwrap()
             .validate()
             .unwrap_err()

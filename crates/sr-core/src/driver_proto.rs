@@ -28,6 +28,7 @@ pub fn read_ahead_repush(want: bool, live: ReadAheadState) -> Option<bool> {
 
 /// Counters per device id, e.g. `EngineStatus::xruns`.
 pub type Counters = [(String, u64)];
+type OwnedCounters = Vec<(String, u64)>;
 
 /// Whether any counter in `now` is above the same id's in `before` (a new or lower counter is a new
 /// baseline, not growth).
@@ -41,7 +42,7 @@ pub fn counters_grew(before: &Counters, now: &Counters) -> bool {
 /// trouble. Pure logic: the caller supplies the counters, one look per status poll.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadAheadGuard {
-    last: Option<(Vec<(String, u64)>, Vec<(String, u64)>)>,
+    last: Option<(OwnedCounters, OwnedCounters)>,
 }
 
 impl ReadAheadGuard {

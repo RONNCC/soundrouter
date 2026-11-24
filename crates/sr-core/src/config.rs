@@ -1,5 +1,5 @@
 use crate::driver_proto::{COMPANION_SUFFIX, MAX_DEVICES};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashSet;
 
 pub const MAX_CH: usize = 64;
@@ -8,7 +8,10 @@ pub const MAX_FRAMES: usize = 4096;
 pub const MAX_NAME_CHARS: usize = 64;
 /// Highest accepted volume in dB; anything lower (even -200) is valid and just means near-silence.
 pub const MAX_DB: f32 = 24.0;
-pub const CONFIG_VERSION: u32 = 1;
+/// Highest `version` this build reads. [`Config`] writes the lowest version that can hold its content
+/// (1 unless a wire carries a trim), so a file stays readable by older builds until it uses something
+/// they would silently ignore; see `Config::written_version`.
+pub const CONFIG_VERSION: u32 = 2;
 /// Longest device id; the driver uid `soundrouter:<id>` (and its `.engine` companion) must stay a valid driver uid.
 pub const MAX_ID_BYTES: usize = 64;
 /// IO buffer sizes (frames) the engine's aggregate may run at: each one adds one buffer of
@@ -23,7 +26,7 @@ fn stereo() -> u16 {
     2
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub version: u32,
@@ -34,10 +37,29 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            version: CONFIG_VERSION,
+            version: 1,
             devices: Vec::new(),
             buffer_frames: DEFAULT_BUFFER_FRAMES,
         }
+    }
+}
+
+impl Serialize for Config {
+    /// Writes `version` as [`Config::written_version`], not the field: an old build reads a file that
+    /// uses nothing new, and refuses (rather than half-understands) one that does.
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Out<'a> {
+            version: u32,
+            devices: &'a [VirtualDevice],
+            buffer_frames: u32,
+        }
+        Out {
+            version: self.written_version(),
+            devices: &self.devices,
+            buffer_frames: self.buffer_frames,
+        }
+        .serialize(s)
     }
 }
 
@@ -93,12 +115,39 @@ pub enum SourceKind {
     PassThru,
 }
 
+/// One cable: source channel -> vdev channel, with an optional trim.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Wire {
     pub source: String,
     pub src_ch: u16,
     pub out_ch: u16,
-} // source ch -> vdev ch
+    /// Trim on this cable alone, `<= MAX_DB`; 0 is unity and is not written. Two mono sources onto one
+    /// output channel add +6 dB, a -6 dB trim per wire fixes it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gain_db: f32,
+    /// Flip polarity (the wire's gain is negated); false is not written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invert: bool,
+}
+fn is_zero(x: &f32) -> bool {
+    *x == 0.0
+}
+impl Wire {
+    /// A plain cable at unity.
+    pub fn new(source: impl Into<String>, src_ch: u16, out_ch: u16) -> Wire {
+        Wire {
+            source: source.into(),
+            src_ch,
+            out_ch,
+            gain_db: 0.0,
+            invert: false,
+        }
+    }
+    /// Whether an older build would misread this wire (see [`Config::written_version`]).
+    fn needs_v2(&self) -> bool {
+        self.gain_db != 0.0 || self.invert
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Monitor {
@@ -130,15 +179,29 @@ fn check_db(what: &str, db: f32) -> Result<(), String> {
     }
 }
 
+impl VirtualDevice {
+    /// Whether an older build would misread this device (see [`Config::written_version`]).
+    pub fn needs_v2(&self) -> bool {
+        self.wires.iter().any(Wire::needs_v2)
+    }
+}
+
 impl Config {
+    /// The lowest version that can hold this content: 1 unless a wire has a trim. Serde ignores unknown
+    /// fields, so a v1 build reading trims would route at unity and then overwrite the file on its next
+    /// save; at version 2 it takes the newer-version path instead (defaults, file untouched).
+    pub fn written_version(&self) -> u32 {
+        1 + u32::from(self.devices.iter().any(VirtualDevice::needs_v2))
+    }
+
     /// Checks version, at most `MAX_DEVICES` enabled, ids are unique, names usable, volumes sane, channel counts in range,
     /// and wires reference existing source ids and in-range channels.
     /// `MonitorWire::dst_ch` is not checked: the hardware channel count is unknown here,
     /// so the mixer silently drops wires to channels the monitor device lacks.
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != CONFIG_VERSION {
+        if !(1..=CONFIG_VERSION).contains(&self.version) {
             return Err(format!(
-                "unsupported config version {} (expected {CONFIG_VERSION})",
+                "unsupported config version {} (expected 1..={CONFIG_VERSION})",
                 self.version
             ));
         }
@@ -236,6 +299,10 @@ impl Config {
                         dev.id, w.out_ch, dev.channels
                     ));
                 }
+                check_db(
+                    &format!("device '{}': wire from '{}'", dev.id, w.source),
+                    w.gain_db,
+                )?;
             }
             for m in &dev.monitors {
                 check_db(&format!("monitor '{}'", m.device_uid), m.volume_db)?;
@@ -331,11 +398,7 @@ mod tests {
             mute_original: false,
             name: String::new(),
         });
-        cfg.devices[0].wires.push(Wire {
-            source: "p".into(),
-            src_ch: 1,
-            out_ch: 0,
-        });
+        cfg.devices[0].wires.push(Wire::new("p", 1, 0));
         cfg.validate().unwrap();
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains(r#""kind":{"type":"pass_thru"}"#));
@@ -376,7 +439,7 @@ mod tests {
     #[test]
     fn rejects_bad_values() {
         type Mutate = fn(&mut Config);
-        let bad: [(&str, Mutate); 22] = [
+        let bad: [(&str, Mutate); 25] = [
             ("dup device", |c| {
                 let d = c.devices[0].clone();
                 c.devices.push(d);
@@ -401,7 +464,7 @@ mod tests {
                 c.devices[0].monitors[0].wires[0].out_ch = 2
             }),
             ("source too wide", |c| c.devices[0].sources[1].channels = 65),
-            ("version 2", |c| c.version = 2),
+            ("version 3", |c| c.version = 3),
             ("version 0", |c| c.version = 0),
             ("blank name", |c| c.devices[0].name = " \t ".into()),
             ("long name", |c| c.devices[0].name = "x".repeat(65)),
@@ -411,13 +474,22 @@ mod tests {
                 c.devices[0].monitors[0].volume_db = f32::NEG_INFINITY
             }),
             ("mono app source", |c| c.devices[0].sources[0].channels = 1),
+            ("loud wire", |c| c.devices[0].wires[0].gain_db = 24.5),
+            ("nan wire", |c| c.devices[0].wires[0].gain_db = f32::NAN),
+            ("inf wire", |c| {
+                c.devices[0].wires[0].gain_db = f32::INFINITY
+            }),
         ];
         for (name, f) in bad {
             let mut cfg = example();
             f(&mut cfg);
             assert!(cfg.validate().is_err(), "{name} accepted");
         }
-        let good: [(&str, Mutate); 4] = [
+        let good: [(&str, Mutate); 6] = [
+            ("wire max gain", |c| c.devices[0].wires[0].gain_db = 24.0),
+            ("wire near silence", |c| {
+                c.devices[0].wires[0].gain_db = -200.0
+            }),
             ("max gain", |c| c.devices[0].volume_db = 24.0),
             ("near silence", |c| {
                 c.devices[0].sources[0].volume_db = -200.0
@@ -433,6 +505,39 @@ mod tests {
             cfg.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
         }
         assert!(Config::default().validate().is_ok());
+    }
+
+    /// A config without trims is written exactly as before, at version 1; the first trim moves it to
+    /// version 2 and back again when removed, and a v1-labelled file holding trims still loads.
+    #[test]
+    fn trims_write_the_lowest_version_that_holds_them() {
+        let mut cfg = example();
+        let plain = serde_json::to_string(&cfg).unwrap();
+        assert!(plain.starts_with(r#"{"version":1,"#));
+        assert!(!plain.contains("gain_db") && !plain.contains("invert"));
+        assert_eq!(cfg.written_version(), 1);
+        cfg.devices[0].wires[0].gain_db = -6.0;
+        assert_eq!(cfg.written_version(), 2);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.starts_with(r#"{"version":2,"#));
+        assert!(json.contains(r#""out_ch":0,"gain_db":-6.0}"#));
+        let back: Config = serde_json::from_str(&json).unwrap();
+        back.validate().unwrap();
+        assert_eq!(back.devices, cfg.devices);
+        cfg.devices[0].wires[0].gain_db = 0.0;
+        cfg.devices[0].wires[1].invert = true;
+        assert!(
+            serde_json::to_string(&cfg)
+                .unwrap()
+                .contains(r#""invert":true"#)
+        );
+        assert_eq!(cfg.written_version(), 2);
+        cfg.devices[0].wires[1].invert = false;
+        assert_eq!(serde_json::to_string(&cfg).unwrap(), plain);
+        let relabelled = json.replacen(r#""version":2"#, r#""version":1"#, 1);
+        let loaded: Config = serde_json::from_str(&relabelled).unwrap();
+        loaded.validate().unwrap();
+        assert_eq!(loaded.devices[0].wires[0].gain_db, -6.0);
     }
 
     #[test]

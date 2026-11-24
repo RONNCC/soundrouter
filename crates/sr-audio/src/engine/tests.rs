@@ -36,11 +36,7 @@ fn vdev(sources: Vec<Source>, wires: Vec<Wire>, monitors: Vec<Monitor>) -> Virtu
     }
 }
 fn wire(source: &str, src_ch: u16, out_ch: u16) -> Wire {
-    Wire {
-        source: source.into(),
-        src_ch,
-        out_ch,
-    }
+    Wire::new(source, src_ch, out_ch)
 }
 fn app(id: &str, bundle: &str) -> Source {
     src(
