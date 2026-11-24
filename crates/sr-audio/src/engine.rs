@@ -25,10 +25,14 @@ use objc2_core_audio_types::{
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSNumber, NSString};
 use sr_core::backend::{
-    AppInfo, Backend, Delay, DeviceState, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
+    AppInfo, Backend, Delay, DeviceState, EngineOptions, EngineStatus, HwDevice, MeterReading,
+    ReadAheadState, SelfTest, TccStatus,
 };
 use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice};
-use sr_core::driver_proto::{COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, companion_uid};
+use sr_core::driver_proto::{
+    COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, ReadAheadGuard, companion_uid,
+    read_ahead_repush,
+};
 use sr_core::meters::Meters;
 use sr_core::mixer::{MixPlan, Mixer, MixerHandle, mixer};
 use sr_core::selftest;
@@ -42,7 +46,7 @@ use crate::layout::{self, LayoutSpec, SCRATCH_LEN, SubDesc};
 use crate::power::PowerWatch;
 use crate::tapring::{TapCounters, TapIn, TapInHandle, TapRx, TapStats, tap_in};
 use sr_core::backend::HogInfo;
-use tapagg::{TapAgg, TapAggSpec, retire_tap, tap_split_enabled};
+use tapagg::{TapAgg, TapAggSpec, cushion_blocks, retire_tap, tap_split_enabled};
 
 /// If the hidden companion cannot be found or joined, run on the visible vdev instead.
 /// shortcut: then the Pass-Thru source is off (see `LayoutInputs::passthru`); the companion path is verified live (docs/TESTING.md), this fallback is not.
@@ -233,6 +237,8 @@ struct AggSpec {
     buffer_frames: u32,
     /// One aggregate for the process taps and another for everything else; part of the reuse key.
     split: bool,
+    /// Cushion of the tap ring in whole buffers (split only; part of the reuse key then).
+    cushion_blocks: u8,
     /// Devices whose input the IOProc reads (see [`input_readers`]); the input streams of every other
     /// sub-device are switched off. Part of the reuse key.
     readers: Vec<String>,
@@ -389,6 +395,73 @@ struct Inner {
     /// Hog-mode listeners on devices another process holds and that kept a vdev from building: the
     /// vdev has no listeners of its own, so these are what wake the worker when the holder lets go.
     hog_watch: Vec<Listener>,
+    /// What the app asked for through [`Backend::set_options`].
+    options: EngineOptions,
+    read_ahead: ReadAheadCtl,
+}
+
+/// The engine's side of the driver's loop read-ahead switch. The driver forgets the switch when it
+/// restarts, so every driver sync compares it with the options and writes it only when it differs
+/// (a write restarts the calibration of every stream).
+#[derive(Default)]
+struct ReadAheadCtl {
+    /// Counters of the previous status poll while it is on.
+    guard: ReadAheadGuard,
+    /// A driver overload or xrun grew while it was on: it stays off until options ask for it again.
+    tripped: bool,
+    /// The engine switched it on, so it switches it off when it stops (coreaudiod would keep it on
+    /// with nobody watching).
+    we_enabled: bool,
+}
+
+impl Inner {
+    /// The value the driver's switch should have.
+    fn want_read_ahead(&self) -> bool {
+        self.options.read_ahead && !self.read_ahead.tripped
+    }
+}
+
+/// Brings the driver's switch in line with the options: reads it, writes only a difference.
+fn read_ahead_push(g: &mut Inner, plugin: u32) {
+    let Some(on) = read_ahead_repush(g.want_read_ahead(), hal::read_ahead_of(plugin)) else {
+        return;
+    };
+    match hal::set_read_ahead_of(plugin, on) {
+        Ok(_) => {
+            g.read_ahead.we_enabled = on;
+            g.read_ahead.guard = ReadAheadGuard::default();
+        }
+        Err(e) => log::warn!("could not set the driver's read-ahead switch: {e:#}"),
+    }
+}
+
+/// Status-poll step: while read-ahead is on, a driver overload or xrun that grew since the previous poll
+/// switches it off until options ask for it again. Returns the state to report and the sticky trip flag.
+fn read_ahead_watch(
+    g: &mut Inner,
+    plugin: Option<u32>,
+    state: ReadAheadState,
+    overloads: &[(String, u64)],
+    xruns: &[(String, u64)],
+) -> (ReadAheadState, bool) {
+    if !state.is_on() {
+        // The next enable starts from fresh counters: late writes also count while it is off.
+        g.read_ahead.guard = ReadAheadGuard::default();
+        return (state, g.read_ahead.tripped);
+    }
+    if !g.read_ahead.guard.tripped(overloads, xruns) {
+        return (state, g.read_ahead.tripped);
+    }
+    log::warn!("driver overloads or xruns grew with read-ahead on: switching it off");
+    g.read_ahead.tripped = true;
+    let Some(plugin) = plugin else {
+        return (state, true);
+    };
+    match hal::set_read_ahead_of(plugin, false) {
+        Ok(_) => g.read_ahead.we_enabled = false,
+        Err(e) => log::error!("could not switch the driver's read-ahead off: {e:#}"),
+    }
+    (hal::read_ahead_of(plugin), true)
 }
 
 enum Event {
@@ -414,6 +487,8 @@ enum Event {
     ServiceRestarted,
     /// The system default output device changed.
     DefaultOutput,
+    /// Engine options changed in a way that rebuilds devices.
+    Options,
     Shutdown,
 }
 
@@ -780,7 +855,13 @@ impl Drop for Engine {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
-        for (_, v) in lock(&self.inner).vdevs.drain() {
+        let mut g = lock(&self.inner);
+        if g.read_ahead.we_enabled
+            && let Err(e) = hal::set_read_ahead(false)
+        {
+            log::warn!("could not switch the driver's read-ahead off: {e:#}");
+        }
+        for (_, v) in g.vdevs.drain() {
             retire(Some(v));
         }
     }
@@ -983,6 +1064,8 @@ struct Pending {
     rates: BTreeSet<String>,
     /// `(vdev id, build, started ok)` per finished `AudioDeviceStart`.
     io: Vec<(String, u64, bool)>,
+    /// Options changed that need a full apply.
+    options: bool,
 }
 
 impl Pending {
@@ -1006,6 +1089,7 @@ impl Pending {
             }
             // Re-reads the device list, which only acts when it really changed (status is read live).
             Event::DefaultOutput => self.devs = true,
+            Event::Options => self.options = true,
             Event::Dead(uid) => {
                 self.dead.insert(uid);
             }
@@ -1256,7 +1340,12 @@ fn worker(inner: Arc<Mutex<Inner>>, rx: Receiver<Event>) {
         }
         let devs = device_news(released, pending.devs, &mut g.dev_set, current_device_set)
             || g.vdevs.values().any(companion_arrived);
-        let Some(op) = retry.choose(devs, pending.wake, !targets.is_empty(), pending.procs) else {
+        let Some(op) = retry.choose(
+            devs,
+            pending.wake,
+            !targets.is_empty() || pending.options,
+            pending.procs,
+        ) else {
             continue;
         };
         let res = run_op(&mut g, op);
@@ -1444,8 +1533,9 @@ impl Backend for Engine {
     fn status(&self) -> EngineStatus {
         let tcc = crate::tcc::audio_capture_status().into();
         let mic = mic_status();
-        let driver_version =
-            driver::find_plugin().map(|p| driver::version(p).unwrap_or_else(|| "?".into()));
+        let plugin = driver::find_plugin();
+        let driver_version = plugin.map(|p| driver::version(p).unwrap_or_else(|| "?".into()));
+        let live_read_ahead = plugin.map_or(ReadAheadState::Unsupported, hal::read_ahead_of);
         let g = lock(&self.inner);
         let waiting = g
             .bg_errors
@@ -1487,7 +1577,21 @@ impl Backend for Engine {
             .map(|(id, _)| id.clone())
             .collect();
         let (hogged, bluetooth_hfp) = device_trouble(&g);
+        let ids: Vec<String> = g.vdevs.keys().cloned().collect();
         drop(g);
+        let mut driver_overloads: Vec<(String, u64)> = ids
+            .into_iter()
+            .filter_map(|id| Some((hal::driver_overloads(&id)?, id)))
+            .map(|(n, id)| (id, n))
+            .collect();
+        driver_overloads.sort();
+        let (read_ahead, read_ahead_tripped) = read_ahead_watch(
+            &mut lock(&self.inner),
+            plugin,
+            live_read_ahead,
+            &driver_overloads,
+            &xruns,
+        );
         per_device.sort_by(|a, b| a.0.cmp(&b.0));
         let mut tap_silent = tap_silent;
         tap_silent.sort();
@@ -1505,8 +1609,29 @@ impl Backend for Engine {
             tap_silent,
             hogged,
             bluetooth_hfp,
-            ..EngineStatus::default()
+            read_ahead,
+            driver_overloads,
+            read_ahead_tripped,
         }
+    }
+
+    fn set_options(&mut self, o: &EngineOptions) -> Result<()> {
+        let mut g = lock(&self.inner);
+        let was = std::mem::replace(&mut g.options, o.clone());
+        if o.read_ahead && !was.read_ahead {
+            g.read_ahead.tripped = false;
+        }
+        if let Some(plugin) = driver::find_plugin() {
+            read_ahead_push(&mut g, plugin);
+        }
+        drop(g);
+        // Both are read when a device is built: rebuild the devices that depend on them.
+        if was.tap_split != o.tap_split
+            || cushion_blocks(was.tap_cushion_blocks) != cushion_blocks(o.tap_cushion_blocks)
+        {
+            let _ = self.tx.send(Event::Options);
+        }
+        Ok(())
     }
 
     fn self_test(&mut self, id: &str) -> Result<SelfTest> {
@@ -1803,6 +1928,9 @@ fn apply_locked(g: &mut Inner, cfg: &Config, sync: DriverSync) -> Result<()> {
         // Taken after the driver changed its device list, so our own change compares equal (F4).
         g.dev_set = current_device_set();
     }
+    if let Some(plugin) = driver::find_plugin() {
+        read_ahead_push(g, plugin);
+    }
     sr_core::trace::stage("engine: driver synced");
     let groups: LazyCell<Vec<AppGroup>> = LazyCell::new(|| {
         let groups = apps::list_groups_for_taps();
@@ -1947,11 +2075,13 @@ fn apply_vdev(
         );
     }
     let subs = plan_subs(dev, &|u| hal::device_by_uid(u).is_some());
-    let split = tap_split_enabled();
+    let split = tap_split_enabled(g.options.tap_split);
+    let cushion = cushion_blocks(g.options.tap_cushion_blocks);
     if let Some(v) = g.vdevs.get_mut(&dev.id) {
         let io = v.io();
         if v.spec.readers == input_readers(dev, &v.spec.main)
             && !replugged(&v.dev_objs, &hal::device_by_uid)
+            && (!split || v.spec.cushion_blocks == cushion)
             && keep_in_place(
                 &v.spec,
                 &v.passed_over,
@@ -2000,6 +2130,7 @@ fn apply_vdev(
                 channels: dev.channels,
                 buffer_frames,
                 split,
+                cushion_blocks: cushion,
                 readers: input_readers(dev, &main),
             },
             groups_for(dev, groups),
@@ -2257,6 +2388,7 @@ fn rebuild_tap_agg(v: &mut Vdev) -> Result<()> {
             main: &v.spec.main,
             taps: &v.taps,
             buffer_frames: v.spec.buffer_frames,
+            cushion_blocks: v.spec.cushion_blocks,
             stats: &v.tap_stats,
             events: v.events.as_ref(),
             activity: &v.activity,

@@ -1378,6 +1378,7 @@ fn spec(main: &str, subs: &[&str]) -> AggSpec {
         channels: 2,
         buffer_frames: 256,
         split: true,
+        cushion_blocks: 1,
         readers: vec![],
     }
 }
@@ -2257,4 +2258,46 @@ fn a_build_that_failed_on_a_held_device_names_the_holder() {
             .unwrap()
             .contains("by another process;")
     );
+}
+
+fn counters(v: &[(&str, u64)]) -> Vec<(String, u64)> {
+    v.iter().map(|&(i, n)| (i.to_string(), n)).collect()
+}
+
+#[test]
+fn read_ahead_watch_trips_on_growth_while_on_and_stays_tripped() {
+    use ReadAheadState::*;
+    let mut g = Inner::default();
+    g.options.read_ahead = true;
+    assert!(g.want_read_ahead());
+    let (o, x) = (counters(&[("v1", 4)]), counters(&[("v1", 1)]));
+    assert_eq!(read_ahead_watch(&mut g, None, On, &o, &x), (On, false));
+    assert_eq!(read_ahead_watch(&mut g, None, On, &o, &x), (On, false));
+    let grown = counters(&[("v1", 5)]);
+    assert_eq!(read_ahead_watch(&mut g, None, On, &grown, &x), (On, true));
+    assert!(
+        g.read_ahead.tripped && !g.want_read_ahead(),
+        "wants it off now"
+    );
+    // the flag is reported until options ask again
+    assert_eq!(read_ahead_watch(&mut g, None, Off, &grown, &x), (Off, true));
+}
+
+#[test]
+fn read_ahead_watch_starts_fresh_after_an_off_period() {
+    use ReadAheadState::*;
+    let mut g = Inner::default();
+    let x = counters(&[("v1", 0)]);
+    read_ahead_watch(&mut g, None, On, &counters(&[("v1", 1)]), &x);
+    // late writes counted while it was off must not trip the next enable
+    read_ahead_watch(&mut g, None, Off, &counters(&[("v1", 9)]), &x);
+    assert_eq!(
+        read_ahead_watch(&mut g, None, On, &counters(&[("v1", 9)]), &x),
+        (On, false)
+    );
+}
+
+#[test]
+fn cushion_option_is_clamped_to_one_or_two_buffers() {
+    assert_eq!([0, 1, 2, 9].map(cushion_blocks), [1, 1, 2, 2]);
 }

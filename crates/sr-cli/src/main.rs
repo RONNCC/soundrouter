@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use sr_audio::engine::mic_status;
 use sr_audio::{Engine, IoState, apps, driver, loopback, tcc};
-use sr_core::backend::{Backend, EngineStatus, HogInfo, TccStatus};
+use sr_core::backend::{Backend, EngineOptions, EngineStatus, HogInfo, ReadAheadState, TccStatus};
 use sr_core::config::Config;
 use sr_core::driver_proto::{DEVICE_UID_PREFIX, DriverDevice, PLUGIN_BUNDLE_ID, companion_uid};
 use sr_core::lock;
@@ -55,6 +55,9 @@ enum Cmd {
         /// Run even if SoundRouter.app or another `sr-cli run` owns the audio engine (they fight over the driver list)
         #[arg(long)]
         force: bool,
+        /// Switch the driver's experimental loop read-ahead on while running (off again when this exits)
+        #[arg(long)]
+        read_ahead: bool,
     },
     /// Print per-channel input peaks of a virtual device (what apps record from it) at 4 Hz
     Meter { device_id: String },
@@ -92,6 +95,43 @@ enum DriverOp {
         #[arg(long)]
         force: bool,
     },
+    /// Loop read-ahead in the driver (experimental, off by default): `on` or `off` switches it, no argument
+    /// shows it. The driver forgets the switch when coreaudiod restarts; an engine that has it in its options
+    /// sets it again
+    ReadAhead {
+        #[arg(value_enum)]
+        mode: Option<ReadAheadMode>,
+        /// Switch even if SoundRouter.app or `sr-cli run` owns the audio engine (it resets the switch to its options)
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum ReadAheadMode {
+    On,
+    Off,
+}
+
+/// One line for `driver read-ahead` and `doctor`.
+fn read_ahead_line(state: ReadAheadState) -> &'static str {
+    match state {
+        ReadAheadState::Unsupported => "read-ahead: unsupported (reinstall the driver)",
+        ReadAheadState::Off => "read-ahead: off",
+        ReadAheadState::On => "read-ahead: on",
+    }
+}
+
+fn read_ahead(mode: Option<ReadAheadMode>, force: bool) -> Result<()> {
+    // The lock check comes first: it needs no driver, and a refusal should not depend on one.
+    let _engine = mode.map(|_| claim_engine(force)).transpose()?;
+    let plugin = driver::require_plugin()?;
+    let state = match mode {
+        None => sr_audio::hal::read_ahead_of(plugin),
+        Some(m) => sr_audio::hal::set_read_ahead_of(plugin, m == ReadAheadMode::On)?,
+    };
+    println!("{}", read_ahead_line(state));
+    Ok(())
 }
 
 const DEVICE_WAIT: Duration = Duration::from_secs(15);
@@ -197,13 +237,17 @@ fn main() -> Result<()> {
             println!("ok: {} device(s)", list.len());
             Ok(())
         }
+        Cmd::Driver {
+            op: DriverOp::ReadAhead { mode, force },
+        } => read_ahead(mode, force),
         Cmd::LoopbackTest { uid, secs } => loopback_test(&full_uid(&uid), secs),
         Cmd::Run {
             config,
             self_test,
             buffer,
             force,
-        } => run(&config, self_test.as_deref(), buffer, force),
+            read_ahead,
+        } => run(&config, self_test.as_deref(), buffer, force, read_ahead),
         Cmd::Meter { device_id } => {
             install_ctrlc()?;
             let uid = full_uid(&device_id);
@@ -301,7 +345,13 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>, force: bool) -> Result<()> {
+fn run(
+    path: &PathBuf,
+    self_test: Option<&str>,
+    buffer: Option<u32>,
+    force: bool,
+    read_ahead: bool,
+) -> Result<()> {
     let _engine_lock = claim_engine(force)?;
     let mut cfg: Config = serde_json::from_str(
         &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
@@ -314,6 +364,10 @@ fn run(path: &PathBuf, self_test: Option<&str>, buffer: Option<u32>, force: bool
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
     install_ctrlc()?;
     let mut engine = Engine::new()?;
+    engine.set_options(&EngineOptions {
+        read_ahead,
+        ..EngineOptions::default()
+    })?;
     engine.apply(&cfg)?;
     let ids: Vec<&str> = cfg
         .devices
@@ -401,8 +455,13 @@ fn health_line(s: &EngineStatus) -> String {
         }
     };
     format!(
-        "health: xruns [{}], silent taps [{}], hogged [{}], bluetooth HFP [{}]",
+        "health: xruns [{}], driver overloads [{}], silent taps [{}], hogged [{}], bluetooth HFP [{}]",
         s.xruns
+            .iter()
+            .map(|(id, n)| format!("{id} {n}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        s.driver_overloads
             .iter()
             .map(|(id, n)| format!("{id} {n}"))
             .collect::<Vec<_>>()
@@ -428,6 +487,7 @@ fn doctor() -> Result<()> {
                 "driver plug-in:  found ({PLUGIN_BUNDLE_ID}, object {p}), protocol version {}",
                 driver::version(p).unwrap_or_else(|| "?".into())
             );
+            println!("{}", read_ahead_line(sr_audio::hal::read_ahead_of(p)));
             match driver::get_devices(p) {
                 Ok(list) => {
                     println!("driver devices:  {}", list.len());
@@ -488,6 +548,16 @@ fn doctor() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_ahead_line_says_what_the_driver_reports() {
+        assert_eq!(
+            read_ahead_line(ReadAheadState::Unsupported),
+            "read-ahead: unsupported (reinstall the driver)"
+        );
+        assert_eq!(read_ahead_line(ReadAheadState::Off), "read-ahead: off");
+        assert_eq!(read_ahead_line(ReadAheadState::On), "read-ahead: on");
+    }
 
     #[test]
     fn claim_refuses_while_held_unless_forced() {

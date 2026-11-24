@@ -8,6 +8,10 @@ use objc2::runtime::AnyObject;
 use objc2_core_audio::*;
 use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
+use sr_core::backend::ReadAheadState;
+use sr_core::driver_proto::{
+    DEVICE_UID_PREFIX, PLUGIN_BUNDLE_ID, PROP_OVERLOADS, PROP_READ_AHEAD, companion_uid,
+};
 
 pub const SYSTEM: u32 = kAudioObjectSystemObject as u32;
 
@@ -153,6 +157,61 @@ pub fn device_by_uid(uid: &str) -> Option<u32> {
     }
     .ok()?;
     (id != kAudioObjectUnknown).then_some(id)
+}
+
+/// Whether `obj` has global-scope property `sel` (`AudioObjectHasProperty`).
+pub fn has_property(obj: u32, sel: u32) -> bool {
+    let a = addr(sel, kAudioObjectPropertyScopeGlobal);
+    // SAFETY: `a` is a valid address for the call.
+    unsafe { AudioObjectHasProperty(obj, NonNull::from(&a)) }
+}
+
+/// A CFNumber property in global scope (the driver's `srla` and `srov`); `None` when the object has no
+/// such property or it cannot be read.
+pub fn get_i64(obj: u32, sel: u32) -> Option<i64> {
+    if !has_property(obj, sel) {
+        return None;
+    }
+    let p: *mut NSNumber = get_global(obj, sel).ok()?;
+    // The HAL hands over +1.
+    unsafe { Retained::from_raw(p) }.map(|n| n.as_i64())
+}
+
+/// The driver's read-ahead switch as it reads now: one HAL call. `Unsupported` when the plug-in has no
+/// such property (the protocol version string does not tell: it never changed when `srla` came).
+pub fn read_ahead_of(plugin: u32) -> ReadAheadState {
+    ReadAheadState::from_prop(get_i64(plugin, PROP_READ_AHEAD))
+}
+
+/// Writes the driver's read-ahead switch and returns what the driver reports afterwards. Every write
+/// restarts the calibration of all the driver's streams: callers write only when the value differs. A
+/// driver without the property is `Ok(Unsupported)`: nothing was written.
+pub fn set_read_ahead_of(plugin: u32, on: bool) -> Result<ReadAheadState> {
+    if read_ahead_of(plugin) == ReadAheadState::Unsupported {
+        return Ok(ReadAheadState::Unsupported);
+    }
+    let n = NSNumber::new_i32(i32::from(on));
+    set_object(plugin, PROP_READ_AHEAD, &n)
+        .map_err(|st| anyhow::anyhow!("set 'srla' failed: OSStatus {}", fourcc(st)))?;
+    Ok(read_ahead_of(plugin))
+}
+
+/// [`set_read_ahead_of`] for the SoundRouter plug-in; `Ok(Unsupported)` without one.
+pub fn set_read_ahead(on: bool) -> Result<ReadAheadState> {
+    plugin_by_bundle_id(PLUGIN_BUNDLE_ID).map_or(Ok(ReadAheadState::Unsupported), |p| {
+        set_read_ahead_of(p, on)
+    })
+}
+
+/// The driver's late/short counters (`srov`) of virtual device `id`: its visible device plus its hidden
+/// companion. `None` when the driver publishes neither (or has no counter).
+pub fn driver_overloads(id: &str) -> Option<u64> {
+    let vis = format!("{DEVICE_UID_PREFIX}{id}");
+    [companion_uid(&vis), vis]
+        .iter()
+        .filter_map(|u| get_i64(device_by_uid(u)?, PROP_OVERLOADS))
+        .map(|n| n.max(0) as u64)
+        .reduce(u64::saturating_add)
 }
 
 pub fn plugin_by_bundle_id(bundle: &str) -> Option<u32> {

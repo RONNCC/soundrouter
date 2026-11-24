@@ -9,8 +9,6 @@ use crate::tapring::{TapRx, TapStats, TapTx};
 pub const TAP_SPLIT_ENV: &str = "SR_TAP_SPLIT";
 /// Env: frames of cushion the ring keeps between the two aggregates (default: the IO buffer; rounded up to whole tap blocks, 0 = no margin).
 pub const TAP_CUSHION_ENV: &str = "SR_TAP_CUSHION";
-/// What an unset [`TAP_SPLIT_ENV`] means.
-pub const TAP_SPLIT_DEFAULT: bool = true;
 
 /// `value` is the env value: `0` off, `1` on, anything else (or unset) the default.
 pub fn split_setting(value: Option<&str>, default: bool) -> bool {
@@ -21,20 +19,23 @@ pub fn split_setting(value: Option<&str>, default: bool) -> bool {
     }
 }
 
-pub(super) fn tap_split_enabled() -> bool {
-    split_setting(
-        std::env::var(TAP_SPLIT_ENV).ok().as_deref(),
-        TAP_SPLIT_DEFAULT,
-    )
+/// Whether vdevs split their taps: `SR_TAP_SPLIT` if set, else the engine option `opt`.
+pub(super) fn tap_split_enabled(opt: bool) -> bool {
+    split_setting(std::env::var(TAP_SPLIT_ENV).ok().as_deref(), opt)
+}
+
+/// The option's cushion in whole buffers, as the engine uses it: 1 or 2 (0 would leave no margin).
+pub(super) fn cushion_blocks(opt: u8) -> u8 {
+    opt.clamp(1, 2)
 }
 
 /// Frames the ring keeps behind each read: `SR_TAP_CUSHION` if set to a number, else
-/// [`default_cushion`].
-fn cushion_frames(buffer_frames: u32) -> usize {
+/// `blocks` times [`default_cushion`].
+fn cushion_frames(buffer_frames: u32, blocks: u8) -> usize {
     std::env::var(TAP_CUSHION_ENV)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| default_cushion(buffer_frames))
+        .unwrap_or_else(|| default_cushion(buffer_frames) * usize::from(cushion_blocks(blocks)))
 }
 
 /// The cushion between the tap IOProc and the main IOProc: one IO buffer, which is the tap block. The
@@ -123,6 +124,8 @@ pub(super) struct TapAggSpec<'a> {
     pub main: &'a str,
     pub taps: &'a [Tap],
     pub buffer_frames: u32,
+    /// Cushion in whole buffers (see [`cushion_blocks`]).
+    pub cushion_blocks: u8,
     pub stats: &'a Arc<TapStats>,
     pub events: Option<&'a Sender<Event>>,
     pub activity: &'a Arc<Activity>,
@@ -215,7 +218,11 @@ pub(super) fn build(s: &TapAggSpec) -> Result<(TapAgg, TapRx)> {
             "tap aggregate carries {ch} channels, the engine mixes 1..={MAX_CH}"
         )));
     }
-    let (tx, rx) = crate::tapring::channel(ch, cushion_frames(s.buffer_frames), s.stats.clone());
+    let (tx, rx) = crate::tapring::channel(
+        ch,
+        cushion_frames(s.buffer_frames, s.cushion_blocks),
+        s.stats.clone(),
+    );
     let shared = Arc::new(Shared {
         expected: AtomicU64::new(layout::shape_key_of(&ain, &aout)),
         state: AtomicU64::new(0),

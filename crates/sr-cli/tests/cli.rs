@@ -110,6 +110,44 @@ fn driver_set_missing_file_exits_1() {
 }
 
 #[test]
+fn driver_read_ahead_rejects_an_unknown_mode_and_lists_the_modes() {
+    cli()
+        .args(["driver", "read-ahead", "maybe"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("possible values: on, off"));
+}
+
+/// Without the driver: a clear "not installed" error. With it: one `read-ahead:` line (an old driver says
+/// "unsupported"; the test never switches anything).
+#[test]
+fn driver_read_ahead_reads_one_line_or_says_not_installed() {
+    let out = cli().args(["driver", "read-ahead"]).output().unwrap();
+    if driver_installed() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{out:?}");
+        assert!(stdout.starts_with("read-ahead: "), "{stdout}");
+        assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    } else {
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("driver not installed"));
+    }
+}
+
+#[test]
+fn driver_read_ahead_switch_refuses_while_engine_lock_is_held() {
+    let (home, _held) = home_with_lock("engine.lock");
+    for mode in ["on", "off"] {
+        cli()
+            .env("HOME", home.path())
+            .args(["driver", "read-ahead", mode])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("owns the audio engine"));
+    }
+}
+
+#[test]
 fn meter_unknown_device_is_clear_error() {
     cli()
         .args(["meter", "zz-nope"])
