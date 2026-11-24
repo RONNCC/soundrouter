@@ -1,3 +1,5 @@
+use crate::backend::ReadAheadState;
+
 pub const PLUGIN_BUNDLE_ID: &str = "io.github.ronncc.soundrouter.driver";
 pub const APP_BUNDLE_ID: &str = "com.ronncc.soundrouter";
 pub const DEVICE_UID_PREFIX: &str = "soundrouter:";
@@ -13,6 +15,47 @@ pub const PROP_OVERLOADS: u32 = u32::from_be_bytes(*b"srov");
 /// traversal, calibrated per stream), 0 = off. Default off (`READ_AHEAD_DEFAULT` in the driver); not persisted,
 /// so the setter writes it after each driver start. Changing it restarts every stream's calibration.
 pub const PROP_READ_AHEAD: u32 = u32::from_be_bytes(*b"srla");
+/// Whether the driver's read-ahead must be written again: wanted on or off (`want`) and the driver reports
+/// another value. The driver does not persist the switch (a restart puts it back at its default) and every
+/// write restarts the calibration of all streams, so write only when this says so. `None` when it matches
+/// or the driver has no such property.
+pub fn read_ahead_repush(want: bool, live: ReadAheadState) -> Option<bool> {
+    match live {
+        ReadAheadState::Unsupported => None,
+        live => (want != live.is_on()).then_some(want),
+    }
+}
+
+/// Counters per device id, e.g. `EngineStatus::xruns`.
+pub type Counters = [(String, u64)];
+
+/// Whether any counter in `now` is above the same id's in `before` (a new or lower counter is a new
+/// baseline, not growth).
+pub fn counters_grew(before: &Counters, now: &Counters) -> bool {
+    now.iter()
+        .any(|(id, n)| before.iter().any(|(b, was)| b == id && n > was))
+}
+
+/// Safety net for the experimental read-ahead: while it is on, any growth of a device's driver
+/// overload counter (`srov`: late writes and read-ahead shortfalls) or xruns between two looks means
+/// trouble. Pure logic: the caller supplies the counters, one look per status poll.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadAheadGuard {
+    last: Option<(Vec<(String, u64)>, Vec<(String, u64)>)>,
+}
+
+impl ReadAheadGuard {
+    /// True when `overloads` or `xruns` grew since the previous look. The first look only records.
+    pub fn tripped(&mut self, overloads: &Counters, xruns: &Counters) -> bool {
+        let grew = self
+            .last
+            .as_ref()
+            .is_some_and(|(o, x)| counters_grew(o, overloads) || counters_grew(x, xruns));
+        self.last = Some((overloads.to_vec(), xruns.to_vec()));
+        grew
+    }
+}
+
 /// Device list, on the plug-in object (global scope, element main). Type 'plst' (CFPropertyList), settable.
 /// Value = CFArray of CFDictionary {uid: CFString starting with `DEVICE_UID_PREFIX`, name: CFString, channels: CFNumber 1..=64}, at most `MAX_DEVICES`.
 /// Set replaces the whole list. The driver persists it via host storage under `STORAGE_KEY`.
@@ -55,6 +98,64 @@ pub fn volume_gain(scalar: f32, muted: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn c(v: &[(&str, u64)]) -> Vec<(String, u64)> {
+        v.iter().map(|&(i, n)| (i.to_string(), n)).collect()
+    }
+
+    #[test]
+    fn counters_grow_only_where_an_id_is_in_both_and_higher() {
+        assert!(counters_grew(&c(&[("a", 1)]), &c(&[("a", 2)])));
+        assert!(!counters_grew(&c(&[("a", 2)]), &c(&[("a", 2)])));
+        assert!(
+            !counters_grew(&c(&[("a", 5)]), &c(&[("a", 0)])),
+            "rebuilt: lower is a new baseline"
+        );
+        assert!(
+            !counters_grew(&c(&[("a", 1)]), &c(&[("b", 9)])),
+            "a new id has no history"
+        );
+        assert!(counters_grew(
+            &c(&[("a", 1), ("b", 1)]),
+            &c(&[("a", 1), ("b", 2)])
+        ));
+        assert!(!counters_grew(&[], &c(&[("a", 1)])));
+    }
+
+    #[test]
+    fn guard_records_first_then_trips_on_any_growth() {
+        let mut g = ReadAheadGuard::default();
+        assert!(
+            !g.tripped(&c(&[("v1", 7)]), &c(&[("v1", 2)])),
+            "first look is the baseline"
+        );
+        assert!(!g.tripped(&c(&[("v1", 7)]), &c(&[("v1", 2)])));
+        assert!(g.tripped(&c(&[("v1", 8)]), &c(&[("v1", 2)])));
+        // the grown value is the new baseline
+        assert!(!g.tripped(&c(&[("v1", 8)]), &c(&[("v1", 2)])));
+        assert!(
+            g.tripped(&c(&[("v1", 8)]), &c(&[("v1", 3)])),
+            "xruns count too"
+        );
+    }
+
+    #[test]
+    fn guard_ignores_a_rebuilt_device_that_restarts_from_zero() {
+        let mut g = ReadAheadGuard::default();
+        g.tripped(&c(&[("v1", 7)]), &c(&[("v1", 4)]));
+        assert!(!g.tripped(&c(&[("v1", 0)]), &c(&[("v1", 0)])));
+        assert!(g.tripped(&c(&[("v1", 1)]), &c(&[("v1", 0)])));
+    }
+
+    #[test]
+    fn repush_only_when_the_driver_differs_and_can_do_it() {
+        use ReadAheadState::*;
+        assert_eq!(read_ahead_repush(true, Off), Some(true));
+        assert_eq!(read_ahead_repush(true, On), None);
+        assert_eq!(read_ahead_repush(false, On), Some(false));
+        assert_eq!(read_ahead_repush(false, Off), None);
+        assert_eq!(read_ahead_repush(true, Unsupported), None);
+        assert_eq!(read_ahead_repush(false, Unsupported), None);
+    }
 
     #[test]
     fn volume_gain_is_linear_in_db_with_exact_silence_at_the_bottom() {

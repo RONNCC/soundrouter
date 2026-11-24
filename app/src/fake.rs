@@ -1,7 +1,8 @@
 //! In-app backend for `--demo`: synthetic meters, fake apps and hardware.
 use crate::model::{Edit, apply, default_config};
 use sr_core::backend::{
-    AppInfo, Backend, Delay, EngineStatus, HwDevice, MeterReading, SelfTest, TccStatus,
+    AppInfo, Backend, Delay, EngineOptions, EngineStatus, HwDevice, MeterReading, ReadAheadState,
+    SelfTest, TccStatus,
 };
 use sr_core::config::{Config, SourceKind};
 use std::time::Instant;
@@ -15,6 +16,7 @@ pub fn demo_status() -> EngineStatus {
         tcc: TccStatus::Granted,
         mic: TccStatus::Granted,
         driver_version: Some(DEMO_DRIVER.into()),
+        read_ahead: ReadAheadState::Off,
         ..EngineStatus::default()
     }
 }
@@ -30,6 +32,8 @@ pub struct FakeBackend {
     pub self_test: Option<SelfTest>,
     /// What `measure_delay` returns, in ms; `None` makes it fail.
     pub measured_ms: Option<f64>,
+    /// The last options `set_options` got.
+    pub options: EngineOptions,
     /// Meters stay at silence: stands in for the engine when the real one could not start.
     silent: bool,
 }
@@ -48,6 +52,7 @@ impl FakeBackend {
                 passed: true,
             }),
             measured_ms: Some(5.4),
+            options: EngineOptions::default(),
             silent: false,
         }
     }
@@ -90,6 +95,19 @@ fn wave(t: f32, seed: f32) -> f32 {
 impl Backend for FakeBackend {
     fn apply(&mut self, cfg: &Config) -> anyhow::Result<()> {
         self.cfg = cfg.clone();
+        Ok(())
+    }
+
+    fn set_options(&mut self, o: &EngineOptions) -> anyhow::Result<()> {
+        self.options = o.clone();
+        // A driver without read-ahead (status says Unsupported) stays that way.
+        if self.status.read_ahead != ReadAheadState::Unsupported {
+            self.status.read_ahead = if o.read_ahead {
+                ReadAheadState::On
+            } else {
+                ReadAheadState::Off
+            };
+        }
         Ok(())
     }
 

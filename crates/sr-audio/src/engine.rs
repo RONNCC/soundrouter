@@ -1505,6 +1505,7 @@ impl Backend for Engine {
             tap_silent,
             hogged,
             bluetooth_hfp,
+            ..EngineStatus::default()
         }
     }
 

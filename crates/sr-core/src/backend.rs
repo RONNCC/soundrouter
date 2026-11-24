@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::config::Config;
 #[derive(Clone, Debug)]
 pub struct HwDevice {
@@ -103,6 +105,61 @@ pub struct EngineStatus {
     /// 24 kHz or less, or fewer output channels than when the engine built its aggregate, while an input
     /// stream of the device is open.
     pub bluetooth_hfp: Vec<String>,
+    /// The driver's loop read-ahead switch as it reads now (`Unsupported` = no driver or an old one).
+    pub read_ahead: ReadAheadState,
+    /// Per virtual device id: the driver's late and short read counters (`'srov'`) of its visible and
+    /// companion device added up, sorted like `xruns`. Devices the driver does not publish are absent.
+    pub driver_overloads: Vec<(String, u64)>,
+    /// The engine switched read-ahead off because a driver overload or an xrun grew while it was on;
+    /// sticky until options ask for read-ahead again.
+    pub read_ahead_tripped: bool,
+}
+
+/// What the driver says about its loop read-ahead switch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadAheadState {
+    /// No driver, or one without the property (reinstall it).
+    #[default]
+    Unsupported,
+    Off,
+    On,
+}
+
+impl ReadAheadState {
+    /// The property's value (`None` = the driver has no such property).
+    pub fn from_prop(v: Option<i64>) -> Self {
+        match v {
+            None => Self::Unsupported,
+            Some(0) => Self::Off,
+            Some(_) => Self::On,
+        }
+    }
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+}
+
+/// Engine behaviour the user can change; the app keeps it in its settings and sends it to the backend.
+/// An environment variable the engine already honours (`SR_TAP_SPLIT`, `SR_TAP_CUSHION`) wins over it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EngineOptions {
+    /// Loop read-ahead in the driver (experimental, saves up to ~1 buffer per ring traversal).
+    pub read_ahead: bool,
+    /// Captured apps get an aggregate of their own, so mics and pass-thru keep the short path.
+    pub tap_split: bool,
+    /// Safety margin of an app capture in whole buffers; the engine clamps it to 1..=2.
+    pub tap_cushion_blocks: u8,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            read_ahead: false,
+            tap_split: true,
+            tap_cushion_blocks: 1,
+        }
+    }
 }
 /// Result of a loopback self-test: a tone into a virtual device, read back from its input.
 #[derive(Clone, Debug, PartialEq)]
@@ -130,11 +187,34 @@ pub trait Backend {
     fn measure_delay(&mut self, _id: &str) -> anyhow::Result<f64> {
         anyhow::bail!("delay measurement is not supported by this backend")
     }
+    /// New engine options. The engine acts on the ones that changed (rebuilding devices where needed);
+    /// backends without such options ignore them.
+    fn set_options(&mut self, _o: &EngineOptions) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_ahead_state_maps_the_property_value() {
+        assert_eq!(ReadAheadState::from_prop(None), ReadAheadState::Unsupported);
+        assert_eq!(ReadAheadState::from_prop(Some(0)), ReadAheadState::Off);
+        assert_eq!(ReadAheadState::from_prop(Some(1)), ReadAheadState::On);
+        assert_eq!(ReadAheadState::from_prop(Some(7)), ReadAheadState::On);
+        assert_eq!(ReadAheadState::default(), ReadAheadState::Unsupported);
+    }
+
+    #[test]
+    fn engine_options_default_and_fill_missing_fields() {
+        let d = EngineOptions::default();
+        assert!(!d.read_ahead && d.tap_split && d.tap_cushion_blocks == 1);
+        assert_eq!(serde_json::from_str::<EngineOptions>("{}").unwrap(), d);
+        let o: EngineOptions = serde_json::from_str(r#"{"read_ahead":true}"#).unwrap();
+        assert!(o.read_ahead && o.tap_split);
+    }
 
     #[test]
     fn frames_convert_to_milliseconds() {
