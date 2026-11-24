@@ -14,7 +14,8 @@
 //!   `cargo run -p sr-audio --example stress -- mono` (monitor onto a 1-channel loopback output)
 //! `replug-*` removes the device from the driver list and re-adds it with the same uid within 100 ms,
 //! N times, while routing; the engine must rebuild and the signal must return.
-//! `SR_TAP_SPLIT=0` runs the unsplit engine (no tap aggregates).
+//! `SR_TAP_SPLIT=0` runs the unsplit engine (no tap aggregates). `SR_READ_AHEAD=1` switches the driver's loop
+//! read-ahead on for the run and prints its final state, xruns and driver overloads (a trip switches it off).
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 use sr_audio::engine::AGG_UID_PREFIX;
 use sr_audio::loopback::{Probe, engine_holds_companion};
 use sr_audio::{Engine, IoState, driver, hal};
-use sr_core::backend::{Backend, DeviceState};
+use sr_core::backend::{Backend, DeviceState, EngineOptions};
 use sr_core::config::*;
 use sr_core::driver_proto::DriverDevice;
 
@@ -461,7 +462,13 @@ fn setup(seed_note: &str) -> Rig {
     assert!(built.success(), "clang failed");
     // SAFETY: single-threaded here; no engine thread exists yet.
     unsafe { std::env::set_var("SR_STRESS_TONE", &tone) };
-    let e = Engine::new().unwrap();
+    let mut e = Engine::new().unwrap();
+    let read_ahead = std::env::var("SR_READ_AHEAD").as_deref() == Ok("1");
+    e.set_options(&EngineOptions {
+        read_ahead,
+        ..EngineOptions::default()
+    })
+    .unwrap();
     let bh_uid = e
         .hardware()
         .into_iter()
@@ -822,6 +829,11 @@ fn main() {
         "devices" => devices(),
         m => panic!("unknown mode {m}"),
     };
+    let st = r.e.status();
+    println!(
+        "end: read-ahead {:?} (tripped {}), xruns {:?}, driver overloads {:?}",
+        st.read_ahead, st.read_ahead_tripped, st.xruns, st.driver_overloads
+    );
     // Leave nothing behind: players, probes, then every vdev off.
     r.player.stop();
     r.v1 = None;

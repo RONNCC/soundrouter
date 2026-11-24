@@ -58,7 +58,7 @@ How it stays safe (`ring::ReadAhead`, one per reading device; `do_io` calls `pla
 - **Order of calls.** The ring is only read below `end`, so reading ahead cannot return data that was never written. What the writer's phase can change is slack: when V's and C's threads wake together, the reader sometimes runs before and sometimes after the writer's cycle lands (slack differs by one writer buffer). Calibration normally sees the lower of the two (reader first) within 100 cycles and sizes `ahead` for it. If the order flips only rarely, calibration can miss the lower slack: then the first flip is a shortfall (a silent tail of up to `ahead - slack` frames, counted), the second halves `ahead` below the lower slack and the stream is clean afterwards (never more than two in the model, `ring.rs` tests).
 - **Real-time rules.** `plan` and `do_io` use relaxed atomics only: no allocation, locks or logging.
 
-The switch is the custom property `'srla'` on the plug-in object (`'plst'` CFNumber, settable, nonzero = on; `READ_AHEAD_DEFAULT` = off, not persisted, so whoever wants it writes it after every driver start). Flipping it restarts every calibration. It is off because it has only run against the HAL model in the unit tests and `packaging/fakehost.c`, not in a real coreaudiod: turn the default on after a live run shows `'srov'` staying put.
+The switch is the custom property `'srla'` on the plug-in object (`'plst'` CFNumber, settable, nonzero = on; `READ_AHEAD_DEFAULT` = off, not persisted, so whoever wants it writes it after every driver start). Flipping it restarts every calibration. It stays off by default: the first live run (below) saved the predicted latency and more, but showed shortfalls at stream start and under load at buffers up to 256 frames.
 
 Client side: `EngineOptions::read_ahead` (`Backend::set_options`) is the wish and the engine owns the switch. `ReadAheadState` is `Unsupported` (the plug-in lacks the property: `AudioObjectHasProperty` is false; the protocol version string never changed, so it cannot tell), `Off` or `On`. After every driver sync (so after a coreaudiod restart, which the engine treats like a wake) and in `set_options` the engine reads `'srla'` and writes it only when it differs from the wish (`read_ahead_repush`): every write restarts the calibration of all streams. A running engine that turned it on writes 0 when it is dropped. `EngineStatus` carries the live state (one HAL read per status poll), `driver_overloads` (`'srov'` of V plus C per vdev id) and `read_ahead_tripped`. Safety net (`ReadAheadGuard`, pure logic, one look per status poll): while on, any growth of a device's `'srov'` or xruns since the previous poll switches it off and sets `read_ahead_tripped` until the options ask for read-ahead again (`'srov'` also counts late writes, so a false alarm only costs the experimental feature). Nothing turns it on by itself. CLI: `sr-cli driver read-ahead [on|off]` (no argument reads; refuses while an engine runs unless `--force`), `sr-cli run --read-ahead`, `doctor`.
 
@@ -73,6 +73,35 @@ Frames saved per traversal with equal reader and writer buffers `B`: `B - guard`
 | 1024 | 896 (18.7 ms) | 1792 (37.3 ms) | 85.33 -> 48.00 ms |
 
 Different reader and writer buffers (V's size is the client app's, the engine's the Audio delay setting) save whatever the measured slack leaves; the model above assumes equal ones. Read-ahead does not touch the aggregate's own offsets (process-tap safety offset, drift compensation). The driver must be reinstalled to get any of this.
+
+### Read-ahead live validation
+
+Installed driver = this repo's `driver/` at 8454dfa (`'srla'` present). Apple M3 Max, macOS 14.7.1, 96 kHz virtual devices (the rate the V devices were at; frames = ms x 96), 2026-11-23. Commands: `packaging/readahead-matrix.sh engine|direct [-g] [-l 8]` (3 runs x 60 s per cell), `srctl loop <uid> <frames> <secs>` (one impulse every 4800 frames from V.out, time to V.in in host time, first 2 s ignored, prints min/mean/max, lost impulses and the growth of `'srov'` on V and C), `sr-cli run --buffer N [--read-ahead]`. Engine path: `soundrouter:v1` with one Pass-Thru source (V.out -> C.in -> mixer -> C.out -> V.in), V's buffer = the engine's buffer = B, srtone playing into v1 meanwhile. Direct path: one V device per size, no engine (an engine removes devices it does not hold, so the two cannot run side by side). The engine's own delay readout (`delay` in `sr-cli run`) does not move with read-ahead; only the impulse probe shows it.
+
+Round trip, mean ms (min to max over the three runs was within 0.2 ms except where noted). Model = the table above, converted to frames; saving is off minus on.
+
+| Path | B | off | on | saving (frames) | model saving (frames) | shortfalls (`srov` growth) on, 3 x 60 s |
+|---|---|---|---|---|---|---|
+| engine | 64 | 2.67 (256) | 1.33 (128) | 1.33 ms (128) | 96 | 0 in the one clean cell (`-g`); with `--read-ahead` 2 of 2 cells had 2 to 3 at start (V +2 or earlier), the engine switched it off |
+| engine | 128 | 5.33 (512) | 1.33 (128) | 4.0 ms (384) | 224 | 0 in one cell; in two others (one under load) 1 mid-run (V +1) or 1 at start (C +1), switched off |
+| engine | 256 | 10.67 (1024) | 2.63 to 2.67 (252 to 256) while on | 8.0 ms (768) | 448 | 3 of 3 cells: C +1, C +1, C +3 in run 1, switched off |
+| engine | 512 | 21.33 (2048) | 5.33 (512) | 16.0 ms (1536) | 896 | 0 in 2 cells (6 runs), stayed on |
+| direct | 64 | 1.33 (128) | 0.67 (64) | 0.67 ms (64) | 48 | 0 (3 valid runs; V +1 once under load, as many as off) |
+| direct | 128 | 2.67 | 1.33 | 1.33 ms (128) | 112 | 0 |
+| direct | 256 | 5.33 | 2.67 | 2.67 ms (256) | 224 | 0 |
+| direct | 512 | 10.67 | 5.33 | 5.33 ms (512) | 448 | 0 |
+
+With 8 `yes` CPU burners: direct 64 and 128 on stayed clean (one V +1 at 64, the same as off); engine 64 on: C +7 and V +1 in run 1 (0.67 ms while on), engine 128 on: C +1 in run 1, each switched off by the engine's guard; with read-ahead off the same cells showed V +1 late writes at most (no xruns, glitches 0). Engine xruns and glitches were 0 in every cell, on or off. The late-write part of `'srov'` also counts with read-ahead off (engine start, loaded runs), so growth must be compared with the off cell.
+
+Reading it:
+
+- **Saving is real and larger than the fakehost model.** Engine path 4B -> B (3B saved, 2B at 64), direct loop 2B -> B: callbacks see the frame in the next cycle. The model's guard (`B - guard`) is conservative; a probe in host time cannot resolve less than a callback.
+- **Failing cells and mechanism.** The engine path at 64, 128 and 256 (and the loaded ones) took 1 to 8 shortfalls, nearly all in the first run after srtone and srctl started with read-ahead already on; the driver's own back-off needs two, the engine's guard switches the switch off at the first. 512 (guard 64 frames = 0.67 ms) and every direct loop (guard 16 to 64) were clean. The data do not pin it on one thing: guard of 16 to 32 frames (0.17 to 0.33 ms) is small against a scheduling hiccup of a busy machine (peers were building during the runs), and a second V.out writer (srtone, then srctl) starting while C.in is frozen on the first writer's phase fits the start-up pattern, but no counter says which. Not fixed in the driver: next step is a debug counter of `slack` at each shortfall and runs on an idle machine.
+- **Interference.** Between 20:50 and 21:15 three runs (direct 2026-11-23 about 20:51 and 21:14, engine 512 about 21:10) saw `'srla'` written off by something other than the engine's guard (no trip logged, no `sr-cli` of ours running); later runs (21:20 on, process snapshot at every flip in a 0.3 s poll) showed only our own guard trips and our own cleanup. Those runs are excluded from the table.
+- **`-g` is not a bypass.** The engine guard also watches a switch it did not set; `-g` only delays enabling until after srtone started.
+- **Stress** (`SR_READ_AHEAD=1 stress edits 200`): PASS (all 200 edits), but the guard switched read-ahead off at edit 19 (`add/remove app source`, a tap rebuild), so edits 20 to 200 ran with it off.
+
+Verdict: not "0 shortfalls everywhere", so default stays off. As an experimental toggle (default off) it is acceptable because the engine's guard limits the harm to one silent tail per enable, and 512-frame engine buffers and the direct loop were clean. Evidence that would justify default on: a start-up shortfall explained and removed (or a guard in milliseconds, not frames), 0 shortfalls over at least 10 runs per cell on an idle machine at 64 to 256, a 1 h soak with edits that does not trip, and a run with real hardware in the route (aggregate drift) and at 44.1 and 48 kHz.
 
 ### Clock and zero timestamps
 

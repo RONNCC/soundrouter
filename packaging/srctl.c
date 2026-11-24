@@ -4,7 +4,8 @@
 //   srctl list                        UIDs of soundrouter: devices the system lists (hidden companions must NOT appear)
 //   srctl vol|mute <uid> in|out [value]  read or set V's volume (scalar) / mute control
 //   srctl vmv <uid> [scalar]          the virtual main volume (output scope) the system volume keys set
-//   srctl loop <uid> [frames]         write impulses to the device output, read its input, report delay
+//   srctl srov <uid>                  the driver's late/short counters of V and its companion C
+//   srctl loop <uid> [frames] [secs]  write impulses to the device output, read its input, report delay (min/mean/max) and the driver's srov growth
 #include <CoreAudio/CoreAudio.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
@@ -44,15 +45,25 @@ static AudioObjectID control(AudioObjectID d, UInt32 cls, UInt32 scope) {
 }
 
 // Loopback probe: impulse every 4800 frames into output ch1; measure host-time delay until it shows on input ch1.
-static volatile UInt64 gSentHost, gDelaySum; static volatile int gN, gArmed; static UInt32 gCh;
+static volatile UInt64 gSentHost, gDelaySum, gDelayMin = ~0ULL, gDelayMax; static volatile int gLost; static UInt64 gLostAfter, gWarm; static volatile int gN, gArmed; static UInt32 gCh; // gWarm: host time before which echoes are not counted (read-ahead calibrates over the first cycles)
 static OSStatus io(AudioObjectID d, const AudioTimeStamp* now, const AudioBufferList* in, const AudioTimeStamp* inT, AudioBufferList* out, const AudioTimeStamp* outT, void* u) {
     static UInt64 frames;
     float* o = out->mBuffers[0].mData; UInt32 n = out->mBuffers[0].mDataByteSize / 4 / gCh;
     memset(o, 0, out->mBuffers[0].mDataByteSize);
     const float* i = in->mBuffers[0].mData;
-    for (UInt32 f = 0; f < n; f++) if (gArmed && i[f * gCh] > 0.5f) { gDelaySum += mach_absolute_time() - gSentHost; gN++; gArmed = 0; }
+    for (UInt32 f = 0; f < n; f++) if (gArmed && i[f * gCh] > 0.5f) { UInt64 dt = mach_absolute_time() - gSentHost; gArmed = 0; if (mach_absolute_time() < gWarm) continue; gDelaySum += dt; if (dt < gDelayMin) gDelayMin = dt; if (dt > gDelayMax) gDelayMax = dt; gN++; }
+    if (gArmed && mach_absolute_time() - gSentHost > gLostAfter) { gLost++; gArmed = 0; } // impulse never came back: count it, send the next
     if (!gArmed && frames % 4800 < n) { o[0] = 1.0f; gSentHost = mach_absolute_time(); gArmed = 1; }
     frames += n; return 0;
+}
+
+// The driver's late/short counter ('srov') of a device by uid; -1 when the device or property is missing.
+static long long srov(const char* uid) {
+    AudioObjectID d = device(uid); if (!d) return -1;
+    AudioObjectPropertyAddress pa = { 'srov', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    CFNumberRef n = NULL; UInt32 sz = sizeof n; long long v = -1;
+    if (AudioObjectGetPropertyData(d, &pa, 0, NULL, &sz, &n) || !n) return -1;
+    CFNumberGetValue(n, kCFNumberSInt64Type, &v); CFRelease(n); return v;
 }
 
 int main(int argc, char** argv) {
@@ -126,19 +137,29 @@ int main(int argc, char** argv) {
         Float32 v = -1; UInt32 n = 4; OSStatus e = AudioObjectGetPropertyData(d, &pa, 0, NULL, &n, &v);
         printf("virtual main volume %.4f (err %d)\n", v, (int)e); return e != 0;
     }
+    if (!strcmp(argv[1], "srov") && argc >= 3) {
+        char comp[160]; snprintf(comp, sizeof comp, "%s.engine", argv[2]);
+        printf("srov V %lld C %lld\n", srov(argv[2]), srov(comp)); return 0;
+    }
     if (!strcmp(argv[1], "loop") && argc >= 3) {
         AudioObjectID d = device(argv[2]); if (!d) { fprintf(stderr, "no device %s\n", argv[2]); return 2; }
         UInt32 frames = argc > 3 ? atoi(argv[3]) : 512, sz = 4;
+        unsigned secs = argc > 4 ? atoi(argv[4]) : 3;
+        char comp[160]; snprintf(comp, sizeof comp, "%s.engine", argv[2]);
+        long long v0 = srov(argv[2]), c0 = srov(comp);
         AudioObjectPropertyAddress fa = { kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, 0 };
         AudioObjectSetPropertyData(d, &fa, 0, NULL, 4, &frames);
         AudioStreamBasicDescription f; sz = sizeof f;
+        Float64 rate = 0; { AudioObjectPropertyAddress ra = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, 0 }; UInt32 rs = sizeof rate; AudioObjectGetPropertyData(d, &ra, 0, NULL, &rs, &rate); }
         AudioObjectPropertyAddress va = { kAudioDevicePropertyStreamFormat, kAudioObjectPropertyScopeOutput, 0 };
         AudioObjectGetPropertyData(d, &va, 0, NULL, &sz, &f); gCh = f.mChannelsPerFrame;
+        { mach_timebase_info_data_t t; mach_timebase_info(&t); gLostAfter = 500000000ULL * t.denom / t.numer; gWarm = mach_absolute_time() + 4 * gLostAfter; } // 0.5 s, warm-up 2 s
         AudioDeviceIOProcID pid; AudioDeviceCreateIOProcID(d, io, NULL, &pid); AudioDeviceStart(d, pid);
-        sleep(3); AudioDeviceStop(d, pid); AudioDeviceDestroyIOProcID(d, pid);
+        sleep(secs); AudioDeviceStop(d, pid); AudioDeviceDestroyIOProcID(d, pid);
         mach_timebase_info_data_t tb; mach_timebase_info(&tb);
         if (!gN) { printf("FAIL: no impulse came back\n"); return 1; }
-        printf("buffer=%u frames ch=%u impulses=%d mean loopback delay=%.2f ms\n", frames, gCh, gN, (double)gDelaySum / gN * tb.numer / tb.denom / 1e6);
+        double ms = (double)tb.numer / tb.denom / 1e6; long long v1 = srov(argv[2]), c1 = srov(comp);
+        printf("buffer=%u frames @%.0f Hz ch=%u impulses=%d mean loopback delay=%.2f ms (min %.2f max %.2f) lost %d, srov V +%lld C +%lld\n", frames, rate, gCh, gN, (double)gDelaySum / gN * ms, gDelayMin * ms, gDelayMax * ms, gLost, v1 - v0, c1 < 0 ? 0 : c1 - c0);
         return 0;
     }
     return 1;
