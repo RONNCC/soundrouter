@@ -1,4 +1,5 @@
 mod common;
+use common::graph::{FxSet, device, graph};
 use common::*;
 use proptest::prelude::*;
 use sr_core::config::*;
@@ -40,11 +41,43 @@ fn arb_device() -> impl Strategy<Value = VirtualDevice> {
         any::<u16>(),
         db(),
         any::<bool>(),
+        prop::option::of("[a-z0-9]{0,4}"),
     )
-        .prop_map(|(source, src_ch, out_ch, gain_db, invert)| Wire {
+        .prop_map(|(source, src_ch, out_ch, gain_db, invert, to)| Wire {
             gain_db,
             invert,
+            to,
             ..Wire::new(source, src_ch, out_ch)
+        });
+    let fx = prop_oneof![
+        Just(Fx::Mono),
+        (db(), db()).prop_map(|(ceiling_db, knee_db)| Fx::Limiter {
+            ceiling_db,
+            knee_db
+        }),
+        (db(), db(), db(), db()).prop_map(|(low_hz, low_db, high_hz, high_db)| Fx::Eq {
+            low_hz,
+            low_db,
+            high_hz,
+            high_db
+        }),
+        db().prop_map(|ms| Fx::Delay { ms }),
+    ];
+    let node = (
+        "[a-z0-9]{0,4}",
+        "\\PC{0,10}",
+        any::<u16>(),
+        db(),
+        any::<bool>(),
+        prop::collection::vec(fx, 0..5),
+    )
+        .prop_map(|(id, name, channels, gain_db, muted, fx)| Node {
+            id,
+            name,
+            channels,
+            gain_db,
+            muted,
+            fx,
         });
     let mon = (
         "\\PC{0,10}",
@@ -73,9 +106,10 @@ fn arb_device() -> impl Strategy<Value = VirtualDevice> {
         prop::collection::vec(arb_source(), 0..4),
         prop::collection::vec(wire, 0..6),
         prop::collection::vec(mon, 0..3),
+        prop::collection::vec(node, 0..3),
     )
         .prop_map(
-            |(id, name, enabled, channels, volume_db, muted, sources, wires, monitors)| {
+            |(id, name, enabled, channels, volume_db, muted, sources, wires, monitors, nodes)| {
                 VirtualDevice {
                     id,
                     name,
@@ -86,7 +120,7 @@ fn arb_device() -> impl Strategy<Value = VirtualDevice> {
                     sources,
                     wires,
                     monitors,
-                    nodes: Vec::new(),
+                    nodes,
                 }
             },
         )
@@ -217,6 +251,8 @@ proptest! {
                 prop_assert!(!d.name.trim().is_empty() && d.name.chars().count() <= MAX_NAME_CHARS);
                 prop_assert!(d.volume_db.is_finite() && d.volume_db <= MAX_DB);
                 prop_assert!(d.channels % 2 == 0 && (2..=64).contains(&d.channels));
+                prop_assert!(d.nodes.len() <= MAX_NODES);
+                prop_assert!(d.nodes.iter().map(|n| usize::from(n.channels)).sum::<usize>() <= MAX_NODE_CH_TOTAL);
                 for s in &d.sources {
                     prop_assert!(s.volume_db.is_finite() && s.volume_db <= MAX_DB);
                     if matches!(s.kind, SourceKind::App { .. }) {
@@ -517,6 +553,39 @@ proptest! {
         {
             for d in &cfg.devices {
                 for out in mix_once(d, &ins) {
+                    prop_assert!(out.iter().all(|x| x.is_finite()), "non-finite output from a validated device");
+                }
+            }
+        }
+    }
+
+    /// The same for a document with nodes, effects and wires through them.
+    #[test]
+    fn mutated_node_documents_either_fail_cleanly_or_mix_finitely(
+        g in graph(FxSet::All),
+        edits in prop::collection::vec((any::<prop::sample::Index>(), hostile_leaf()), 0..4),
+        ins in prop::collection::vec(nasty_sample(), 1..40),
+    ) {
+        let mut doc = serde_json::to_value(Config { devices: vec![device(&g)], ..Config::default() }).unwrap();
+        for (at, leaf) in &edits {
+            let mut n = 0;
+            fn count(v: &serde_json::Value, n: &mut usize) {
+                *n += 1;
+                match v {
+                    serde_json::Value::Array(a) => a.iter().for_each(|x| count(x, n)),
+                    serde_json::Value::Object(o) => o.values().for_each(|x| count(x, n)),
+                    _ => {}
+                }
+            }
+            count(&doc, &mut n);
+            replace_node(&mut doc, &mut at.index(n), leaf);
+        }
+        if let Ok(cfg) = serde_json::from_value::<Config>(doc)
+            && cfg.validate().is_ok()
+        {
+            for d in &cfg.devices {
+                // Twice: the second block runs on whatever the first left in filters and delay lines.
+                for out in mix_once(d, &ins).into_iter().chain(mix_once(d, &ins)) {
                     prop_assert!(out.iter().all(|x| x.is_finite()), "non-finite output from a validated device");
                 }
             }

@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub mod graph;
 use sr_core::config::*;
 use sr_core::mixer::*;
 

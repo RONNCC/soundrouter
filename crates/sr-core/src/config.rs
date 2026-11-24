@@ -10,6 +10,11 @@ pub const MAX_NAME_CHARS: usize = 64;
 pub const MAX_NODES: usize = 16;
 pub const MAX_NODE_CH: usize = 8;
 pub const MAX_NODE_CH_TOTAL: usize = 32;
+/// Effects in one node's insert list, the longest `Fx::Delay` in ms, and delay-line channels over a
+/// device's nodes (each is a 200 ms ring, 54 KB at 48 kHz).
+pub const MAX_FX: usize = 4;
+pub const MAX_DELAY_MS: f32 = 200.0;
+pub const MAX_DELAY_CH: usize = 8;
 /// Highest accepted volume in dB; anything lower (even -200) is valid and just means near-silence.
 pub const MAX_DB: f32 = 24.0;
 /// Highest `version` this build reads. [`Config`] writes the lowest version that can hold its content
@@ -105,6 +110,53 @@ pub struct Node {
     pub gain_db: f32,
     #[serde(default)]
     pub muted: bool,
+    /// Inserts, run in order over the summed rows before the fader.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fx: Vec<Fx>,
+}
+
+/// A built-in effect of a node (`docs/NODES.md` section 2). The list is closed: an unknown `type` fails
+/// the parse, so a build never half-understands a file that uses an effect it lacks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Fx {
+    /// Average each channel pair (0,1), (2,3), ...
+    Mono,
+    /// Zero look-ahead soft clip: `ceiling_db` -24..=0, `knee_db` 0..=12.
+    Limiter {
+        #[serde(default = "limiter_ceiling")]
+        ceiling_db: f32,
+        #[serde(default = "limiter_knee")]
+        knee_db: f32,
+    },
+    /// Low and high shelf: `low_hz` 20..=2000, `high_hz` 1000..=20000, gains -18..=18 dB.
+    Eq {
+        #[serde(default = "eq_low_hz")]
+        low_hz: f32,
+        #[serde(default)]
+        low_db: f32,
+        #[serde(default = "eq_high_hz")]
+        high_hz: f32,
+        #[serde(default)]
+        high_db: f32,
+    },
+    /// Sample-accurate delay, `ms` 0..=`MAX_DELAY_MS`; adds exactly that much latency.
+    Delay {
+        #[serde(default)]
+        ms: f32,
+    },
+}
+fn limiter_ceiling() -> f32 {
+    -1.0
+}
+fn limiter_knee() -> f32 {
+    6.0
+}
+fn eq_low_hz() -> f32 {
+    120.0
+}
+fn eq_high_hz() -> f32 {
+    8000.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -219,6 +271,7 @@ fn validate_nodes<'a>(dev: &'a VirtualDevice, ids: &mut HashSet<&'a str>) -> Res
         ));
     }
     let mut total = 0;
+    let mut delay_ch = 0;
     for n in &dev.nodes {
         if n.id.is_empty() || n.id.len() > MAX_ID_BYTES || n.id.contains('\0') {
             return Err(format!(
@@ -246,6 +299,25 @@ fn validate_nodes<'a>(dev: &'a VirtualDevice, ids: &mut HashSet<&'a str>) -> Res
         }
         total += usize::from(n.channels);
         check_db(&format!("node '{}'", n.id), n.gain_db)?;
+        if n.fx.len() > MAX_FX {
+            return Err(format!(
+                "node '{}': {} effects, at most {MAX_FX}",
+                n.id,
+                n.fx.len()
+            ));
+        }
+        for fx in &n.fx {
+            check_fx(&n.id, fx)?;
+            if matches!(fx, Fx::Delay { .. }) {
+                delay_ch += usize::from(n.channels);
+            }
+        }
+    }
+    if delay_ch > MAX_DELAY_CH {
+        return Err(format!(
+            "device '{}': {delay_ch} delay channels, at most {MAX_DELAY_CH}",
+            dev.id
+        ));
     }
     if total > MAX_NODE_CH_TOTAL {
         return Err(format!(
@@ -254,6 +326,41 @@ fn validate_nodes<'a>(dev: &'a VirtualDevice, ids: &mut HashSet<&'a str>) -> Res
         ));
     }
     Ok(())
+}
+
+/// Every parameter finite and in its range.
+fn check_fx(node: &str, fx: &Fx) -> Result<(), String> {
+    let ok = |what: &str, x: f32, lo: f32, hi: f32| {
+        if x.is_finite() && (lo..=hi).contains(&x) {
+            Ok(())
+        } else {
+            Err(format!(
+                "node '{node}': {what} {x} must be finite and in {lo}..={hi}"
+            ))
+        }
+    };
+    match *fx {
+        Fx::Mono => Ok(()),
+        Fx::Limiter {
+            ceiling_db,
+            knee_db,
+        } => {
+            ok("limiter ceiling_db", ceiling_db, -24.0, 0.0)?;
+            ok("limiter knee_db", knee_db, 0.0, 12.0)
+        }
+        Fx::Eq {
+            low_hz,
+            low_db,
+            high_hz,
+            high_db,
+        } => {
+            ok("eq low_hz", low_hz, 20.0, 2000.0)?;
+            ok("eq low_db", low_db, -18.0, 18.0)?;
+            ok("eq high_hz", high_hz, 1000.0, 20000.0)?;
+            ok("eq high_db", high_db, -18.0, 18.0)
+        }
+        Fx::Delay { ms } => ok("delay ms", ms, 0.0, MAX_DELAY_MS),
+    }
 }
 
 /// Kahn's algorithm over the node-to-node wires; what it cannot order is a cycle (a self wire included).

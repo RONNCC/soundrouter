@@ -909,6 +909,7 @@ fn feedback_through_a_node_is_found_and_a_node_input_is_not_a_vdev_channel() {
         channels: 2,
         gain_db: 0.0,
         muted: false,
+        fx: Vec::new(),
     }];
     let virt = |u: &str| u == "BlackHole16ch_UID";
     let (clean, warnings) = without_feedback(&dev, &virt);

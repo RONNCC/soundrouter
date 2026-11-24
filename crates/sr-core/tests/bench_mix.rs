@@ -50,6 +50,7 @@ fn buses16() -> (VirtualDevice, IoLayout) {
             channels: 2,
             gain_db: -1.0,
             muted: false,
+            fx: Vec::new(),
         })
         .collect();
     d.wires = (0..32u16)
@@ -64,6 +65,31 @@ fn buses16() -> (VirtualDevice, IoLayout) {
             ]
         })
         .collect();
+    (d, l)
+}
+
+/// `buses16` with the effects of the spec's cost gate: every node has mono, an EQ and a limiter, and four
+/// of them (the delay-line budget, 8 channels) a 5 ms delay as well.
+fn buses16_fx() -> (VirtualDevice, IoLayout) {
+    let (mut d, l) = buses16();
+    for (i, n) in d.nodes.iter_mut().enumerate() {
+        n.fx = vec![
+            Fx::Mono,
+            Fx::Eq {
+                low_hz: 120.0,
+                low_db: 3.0,
+                high_hz: 8000.0,
+                high_db: -3.0,
+            },
+            Fx::Limiter {
+                ceiling_db: -1.0,
+                knee_db: 6.0,
+            },
+        ];
+        if i < 4 {
+            n.fx.push(Fx::Delay { ms: 5.0 });
+        }
+    }
     (d, l)
 }
 
@@ -103,13 +129,15 @@ fn bench_mix() {
     let (d64, l64) = wide(64);
     let (d32, l32) = wide(32);
     let (db, lb) = buses16();
+    let (dx, lx) = buses16_fx();
     for frames in [64, 128, 256] {
         println!(
-            "frames {frames:>3}: stereo {:>8.0} ns   64ch {:>8.0} ns   32ch {:>8.0} ns   16 buses (32 node ch) {:>8.0} ns",
+            "frames {frames:>3}: stereo {:>8.0} ns   64ch {:>8.0} ns   32ch {:>8.0} ns   16 buses (32 node ch) {:>8.0} ns   16 buses + all effects {:>8.0} ns",
             ns_per_call(&d2, &l2, frames),
             ns_per_call(&d64, &l64, frames),
             ns_per_call(&d32, &l32, frames),
-            ns_per_call(&db, &lb, frames)
+            ns_per_call(&db, &lb, frames),
+            ns_per_call(&dx, &lx, frames)
         );
     }
 }

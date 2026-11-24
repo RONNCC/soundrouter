@@ -1,7 +1,8 @@
 use crate::config::{
-    MAX_CH, MAX_DB, MAX_FRAMES, MAX_NODE_CH, MAX_NODE_CH_TOTAL, MAX_NODES, SourceKind,
-    VirtualDevice,
+    MAX_CH, MAX_DB, MAX_DELAY_CH, MAX_FRAMES, MAX_FX, MAX_NODE_CH, MAX_NODE_CH_TOTAL, MAX_NODES,
+    SourceKind, VirtualDevice,
 };
+use crate::fx::Effect;
 use crate::meters::{METER_SLOTS, Meters, node_slots, peak, peak_finite};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::collections::hash_map::DefaultHasher;
@@ -26,7 +27,7 @@ pub struct IoLayout {
 /// Frames a gain change takes to cross one unit of gain: 10 ms at 48 kHz. A block shorter than this
 /// (64-frame buffers are 1.3 ms) moves only part of the way and the next blocks go on, so a mute or a
 /// volume jump never steps in less time than that; a longer block ramps across the whole block.
-const RAMP_FRAMES: f32 = 480.0;
+pub(crate) const RAMP_FRAMES: f32 = 480.0;
 
 /// Where a gain that is at `cur` and wants `target` stands after `n` frames.
 fn slew(cur: f32, target: f32, n: usize) -> f32 {
@@ -111,6 +112,12 @@ struct NodePlan {
     gain: usize,
     /// First `Meters` node slot: config order, so `Meters::take` can name them from the device alone.
     meter: usize,
+    /// Position in `dev.nodes`, the slot of its limiter reduction.
+    cfg: usize,
+    /// The inserts, run in order over the rows after the incoming taps.
+    fx: Vec<Effect>,
+    /// It was muted (and so skipped) in an earlier block: what the effects remember is stale.
+    was_silent: bool,
 }
 
 /// What V's volume and mute (what the volume keys move while V is the system output) do to each app source,
@@ -209,7 +216,7 @@ fn clean(x: f32) -> f32 {
 
 /// Zeroed scratch whose pages are already mapped. Fresh zero pages fault in on the first write, and that
 /// write would be the audio thread's: up to 64 faults (about 1.5 us each) after every plan swap.
-fn prefaulted(len: usize) -> Vec<f32> {
+pub(crate) fn prefaulted(len: usize) -> Vec<f32> {
     let mut v = vec![0.0f32; len];
     // One write per 4 KiB, the smallest page; volatile so the store of a zero over zeroed memory stays.
     for x in v.iter_mut().step_by(1024) {
@@ -345,6 +352,21 @@ impl MixPlan {
                 srcs.push(Gain::new(&n.id, n.gain_db, n.muted));
             }
         }
+        // The inserts of each usable node, built in config order so the delay-line budget is spent in a
+        // fixed order; those past `MAX_FX` or the budget are not built.
+        let mut delay_budget = MAX_DELAY_CH;
+        let mut fx_of: Vec<Vec<Effect>> = usable
+            .iter()
+            .map(|&i| {
+                let n = &dev.nodes[i];
+                n.fx.iter()
+                    .take(MAX_FX)
+                    .filter_map(|f| {
+                        Effect::new(f, usize::from(n.channels), rate, &mut delay_budget)
+                    })
+                    .collect()
+            })
+            .collect();
         let node_of = |id: &str| usable.iter().position(|&i| dev.nodes[i].id == id);
         let node_ch = |k: usize| usize::from(dev.nodes[usable[k]].channels);
         let src_gain = dev.sources.len();
@@ -473,6 +495,9 @@ impl MixPlan {
                 ch: node_ch(k),
                 gain: src_gain + k,
                 meter: slots[usable[k]],
+                cfg: usable[k],
+                fx: std::mem::take(&mut fx_of[k]),
+                was_silent: false,
             })
             .collect();
         let mut dev_out = Vec::new();
@@ -547,6 +572,7 @@ impl MixPlan {
         }
         for n in &nodes {
             (srcs[n.gain].key, n.row0, n.ch).hash(&mut h);
+            n.fx.iter().for_each(|f| f.tag().hash(&mut h));
         }
         dev_out.hash(&mut h);
         for m in &mons {
@@ -582,9 +608,25 @@ impl MixPlan {
         self.rate
     }
 
-    /// Continue gain ramps from what `old` last applied.
-    fn inherit(&mut self, old: &MixPlan) {
+    /// Continue gain ramps and effect state from what `old` last applied. `keep_old`: `old` still runs one
+    /// more block (a crossfade), so its large state is copied instead of swapped.
+    fn inherit(&mut self, old: &mut MixPlan, keep_old: bool) {
         self.srcs.iter_mut().for_each(|g| g.inherit(&old.srcs));
+        for n in &mut self.nodes {
+            let key = self.srcs[n.gain].key;
+            if let Some(o) = old
+                .nodes
+                .iter_mut()
+                .find(|o| old.srcs[o.gain].key == key && o.ch == n.ch)
+            {
+                n.was_silent = o.was_silent;
+                for (f, of) in n.fx.iter_mut().zip(&mut o.fx) {
+                    if f.tag() == of.tag() {
+                        f.inherit(of, keep_old);
+                    }
+                }
+            }
+        }
         let (mut i, mut j) = (0, 0);
         while let (Some(&(ki, ti)), Some(&(kj, tj))) = (self.tap_keys.get(i), old.tap_keys.get(j)) {
             match ki.cmp(&kj) {
@@ -636,7 +678,7 @@ impl MixPlan {
             self.acc[c * MAX_FRAMES..][..n].fill(0.0);
         }
         let mut start = 0;
-        for (node, &stop) in self.nodes.iter().zip(&self.node_end) {
+        for (node, &stop) in self.nodes.iter_mut().zip(&self.node_end) {
             let g = &self.srcs[node.gain];
             // A node whose mute has settled neither mixes nor meters: its outgoing wires add nothing.
             if g.cur != 0.0 || g.next != 0.0 {
@@ -654,12 +696,26 @@ impl MixPlan {
                         &mut self.acc,
                     );
                 }
+                let rows = &mut self.node_buf[node.row0 * MAX_FRAMES..][..node.ch * MAX_FRAMES];
+                if node.was_silent {
+                    node.fx.iter_mut().for_each(Effect::reset);
+                    node.was_silent = false;
+                }
+                let mut reduction = 0.0f32;
+                for f in &mut node.fx {
+                    reduction = reduction.max(f.run(rows, node.ch, n));
+                }
+                if reduction > 0.0 {
+                    meters.update_reduction(node.cfg, reduction);
+                }
                 // What leaves the node: row peak times the fader's larger end of the block.
                 let fader = g.cur.abs().max(g.next.abs());
                 for r in 0..node.ch {
                     let row = &self.node_buf[(node.row0 + r) * MAX_FRAMES..][..n];
                     meters.update_node(node.meter + r, peak(row) * fader);
                 }
+            } else {
+                node.was_silent = true;
             }
             start = stop;
         }
@@ -815,13 +871,13 @@ impl Mixer {
             if let Some(stale) = self.fade.take() {
                 let _ = self.ret.push(stale); // a fade the block loop never reached
             }
-            if let Some(old) = self.plan.take() {
-                new.inherit(&old);
-                if old.route != new.route
+            if let Some(mut old) = self.plan.take() {
+                let fade = old.route != new.route
                     && old.in_len == new.in_len
                     && old.out_len == new.out_len
-                    && old.out_len <= MAX_CH
-                {
+                    && old.out_len <= MAX_CH;
+                new.inherit(&mut old, fade);
+                if fade {
                     self.fade = Some(old);
                 } else {
                     let _ = self.ret.push(old); // full return queue: drops here, cannot happen by sizing
@@ -983,7 +1039,7 @@ mod tests {
             &layout(),
             48_000.0,
         );
-        new.inherit(&old);
+        new.inherit(&mut old, false);
         let cur: Vec<f32> = new.taps.iter().map(|t| t.wire.cur).collect();
         assert_eq!(
             cur,

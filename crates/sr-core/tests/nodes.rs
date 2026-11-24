@@ -8,216 +8,16 @@ use sr_core::meters::Meters;
 use sr_core::mixer::*;
 use std::sync::Arc;
 
-const SRCS: usize = 3; // stereo sources s0..s2
-const NCH: usize = 4; // vdev channels
-
-/// A signal in the graph: a source channel or a node row.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Sig {
-    Src(usize, usize),
-    Node(usize, usize),
-}
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Target {
-    Node(usize, usize),
-    Vdev(usize),
-}
-#[derive(Clone, Debug)]
-struct W {
-    from: Sig,
-    to: Target,
-    db: f32,
-    invert: bool,
-}
-#[derive(Clone, Debug)]
-struct G {
-    src_db: Vec<(f32, bool)>,
-    nodes: Vec<(u16, f32, bool)>, // channels, fader dB, muted
-    wires: Vec<W>,
-}
-
-/// Random DAG: `keys` order the nodes (a wire goes from the lower to the higher key), which is unrelated
-/// to their config order, so the plan has to find the topological order itself.
-fn graph() -> impl Strategy<Value = G> {
-    (
-        prop::collection::vec((-12.0f32..=6.0, any::<bool>()), SRCS),
-        prop::collection::vec((1u16..=3, -12.0f32..=6.0, any::<bool>()), 0..=6),
-        prop::collection::vec(any::<u8>(), 6),
-        prop::collection::vec((any::<u32>(), -12.0f32..=6.0, any::<bool>()), 0..24),
-    )
-        .prop_map(|(src_db, nodes, keys, picks)| {
-            let mut sigs: Vec<Sig> = (0..SRCS)
-                .flat_map(|s| (0..2).map(move |c| Sig::Src(s, c)))
-                .collect();
-            for (n, (ch, ..)) in nodes.iter().enumerate() {
-                sigs.extend((0..usize::from(*ch)).map(|c| Sig::Node(n, c)));
-            }
-            let rank = |n: usize| (keys[n], n);
-            let mut cands: Vec<(Sig, Target)> = Vec::new();
-            for &s in &sigs {
-                for c in 0..NCH {
-                    cands.push((s, Target::Vdev(c)));
-                }
-                for (b, (ch, ..)) in nodes.iter().enumerate() {
-                    let ok = match s {
-                        Sig::Src(..) => true,
-                        Sig::Node(a, _) => rank(a) < rank(b),
-                    };
-                    if ok {
-                        cands.extend((0..usize::from(*ch)).map(|c| (s, Target::Node(b, c))));
-                    }
-                }
-            }
-            let mut taken = vec![false; cands.len()];
-            let mut wires = Vec::new();
-            for (i, db, invert) in picks {
-                let i = i as usize % cands.len();
-                if !std::mem::replace(&mut taken[i], true) {
-                    wires.push(W {
-                        from: cands[i].0,
-                        to: cands[i].1,
-                        db,
-                        invert,
-                    });
-                }
-            }
-            G {
-                src_db,
-                nodes,
-                wires,
-            }
-        })
-}
-
-fn lin(db: f32, off: bool) -> f64 {
-    if off {
-        0.0
-    } else {
-        10f64.powf(f64::from(db) / 20.0)
-    }
-}
-
-/// Steady output per vdev channel for constant inputs `x` (6 slots), summed naively in f64. `flat`:
-/// every gain 1, nothing muted or inverted: an upper bound of any level for `x >= 0` and gains <= 1.
-fn oracle(g: &G, x: &[f64], flat: bool) -> Vec<f64> {
-    fn val(g: &G, x: &[f64], flat: bool, memo: &mut Vec<Vec<Option<f64>>>, s: Sig) -> f64 {
-        match s {
-            Sig::Src(i, c) => {
-                x[i * 2 + c]
-                    * if flat {
-                        1.0
-                    } else {
-                        lin(g.src_db[i].0, g.src_db[i].1)
-                    }
-            }
-            Sig::Node(n, c) => {
-                let row = match memo[n][c] {
-                    Some(v) => v,
-                    None => {
-                        let v = sum(g, x, flat, memo, Target::Node(n, c));
-                        memo[n][c] = Some(v);
-                        v
-                    }
-                };
-                let (_, db, muted) = g.nodes[n];
-                row * if flat { 1.0 } else { lin(db, muted) }
-            }
-        }
-    }
-    fn sum(g: &G, x: &[f64], flat: bool, memo: &mut Vec<Vec<Option<f64>>>, t: Target) -> f64 {
-        g.wires
-            .iter()
-            .filter(|w| w.to == t)
-            .map(|w| {
-                let trim = if flat {
-                    1.0
-                } else {
-                    lin(w.db, false) * if w.invert { -1.0 } else { 1.0 }
-                };
-                trim * val(g, x, flat, memo, w.from)
-            })
-            .sum()
-    }
-    let mut memo: Vec<Vec<Option<f64>>> = g
-        .nodes
-        .iter()
-        .map(|(ch, ..)| vec![None; usize::from(*ch)])
-        .collect();
-    (0..NCH)
-        .map(|c| sum(g, x, flat, &mut memo, Target::Vdev(c)))
-        .collect()
-}
-
-fn device(g: &G) -> VirtualDevice {
-    let mut d = dev();
-    d.channels = NCH as u16;
-    d.sources = (0..SRCS)
-        .map(|i| src(&format!("s{i}"), 2, g.src_db[i].0, g.src_db[i].1))
-        .collect();
-    d.nodes = g
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, &(channels, gain_db, muted))| Node {
-            id: format!("n{i}"),
-            name: format!("Node {i}"),
-            channels,
-            gain_db,
-            muted,
-        })
-        .collect();
-    d.wires = g
-        .wires
-        .iter()
-        .map(|w| {
-            let (source, src_ch) = match w.from {
-                Sig::Src(i, c) => (format!("s{i}"), c),
-                Sig::Node(i, c) => (format!("n{i}"), c),
-            };
-            let (to, out_ch) = match w.to {
-                Target::Node(i, c) => (Some(format!("n{i}")), c),
-                Target::Vdev(c) => (None, c),
-            };
-            Wire {
-                gain_db: w.db,
-                invert: w.invert,
-                to,
-                ..Wire::new(source, src_ch as u16, out_ch as u16)
-            }
-        })
-        .collect();
-    d
-}
-
-fn layout6() -> IoLayout {
-    IoLayout {
-        inputs: (0..SRCS * 2)
-            .map(|i| Some((format!("s{}", i / 2), (i % 2) as u16)))
-            .collect(),
-        outputs: (0..NCH as u16).map(|c| Some(OutPort::Device(c))).collect(),
-    }
-}
-
-fn mixer_for(d: &VirtualDevice) -> (Mixer, MixerHandle, Arc<Meters>) {
-    let meters = Arc::new(Meters::new());
-    let (m, mut h) = mixer(meters.clone());
-    h.set_plan(MixPlan::compile(d, &layout6(), 48_000.0));
-    (m, h, meters)
-}
-
-fn block(m: &mut Mixer, x: &[f64], n: usize) -> Vec<Vec<f32>> {
-    let ins: Vec<Vec<f32>> = x.iter().map(|v| vec![*v as f32; n]).collect();
-    run(m, &ins, NCH, n)
-}
+use common::graph::*;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
 
-    /// Whatever the DAG (node order in the config unrelated to the signal order), the settled output is the
+    /// Whatever the DAG (node order in the config unrelated to the signal order), the output is the
     /// naive sum of gains along every path.
     #[test]
     fn output_is_the_sum_of_gains_over_every_path(
-        g in graph(),
+        g in graph(FxSet::None),
         n in 1usize..200,
         x in prop::collection::vec(-1.0f64..=1.0, SRCS * 2),
     ) {
@@ -225,19 +25,19 @@ proptest! {
         let cfg = Config { devices: vec![d.clone()], ..Config::default() };
         prop_assert!(cfg.validate().is_ok());
         let (mut m, _h, _) = mixer_for(&d);
-        let want = oracle(&g, &x, false);
+        let want = constant(&g, &x, n, false);
         let got = block(&mut m, &x, n);
         for c in 0..NCH {
             prop_assert!(
-                got[c].iter().all(|v| (f64::from(*v) - want[c]).abs() <= 1e-4 * (1.0 + want[c].abs())),
-                "ch {c}: {} vs {}", got[c][0], want[c]
+                got[c].iter().zip(&want[c]).all(|(v, w)| (f64::from(*v) - w).abs() <= 1e-4 * (1.0 + w.abs())),
+                "ch {c}: {} vs {}", got[c][0], want[c][0]
             );
         }
     }
 
     /// Settled gains make every block split bit-identical: nothing in a node depends on where blocks end.
     #[test]
-    fn block_splits_do_not_change_a_sample(g in graph(), seed in any::<u64>()) {
+    fn block_splits_do_not_change_a_sample(g in graph(FxSet::None), seed in any::<u64>()) {
         let d = device(&g);
         let total = 600;
         let ins: Vec<Vec<f32>> = (0..SRCS * 2)
@@ -265,59 +65,78 @@ proptest! {
 
     /// Swaps between random graphs (a node or wire appears, goes away, is re-pointed, a fader moves): the
     /// swap block crossfades and the rest are gain slews, never a step of the whole level, and 2000 frames
-    /// later the output is the new graph's oracle.
+    /// later the output is the new graph's steady value.
     #[test]
     fn swaps_between_graphs_neither_click_nor_drift(
-        seq in prop::collection::vec((graph(), 16usize..200), 2..6),
+        seq in prop::collection::vec((graph(FxSet::None), 16usize..200), 2..6),
         x in prop::collection::vec(0.1f64..=1.0, SRCS * 2),
     ) {
-        let mut seq = seq;
-        // The tests' levels stay below 1 per stage so the flat graph bounds every path.
-        for (g, _) in &mut seq {
-            g.src_db.iter_mut().for_each(|s| s.0 = s.0.min(0.0));
-            g.nodes.iter_mut().for_each(|n| n.1 = n.1.min(0.0));
-            g.wires.iter_mut().for_each(|w| w.db = w.db.min(0.0));
-        }
-        let (mut m, mut h, _) = mixer_for(&device(&seq[0].0));
-        block(&mut m, &x, seq[0].1);
-        let mut last = oracle(&seq[0].0, &x, false);
-        let mut prev = seq[0].0.clone();
-        for (g, n) in &seq[1..] {
-            h.set_plan(MixPlan::compile(&device(g), &layout6(), 48_000.0));
-            let want = oracle(g, &x, false);
-            let level = bound(&prev, g, &x);
-            for b in 0..=2000usize.div_ceil(*n) {
-                let o = block(&mut m, &x, *n);
-                for c in 0..NCH {
-                    // up to ~16 gain stages slew at once; the first block also crossfades
-                    let step = 16.0 * level[c] / 480.0 + if b == 0 { 5.0 * level[c] / *n as f64 } else { 0.0 } + 1e-4;
-                    for &v in &o[c] {
-                        prop_assert!(v.is_finite());
-                        prop_assert!(
-                            (f64::from(v) - last[c]).abs() <= step,
-                            "ch {c} block {b}: {} -> {v} exceeds {step} (n={n})", last[c]
-                        );
-                        last[c] = f64::from(v);
-                    }
-                }
-            }
-            let o = block(&mut m, &x, *n);
-            for c in 0..NCH {
-                prop_assert!(
-                    o[c].iter().all(|v| (f64::from(*v) - want[c]).abs() <= 1e-3 * (1.0 + want[c].abs())),
-                    "ch {c} settled at {}, oracle {}", o[c][0], want[c]
-                );
-            }
-            last = want;
-            prev = g.clone();
-        }
+        swap_fuzz(seq, &x)?;
+    }
+
+    /// The same with mono, limiters and cutting EQs inserted and removed along the way.
+    #[test]
+    fn swaps_between_graphs_with_effects_neither_click_nor_drift(
+        seq in prop::collection::vec((graph(FxSet::Steady), 16usize..200), 2..6),
+        x in prop::collection::vec(0.1f64..=1.0, SRCS * 2),
+    ) {
+        swap_fuzz(seq, &x)?;
     }
 }
 
-/// Largest level a vdev channel can reach moving between two graphs: every path of either, at full gain.
-fn bound(a: &G, b: &G, x: &[f64]) -> Vec<f64> {
-    let (oa, ob) = (oracle(a, x, true), oracle(b, x, true));
-    oa.iter().zip(&ob).map(|(p, q)| p + q).collect()
+fn swap_fuzz(mut seq: Vec<(G, usize)>, x: &[f64]) -> Result<(), TestCaseError> {
+    // Levels stay below 1 per stage so the flat graph bounds every path.
+    for (g, _) in &mut seq {
+        g.src_db.iter_mut().for_each(|s| s.0 = s.0.min(0.0));
+        g.nodes.iter_mut().for_each(|n| n.db = n.db.min(0.0));
+        g.wires.iter_mut().for_each(|w| w.db = w.db.min(0.0));
+    }
+    let (mut m, mut h, _) = mixer_for(&device(&seq[0].0));
+    for _ in 0..=2000usize.div_ceil(seq[0].1) {
+        block(&mut m, x, seq[0].1);
+    }
+    let mut last = steady(&seq[0].0, x, false);
+    let mut prev = seq[0].0.clone();
+    for (g, n) in &seq[1..] {
+        h.set_plan(MixPlan::compile(&device(g), &layout6(), RATE as f32));
+        let want = steady(g, x, false);
+        let level = swap_bound(&prev, g, x);
+        for b in 0..=2000usize.div_ceil(*n) {
+            let o = block(&mut m, x, *n);
+            for c in 0..NCH {
+                // up to ~16 gain stages slew at once; the first block also crossfades
+                let step = 16.0 * level[c] / 480.0
+                    + if b == 0 {
+                        5.0 * level[c] / *n as f64
+                    } else {
+                        0.0
+                    }
+                    + 1e-4;
+                for &v in &o[c] {
+                    prop_assert!(v.is_finite());
+                    prop_assert!(
+                        (f64::from(v) - last[c]).abs() <= step,
+                        "ch {c} block {b}: {} -> {v} exceeds {step} (n={n})",
+                        last[c]
+                    );
+                    last[c] = f64::from(v);
+                }
+            }
+        }
+        let o = block(&mut m, x, *n);
+        for c in 0..NCH {
+            prop_assert!(
+                o[c].iter()
+                    .all(|v| (f64::from(*v) - want[c]).abs() <= 1e-3 * (1.0 + want[c].abs())),
+                "ch {c} settled at {}, steady {}",
+                o[c][0],
+                want[c]
+            );
+        }
+        last = want;
+        prev = g.clone();
+    }
+    Ok(())
 }
 
 // ---- named cases ---------------------------------------------------------------------------------------
@@ -329,6 +148,7 @@ fn node(id: &str, channels: u16, gain_db: f32, muted: bool) -> Node {
         channels,
         gain_db,
         muted,
+        fx: Vec::new(),
     }
 }
 fn via(source: &str, src_ch: u16, to: &str, out_ch: u16) -> Wire {

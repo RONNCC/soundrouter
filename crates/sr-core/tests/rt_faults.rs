@@ -5,7 +5,7 @@
 //! This is the only test in its binary so that nothing else in the process faults meanwhile.
 mod common;
 use common::*;
-use sr_core::config::{Node, Wire};
+use sr_core::config::{Fx, Node, Wire};
 use sr_core::meters::Meters;
 use sr_core::mixer::*;
 use std::sync::Arc;
@@ -50,6 +50,7 @@ fn a_plan_swap_does_not_fault_pages_in_on_the_audio_thread() {
                 channels: 8,
                 gain_db: 0.0,
                 muted: false,
+                fx: vec![Fx::Delay { ms: 20.0 }],
             })
             .collect();
         nodes.wires = (0..n as u16)

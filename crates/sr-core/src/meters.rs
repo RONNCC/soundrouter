@@ -1,5 +1,5 @@
 use crate::backend::MeterReading;
-use crate::config::{MAX_CH, MAX_NODE_CH, MAX_NODE_CH_TOTAL, Node, VirtualDevice};
+use crate::config::{MAX_CH, MAX_NODE_CH, MAX_NODE_CH_TOTAL, MAX_NODES, Node, VirtualDevice};
 use crate::mixer::IoLayout;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
@@ -18,6 +18,8 @@ pub struct Meters {
     outputs: Box<[AtomicU32]>,
     /// Post-fader peaks of the node channels, in config order ([`node_slots`]).
     nodes: Box<[AtomicU32]>,
+    /// Largest limiter gain reduction (`1 - |y|/|x|`) per node, by config position.
+    reductions: Box<[AtomicU32]>,
     /// Blocks silenced because the buffer layout did not match the plan. Written by the audio thread.
     pub mismatch_count: AtomicU64,
     /// IOProc cycles whose sample time did not follow the previous one: the HAL skipped audio (CPU
@@ -36,6 +38,7 @@ impl Default for Meters {
             watched: slots(),
             outputs: slots(),
             nodes: (0..MAX_NODE_CH_TOTAL).map(|_| AtomicU32::new(0)).collect(),
+            reductions: (0..MAX_NODES).map(|_| AtomicU32::new(0)).collect(),
             mismatch_count: AtomicU64::new(0),
             glitch_count: AtomicU64::new(0),
             clipped_blocks: AtomicU64::new(0),
@@ -127,6 +130,11 @@ impl Meters {
         bump(self.nodes.get(idx), p);
     }
 
+    /// Audio thread: record a limiter gain reduction for the node at config position `idx`.
+    pub fn update_reduction(&self, idx: usize, r: f32) {
+        bump(self.reductions.get(idx), r);
+    }
+
     pub fn mismatch_count(&self) -> u64 {
         self.mismatch_count.load(Relaxed)
     }
@@ -177,10 +185,14 @@ impl Meters {
                 (n.id.clone(), peaks)
             })
             .collect();
+        let limiter_reduction = (0..dev.nodes.len())
+            .map(|i| self.reductions.get(i).map_or(0.0, take))
+            .collect();
         MeterReading {
             sources,
             channels,
             nodes,
+            limiter_reduction,
         }
     }
 }

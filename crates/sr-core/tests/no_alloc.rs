@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use sr_core::config::{MAX_FRAMES, Node, Wire};
+use sr_core::config::{Fx, MAX_FRAMES, Node, Wire};
 use sr_core::meters::Meters;
 use sr_core::mixer::*;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -87,6 +87,7 @@ fn bus_dev() -> sr_core::config::VirtualDevice {
         channels: 2,
         gain_db: -1.0,
         muted: false,
+        fx: Vec::new(),
     };
     let via = |s: &str, c, to: &str| Wire {
         to: Some(to.into()),
@@ -141,4 +142,75 @@ fn nodes_do_not_allocate_in_process_or_in_a_plan_swap() {
     let before = ALLOCS.with(|c| c.get());
     m.process(&ins, &mut refs, 64);
     assert_eq!(ALLOCS.with(|c| c.get()) - before, 0);
+}
+
+/// `s1 -> n -> out` with every effect on `n`.
+fn fx_dev(ms: f32, db: f32) -> sr_core::config::VirtualDevice {
+    let mut d = dev();
+    d.nodes = vec![Node {
+        id: "n".into(),
+        name: String::new(),
+        channels: 2,
+        gain_db: 0.0,
+        muted: false,
+        fx: vec![
+            Fx::Mono,
+            Fx::Eq {
+                low_hz: 200.0,
+                low_db: db,
+                high_hz: 6000.0,
+                high_db: -db,
+            },
+            Fx::Limiter {
+                ceiling_db: -3.0,
+                knee_db: 6.0,
+            },
+            Fx::Delay { ms },
+        ],
+    }];
+    d.wires = vec![
+        Wire {
+            to: Some("n".into()),
+            ..Wire::new("s1", 0, 0)
+        },
+        Wire {
+            to: Some("n".into()),
+            ..Wire::new("s1", 1, 1)
+        },
+        Wire::new("n", 0, 0),
+        Wire::new("n", 1, 1),
+    ];
+    d
+}
+
+#[test]
+fn every_effect_runs_and_swaps_without_allocating() {
+    let l = layout();
+    let (mut m, mut h) = mixer(Arc::new(Meters::new()));
+    h.set_plan(MixPlan::compile(&fx_dev(5.0, 6.0), &l, 48_000.0));
+    let ins = vec![vec![0.7f32; MAX_FRAMES + 100]; 2];
+    let ins: Vec<&[f32]> = ins.iter().map(|v| v.as_slice()).collect();
+    let mut outs = vec![vec![0.0f32; MAX_FRAMES + 100]; 4];
+    let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(|v| v.as_mut_slice()).collect();
+    m.process(&ins, &mut refs, MAX_FRAMES + 100);
+    let before = ALLOCS.with(|c| c.get());
+    for _ in 0..100 {
+        m.process(&ins, &mut refs, MAX_FRAMES + 100);
+        m.process(&ins, &mut refs, 64);
+    }
+    assert_eq!(ALLOCS.with(|c| c.get()) - before, 0);
+    // Parameter edits (same route: state swapped, a delay retime fading, filter retune), then a structural
+    // edit (a crossfade block with state copied) and back.
+    for (plan, name) in [
+        (fx_dev(30.0, -6.0), "params"),
+        (dev(), "node removed"),
+        (fx_dev(2.0, 3.0), "node back"),
+    ] {
+        h.set_plan(MixPlan::compile(&plan, &l, 48_000.0));
+        let before = ALLOCS.with(|c| c.get());
+        for _ in 0..12 {
+            m.process(&ins, &mut refs, 64);
+        }
+        assert_eq!(ALLOCS.with(|c| c.get()) - before, 0, "{name}");
+    }
 }

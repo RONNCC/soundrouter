@@ -29,6 +29,16 @@ Time for one `Mixer::process` call, measured here (best of 5 rounds, 3 runs, wor
 
 Per-wire trim (NODES step 1) gives each tap a second ramped gain, `g.cur * s0 * wire.cur`; measured against the commit before it, same machine, back to back: stereo 114 vs 114 ns, 64-channel mix 7.6 vs 7.7 us at 64 frames, 8.3-9.7 vs 8.3 us at 128, 16.1 vs 16.4 us at 256, so within run-to-run noise.
 
+Mixer nodes (NODES steps 3 and 4), measured the same way (best of 5 rounds, 3 runs, worst run shown). 16 stereo buses, the cap of 32 node channels, over the plain 32-channel mix, then every node also running mono, a 2-band EQ and a limiter, four of them (the 8 delay channels) a 5 ms delay as well:
+
+| Frames | Period | 32-channel mix | + 16 buses | % of period | + mono, EQ, limiter, delay on 4 | % of period |
+|---|---|---|---|---|---|---|
+| 64 | 1333 us | 3.1 us | 4.3 us | 0.32 % | 15.2 us | 1.14 % |
+| 128 | 2667 us | 4.5 us | 5.9 us | 0.22 % | 31.7 us | 1.19 % |
+| 256 | 5333 us | 8.0 us | 10.8 us | 0.20 % | 65.1 us | 1.22 % |
+
+The review gate of NODES section 1 is 2 % of the period at 64 frames (27 us): met at 1.14 %. The EQ is most of it. Each effect over one stereo node (`bench_effects`, ns per call, 64 / 128 / 256 frames): mono 14 / 15 / 25; limiter 127 / 242 / 536 below the knee and 526 / 741 / 1249 while clipping; EQ, 2 bands 518 / 1334 / 2963; delay 27 / 35 / 56 and 145 / 288 / 575 while retiming. The EQ on subnormal input costs the same as on normal input (911 ns against 911 ns at 64 frames), so the denormal sweep is for the tail and other targets, not for speed here.
+
 The device asks for one buffer every period on its own clock and plays what we hand back at the next period. Work only has to finish before that deadline. Finishing at 17 us or at 0.017 us (1000x faster) delivers the same buffer at the same sample time: latency = buffer count x buffer length + fixed safety offsets, with no compute term. Even the worst case here uses under 1 % of the deadline, so the only thing faster math buys is headroom, as the changelog for e7d390d says ("0 ms by design").
 
 ## 3. Vectorization
@@ -87,6 +97,7 @@ Machine: Apple M3 Max, macOS 14.7.1, 2026-11-21, commit cc0b804, `PATH="$HOME/.c
 
 ```
 cargo test --release -p sr-core --test bench_mix -- --ignored --nocapture    # section 2, run 3 times
+cargo test --release -p sr-core --lib -- --ignored --nocapture bench_effects   # section 2, effects, run 2 times
 cargo rustc -p sr-core --release --lib -- --emit asm -C codegen-units=1       # section 3; count .4s lines after the Mixer::process label in target/release/deps/sr_core-*.s
 clang -O3 -o vdsp docs/latency-bench/vdsp.c -framework Accelerate && ./vdsp    # section 3 table, run 3 times
 clang -O2 -fobjc-arc -o metal docs/latency-bench/metal.m -framework Metal -framework Foundation && ./metal   # section 4, run 2 times
