@@ -2,7 +2,7 @@
 //! drawing: it emits `Edit`s, and `apply` runs them after the frame.
 use sr_core::backend::{AppInfo, EngineStatus, HwDevice};
 use sr_core::config::{
-    Config, MAX_CH, Monitor, MonitorWire, Source, SourceKind, VirtualDevice, Wire,
+    Config, MAX_CH, MAX_DB, Monitor, MonitorWire, Source, SourceKind, VirtualDevice, Wire,
 };
 
 /// Lowest volume the GUI writes (0 % on the slider).
@@ -198,6 +198,15 @@ pub enum Edit {
     Unlink(usize, Link),
     /// Remove every wire ending at this input port.
     Disconnect(usize, Port),
+    /// Trim of one cable in dB (`Wire::gain_db`); the engine checks the range, as for a volume.
+    WireGain(usize, Link, f32),
+    /// Flip the polarity of one cable.
+    WireInvert(usize, Link, bool),
+    /// Pan of a mono L/R cable pair, -1 (left) ..= 1 (right): rewrites both cables' gains. Either
+    /// cable of the pair names it. Not stored: `pan_of` reads it back from the two gains.
+    WirePan(usize, Link, f32),
+    /// Trim every cable into one output channel so they sum back to unity (`balance_db`).
+    BalanceCables(usize, u16),
 }
 
 pub fn new_device(cfg: &mut Config) {
@@ -316,7 +325,11 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
         | Edit::MonitorVolume(d, ..)
         | Edit::Connect(d, _)
         | Edit::Unlink(d, _)
-        | Edit::Disconnect(d, _) => *d,
+        | Edit::Disconnect(d, _)
+        | Edit::WireGain(d, ..)
+        | Edit::WireInvert(d, ..)
+        | Edit::WirePan(d, ..)
+        | Edit::BalanceCables(d, _) => *d,
     };
     if let Edit::RemoveDevice(_) = edit {
         if d < cfg.devices.len() {
@@ -424,6 +437,31 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
                 m.volume_db = db;
             }
         }
+        Edit::WireGain(_, l, db) => {
+            if let Some(w) = wire_mut(dev, l) {
+                w.gain_db = db;
+            }
+        }
+        Edit::WireInvert(_, l, on) => {
+            if let Some(w) = wire_mut(dev, l) {
+                w.invert = on;
+            }
+        }
+        Edit::WirePan(_, l, pan) => {
+            if let Some([left, right]) = pan_pair(dev, l) {
+                let (gl, gr) = pan_gains(pair_level_db(&dev.wires[left], &dev.wires[right]), pan);
+                dev.wires[left].gain_db = gl;
+                dev.wires[right].gain_db = gr;
+            }
+        }
+        Edit::BalanceCables(_, ch) => {
+            let n = fan_in(dev, ch);
+            if n >= 2 {
+                for i in wires_into(dev, ch) {
+                    dev.wires[i].gain_db = balance_db(n);
+                }
+            }
+        }
         Edit::Connect(_, Link { from, to }) => connect(dev, from, to),
         Edit::Unlink(_, link) => unlink(dev, link),
         Edit::Disconnect(_, port) => match port {
@@ -447,9 +485,12 @@ fn connect(dev: &mut VirtualDevice, from: Port, to: Port) {
             if ch >= s.channels || out_ch >= dev.channels {
                 return;
             }
-            let w = Wire::new(s.id.clone(), ch, out_ch);
-            if !dev.wires.contains(&w) {
-                dev.wires.push(w);
+            let same = |w: &Wire| {
+                w.to.is_none() && w.source == s.id && w.src_ch == ch && w.out_ch == out_ch
+            };
+            // A cable keeps its trim when it is plugged in again: match by ends, not by value.
+            if !dev.wires.iter().any(same) {
+                dev.wires.push(Wire::new(s.id.clone(), ch, out_ch));
             }
         }
         (Port::OutOut { ch: out_ch }, Port::Mon { mon, ch }) => {
@@ -483,6 +524,97 @@ fn unlink(dev: &mut VirtualDevice, Link { from, to }: Link) {
         }
         _ => {}
     }
+}
+
+/// The cable of `dev` that `l` draws, if it is a source cable.
+pub fn wire_of(dev: &VirtualDevice, l: Link) -> Option<&Wire> {
+    wire_index(dev, l).map(|i| &dev.wires[i])
+}
+
+fn wire_index(dev: &VirtualDevice, l: Link) -> Option<usize> {
+    let (Port::Src { src, ch }, Port::OutIn { ch: out_ch }) = (l.from, l.to) else {
+        return None;
+    };
+    let id = &dev.sources.get(src)?.id;
+    dev.wires
+        .iter()
+        .position(|w| w.to.is_none() && &w.source == id && w.src_ch == ch && w.out_ch == out_ch)
+}
+
+fn wire_mut(dev: &mut VirtualDevice, l: Link) -> Option<&mut Wire> {
+    wire_index(dev, l).map(|i| &mut dev.wires[i])
+}
+
+/// Indices of the cables that end at output channel `ch` (their source exists).
+fn wires_into(dev: &VirtualDevice, ch: u16) -> Vec<usize> {
+    (0..dev.wires.len())
+        .filter(|&i| {
+            dev.wires[i].to.is_none()
+                && dev.wires[i].out_ch == ch
+                && dev.sources.iter().any(|s| s.id == dev.wires[i].source)
+        })
+        .collect()
+}
+
+/// How many cables feed output channel `ch`: two or more add up.
+pub fn fan_in(dev: &VirtualDevice, ch: u16) -> usize {
+    wires_into(dev, ch).len()
+}
+
+/// Trim per cable that brings `n` equal cables back to the level of one: `-20 log10 n`, to 0.1 dB
+/// (two cables: -6.0).
+pub fn balance_db(n: usize) -> f32 {
+    (-20.0 * (n.max(1) as f32).log10() * 10.0).round() / 10.0
+}
+
+/// Whether every cable into `ch` already carries `balance_db` (nothing left to balance).
+pub fn balanced(dev: &VirtualDevice, ch: u16) -> bool {
+    let want = balance_db(fan_in(dev, ch));
+    wires_into(dev, ch)
+        .iter()
+        .all(|&i| (dev.wires[i].gain_db - want).abs() < 0.05)
+}
+
+/// Lowest gain a pan writes to the far side at the hard stops: finite, as a wire's gain must be,
+/// and far below anything audible.
+const PAN_FLOOR_DB: f32 = -80.0;
+
+/// Indices `[left, right]` of the two cables that carry one source channel to both channels of an
+/// output pair, when `l` is one of them: the cables a pan control moves.
+pub fn pan_pair(dev: &VirtualDevice, l: Link) -> Option<[usize; 2]> {
+    let i = wire_index(dev, l)?;
+    let w = &dev.wires[i];
+    let other = dev
+        .wires
+        .iter()
+        .position(|o| o.source == w.source && o.src_ch == w.src_ch && o.out_ch == w.out_ch ^ 1)?;
+    Some(if w.out_ch.is_multiple_of(2) {
+        [i, other]
+    } else {
+        [other, i]
+    })
+}
+
+/// Combined level of a left/right pair in dB power (two equal cables at 0 dB: +3.01).
+fn pair_level_db(left: &Wire, right: &Wire) -> f32 {
+    let p = |w: &Wire| 10f32.powf(w.gain_db / 10.0);
+    10.0 * (p(left) + p(right)).log10()
+}
+
+/// Constant-power pair for `pan` in -1..=1 at `level` dB: `cos t` and `sin t` with
+/// `t = (pan + 1) pi/4`, so centre is level - 3.01 dB on each side and the power never moves.
+fn pan_gains(level: f32, pan: f32) -> (f32, f32) {
+    let t = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    let db = |x: f32| (level + 20.0 * x.max(1e-9).log10()).clamp(PAN_FLOOR_DB, MAX_DB);
+    (db(t.cos()), db(t.sin()))
+}
+
+/// Pan of the cable pair `l` belongs to, -1 (left) ..= 1 (right), read from the two gains.
+pub fn pan_of(dev: &VirtualDevice, l: Link) -> Option<f32> {
+    let [left, right] = pan_pair(dev, l)?;
+    let lin = |i: usize| 10f32.powf(dev.wires[i].gain_db / 20.0);
+    let t = lin(right).atan2(lin(left));
+    Some((t / std::f32::consts::FRAC_PI_4 - 1.0).clamp(-1.0, 1.0))
 }
 
 /// Valid drop target for a drag that started at `from`.
@@ -822,6 +954,191 @@ pub(crate) mod tests {
         c.validate().unwrap();
     }
 
+    fn src_link(src: usize, ch: u16, out: u16) -> Link {
+        Link {
+            from: Port::Src { src, ch },
+            to: Port::OutIn { ch: out },
+        }
+    }
+
+    /// One mono source wired to both sides of the pair, as `AddSource` does for a microphone.
+    fn mono_pair() -> Config {
+        let mut c = bare_config();
+        let mic = SourceKind::Device { uid: "mic".into() };
+        apply(&mut c, Edit::AddSource(0, mic, 1));
+        assert_eq!(c.devices[0].wires.len(), 2);
+        c
+    }
+
+    #[test]
+    fn wire_gain_and_invert_edit_one_cable() {
+        let mut c = cfg_with_dev();
+        apply(&mut c, Edit::WireGain(0, src_link(0, 1, 1), -6.0));
+        apply(&mut c, Edit::WireInvert(0, src_link(0, 0, 0), true));
+        let w = &c.devices[0].wires;
+        assert_eq!((w[0].gain_db, w[0].invert), (0.0, true));
+        assert_eq!((w[1].gain_db, w[1].invert), (-6.0, false));
+        assert_eq!(wire_of(&c.devices[0], src_link(0, 1, 1)), Some(&w[1]));
+        c.validate().unwrap();
+        // A cable that is not there, or not a source cable, changes nothing.
+        let before = c.clone();
+        apply(&mut c, Edit::WireGain(0, src_link(0, 0, 1), -3.0));
+        apply(&mut c, Edit::WireGain(5, src_link(0, 0, 0), -3.0));
+        apply(
+            &mut c,
+            Edit::WireInvert(
+                0,
+                Link {
+                    from: Port::OutOut { ch: 0 },
+                    to: Port::Mon { mon: 0, ch: 0 },
+                },
+                true,
+            ),
+        );
+        assert_eq!(c, before);
+    }
+
+    #[test]
+    fn a_wire_gain_out_of_range_fails_validation() {
+        for bad in [24.5, 100.0, f32::NAN, f32::INFINITY] {
+            let mut c = cfg_with_dev();
+            apply(&mut c, Edit::WireGain(0, src_link(0, 0, 0), bad));
+            let e = c.validate().unwrap_err();
+            assert!(e.contains("must be finite and <= 24"), "{bad}: {e}");
+        }
+        let mut c = cfg_with_dev();
+        apply(&mut c, Edit::WireGain(0, src_link(0, 0, 0), 24.0));
+        apply(&mut c, Edit::WireGain(0, src_link(0, 1, 1), -200.0));
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn a_trim_survives_unplugging_and_replugging_nothing_else() {
+        let mut c = cfg_with_dev();
+        apply(&mut c, Edit::WireGain(0, src_link(0, 0, 0), -6.0));
+        // Connecting a cable that exists keeps its trim and adds no twin.
+        apply(&mut c, Edit::Connect(0, src_link(0, 0, 0)));
+        assert_eq!(c.devices[0].wires.len(), 2);
+        assert_eq!(c.devices[0].wires[0].gain_db, -6.0);
+        apply(&mut c, Edit::Unlink(0, src_link(0, 0, 0)));
+        apply(&mut c, Edit::Connect(0, src_link(0, 0, 0)));
+        assert_eq!(c.devices[0].wires.last().unwrap().gain_db, 0.0);
+    }
+
+    #[test]
+    fn a_trim_writes_version_2_and_clearing_it_goes_back() {
+        let mut c = cfg_with_dev();
+        let json = |c: &Config| serde_json::to_string(c).unwrap();
+        assert!(json(&c).starts_with(r#"{"version":1,"#));
+        apply(&mut c, Edit::WireInvert(0, src_link(0, 0, 0), true));
+        assert!(json(&c).starts_with(r#"{"version":2,"#));
+        apply(&mut c, Edit::WireInvert(0, src_link(0, 0, 0), false));
+        assert!(json(&c).starts_with(r#"{"version":1,"#));
+    }
+
+    #[test]
+    fn pan_writes_two_constant_power_cables_and_reads_back() {
+        let mut c = mono_pair();
+        let (l, r) = (src_link(0, 0, 0), src_link(0, 0, 1));
+        let dev = |c: &Config| c.devices[0].clone();
+        // Two cables at 0 dB are the centre; reading it changes nothing.
+        assert_eq!(pan_of(&dev(&c), l), Some(0.0));
+        assert_eq!(pan_of(&dev(&c), r), Some(0.0));
+        apply(&mut c, Edit::WirePan(0, r, 0.0));
+        assert!(c.devices[0].wires.iter().all(|w| w.gain_db.abs() < 1e-4));
+        for pan in [-1.0f32, -0.5, 0.25, 1.0] {
+            apply(&mut c, Edit::WirePan(0, l, pan));
+            let w = &c.devices[0].wires;
+            let lin = |i: usize| 10f32.powf(w[i].gain_db / 20.0);
+            // Constant power: the pair's power is what it was at the centre (+3.01 dB).
+            assert!(
+                (lin(0).powi(2) + lin(1).powi(2) - 2.0).abs() < 1e-3,
+                "{pan}"
+            );
+            assert!((pan_of(&dev(&c), r).unwrap() - pan).abs() < 1e-3, "{pan}");
+            assert_eq!(pan_of(&dev(&c), l), pan_of(&dev(&c), r));
+            c.validate().unwrap();
+        }
+        // Hard right keeps the left cable finite (the engine refuses -inf).
+        assert!(c.devices[0].wires[0].gain_db <= -79.0);
+        // From unity at 0 dB the unit-level law: each side is cos t / sin t, so centre is -3.01 dB
+        // below the pair's own level.
+        let mut c = mono_pair();
+        c.devices[0].wires[0].gain_db = -3.0103;
+        c.devices[0].wires[1].gain_db = -3.0103;
+        apply(&mut c, Edit::WirePan(0, l, 0.0));
+        assert!((c.devices[0].wires[0].gain_db + 3.0103).abs() < 1e-3);
+        assert!(pan_of(&dev(&c), l).unwrap().abs() < 1e-4);
+    }
+
+    #[test]
+    fn only_a_cable_pair_of_one_source_channel_has_a_pan() {
+        let c = cfg_with_dev(); // 0->0 and 1->1: two separate channels, no pair
+        assert!(pan_pair(&c.devices[0], src_link(0, 0, 0)).is_none());
+        assert_eq!(pan_of(&c.devices[0], src_link(0, 1, 1)), None);
+        let mut c = mono_pair();
+        apply(&mut c, Edit::Unlink(0, src_link(0, 0, 1)));
+        assert!(pan_pair(&c.devices[0], src_link(0, 0, 0)).is_none());
+        // A pan edit on a lone cable does nothing.
+        let before = c.clone();
+        apply(&mut c, Edit::WirePan(0, src_link(0, 0, 0), 0.7));
+        assert_eq!(c, before);
+    }
+
+    #[test]
+    fn balancing_trims_every_cable_into_a_channel() {
+        let mut c = default_config();
+        apply(&mut c, Edit::AddSource(0, SourceKind::PassThru, 0));
+        apply(
+            &mut c,
+            Edit::AddSource(
+                0,
+                SourceKind::App {
+                    bundle_id: "a.b".into(),
+                },
+                2,
+            ),
+        );
+        apply(&mut c, Edit::WireInvert(0, src_link(1, 0, 0), true));
+        let d = &c.devices[0];
+        assert_eq!(fan_in(d, 0), 2);
+        assert_eq!(fan_in(d, 1), 2);
+        assert!(!balanced(d, 0));
+        apply(&mut c, Edit::BalanceCables(0, 0));
+        let d = &c.devices[0];
+        assert!(balanced(d, 0) && !balanced(d, 1));
+        let gains: Vec<_> = d
+            .wires
+            .iter()
+            .map(|w| (w.out_ch, w.gain_db, w.invert))
+            .collect();
+        assert_eq!(
+            gains,
+            [
+                (0, -6.0, false),
+                (1, 0.0, false),
+                (0, -6.0, true),
+                (1, 0.0, false)
+            ]
+        );
+        c.validate().unwrap();
+        // One cable alone, or a channel nothing feeds, is left alone.
+        let mut one = cfg_with_dev();
+        let before = one.clone();
+        apply(&mut one, Edit::BalanceCables(0, 0));
+        apply(&mut one, Edit::BalanceCables(0, 1));
+        assert_eq!(one, before);
+    }
+
+    #[test]
+    fn balance_trim_is_minus_twenty_log_n_to_a_tenth() {
+        assert_eq!(balance_db(2), -6.0);
+        assert_eq!(balance_db(3), -9.5);
+        assert_eq!(balance_db(4), -12.0);
+        assert_eq!(balance_db(1), 0.0);
+        assert_eq!(balance_db(0), 0.0);
+    }
+
     #[test]
     fn monitor_wiring_and_channel_shrink() {
         let mut c = cfg_with_dev();
@@ -927,7 +1244,14 @@ pub(crate) mod tests {
                     .prop_map(|(d, from, to)| Edit::Connect(d, Link { from, to })),
                 (d.clone(), port(), port())
                     .prop_map(|(d, from, to)| Edit::Unlink(d, Link { from, to })),
-                (d, port()).prop_map(|(d, p)| Edit::Disconnect(d, p)),
+                (d.clone(), port()).prop_map(|(d, p)| Edit::Disconnect(d, p)),
+                (d.clone(), port(), port(), -100.0f32..=24.0)
+                    .prop_map(|(d, from, to, g)| Edit::WireGain(d, Link { from, to }, g)),
+                (d.clone(), port(), port(), any::<bool>())
+                    .prop_map(|(d, from, to, b)| Edit::WireInvert(d, Link { from, to }, b)),
+                (d.clone(), port(), port(), -2.0f32..2.0)
+                    .prop_map(|(d, from, to, p)| Edit::WirePan(d, Link { from, to }, p)),
+                (d, 0u16..70).prop_map(|(d, ch)| Edit::BalanceCables(d, ch)),
             ]
         }
 

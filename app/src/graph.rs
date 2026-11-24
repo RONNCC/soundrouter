@@ -8,11 +8,13 @@ use crate::layout::{
     body_height, wire_distance, wire_mid, wire_points,
 };
 use crate::meter::{PeakHold, level};
-use crate::model::{Edit, Link, Port, can_link, ch_label, links};
+use crate::model::{
+    Edit, Link, Port, balance_db, balanced, can_link, ch_label, fan_in, links, pan_of, wire_of,
+};
 use crate::theme::{Tokens, body, cable_color, caption, label, num, radius, section, tile_tint};
 use crate::widgets::{
-    MIN_HIT, Plug, chevron, darken, hit, jack, loops, menu_hint, meter, name_button, name_widget,
-    plus_circle, slider, switch, tile, x_button, xmark,
+    MIN_HIT, Plug, chevron, darken, hit, hit_rect, jack, loops, menu_hint, meter, name_button,
+    name_widget, plus_circle, slider, switch, tile, trim_glyph, x_button, xmark,
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Popup, PopupCloseBehavior, Pos2, Rect,
@@ -20,7 +22,7 @@ use eframe::egui::{
     epaint::CubicBezierShape, pos2, text::LayoutJob, vec2,
 };
 use sr_core::backend::{AppInfo, HwDevice, MeterReading, TccStatus};
-use sr_core::config::{Config, Monitor, Source, SourceKind, VirtualDevice};
+use sr_core::config::{Config, Monitor, Source, SourceKind, VirtualDevice, Wire};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -56,6 +58,11 @@ pub struct GraphState {
     /// Palette slot of every cable of the shown device, kept until its wires change.
     cables: Cables,
     pub drag: Option<Port>,
+    /// The source cable whose trim controls were showing last frame, so the pointer can travel from
+    /// the cable to its x, which sits off the cable.
+    trim_hot: Option<Link>,
+    /// Text of the open trim popover's gain field while it is being typed in.
+    trim_text: String,
     /// Filled once by a background scan (started on the first frame), see `sr_audio::apps::installed_apps`.
     pub installed: Arc<OnceLock<Vec<AppInfo>>>,
     pub scan_started: bool,
@@ -118,20 +125,29 @@ fn monitor_title(m: &Monitor, hw: &[HwDevice]) -> String {
         .map_or_else(|| last_seen(&m.name, &m.device_uid), |h| h.name.clone())
 }
 
-/// What a card removal removes, as the card names it, for the Undo toast.
-pub fn removed_title(
+/// What an undoable edit did, for the Undo toast: "{verb} {name}." A card removal names the card
+/// as it shows it; balancing cables names the output channel.
+pub fn undo_note(
     cfg: &Config,
     edit: &Edit,
     hw: &[HwDevice],
     apps: &[AppInfo],
     installed: &[AppInfo],
-) -> Option<String> {
+) -> Option<(&'static str, String)> {
     Some(match *edit {
-        Edit::RemoveDevice(d) => cfg.devices.get(d)?.name.clone(),
-        Edit::RemoveSource(d, s) => {
-            source_title(hw, apps, installed, cfg.devices.get(d)?.sources.get(s)?).0
-        }
-        Edit::RemoveMonitor(d, m) => monitor_title(cfg.devices.get(d)?.monitors.get(m)?, hw),
+        Edit::RemoveDevice(d) => ("Removed", cfg.devices.get(d)?.name.clone()),
+        Edit::RemoveSource(d, s) => (
+            "Removed",
+            source_title(hw, apps, installed, cfg.devices.get(d)?.sources.get(s)?).0,
+        ),
+        Edit::RemoveMonitor(d, m) => (
+            "Removed",
+            monitor_title(cfg.devices.get(d)?.monitors.get(m)?, hw),
+        ),
+        Edit::BalanceCables(_, ch) => (
+            "Balanced cables into",
+            format!("channel {}", ch_label(ch, 0)),
+        ),
         _ => return None,
     })
 }
@@ -1434,6 +1450,434 @@ fn draw_cable(p: &egui::Painter, pts: [Pos2; 4], color: Color32, width: f32) {
     }
 }
 
+/// A source cable's trim control: a chip on its middle, always there so the keyboard can reach
+/// it. It shows the cable's gain and polarity when they are set, and opens the trim popover.
+struct Trim {
+    mid: Pos2,
+    /// Where the x sits relative to `mid` while the cable is hot: above or below the chip, in
+    /// whichever slot no other cable's chip is in.
+    x_dy: f32,
+    chip: Rect,
+    /// "-6 dB" and "inv", one per line, only while the cable is trimmed.
+    badge: Vec<String>,
+    resp: Response,
+    open: bool,
+}
+
+const CHIP_H: f32 = 16.0;
+/// Pitch of the chip's lines when it carries both a gain and a polarity.
+const LINE_H: f32 = 12.0;
+/// How far the hovered cable's x sits from its chip: clear of the chip's own `MIN_HIT` target.
+const X_LIFT: f32 = 28.0;
+/// Along the cable, where the chip may sit: the middle, else as near to it as keeps it off
+/// the chips of the cables beside it.
+const CHIP_AT: [f32; 7] = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74];
+/// Width of the trim popover.
+const TRIM_W: f32 = 280.0;
+/// Lowest gain the trim slider reaches; a typed value goes lower.
+const TRIM_MIN_DB: f32 = -40.0;
+
+impl Trim {
+    fn x_at(&self) -> Pos2 {
+        self.mid + vec2(0.0, self.x_dy)
+    }
+
+    /// The x button's target.
+    fn x_zone(&self) -> Rect {
+        hit_rect(Rect::from_center_size(self.x_at(), vec2(8.0, 8.0)))
+    }
+
+    /// The chip, and when the cable is hot a capsule joining it to its x.
+    fn paint(&self, p: &egui::Painter, t: &Tokens, hot: bool) {
+        if hot {
+            let w = self.chip.width().max(MIN_HIT) + 4.0;
+            let (top, bottom) = (
+                (self.chip.top() - 3.0).min(self.x_at().y - 14.0),
+                (self.chip.bottom() + 3.0).max(self.x_at().y + 14.0),
+            );
+            p.rect(
+                Rect::from_min_max(
+                    pos2(self.mid.x - w / 2.0, top),
+                    pos2(self.mid.x + w / 2.0, bottom),
+                ),
+                CornerRadius::same(radius::STRIP),
+                t.raised,
+                Stroke::new(1.0, t.hairline),
+                StrokeKind::Inside,
+            );
+        }
+        let aimed = self.resp.hovered() || self.resp.has_focus();
+        if self.badge.is_empty() {
+            if hot {
+                trim_glyph(p, self.mid, if aimed { t.ink } else { t.muted });
+            }
+        } else {
+            if !hot {
+                p.rect(
+                    self.chip,
+                    CornerRadius::same(8),
+                    t.raised,
+                    Stroke::new(1.0, if aimed { t.muted } else { t.hairline }),
+                    StrokeKind::Inside,
+                );
+            }
+            let n = self.badge.len() as f32;
+            for (i, line) in self.badge.iter().enumerate() {
+                let dy = (i as f32 - (n - 1.0) / 2.0) * LINE_H;
+                p.text(
+                    self.mid + vec2(0.0, dy),
+                    Align2::CENTER_CENTER,
+                    line,
+                    num(10.0),
+                    t.ink,
+                );
+            }
+        }
+        if self.resp.has_focus() {
+            p.rect_stroke(
+                self.chip.expand(2.0),
+                CornerRadius::same(10),
+                Stroke::new(2.0, t.focus),
+                StrokeKind::Outside,
+            );
+        }
+    }
+}
+
+/// A dB value as the chip and the readouts print it: "+3", "-6", "-9.5".
+fn db_text(db: f32) -> String {
+    let r = (db * 10.0).round() / 10.0 + 0.0; // + 0.0 turns -0.0 into 0.0
+    if r.fract() == 0.0 {
+        format!("{r:+.0}")
+    } else {
+        format!("{r:+.1}")
+    }
+}
+
+/// What the chip prints for a trimmed cable: the gain, "inv" for a flipped polarity, or both on
+/// two lines (one line would not fit between the cards at the minimum window).
+fn badge_lines(w: &Wire) -> Vec<String> {
+    let gain = (w.gain_db != 0.0).then(|| format!("{} dB", db_text(w.gain_db)));
+    gain.into_iter()
+        .chain(w.invert.then(|| "inv".to_string()))
+        .collect()
+}
+
+/// Point of the cable `pts` at parameter `t`.
+fn wire_at(pts: [Pos2; 4], t: f32) -> Pos2 {
+    CubicBezierShape::from_points_stroke(pts, false, Color32::TRANSPARENT, Stroke::NONE).sample(t)
+}
+
+/// Whether two targets get in each other's way. Two rows are 24 apart and a target 28 tall, so
+/// the 4 px two straight neighbours share is allowed.
+fn crowd(a: Rect, b: Rect) -> bool {
+    a.shrink(2.0).intersects(b.shrink(2.0))
+}
+
+/// The chip of every source cable (`None` for the others, same order as `all`), and its popover.
+/// Cables of one source channel to both sides of a pair run close together, so a chip slides
+/// along its cable until its target is clear of the chips placed before it.
+fn trim_controls(
+    ui: &mut Ui,
+    g: &GraphCtx,
+    st: &mut GraphState,
+    edits: &mut Vec<Edit>,
+    layout: &Layout,
+    all: &[Link],
+) -> Vec<Option<Trim>> {
+    let (dev, t, d) = (g.dev, g.t, g.dev_idx);
+    let mut taken: Vec<Rect> = Vec::new();
+    let mut trims: Vec<Option<Trim>> = all
+        .iter()
+        .map(|l| {
+            let w = wire_of(dev, *l)?;
+            let (a, b) = (layout.port_pos(l.from)?, layout.port_pos(l.to)?);
+            let pts = wire_points(a, b);
+            let badge = badge_lines(w);
+            let width = badge.iter().fold(20.0_f32, |m, line| {
+                let text_w = ui
+                    .painter()
+                    .layout_no_wrap(line.clone(), num(10.0), t.ink)
+                    .size()
+                    .x;
+                m.max(text_w + 12.0)
+            });
+            let size = vec2(
+                width,
+                CHIP_H + LINE_H * badge.len().saturating_sub(1) as f32,
+            );
+            let at = |t: f32| Rect::from_center_size(wire_at(pts, t), size);
+            let t_at = CHIP_AT
+                .into_iter()
+                .find(|&t| !taken.iter().any(|r| crowd(*r, hit_rect(at(t)))))
+                .unwrap_or(CHIP_AT[0]);
+            let chip = at(t_at);
+            taken.push(hit_rect(chip));
+            let resp = hit(ui, chip, Id::unique(("trim", d, l.from, l.to)));
+            let invert = if w.invert { ", inverted" } else { "" };
+            let gain = if w.gain_db != 0.0 {
+                format!(", {} dB", db_text(w.gain_db))
+            } else {
+                String::new()
+            };
+            name_button(
+                &resp,
+                &format!("Cable trim, {}{gain}{invert}", link_tip(g, *l)),
+            );
+            Some(Trim {
+                mid: chip.center(),
+                x_dy: -X_LIFT,
+                chip,
+                badge,
+                resp,
+                open: false,
+            })
+        })
+        .collect();
+    // The x goes above or below its chip, in the first slot no chip is in; with none free, the
+    // one that crowds least.
+    for tr in trims.iter_mut().flatten() {
+        let crowded = |dy: f32| {
+            let zone = hit_rect(Rect::from_center_size(
+                tr.mid + vec2(0.0, dy),
+                vec2(8.0, 8.0),
+            ));
+            taken.iter().filter(|r| crowd(**r, zone)).count()
+        };
+        // The cable's own chip is in `taken` once and clear of every slot by construction.
+        let dy = [-X_LIFT, X_LIFT, -2.0 * X_LIFT, 2.0 * X_LIFT]
+            .into_iter()
+            .min_by_key(|&dy| crowded(dy))
+            .unwrap_or(-X_LIFT);
+        tr.x_dy = dy;
+    }
+    for (l, tr) in all.iter().zip(trims.iter_mut()) {
+        let Some(tr) = tr else { continue };
+        Popup::menu(&tr.resp)
+            .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| trim_popover(ui, g, st, edits, *l));
+        tr.open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&tr.resp));
+    }
+    trims
+}
+
+/// "Two", "Three" ... for the fan-in hint; a plain count past five.
+fn count_word(n: usize) -> String {
+    match n {
+        2 => "Two".into(),
+        3 => "Three".into(),
+        4 => "Four".into(),
+        5 => "Five".into(),
+        n => n.to_string(),
+    }
+}
+
+/// The popover of one source cable: gain, polarity, pan of an L/R pair, and the fan-in hint.
+fn trim_popover(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit>, l: Link) {
+    let (dev, t, d) = (g.dev, g.t, g.dev_idx);
+    let Some(w) = wire_of(dev, l) else {
+        ui.close();
+        return;
+    };
+    let Port::OutIn { ch: out_ch } = l.to else {
+        return;
+    };
+    ui.set_width(TRIM_W);
+    ui.label(
+        egui::RichText::new(link_tip(g, l))
+            .size(11.0)
+            .color(t.muted),
+    );
+    let row = |ui: &mut Ui| {
+        ui.allocate_exact_size(vec2(TRIM_W, MIN_HIT), Sense::hover())
+            .0
+    };
+    let label_at = |ui: &Ui, r: Rect, text: &str| {
+        ui.painter().text(
+            pos2(r.left(), r.center().y),
+            Align2::LEFT_CENTER,
+            text,
+            caption(),
+            t.muted,
+        );
+    };
+
+    // Gain: slider and a field to type a value in.
+    let r = row(ui);
+    label_at(ui, r, "Gain");
+    let before = w.gain_db.clamp(TRIM_MIN_DB, sr_core::config::MAX_DB);
+    let mut v = before;
+    let rail = Rect::from_x_y_ranges((r.left() + 40.0)..=(r.right() - 84.0), r.y_range());
+    slider(
+        ui,
+        rail,
+        Id::unique(("trim_gain", d, l.from, l.to)),
+        "Cable gain, dB",
+        &mut v,
+        TRIM_MIN_DB..=sr_core::config::MAX_DB,
+        0.0,
+        t,
+    );
+    if (v - before).abs() > 1e-4 {
+        edits.push(Edit::WireGain(d, l, (v * 10.0).round() / 10.0));
+    }
+    let id = Id::unique(("trim_db", d, l.from, l.to));
+    if !ui.memory(|m| m.has_focus(id)) {
+        st.trim_text = db_text(w.gain_db).trim_start_matches('+').to_string();
+    }
+    let field = Rect::from_x_y_ranges((r.right() - 76.0)..=(r.right() - 24.0), r.y_range())
+        .shrink2(vec2(0.0, 2.0));
+    ui.painter().rect(
+        field,
+        CornerRadius::same(radius::INPUT),
+        t.canvas,
+        Stroke::new(1.0, t.hairline),
+        StrokeKind::Inside,
+    );
+    let te = ui.put(
+        field,
+        egui::TextEdit::singleline(&mut st.trim_text)
+            .id(id)
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::symmetric(6, 4))
+            .align(Align2::RIGHT_CENTER),
+    );
+    name_widget(ui, &te, "Cable gain value, dB");
+    if te.has_focus() {
+        ui.painter().rect_stroke(
+            te.rect,
+            CornerRadius::same(radius::INPUT),
+            Stroke::new(2.0, t.focus),
+            StrokeKind::Inside,
+        );
+    }
+    if te.lost_focus()
+        && let Ok(typed) = st.trim_text.trim().parse::<f32>()
+        && typed.is_finite()
+        && (typed - w.gain_db).abs() > 1e-4
+    {
+        edits.push(Edit::WireGain(d, l, typed));
+    }
+    ui.painter().text(
+        pos2(r.right(), r.center().y),
+        Align2::RIGHT_CENTER,
+        "dB",
+        caption(),
+        t.muted,
+    );
+
+    // Polarity.
+    let r = row(ui);
+    label_at(ui, r, "Flip polarity");
+    let sw = Rect::from_center_size(pos2(r.right() - 16.0, r.center().y), vec2(32.0, 18.0));
+    let on = switch(
+        ui,
+        sw,
+        r,
+        Id::unique(("trim_invert", d, l.from, l.to)),
+        w.invert,
+        t,
+        "Flip polarity",
+    );
+    if on != w.invert {
+        edits.push(Edit::WireInvert(d, l, on));
+    }
+
+    // Pan, when this cable and its partner carry one source channel to both sides of a pair.
+    if let Some(pan) = pan_of(dev, l) {
+        let r = row(ui);
+        label_at(ui, r, "Pan");
+        let before = pan * 100.0;
+        let mut v = before;
+        let rail = Rect::from_x_y_ranges((r.left() + 40.0)..=(r.right() - 64.0), r.y_range());
+        slider(
+            ui,
+            rail,
+            Id::unique(("trim_pan", d, l.from, l.to)),
+            "Cable pan",
+            &mut v,
+            -100.0..=100.0,
+            0.0,
+            t,
+        );
+        if (v - before).abs() > 1e-3 {
+            edits.push(Edit::WirePan(d, l, v / 100.0));
+        }
+        let shown = if (v - before).abs() > 1e-3 { v } else { before };
+        let text = match shown.round() as i32 {
+            0 => "Centre".to_string(),
+            n if n < 0 => format!("L {}", -n),
+            n => format!("R {n}"),
+        };
+        ui.painter().text(
+            pos2(r.right(), r.center().y),
+            Align2::RIGHT_CENTER,
+            text,
+            num(11.0),
+            t.muted,
+        );
+    }
+
+    // Cables that meet in one output channel add up.
+    let n = fan_in(dev, out_ch);
+    if n >= 2 {
+        ui.separator();
+        let each = balance_db(n);
+        let text = if balanced(dev, out_ch) {
+            format!(
+                "The {n} cables into this channel are balanced, each trimmed by {} dB.",
+                db_text(each)
+            )
+        } else {
+            format!(
+                "{} cables add up ({} dB). Trim each by {} dB.",
+                count_word(n),
+                db_text(-each),
+                db_text(each)
+            )
+        };
+        ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(t.ink)).wrap());
+        if !balanced(dev, out_ch) {
+            let r = ui
+                .allocate_exact_size(vec2(TRIM_W, MIN_HIT), Sense::hover())
+                .0;
+            let btn = Rect::from_min_size(r.min, vec2(130.0, MIN_HIT)).shrink2(vec2(0.0, 2.0));
+            let resp = hit(ui, btn, Id::unique(("trim_balance", d, out_ch)));
+            name_button(&resp, "Balance cables");
+            ui.painter().rect(
+                btn,
+                CornerRadius::same(radius::INPUT),
+                if resp.hovered() {
+                    t.muted.gamma_multiply(0.12)
+                } else {
+                    Color32::TRANSPARENT
+                },
+                Stroke::new(
+                    if resp.has_focus() { 2.0 } else { 1.0 },
+                    if resp.has_focus() {
+                        t.focus
+                    } else {
+                        t.hairline
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(
+                btn.center(),
+                Align2::CENTER_CENTER,
+                "Balance cables",
+                body(),
+                t.ink,
+            );
+            if resp.clicked() {
+                edits.push(Edit::BalanceCables(d, out_ch));
+                // Done: the toast offers Undo, and a click there would only close this first.
+                ui.close();
+            }
+        }
+    }
+}
+
 fn wires_and_ports(
     ui: &mut Ui,
     g: &GraphCtx,
@@ -1443,6 +1887,9 @@ fn wires_and_ports(
 ) {
     let (dev, t, d) = (g.dev, g.t, g.dev_idx);
     let ports = layout.ports();
+    let all = links(dev);
+    // Before the ports: where a chip's target runs into a port's, the port wins.
+    let trims = trim_controls(ui, g, st, edits, layout, &all);
     // Interaction first so this frame's drag state drives the painting below.
     for &p in &ports {
         let Some(pos) = layout.port_pos(p) else {
@@ -1486,7 +1933,6 @@ fn wires_and_ports(
     }
 
     let painter = ui.painter().clone();
-    let all = links(dev);
     let slots = st.cables.slots(dev, &all);
     let now = ui.input(|i| i.time);
     // A wire seen for the first time pops its destination jack. The first frame of a device only
@@ -1527,26 +1973,56 @@ fn wires_and_ports(
     };
     // Only the graph's own layer: never a wire under an open menu or the setup sheet.
     let on_graph = |pos| ui.ctx().layer_id_at(pos).is_none_or(|l| l == ui.layer_id());
+    // A source cable is hovered over its trim chip, or its x while that was showing, else
+    // anywhere along it; a monitor cable anywhere along it.
     let hovered_wire = match (hover, pointer, st.drag) {
-        (None, Some(pos), None) if on_graph(pos) => {
-            all.iter()
-                .position(|l| match (layout.port_pos(l.from), layout.port_pos(l.to)) {
-                    (Some(a), Some(b)) => wire_distance(&wire_points(a, b), pos) < 7.0,
-                    _ => false,
+        (None, Some(pos), None) if on_graph(pos) => trims
+            .iter()
+            .position(|tr| tr.as_ref().is_some_and(|tr| tr.resp.hovered()))
+            .or_else(|| {
+                all.iter().enumerate().position(|(n, l)| {
+                    st.trim_hot == Some(*l)
+                        && trims[n]
+                            .as_ref()
+                            .is_some_and(|tr| tr.x_zone().contains(pos))
                 })
-        }
+            })
+            .or_else(|| {
+                all.iter()
+                    .position(|l| match (layout.port_pos(l.from), layout.port_pos(l.to)) {
+                        (Some(a), Some(b)) => wire_distance(&wire_points(a, b), pos) < 7.0,
+                        _ => false,
+                    })
+            }),
         _ => None,
     };
-    // Clicking a highlighted wire removes it (as does dragging its input end away).
+    // The x also stays while the chip or the x itself has the keyboard.
+    let x_id = |l: &Link| Id::unique(("unplug", d, l.from, l.to));
+    st.trim_hot = hovered_wire
+        .or_else(|| {
+            all.iter().enumerate().position(|(n, l)| {
+                trims[n].as_ref().is_some_and(|tr| tr.resp.has_focus())
+                    || ui.memory(|m| m.has_focus(x_id(l)))
+            })
+        })
+        .map(|n| all[n]);
+    // Clicking a highlighted monitor cable removes it (as does dragging its input end away); a
+    // source cable only comes out by its x.
     if let Some(n) = hovered_wire
+        && matches!(all[n].to, Port::Mon { .. })
         && ui.input(|i| i.pointer.primary_clicked())
     {
         edits.push(Edit::Unlink(d, all[n]));
     }
+    let open_trim = trims
+        .iter()
+        .position(|tr| tr.as_ref().is_some_and(|tr| tr.open));
     // A hovered jack or cable lights every cable it touches and the jacks at their ends, and
     // the rest step back a little.
     let lit = |l: &Link, n: usize| {
-        hovered_wire == Some(n) || hover.is_some_and(|h| h == l.from || h == l.to)
+        hovered_wire == Some(n)
+            || open_trim == Some(n)
+            || hover.is_some_and(|h| h == l.from || h == l.to)
     };
     let any_lit = st.drag.is_none() && all.iter().enumerate().any(|(n, l)| lit(l, n));
     let step_back = |c: Color32, on: bool| {
@@ -1621,16 +2097,33 @@ fn wires_and_ports(
         let grow = if hot { 1.25 } else { 1.0 };
         jack(&painter, pos, plug, grow * pop(p), hot, t);
     }
-    // The hovered wire shows where a click takes it out.
-    if let Some(n) = hovered_wire
-        && let (Some(a), Some(b)) = (layout.port_pos(all[n].from), layout.port_pos(all[n].to))
-    {
-        let mid = wire_mid(&wire_points(a, b));
-        painter.circle(mid, 9.0, t.raised, Stroke::new(1.0, t.bad_ink));
-        xmark(&painter, mid, t.bad_ink);
+    // Trim badges, and over the hovered cable its trim button with the x that unplugs it. A
+    // monitor cable shows the x on the cable itself.
+    for (n, l) in all.iter().enumerate() {
+        let hot = hovered_wire == Some(n);
+        if let Some(tr) = &trims[n] {
+            let hot = hot || tr.open || tr.resp.has_focus() || ui.memory(|m| m.has_focus(x_id(l)));
+            tr.paint(&painter, t, hot);
+            if hot {
+                let x = x_button(
+                    ui,
+                    tr.x_at(),
+                    x_id(l),
+                    t,
+                    &format!("Unplug cable, {}", link_tip(g, *l)),
+                );
+                if x.clicked() {
+                    edits.push(Edit::Unlink(d, *l));
+                }
+            }
+        } else if hot && let (Some(a), Some(b)) = (layout.port_pos(l.from), layout.port_pos(l.to)) {
+            let mid = wire_mid(&wire_points(a, b));
+            painter.circle(mid, 9.0, t.raised, Stroke::new(1.0, t.bad_ink));
+            xmark(&painter, mid, t.bad_ink);
+        }
     }
     // What the hovered cable (or every cable of the hovered jack) joins, in words.
-    if st.drag.is_none() && (hovered_wire.is_some() || hover.is_some()) {
+    if st.drag.is_none() && open_trim.is_none() && (hovered_wire.is_some() || hover.is_some()) {
         let tip = all
             .iter()
             .enumerate()

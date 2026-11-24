@@ -483,3 +483,111 @@ fn nothing_clips_at_the_minimum_window() {
 fn click_label(h: &mut Harness<App>, label: &str) {
     super::tests::click(h, label);
 }
+
+const CHIP: &str = "Cable trim, Safari, channel 1 (L) to Channel 1 (L)";
+const UNPLUG: &str = "Unplug cable, Safari, channel 1 (L) to Channel 1 (L)";
+
+/// A window of `size` showing Safari's first cable trimmed by `db` (0 leaves it plain).
+fn with_trim(size: egui::Vec2, db: f32) -> Harness<'static, App> {
+    let mut cfg = demo_config();
+    if db != 0.0 {
+        let l = crate::model::Link {
+            from: crate::model::Port::Src { src: 0, ch: 0 },
+            to: crate::model::Port::OutIn { ch: 0 },
+        };
+        crate::model::apply(&mut cfg, crate::model::Edit::WireGain(0, l, db));
+    }
+    let mut h = open(cfg);
+    h.set_size(size);
+    settle(&mut h);
+    h
+}
+
+/// The part of a chip's target a click must land in: `MIN_HIT` wide, however narrow the chip is
+/// (a wide chip's ends may run under a port), and 20 tall, clear of the 4 px two straight
+/// neighbours 24 apart share.
+fn core(r: Rect) -> Rect {
+    Rect::from_center_size(r.center(), vec2(MIN_HIT, 20.0))
+}
+
+#[test]
+fn a_cable_chip_takes_a_click_at_every_corner_of_its_target_in_both_window_sizes() {
+    for size in [vec2(1180.0, 700.0), vec2(1000.0, 520.0)] {
+        for db in [0.0, -6.0, -12.5] {
+            for n in 0..4 {
+                let mut h = with_trim(size, db);
+                let r = h.get_by_label_contains(CHIP).rect();
+                assert!(r.width() >= MIN_HIT && r.height() >= MIN_HIT, "{r:?}");
+                tap(&mut h, corners(core(r))[n]);
+                h.get_by_label("Cable gain, dB");
+                // This cable's popover, not a neighbour's.
+                h.get_by_label("Safari, channel 1 (L) to Channel 1 (L)");
+                assert_eq!(
+                    h.state().cfg.devices[0].wires.len(),
+                    6,
+                    "{size:?} {db} corner {n}: a chip click trims, never unplugs"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_x_over_a_cable_takes_a_click_at_every_corner_and_never_overlaps_the_chip() {
+    for size in [vec2(1180.0, 700.0), vec2(1000.0, 520.0)] {
+        for n in 0..4 {
+            let mut h = with_trim(size, -6.0);
+            let chip = h.get_by_label_contains(CHIP).rect();
+            h.hover_at(chip.center());
+            settle(&mut h);
+            let x = rect(&h, UNPLUG);
+            assert!(x.width() >= MIN_HIT && x.height() >= MIN_HIT, "{x:?}");
+            assert!(x.bottom() <= chip.top() + 0.5, "x {x:?} over chip {chip:?}");
+            // The pointer travels from the chip up to the x without the x going away.
+            for step in 1..=4 {
+                h.hover_at(chip.center() + (x.center() - chip.center()) * (step as f32 / 4.0));
+                h.step();
+            }
+            tap(&mut h, corners(x)[n]);
+            assert_eq!(
+                h.state().cfg.devices[0].wires.len(),
+                5,
+                "{size:?} corner {n}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_popover_controls_are_at_least_24_points() {
+    for (db, who) in [(0.0, "plain"), (-6.0, "trimmed")] {
+        let mut h = with_trim(vec2(1180.0, 700.0), db);
+        h.get_by_label_contains(CHIP).click();
+        settle(&mut h);
+        h.get_by_label("Cable gain, dB");
+        h.get_by_label("Balance cables");
+        audit(&format!("a {who} cable's popover"), &h);
+        let slider = rect(&h, "Cable gain, dB");
+        assert!(
+            slider.width() > 80.0 && slider.height() >= MIN_HIT,
+            "{slider:?}"
+        );
+        assert!(rect(&h, "Flip polarity").height() >= MIN_HIT);
+        assert!(rect(&h, "Balance cables").height() >= 24.0);
+    }
+}
+
+#[test]
+fn the_pan_row_is_a_full_target_too() {
+    let mut h = open(demo_config());
+    click_label(&mut h, "Select Stream Mix");
+    let name = h
+        .query_all_by_label_contains("Cable trim, ")
+        .filter_map(|n| n.accesskit_node().label())
+        .find(|l| l.contains(", channel 1 to Channel 1 (L)"))
+        .unwrap();
+    click_label(&mut h, &name);
+    audit("the pan popover", &h);
+    let pan = rect(&h, "Cable pan");
+    assert!(pan.width() > 80.0 && pan.height() >= MIN_HIT, "{pan:?}");
+}

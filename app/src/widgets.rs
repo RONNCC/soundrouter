@@ -426,6 +426,17 @@ pub fn plus_circle(
     resp
 }
 
+/// Two slider rails with a knob each: the mark of a cable's trim.
+pub fn trim_glyph(p: &Painter, center: Pos2, c: Color32) {
+    for (dy, dx) in [(-3.0, -2.5), (3.0, 2.5)] {
+        p.line_segment(
+            [center + vec2(-5.0, dy), center + vec2(5.0, dy)],
+            Stroke::new(1.4, c),
+        );
+        p.circle_filled(center + vec2(dx, dy), 2.2, c);
+    }
+}
+
 /// Small × (remove) glyph, ~8 px across.
 pub fn xmark(p: &Painter, center: Pos2, c: Color32) {
     let s = Stroke::new(1.4, c);

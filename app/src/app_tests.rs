@@ -890,6 +890,31 @@ fn an_unplugged_monitor_is_named_from_the_config_and_flagged() {
     assert_eq!(h.state().cfg.devices[0].sources[0].name, "Safari");
 }
 
+/// The chip on the middle of the cable from `src` channel `ch` into output channel `out`.
+fn chip(src: &str, ch: u16, out: u16) -> String {
+    let side = |c: u16| if c.is_multiple_of(2) { "L" } else { "R" };
+    format!(
+        "Cable trim, {src}, channel {} ({}) to Channel {} ({})",
+        ch + 1,
+        side(ch),
+        out + 1,
+        side(out)
+    )
+}
+
+macro_rules! chip_node {
+    ($h:expr, $src:expr, $ch:expr, $out:expr) => {
+        $h.get_by_label_contains(&chip($src, $ch, $out))
+    };
+}
+
+/// Safari and Spotify into the two channels: two cables meet in each, no Pass-Thru.
+fn two_sources() -> Config {
+    let mut cfg = demo_config();
+    apply(&mut cfg, Edit::RemoveSource(0, 2));
+    cfg
+}
+
 /// GPU snapshots: `cargo test -p soundrouter-app --features snapshots`
 /// (`UPDATE_SNAPSHOTS=1` to rewrite the baselines in `app/tests/snapshots`).
 #[cfg(feature = "snapshots")]
@@ -979,6 +1004,102 @@ mod snapshots {
     #[test]
     fn empty_state() {
         both("empty", Config::default, None, |_| {});
+    }
+
+    /// Safari, Spotify and Pass-Thru into one stereo pair, with trims of every kind on show.
+    fn trimmed() -> Config {
+        let mut cfg = demo_config();
+        let l = |src, ch, out| crate::model::Link {
+            from: crate::model::Port::Src { src, ch },
+            to: crate::model::Port::OutIn { ch: out },
+        };
+        apply(&mut cfg, Edit::WireGain(0, l(0, 0, 0), -6.0));
+        apply(&mut cfg, Edit::WireGain(0, l(1, 1, 1), -3.5));
+        apply(&mut cfg, Edit::WireInvert(0, l(1, 1, 1), true));
+        apply(&mut cfg, Edit::WireInvert(0, l(2, 0, 0), true));
+        apply(&mut cfg, Edit::WireGain(0, l(2, 1, 1), 2.5));
+        cfg
+    }
+
+    /// The window at its smallest, where the gutters between the cards are narrowest.
+    fn minimum(h: &mut Harness<App>) {
+        h.set_size(vec2(1000.0, 520.0));
+        settle(h);
+    }
+
+    fn aim_at_a_cable(h: &mut Harness<App>) {
+        let at = chip_node!(h, "Safari", 1, 1).rect().center();
+        h.hover_at(at);
+        settle(h);
+    }
+
+    fn open_fan_in(h: &mut Harness<App>) {
+        chip_node!(h, "Safari", 0, 0).click();
+        settle(h);
+    }
+
+    /// Open the trim popover of the microphone's left cable on Stream Mix: a mono input wired to
+    /// both sides of the pair.
+    fn open_pair(h: &mut Harness<App>) {
+        click(h, "Select Stream Mix");
+        let name = h
+            .query_all_by_label_contains("Cable trim, ")
+            .filter_map(|n| n.accesskit_node().label())
+            .find(|l| l.contains(", channel 1 to Channel 1 (L)"))
+            .unwrap();
+        h.get_by_label_contains(&name).click();
+        settle(h);
+    }
+
+    /// Mic panned right and its left cable flipped, on top of the demo's Stream Mix.
+    fn panned_pair() -> Config {
+        let mut cfg = demo_config();
+        let l = crate::model::Link {
+            from: crate::model::Port::Src { src: 1, ch: 0 },
+            to: crate::model::Port::OutIn { ch: 0 },
+        };
+        apply(&mut cfg, Edit::WirePan(1, l, 0.4));
+        apply(&mut cfg, Edit::WireInvert(1, l, true));
+        cfg
+    }
+
+    #[test]
+    fn cable_trim_badges_and_the_hovered_cable() {
+        both("cable_trim_badges", trimmed, None, aim_at_a_cable);
+    }
+
+    #[test]
+    fn cable_trim_badges_and_the_hovered_cable_at_the_minimum_window() {
+        both("cable_trim_badges_1000", trimmed, None, |h| {
+            minimum(h);
+            aim_at_a_cable(h);
+        });
+    }
+
+    #[test]
+    fn cable_trim_popover_with_the_fan_in_hint() {
+        both("cable_trim_popover", two_sources, None, open_fan_in);
+    }
+
+    #[test]
+    fn cable_trim_popover_with_the_fan_in_hint_at_the_minimum_window() {
+        both("cable_trim_popover_1000", two_sources, None, |h| {
+            minimum(h);
+            open_fan_in(h);
+        });
+    }
+
+    #[test]
+    fn cable_trim_popover_with_pan_on_a_trimmed_inverted_cable() {
+        both("cable_trim_pan", panned_pair, None, open_pair);
+    }
+
+    #[test]
+    fn cable_trim_popover_with_pan_at_the_minimum_window() {
+        both("cable_trim_pan_1000", panned_pair, None, |h| {
+            minimum(h);
+            open_pair(h);
+        });
     }
 
     #[test]
@@ -3296,4 +3417,282 @@ fn the_os_reduce_motion_setting_turns_the_switch_slide_and_sheet_fade_off() {
     h.state_mut().os.reduce_motion = Arc::new(|| false);
     settle(&mut h);
     assert!(h.ctx.global_style().animation_time > 0.0, "and back");
+}
+
+// ---- cable trim: the popover on a cable's middle -------------------------------------------
+
+fn wire0(h: &Harness<App>, i: usize) -> sr_core::config::Wire {
+    h.state().cfg.devices[0].wires[i].clone()
+}
+
+#[test]
+fn a_cables_chip_opens_its_popover_and_esc_closes_it() {
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    assert!(!has(&h, "Cable gain, dB"));
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    h.get_by_label("Cable gain, dB");
+    h.get_by_label("Cable gain value, dB");
+    h.get_by_label("Flip polarity");
+    // Two separate channels are no L/R pair: no pan.
+    assert!(!has(&h, "Cable pan"));
+    assert_eq!(h.state().cfg, before, "opening edits nothing");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(!has(&h, "Cable gain, dB"));
+    assert_eq!(h.state().cfg, before);
+}
+
+#[test]
+fn the_chip_is_reachable_by_keyboard() {
+    let mut h = open(demo_config());
+    chip_node!(h, "Spotify", 1, 1).focus();
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    h.get_by_label("Cable gain, dB");
+    h.get_by_label("Flip polarity");
+}
+
+#[test]
+fn the_gain_slider_and_field_trim_one_cable() {
+    let mut h = open(demo_config());
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    // The slider steps with the arrow keys, in tenths of a dB.
+    h.get_by_label("Cable gain, dB").focus();
+    settle(&mut h);
+    h.key_press(egui::Key::ArrowLeft);
+    settle(&mut h);
+    let g = wire0(&h, 0).gain_db;
+    assert!(
+        (-1.0..0.0).contains(&g) && (g * 10.0).round() == g * 10.0,
+        "{g}"
+    );
+    // The cable's own chip now says so, for screen readers and for the eye.
+    h.get_by_label_contains(&format!("{}, -0.6 dB", chip("Safari", 0, 0)));
+    // Typing a value takes it on Enter; only this cable changes.
+    let field = h.get_by_label("Cable gain value, dB");
+    field.focus();
+    settle(&mut h);
+    select_all(&mut h);
+    h.get_by_label("Cable gain value, dB").type_text("-4.5");
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert_eq!(wire0(&h, 0).gain_db, -4.5);
+    assert!(
+        h.state().cfg.devices[0].wires[1..]
+            .iter()
+            .all(|w| w.gain_db == 0.0)
+    );
+    h.get_by_label_contains(&format!("{}, -4.5 dB", chip("Safari", 0, 0)));
+    h.state().cfg.validate().unwrap();
+}
+
+#[test]
+fn a_gain_out_of_range_is_refused_with_a_message_and_junk_is_ignored() {
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    let type_in = |h: &mut Harness<App>, text: &str| {
+        h.get_by_label("Cable gain value, dB").focus();
+        settle(h);
+        select_all(h);
+        h.get_by_label("Cable gain value, dB").type_text(text);
+        h.key_press(egui::Key::Enter);
+        settle(h);
+    };
+    type_in(&mut h, "30");
+    assert_eq!(h.state().cfg, before, "rolled back");
+    h.get_by_label_contains("That change was not applied");
+    h.get_by_label_contains("must be finite and <= 24");
+    type_in(&mut h, "loud");
+    assert_eq!(h.state().cfg, before);
+    // The field shows the real gain again, not the refused text.
+    assert_eq!(wire0(&h, 0).gain_db, 0.0);
+}
+
+#[test]
+fn flip_polarity_toggles_one_cable_and_the_chip_says_so() {
+    let mut h = open(demo_config());
+    assert!(!chip_label_has(&h, "inverted"));
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    click(&mut h, "Flip polarity");
+    assert!(wire0(&h, 0).invert);
+    assert!(!wire0(&h, 1).invert);
+    h.get_by_label_contains(&format!("{}, inverted", chip("Safari", 0, 0)));
+    click(&mut h, "Flip polarity");
+    assert!(!wire0(&h, 0).invert);
+}
+
+fn chip_label_has(h: &Harness<App>, text: &str) -> bool {
+    h.query_all_by_label_contains("Cable trim, ")
+        .any(|n| n.accesskit_node().label().is_some_and(|l| l.contains(text)))
+}
+
+#[test]
+fn a_mono_pair_has_a_pan_that_writes_both_cables() {
+    let mut h = open(demo_config());
+    click(&mut h, "Select Stream Mix");
+    let mic = h.state().cfg.devices[1].sources[1].clone();
+    assert_eq!((mic.channels, mic.id.as_str()), (1, "s2"));
+    // The mono input's channel has no side label: it feeds both sides of the pair.
+    let name = h
+        .query_all_by_label_contains("Cable trim, ")
+        .filter_map(|n| n.accesskit_node().label())
+        .find(|l| l.contains(", channel 1 to Channel 1 (L)"))
+        .unwrap();
+    h.get_by_label_contains(&name).click();
+    settle(&mut h);
+    h.get_by_label("Cable pan");
+    let w = |h: &Harness<App>| {
+        let mut w = h.state().cfg.devices[1].wires.clone();
+        w.retain(|w| w.source == "s2");
+        w
+    };
+    assert_eq!(mic.channels, 1);
+    assert_eq!(w(&h).len(), 2);
+    h.get_by_label("Cable pan").focus();
+    settle(&mut h);
+    for _ in 0..25 {
+        h.key_press(egui::Key::ArrowRight);
+        settle(&mut h);
+    }
+    let (l, r) = (w(&h)[0].gain_db, w(&h)[1].gain_db);
+    assert!(r > l, "panned right: {l} {r}");
+    // Constant power: the pair carries what the two unity cables did (+3.01 dB).
+    let p = |g: f32| 10f32.powf(g / 10.0);
+    assert!((p(l) + p(r) - 2.0).abs() < 0.02, "{l} {r}");
+    // Both cables are trimmed, so both chips say so.
+    assert!(chip_label_has(&h, " dB"));
+    h.state().cfg.validate().unwrap();
+    // Dragging back to centre restores unity cables.
+    for _ in 0..25 {
+        h.key_press(egui::Key::ArrowLeft);
+        settle(&mut h);
+    }
+    assert!(w(&h).iter().all(|w| w.gain_db.abs() < 0.05), "{:?}", w(&h));
+}
+
+#[test]
+fn two_cables_into_a_channel_offer_to_balance_them_and_undo_takes_it_back() {
+    let mut h = open(two_sources());
+    let before = h.state().cfg.clone();
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    h.get_by_label("Two cables add up (+6 dB). Trim each by -6 dB.");
+    click(&mut h, "Balance cables");
+    let d = &h.state().cfg.devices[0];
+    let gains: Vec<_> = d.wires.iter().map(|w| (w.out_ch, w.gain_db)).collect();
+    // Only the cables into the channel that was open; the other channel still has its pair.
+    assert_eq!(gains, [(0, -6.0), (1, 0.0), (0, -6.0), (1, 0.0)]);
+    // The popover closes; the toast offers the way back.
+    assert!(!has(&h, "Balance cables"));
+    h.get_by_label("Balanced cables into channel 1 (L)");
+    click(&mut h, "Undo");
+    assert_eq!(h.state().cfg, before);
+    // Open again: now balanced cables say so and offer nothing.
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    click(&mut h, "Balance cables");
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    h.get_by_label_contains("are balanced, each trimmed by -6 dB");
+    assert!(!has(&h, "Balance cables"));
+}
+
+#[test]
+fn three_cables_say_how_much_they_add_up_to() {
+    let mut h = open(demo_config());
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    h.get_by_label("Three cables add up (+9.5 dB). Trim each by -9.5 dB.");
+    click(&mut h, "Balance cables");
+    assert!(
+        h.state().cfg.devices[0]
+            .wires
+            .iter()
+            .filter(|w| w.out_ch == 0)
+            .all(|w| w.gain_db == -9.5)
+    );
+}
+
+#[test]
+fn a_lone_cable_offers_no_balance() {
+    let mut cfg = demo_config();
+    apply(&mut cfg, Edit::RemoveSource(0, 2));
+    apply(&mut cfg, Edit::RemoveSource(0, 1));
+    let mut h = open(cfg);
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    h.get_by_label("Cable gain, dB");
+    assert!(!has(&h, "Balance cables"));
+    assert!(h.query_by_label_contains("add up").is_none());
+}
+
+#[test]
+fn the_x_beside_a_cable_chip_is_the_one_way_to_unplug_it() {
+    let mut h = open(demo_config());
+    let before = h.state().cfg.clone();
+    let unplug = "Unplug cable, Safari, channel 1 (L) to Channel 1 (L)";
+    // Out of sight until the cable is aimed at.
+    assert!(!has(&h, unplug));
+    let at = chip_node!(h, "Safari", 0, 0).rect().center();
+    h.hover_at(at);
+    settle(&mut h);
+    h.get_by_label(unplug);
+    // Clicking the chip trims, it never unplugs.
+    tap_at(&mut h, at);
+    h.get_by_label("Cable gain, dB");
+    assert_eq!(h.state().cfg, before);
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    // Keyboard focus shows the x too.
+    chip_node!(h, "Safari", 0, 0).focus();
+    settle(&mut h);
+    click(&mut h, unplug);
+    let d = &h.state().cfg.devices[0];
+    assert_eq!(d.wires.len(), before.devices[0].wires.len() - 1);
+    assert!(
+        !d.wires
+            .iter()
+            .any(|w| w.source == "s1" && w.src_ch == 0 && w.out_ch == 0)
+    );
+}
+
+fn tap_at(h: &mut Harness<App>, at: egui::Pos2) {
+    h.hover_at(at);
+    h.step();
+    h.drag_at(at);
+    h.step();
+    h.drop_at(at);
+    settle(h);
+}
+
+#[test]
+fn an_idle_window_with_a_trimmed_cable_and_an_open_popover_asks_for_no_frames() {
+    let mut cfg = demo_config();
+    let l = crate::model::Link {
+        from: crate::model::Port::Src { src: 0, ch: 0 },
+        to: crate::model::Port::OutIn { ch: 0 },
+    };
+    apply(&mut cfg, Edit::WireGain(0, l, -6.0));
+    let mut h = open(cfg);
+    h.run_steps(60);
+    assert!(
+        !h.ctx.has_requested_repaint(),
+        "{:?}",
+        h.ctx.repaint_causes()
+    );
+    chip_node!(h, "Safari", 0, 0).click();
+    settle(&mut h);
+    h.run_steps(60);
+    assert!(
+        !h.ctx.has_requested_repaint(),
+        "{:?}",
+        h.ctx.repaint_causes()
+    );
 }

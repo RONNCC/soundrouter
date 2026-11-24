@@ -870,7 +870,7 @@ impl App {
             let installed = self.graph.installed.get().map_or(&[][..], Vec::as_slice);
             edits
                 .iter()
-                .find_map(|e| graph::removed_title(&self.cfg, e, &s.hardware, &s.apps, installed))
+                .find_map(|e| graph::undo_note(&self.cfg, e, &s.hardware, &s.apps, installed))
         };
         let prev = self.cfg.clone();
         let prev_selected = self.selected;
@@ -889,8 +889,8 @@ impl App {
             return;
         }
         self.toast = blank_rename.then(|| BLANK_NAME.to_string());
-        self.undo = removed.map(|name| Undo {
-            verb: "Removed",
+        self.undo = removed.map(|(verb, name)| Undo {
+            verb,
             name,
             prev,
             selected: prev_selected,
