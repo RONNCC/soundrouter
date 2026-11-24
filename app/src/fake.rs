@@ -1,5 +1,5 @@
 //! In-app backend for `--demo`: synthetic meters, fake apps and hardware.
-use crate::model::{Edit, FxEdit, NewNode, apply, default_config};
+use crate::model::{Edit, FxEdit, Module, NewNode, apply, default_config};
 use sr_core::backend::{
     AppInfo, Backend, Delay, EngineOptions, EngineStatus, HwDevice, MeterReading, ReadAheadState,
     SelfTest, TccStatus,
@@ -272,7 +272,10 @@ pub fn demo_config() -> Config {
     apply(&mut cfg, Edit::AddSource(0, app("com.spotify.client"), 2));
     apply(&mut cfg, Edit::AddSource(0, SourceKind::PassThru, 2));
     // Spotify runs through a "Music" mixer, so the demo shows the middle of the graph.
-    apply(&mut cfg, Edit::AddNode(0, NewNode::ForSource(1)));
+    apply(
+        &mut cfg,
+        Edit::AddNode(0, NewNode::ForSource(1), Module::Mixer),
+    );
     apply(&mut cfg, Edit::RenameNode(0, 0, "Music".into()));
     for fx in [
         Fx::Eq {

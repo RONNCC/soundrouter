@@ -488,9 +488,14 @@ fn click_label(h: &mut Harness<App>, label: &str) {
 const CHIP: &str = "Cable trim, Safari, channel 1 (L) to Channel 1 (L)";
 const UNPLUG: &str = "Unplug cable, Safari, channel 1 (L) to Channel 1 (L)";
 
-/// A window of `size` showing Safari's first cable trimmed by `db` (0 leaves it plain).
-fn with_trim(size: egui::Vec2, db: f32) -> Harness<'static, App> {
+/// A window of `size` showing Safari's first cable trimmed by `db` (0 leaves it plain), and with
+/// `music` the demo's Music module, which Safari's cables pass under (else the Processing column
+/// is empty and they cross it in the open).
+fn with_trim(size: egui::Vec2, db: f32, music: bool) -> Harness<'static, App> {
     let mut cfg = demo_config();
+    if !music {
+        crate::model::apply(&mut cfg, crate::model::Edit::RemoveNode(0, 0));
+    }
     if db != 0.0 {
         let l = crate::model::Link {
             from: crate::model::Port::Src { src: 0, ch: 0 },
@@ -516,7 +521,8 @@ fn a_cable_chip_takes_a_click_at_every_corner_of_its_target_in_both_window_sizes
     for size in [vec2(1180.0, 700.0), vec2(1000.0, 520.0)] {
         for db in [0.0, -6.0, -12.5] {
             for n in 0..4 {
-                let mut h = with_trim(size, db);
+                let mut h = with_trim(size, db, false);
+                let wires = h.state().cfg.devices[0].wires.len();
                 let r = h.get_by_label_contains(CHIP).rect();
                 assert!(r.width() >= MIN_HIT && r.height() >= MIN_HIT, "{r:?}");
                 tap(&mut h, corners(core(r))[n]);
@@ -525,7 +531,7 @@ fn a_cable_chip_takes_a_click_at_every_corner_of_its_target_in_both_window_sizes
                 h.get_by_label("Safari, channel 1 (L) to Channel 1 (L)");
                 assert_eq!(
                     h.state().cfg.devices[0].wires.len(),
-                    demo_config().devices[0].wires.len(),
+                    wires,
                     "{size:?} {db} corner {n}: a chip click trims, never unplugs"
                 );
             }
@@ -536,7 +542,8 @@ fn a_cable_chip_takes_a_click_at_every_corner_of_its_target_in_both_window_sizes
 #[test]
 fn the_x_over_a_cable_takes_a_click_at_every_corner_and_never_overlaps_the_chip() {
     for n in 0..4 {
-        let mut h = with_trim(vec2(1180.0, 700.0), -6.0);
+        let mut h = with_trim(vec2(1180.0, 700.0), -6.0, false);
+        let wires = h.state().cfg.devices[0].wires.len();
         let chip = h.get_by_label_contains(CHIP).rect();
         h.hover_at(chip.center());
         settle(&mut h);
@@ -554,34 +561,39 @@ fn the_x_over_a_cable_takes_a_click_at_every_corner_and_never_overlaps_the_chip(
         tap(&mut h, corners(x)[n]);
         assert_eq!(
             h.state().cfg.devices[0].wires.len(),
-            demo_config().devices[0].wires.len() - 1,
+            wires - 1,
             "corner {n}"
         );
     }
 }
 
-/// At the smallest window the cables beside the Music strip stack so close that no slot beside
-/// Safari's chip is free: no x or + appears there (a click could land on a neighbour's chip),
-/// and the chip's popover still inserts a mixer.
+/// At the smallest window Safari's cables pass under the Music module, so their chips crowd into
+/// the 40 px gutters beside it: the chip stays off the module and still opens its own popover,
+/// and an x that shows never covers another chip.
 #[test]
-fn a_crowded_chip_shows_no_x_and_its_popover_still_inserts_a_mixer() {
-    let mut h = with_trim(vec2(1000.0, 520.0), -6.0);
+fn a_chip_beside_a_module_stays_off_it_and_opens_its_own_popover() {
+    let mut h = with_trim(vec2(1000.0, 520.0), -6.0, true);
     let chip = h.get_by_label_contains(CHIP).rect();
+    let music = h
+        .get_by_label("Music module, processing Channels 1 & 2")
+        .rect();
+    assert!(chip.center().x < music.left() || chip.center().x > music.right());
     h.hover_at(chip.center());
     settle(&mut h);
-    assert!(h.query_by_label(UNPLUG).is_none());
-    assert!(h.query_by_label_contains("Insert mixer on cable").is_none());
+    if let Some(x) = h.query_by_label(UNPLUG).map(|n| n.rect()) {
+        for other in h.query_all_by_label_contains("Cable trim, ") {
+            assert!(!x.shrink(2.0).intersects(other.rect().shrink(2.0)));
+        }
+    }
     tap(&mut h, chip.center());
-    click_label(&mut h, "Insert mixer");
-    let d = &h.state().cfg.devices[0];
-    assert_eq!(d.nodes.len(), 2);
-    h.state().cfg.validate().unwrap();
+    h.get_by_label("Safari, channel 1 (L) to Channel 1 (L)");
+    h.get_by_label("Cable gain, dB");
 }
 
 #[test]
 fn the_popover_controls_are_at_least_24_points() {
     for (db, who) in [(0.0, "plain"), (-6.0, "trimmed")] {
-        let mut h = with_trim(vec2(1180.0, 700.0), db);
+        let mut h = with_trim(vec2(1180.0, 700.0), db, false);
         h.get_by_label_contains(CHIP).click();
         settle(&mut h);
         h.get_by_label("Cable gain, dB");

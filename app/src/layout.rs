@@ -1,4 +1,4 @@
-//! Geometry of the three-column graph: card rects, port positions, hit-testing, wire curves.
+//! Geometry of the four-column graph: card rects, port positions, hit-testing, wire curves.
 use crate::model::Port;
 use eframe::egui::{Color32, Pos2, Rect, Stroke, Vec2, epaint::CubicBezierShape, pos2, vec2};
 
@@ -16,10 +16,15 @@ pub const GAP: f32 = 16.0;
 /// Space above the first card for the column headers.
 pub const TOP: f32 = 54.0;
 pub const SIDE: f32 = 24.0;
-/// Width of a mixer strip, which sits in the gutter between Sources and Output Channels.
-pub const STRIP_W: f32 = 84.0;
-/// The gutters while a device has mixers: a strip and a cable's run on each side of it.
-const NODE_GUTTER: f32 = 124.0;
+/// Narrowest the Processing column gets (the 1000 px window); it widens to `PROC_W_MAX`.
+pub const PROC_W_MIN: f32 = 120.0;
+pub const PROC_W_MAX: f32 = 150.0;
+/// Height of the empty-state placeholder in the Processing column.
+pub const PROC_EMPTY_H: f32 = 96.0;
+/// Gutters at the 750 px pane: Sources|Processing, Processing|Output channels, Output channels|Monitors.
+const GUTTERS: [f32; 3] = [40.0, 40.0, 52.0];
+/// 2 SIDE + 3 cards + processing column + gutters at the minimum pane.
+const MIN_PANE: f32 = 750.0;
 /// Mixer strip parts below its channel rows: the vertical meters, the limiter line, one row
 /// (fader, mute, each effect chip) and the padding at the foot.
 pub const STRIP_METER_H: f32 = 64.0;
@@ -78,9 +83,14 @@ pub fn strip_height(s: NodeSpec) -> f32 {
 pub struct Layout {
     pub origin: Pos2,
     pub cards: Vec<CardLayout>,
+    /// Width of a Sources / Output channels / Monitors card.
     pub card_w: f32,
-    /// Left edge of the Sources, Output Channels and Monitors columns.
-    pub col_x: [f32; 3],
+    /// Left edge of Sources, Processing, Output channels and Monitors (relative to `origin`).
+    pub cols: [f32; 4],
+    /// Width of the Processing column and of every module card in it.
+    pub proc_w: f32,
+    /// Placeholder shown where the first module goes; `None` once the device has modules.
+    pub proc_empty: Option<Rect>,
     pub size: Vec2,
 }
 
@@ -101,8 +111,10 @@ pub fn card_height(rows: u16, options: bool, expanded: bool, icon: bool, mute_ro
 }
 
 impl Layout {
-    /// `width` is the pane width; `origin` the top-left of the graph area. While the device has
-    /// mixers the gutters widen to hold them and the cards narrow (150 px at the 1000 px window).
+    /// `width` is the pane width; `origin` the top-left of the graph area. Four columns, the
+    /// Processing one always present: 48 + 3x150 + 120 + 40 + 40 + 52 = 750 px at the 1000 px
+    /// window. Past that a fifth of every pixel goes to each card, a twentieth to the Processing
+    /// column and the rest to the gutters.
     pub fn compute(
         origin: Pos2,
         width: f32,
@@ -111,24 +123,19 @@ impl Layout {
         monitors: &[CardSpec],
         nodes: &[NodeSpec],
     ) -> Layout {
-        // With mixers: 150 px cards and 124 px gutters at the 750 px pane of the 1000 px window;
-        // a fifth of every pixel past that goes to each card and the rest to the gutters, so the
-        // cables beside a strip get room to bend.
-        let (card_w, reach) = if nodes.is_empty() {
-            (
-                ((width - 2.0 * SIDE - 2.0 * 64.0) / 3.0).clamp(180.0, 250.0),
-                40.0,
-            )
-        } else {
-            let card_w = (150.0 + 0.2 * (width - 750.0)).clamp(150.0, 250.0);
-            let gutter = ((width - 2.0 * SIDE - 3.0 * card_w) / 2.0).max(NODE_GUTTER);
-            (card_w, gutter)
-        };
-        let col_x = [
+        let extra = (width - MIN_PANE).max(0.0);
+        let card_w = (150.0 + 0.2 * (width - MIN_PANE)).clamp(150.0, 250.0);
+        let proc_w = (PROC_W_MIN + 0.05 * extra).clamp(PROC_W_MIN, PROC_W_MAX);
+        let gutter_sum: f32 = GUTTERS.iter().sum();
+        let spare = width - 2.0 * SIDE - 3.0 * card_w - proc_w;
+        let k = (spare / gutter_sum).max(1.0);
+        let cols = [
             SIDE,
-            ((width - card_w) / 2.0).max(SIDE + card_w + reach),
-            (width - SIDE - card_w).max(SIDE + 2.0 * card_w + 2.0 * reach),
+            SIDE + card_w + GUTTERS[0] * k,
+            SIDE + card_w + GUTTERS[0] * k + proc_w + GUTTERS[1] * k,
+            SIDE + 2.0 * card_w + proc_w + (GUTTERS[0] + GUTTERS[1] + GUTTERS[2]) * k,
         ];
+        let widths = [card_w, proc_w, card_w, card_w];
         let mut cards = Vec::new();
         let mut height = TOP;
         let mut column = |col: usize, specs: &mut dyn Iterator<Item = (CardId, CardSpec, bool)>| {
@@ -138,7 +145,7 @@ impl Layout {
                 let h = card_height(spec.rows, options, spec.expanded, icon, spec.mute_row);
                 cards.push(CardLayout {
                     id,
-                    rect: Rect::from_min_size(origin + vec2(col_x[col], y), vec2(card_w, h)),
+                    rect: Rect::from_min_size(origin + vec2(cols[col], y), vec2(widths[col], h)),
                     rows: spec.rows,
                     options,
                     expanded: spec.expanded,
@@ -156,7 +163,7 @@ impl Layout {
                 .map(|(i, s)| (CardId::Src(i), *s, true)),
         );
         column(
-            1,
+            2,
             &mut (0..out_pairs).map(|i| {
                 (
                     CardId::Out(i),
@@ -170,20 +177,19 @@ impl Layout {
             }),
         );
         column(
-            2,
+            3,
             &mut monitors
                 .iter()
                 .enumerate()
                 .map(|(i, s)| (CardId::Mon(i), *s, true)),
         );
-        // Strips stack in the middle of the gutter between Sources and Output Channels.
-        let x = SIDE + card_w + (col_x[1] - SIDE - card_w - STRIP_W) / 2.0;
+        // Module cards stack down the Processing column.
         let mut y = TOP;
         for (i, s) in nodes.iter().enumerate() {
             let h = strip_height(*s);
             cards.push(CardLayout {
                 id: CardId::Node(i),
-                rect: Rect::from_min_size(origin + vec2(x, y), vec2(STRIP_W, h)),
+                rect: Rect::from_min_size(origin + vec2(cols[1], y), vec2(proc_w, h)),
                 rows: s.rows,
                 options: false,
                 expanded: false,
@@ -191,12 +197,20 @@ impl Layout {
             });
             y += h + GAP;
         }
+        let proc_empty = nodes
+            .is_empty()
+            .then(|| Rect::from_min_size(origin + vec2(cols[1], TOP), vec2(proc_w, PROC_EMPTY_H)));
+        if proc_empty.is_some() {
+            y = TOP + PROC_EMPTY_H + GAP;
+        }
         height = height.max(y);
         Layout {
             origin,
             cards,
             card_w,
-            col_x,
+            cols,
+            proc_w,
+            proc_empty,
             size: vec2(width, height + 8.0),
         }
     }
@@ -277,7 +291,7 @@ impl Layout {
 }
 
 /// Longest droop the control points get, in px.
-const SAG_MAX: f32 = 36.0;
+pub const SAG_MAX: f32 = 36.0;
 
 /// Cubic bezier control points of a cable: the handles run out of each end and gravity pushes
 /// them down in proportion to the horizontal run (capped), so a long cable hangs lower.
@@ -414,35 +428,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mixer_strips_fit_the_gutter_at_the_minimum_window() {
-        let s = CardSpec {
+    fn spec() -> CardSpec {
+        CardSpec {
             rows: 2,
             expanded: false,
             mute_row: false,
-        };
-        let n = NodeSpec {
+        }
+    }
+
+    fn node() -> NodeSpec {
+        NodeSpec {
             rows: 2,
             fx: 1,
             limiter: true,
-        };
-        // 750 px: the graph pane of the 1000 px window.
-        let l = Layout::compute(Pos2::ZERO, 750.0, &[s], 1, &[s], &[n, n]);
-        assert!((150.0..152.0).contains(&l.card_w), "{}", l.card_w);
+        }
+    }
+
+    /// Four columns left to right, each card inside its column and the pane.
+    fn assert_columns(l: &Layout, width: f32) {
         let src = l.card(CardId::Src(0)).unwrap().rect;
         let out = l.card(CardId::Out(0)).unwrap().rect;
         let mon = l.card(CardId::Mon(0)).unwrap().rect;
-        assert!(mon.right() <= 750.0 - SIDE + 0.5, "{mon:?}");
+        let proc = l.origin.x + l.cols[1]..l.origin.x + l.cols[1] + l.proc_w;
+        assert!(src.right() < proc.start && proc.end < out.left() && out.right() < mon.left());
+        assert!(mon.right() <= l.origin.x + width - SIDE + 0.5, "{mon:?}");
+    }
+
+    #[test]
+    fn processing_column_is_always_there_at_the_minimum_window() {
+        // 750 px: the graph pane of the 1000 px window; 48 + 3x150 + 120 + 40 + 40 + 52.
+        let l = Layout::compute(Pos2::ZERO, 750.0, &[spec()], 1, &[spec()], &[]);
+        assert_eq!(l.card_w, 150.0);
+        assert_eq!(l.proc_w, PROC_W_MIN);
+        assert_eq!(l.cols, [24.0, 214.0, 374.0, 576.0]);
+        assert_columns(&l, 750.0);
+        // Empty device: a placeholder fills the head of the column, no module cards.
+        let e = l.proc_empty.unwrap();
+        assert_eq!((e.left(), e.top(), e.width()), (214.0, TOP, PROC_W_MIN));
+        assert!(l.cards.iter().all(|c| !matches!(c.id, CardId::Node(_))));
+        assert!(l.size.y >= e.bottom());
+    }
+
+    #[test]
+    fn module_cards_stack_in_the_processing_column() {
+        let n = node();
+        let l = Layout::compute(Pos2::ZERO, 750.0, &[spec()], 1, &[spec()], &[n, n]);
+        assert_columns(&l, 750.0);
+        assert!(l.proc_empty.is_none());
         let (a, b) = (
             l.card(CardId::Node(0)).unwrap().rect,
             l.card(CardId::Node(1)).unwrap().rect,
         );
-        assert_eq!(a.width(), STRIP_W);
-        // Centred in the gutter with room for a cable on each side, stacked with GAP.
-        assert!((a.left() - src.right() - (out.left() - a.right())).abs() < 0.5);
-        assert!(a.left() - src.right() >= 19.0, "{a:?} {src:?}");
-        assert!((b.top() - a.bottom() - GAP).abs() < 1e-3);
+        assert_eq!((a.left(), a.width()), (l.cols[1], l.proc_w));
+        assert_eq!(a.top(), TOP);
         assert_eq!(a.height(), strip_height(n));
+        assert!((b.top() - a.bottom() - GAP).abs() < 1e-3);
         assert_eq!(
             l.port_pos(Port::NodeIn { node: 1, ch: 1 }).unwrap().x,
             b.left()
@@ -453,9 +493,42 @@ mod tests {
         );
         assert!(l.port_pos(Port::NodeOut { node: 0, ch: 2 }).is_none());
         assert!(l.size.y >= b.bottom());
-        // Without mixers the cards keep their width.
-        let plain = Layout::compute(Pos2::ZERO, 750.0, &[s], 1, &[s], &[]);
-        assert!(plain.card_w > 190.0);
+    }
+
+    #[test]
+    fn wide_window_spreads_cards_processing_and_gutters() {
+        let l = Layout::compute(Pos2::ZERO, 1400.0, &[spec()], 1, &[spec()], &[node()]);
+        assert_columns(&l, 1400.0);
+        assert_eq!(l.card_w, 250.0);
+        assert_eq!(l.proc_w, PROC_W_MAX);
+        // Gutters keep the 40 : 40 : 52 proportion and all exceed their minimum.
+        let g1 = l.cols[1] - (l.cols[0] + l.card_w);
+        let g2 = l.cols[2] - (l.cols[1] + l.proc_w);
+        let g3 = l.cols[3] - (l.cols[2] + l.card_w);
+        assert!(g1 > 40.0 && (g1 - g2).abs() < 1e-3);
+        assert!((g3 / g1 - 52.0 / 40.0).abs() < 1e-3);
+        assert!((l.cols[3] + l.card_w - (1400.0 - SIDE)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn eight_channel_device_and_many_nodes_grow_the_height_only() {
+        let n = node();
+        let nodes = [n; 6];
+        let l = Layout::compute(Pos2::ZERO, 750.0, &[spec()], 4, &[spec()], &nodes);
+        assert_columns(&l, 750.0);
+        let last_out = l.card(CardId::Out(3)).unwrap().rect;
+        let last_node = l.card(CardId::Node(5)).unwrap().rect;
+        assert!(last_out.left() > l.cols[1] + l.proc_w);
+        assert_eq!(
+            last_node.left(),
+            l.card(CardId::Node(0)).unwrap().rect.left()
+        );
+        assert!(last_node.bottom() > last_out.bottom());
+        assert!(l.size.y >= last_node.bottom());
+        assert_eq!(
+            l.port_pos(Port::OutIn { ch: 7 }).unwrap().x,
+            last_out.left()
+        );
     }
 
     #[test]

@@ -246,8 +246,8 @@ pub enum Edit {
     WirePan(usize, Link, f32),
     /// Trim every cable into one output channel so they sum back to unity (`balance_db`).
     BalanceCables(usize, u16),
-    /// A new mixer node, see `NewNode`.
-    AddNode(usize, NewNode),
+    /// A new node, see `NewNode`, starting as `Module`.
+    AddNode(usize, NewNode, Module),
     /// Remove a node and splice it out: each cable into its row k is joined to each cable out
     /// of row k (gains added, polarities combined); a muted node takes its cables with it.
     RemoveNode(usize, usize),
@@ -263,11 +263,63 @@ pub enum Edit {
 pub enum NewNode {
     /// A stereo node with no cables, to wire by hand.
     Empty,
-    /// On this cable: a unity cable feeds the node (the row on the destination's side, L or R)
-    /// and the cable itself now leaves from the node, keeping its trim.
-    OnCable(Link),
     /// Behind this source: channel for channel, every cable of the source leaves from the node.
     ForSource(usize),
+    /// In front of an output pair, `first` its even first channel: every cable that reaches
+    /// either channel of it (from a source or a node) goes into the node's row `out_ch % 2`
+    /// instead, keeping its trim and polarity, and unity cables run from the two rows to the
+    /// pair. A pair nobody feeds still gets the node, wired to the pair only: the cables
+    /// in are left to whoever connects a source later. Nothing happens for an odd or out of
+    /// range `first`, or a full device.
+    ForOutputs(u16),
+}
+
+/// What a new node starts as; it is named after it ("EQ", "EQ 2", ...).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Module {
+    Mixer,
+    /// A node kept for its fader.
+    Gain,
+    /// A node holding this one effect.
+    Fx(Fx),
+}
+
+impl Module {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Module::Mixer => "Mixer",
+            Module::Gain => "Gain",
+            Module::Fx(fx) => fx_name(fx),
+        }
+    }
+}
+
+/// An effect's name, as its chip, its inspector heading and the Add effect row say it.
+pub fn fx_name(fx: &Fx) -> &'static str {
+    match fx {
+        Fx::Mono => "Mono",
+        Fx::Eq { .. } => "EQ",
+        Fx::Limiter { .. } => "Limiter",
+        Fx::Delay { .. } => "Delay",
+    }
+}
+
+/// One effect of each kind at its starting values, in the order the menus list them.
+pub fn fx_kinds() -> [Fx; 4] {
+    [
+        Fx::Eq {
+            low_hz: 120.0,
+            low_db: 0.0,
+            high_hz: 8000.0,
+            high_db: 0.0,
+        },
+        Fx::Limiter {
+            ceiling_db: -1.0,
+            knee_db: 6.0,
+        },
+        Fx::Delay { ms: 0.0 },
+        Fx::Mono,
+    ]
 }
 
 /// A change to a node's insert list.
@@ -412,7 +464,7 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
         | Edit::WireInvert(d, ..)
         | Edit::WirePan(d, ..)
         | Edit::BalanceCables(d, _)
-        | Edit::AddNode(d, _)
+        | Edit::AddNode(d, ..)
         | Edit::RemoveNode(d, _)
         | Edit::RenameNode(d, ..)
         | Edit::NodeVolume(d, ..)
@@ -568,7 +620,7 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
             }
             _ => {}
         },
-        Edit::AddNode(_, at) => add_node(dev, at),
+        Edit::AddNode(_, at, module) => add_node(dev, at, module),
         Edit::RemoveNode(_, n) => remove_node(dev, n),
         Edit::RenameNode(_, n, name) => {
             let name: String = name.trim().chars().take(MAX_NAME_CHARS).collect();
@@ -622,16 +674,9 @@ pub fn apply(cfg: &mut Config, edit: Edit) {
     }
 }
 
-/// Whether node `n` takes one more effect of a kind: under `MAX_FX`, and a delay only while the
-/// device's delay lines stay within `MAX_DELAY_CH` channels.
-pub fn can_add_fx(dev: &VirtualDevice, n: usize) -> impl Fn(&Fx) -> bool + use<> {
-    let (len, ch) = dev
-        .nodes
-        .get(n)
-        .map_or((MAX_FX, 0), |n| (n.fx.len(), usize::from(n.channels)));
-    // Each delay holds a line per channel of its node, as `Config::validate` counts them.
-    let delay_ch: usize = dev
-        .nodes
+/// Channels of delay line the device holds: one per channel of a node, for each delay on it.
+fn delay_ch(dev: &VirtualDevice) -> usize {
+    dev.nodes
         .iter()
         .map(|n| {
             n.fx.iter()
@@ -639,38 +684,64 @@ pub fn can_add_fx(dev: &VirtualDevice, n: usize) -> impl Fn(&Fx) -> bool + use<>
                 .count()
                 * usize::from(n.channels)
         })
-        .sum();
+        .sum()
+}
+
+/// Whether node `n` takes one more effect of a kind: under `MAX_FX`, and a delay only while the
+/// device's delay lines stay within `MAX_DELAY_CH` channels.
+pub fn can_add_fx(dev: &VirtualDevice, n: usize) -> impl Fn(&Fx) -> bool + use<> {
+    let (len, ch) = dev
+        .nodes
+        .get(n)
+        .map_or((MAX_FX, 0), |n| (n.fx.len(), usize::from(n.channels)));
+    let delay_ch = delay_ch(dev);
     move |fx| len < MAX_FX && (!matches!(fx, Fx::Delay { .. }) || delay_ch + ch <= MAX_DELAY_CH)
 }
 
-/// Whether one more node of `channels` rows fits the device (`MAX_NODES`, `MAX_NODE_CH_TOTAL`).
-pub fn can_add_node(dev: &VirtualDevice, channels: u16) -> bool {
-    let total: usize = dev.nodes.iter().map(|n| usize::from(n.channels)).sum();
-    dev.nodes.len() < MAX_NODES && total + usize::from(channels) <= MAX_NODE_CH_TOTAL
+/// Rows of a node added at `at`; `None` where none can go (no such source, a bad pair).
+fn node_channels(dev: &VirtualDevice, at: &NewNode) -> Option<u16> {
+    match at {
+        NewNode::ForSource(s) => dev
+            .sources
+            .get(*s)
+            .map(|s| s.channels.clamp(1, MAX_NODE_CH as u16)),
+        NewNode::Empty => Some(2),
+        NewNode::ForOutputs(first) => (first % 2 == 0 && first + 1 < dev.channels).then_some(2),
+    }
 }
 
-fn add_node(dev: &mut VirtualDevice, at: NewNode) {
-    let channels = match &at {
-        NewNode::ForSource(s) => match dev.sources.get(*s) {
-            Some(s) => s.channels.clamp(1, MAX_NODE_CH as u16),
-            None => return,
-        },
-        NewNode::Empty | NewNode::OnCable(_) => 2,
+/// Whether a node added at `at` as `module` fits the device: `MAX_NODES`, `MAX_NODE_CH_TOTAL`,
+/// and for a delay `MAX_DELAY_CH`.
+pub fn can_add_node(dev: &VirtualDevice, at: &NewNode, module: &Module) -> bool {
+    let Some(channels) = node_channels(dev, at) else {
+        return false;
     };
-    if !can_add_node(dev, channels) {
+    let total: usize = dev.nodes.iter().map(|n| usize::from(n.channels)).sum();
+    let delay = matches!(module, Module::Fx(Fx::Delay { .. }));
+    dev.nodes.len() < MAX_NODES
+        && total + usize::from(channels) <= MAX_NODE_CH_TOTAL
+        && (!delay || delay_ch(dev) + usize::from(channels) <= MAX_DELAY_CH)
+}
+
+fn add_node(dev: &mut VirtualDevice, at: NewNode, module: Module) {
+    if !can_add_node(dev, &at, &module) {
         return;
     }
+    let Some(channels) = node_channels(dev, &at) else {
+        return;
+    };
     let n = (1..)
         .find(|n| !id_taken(dev, &format!("n{n}")))
         .unwrap_or(1);
     let id = format!("n{n}");
-    // Numbered like a device: "Mixer", "Mixer 2", ... skipping names already worn.
+    // Numbered like a device: "EQ", "EQ 2", ... skipping names already worn.
+    let base = module.name();
     let name = (1..)
         .map(|k| {
             if k == 1 {
-                "Mixer".to_string()
+                base.to_string()
             } else {
-                format!("Mixer {k}")
+                format!("{base} {k}")
             }
         })
         .find(|name| !dev.nodes.iter().any(|n| node_name(n) == name))
@@ -681,28 +752,27 @@ fn add_node(dev: &mut VirtualDevice, at: NewNode) {
         channels,
         gain_db: 0.0,
         muted: false,
-        fx: Vec::new(),
+        fx: match module {
+            Module::Fx(fx) => vec![fx],
+            Module::Mixer | Module::Gain => Vec::new(),
+        },
     };
     match at {
         NewNode::Empty => dev.nodes.push(node),
-        NewNode::OnCable(l) => {
-            let Some(i) = wire_index(dev, l) else {
-                return;
-            };
-            let w = dev.wires[i].clone();
-            let row = w.out_ch % 2;
-            // Ahead of a node it feeds, so node-to-node cables keep running to later nodes.
-            let at = match l.to {
-                Port::NodeIn { node, .. } => node,
-                _ => dev.nodes.len(),
-            };
-            dev.nodes.insert(at, node);
-            dev.wires[i].source.clone_from(&id);
-            dev.wires[i].src_ch = row;
-            dev.wires.push(Wire {
-                to: Some(id),
-                ..Wire::new(w.source, w.src_ch, row)
-            });
+        NewNode::ForOutputs(first) => {
+            // Last: after every node that feeds it, and it feeds no node.
+            dev.nodes.push(node);
+            for w in dev
+                .wires
+                .iter_mut()
+                .filter(|w| w.to.is_none() && (first..first + 2).contains(&w.out_ch))
+            {
+                w.to = Some(id.clone());
+                w.out_ch %= 2;
+            }
+            for row in 0..2 {
+                dev.wires.push(Wire::new(id.clone(), row, first + row));
+            }
         }
         NewNode::ForSource(s) => {
             let src = dev.sources[s].id.clone();
@@ -1054,46 +1124,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_mixer_on_a_cable_takes_it_in_and_passes_it_on_with_its_trim() {
-        let mut c = two_sources();
-        let l = link(Port::Src { src: 0, ch: 1 }, Port::OutIn { ch: 1 });
-        apply(&mut c, Edit::WireGain(0, l, -6.0));
-        apply(&mut c, Edit::AddNode(0, NewNode::OnCable(l)));
-        c.validate().unwrap();
-        let d = &c.devices[0];
-        assert_eq!(d.nodes.len(), 1);
-        assert_eq!(
-            (d.nodes[0].id.as_str(), node_name(&d.nodes[0])),
-            ("n1", "Mixer")
-        );
-        assert_eq!(d.nodes[0].channels, 2);
-        let all = links(d);
-        // Into the node's right row (the destination's side), then on to channel 2 with the trim.
-        let into = link(Port::Src { src: 0, ch: 1 }, Port::NodeIn { node: 0, ch: 1 });
-        let out = link(Port::NodeOut { node: 0, ch: 1 }, Port::OutIn { ch: 1 });
-        assert!(all.contains(&into) && all.contains(&out), "{all:?}");
-        assert!(!all.contains(&l));
-        assert_eq!(wire_of(d, into).unwrap().gain_db, 0.0);
-        assert_eq!(wire_of(d, out).unwrap().gain_db, -6.0);
-        // A second mixer, on the cable into the first, goes ahead of it.
-        apply(&mut c, Edit::AddNode(0, NewNode::OnCable(into)));
-        c.validate().unwrap();
-        let d = &c.devices[0];
-        assert_eq!(
-            d.nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
-            ["Mixer 2", "Mixer"]
-        );
-        assert!(links(d).contains(&link(
-            Port::NodeOut { node: 0, ch: 1 },
-            Port::NodeIn { node: 1, ch: 1 }
-        )));
-    }
-
-    #[test]
     fn a_mixer_for_a_source_carries_every_cable_of_it_channel_for_channel() {
         let mut c = two_sources();
         // The mono mic feeds both channels: one row in, both cables out of that row.
-        apply(&mut c, Edit::AddNode(0, NewNode::ForSource(1)));
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForSource(1), Module::Mixer),
+        );
         c.validate().unwrap();
         let d = &c.devices[0];
         assert_eq!(d.nodes[0].channels, 1);
@@ -1111,7 +1148,10 @@ pub(crate) mod tests {
         let mut c = two_sources();
         let l = link(Port::Src { src: 0, ch: 0 }, Port::OutIn { ch: 0 });
         apply(&mut c, Edit::WireInvert(0, l, true));
-        apply(&mut c, Edit::AddNode(0, NewNode::OnCable(l)));
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForSource(0), Module::Mixer),
+        );
         let into = link(Port::Src { src: 0, ch: 0 }, Port::NodeIn { node: 0, ch: 0 });
         apply(&mut c, Edit::WireGain(0, into, -3.0));
         apply(&mut c, Edit::NodeVolume(0, 0, -2.5));
@@ -1120,11 +1160,15 @@ pub(crate) mod tests {
         c.validate().unwrap();
         let d = &c.devices[0];
         assert!(d.nodes.is_empty());
-        assert_eq!(d.wires.len(), before - 1);
+        // Two cables in and two out of the stereo node become two joined ones.
+        assert_eq!(d.wires.len(), before - 2);
         let w = wire_of(d, l).unwrap();
         assert_eq!((w.gain_db, w.invert), (-5.5, true));
         // A muted mixer passed nothing: its cables go with it.
-        apply(&mut c, Edit::AddNode(0, NewNode::OnCable(l)));
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForSource(0), Module::Mixer),
+        );
         apply(&mut c, Edit::NodeMute(0, 0, true));
         apply(&mut c, Edit::RemoveNode(0, 0));
         assert!(wire_of(&c.devices[0], l).is_none());
@@ -1136,7 +1180,10 @@ pub(crate) mod tests {
         let l = link(Port::Src { src: 0, ch: 0 }, Port::OutIn { ch: 0 });
         let with_direct = |direct_db: f32| {
             let mut c = two_sources();
-            apply(&mut c, Edit::AddNode(0, NewNode::OnCable(l)));
+            apply(
+                &mut c,
+                Edit::AddNode(0, NewNode::ForSource(0), Module::Mixer),
+            );
             // The same ends as the cable through the mixer will have once it is gone.
             let src = c.devices[0].sources[0].id.clone();
             c.devices[0].wires.push(Wire {
@@ -1166,10 +1213,168 @@ pub(crate) mod tests {
         assert_eq!(wire_of(&c.devices[0], l).unwrap().gain_db, MAX_DB);
     }
 
+    fn sorted(mut w: Vec<Wire>) -> Vec<String> {
+        w.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        w.iter().map(|w| format!("{w:?}")).collect()
+    }
+
+    #[test]
+    fn a_mixer_for_outputs_takes_in_every_cable_of_the_pair_and_removes_cleanly() {
+        let mut c = two_sources();
+        let before = c.clone();
+        let mut on_clone = c.clone();
+        apply(
+            &mut on_clone,
+            Edit::AddNode(0, NewNode::ForOutputs(0), Module::Mixer),
+        );
+        assert_eq!(c, before, "apply works on the clone it is given");
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForOutputs(0), Module::Mixer),
+        );
+        assert_eq!(c, on_clone);
+        c.validate().unwrap();
+        let d = &c.devices[0];
+        assert_eq!((d.nodes.len(), d.nodes[0].channels), (1, 2));
+        let all = links(d);
+        // Nothing reaches the pair but through the node: Safari L/R and the mono mic, row by row.
+        assert!(
+            !all.iter()
+                .any(|l| matches!(l.to, Port::OutIn { .. })
+                    && !matches!(l.from, Port::NodeOut { .. }))
+        );
+        for (src, ch, row) in [(0, 0, 0), (0, 1, 1), (1, 0, 0), (1, 0, 1)] {
+            assert!(
+                all.contains(&link(
+                    Port::Src { src, ch },
+                    Port::NodeIn { node: 0, ch: row }
+                )),
+                "{all:?}"
+            );
+        }
+        for ch in 0..2 {
+            let out = link(Port::NodeOut { node: 0, ch }, Port::OutIn { ch });
+            assert_eq!(
+                wire_of(d, out).map(|w| (w.gain_db, w.invert)),
+                Some((0.0, false))
+            );
+        }
+        // Taking the mixer out again splices back exactly the cables there were.
+        apply(&mut c, Edit::RemoveNode(0, 0));
+        assert_eq!(
+            sorted(c.devices[0].wires.clone()),
+            sorted(before.devices[0].wires.clone())
+        );
+    }
+
+    #[test]
+    fn a_mixer_for_outputs_keeps_the_trim_and_polarity_of_the_cables() {
+        let mut c = two_sources();
+        let l = link(Port::Src { src: 0, ch: 1 }, Port::OutIn { ch: 1 });
+        apply(&mut c, Edit::WireGain(0, l, -6.0));
+        apply(&mut c, Edit::WireInvert(0, l, true));
+        let before = c.devices[0].wires.clone();
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForOutputs(0), Module::Mixer),
+        );
+        c.validate().unwrap();
+        let into = link(Port::Src { src: 0, ch: 1 }, Port::NodeIn { node: 0, ch: 1 });
+        let w = wire_of(&c.devices[0], into).unwrap();
+        assert_eq!((w.gain_db, w.invert), (-6.0, true));
+        apply(&mut c, Edit::RemoveNode(0, 0));
+        assert_eq!(sorted(c.devices[0].wires.clone()), sorted(before));
+    }
+
+    #[test]
+    fn a_mixer_for_outputs_leaves_other_pairs_alone_and_stacks_on_a_second_call() {
+        let mut c = two_sources();
+        apply(&mut c, Edit::GrowChannels(0));
+        assert_eq!(c.devices[0].channels, 4);
+        let src = c.devices[0].sources[0].id.clone();
+        c.devices[0].wires.push(Wire::new(src, 0, 2));
+        let far = link(Port::Src { src: 0, ch: 0 }, Port::OutIn { ch: 2 });
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForOutputs(0), Module::Mixer),
+        );
+        assert!(links(&c.devices[0]).contains(&far));
+        // Pair 2 has a cable of its own: its node takes it into row 0 and feeds channels 2, 3.
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForOutputs(2), Module::Mixer),
+        );
+        c.validate().unwrap();
+        let d = &c.devices[0];
+        assert!(!links(d).contains(&far));
+        assert!(links(d).contains(&link(
+            Port::Src { src: 0, ch: 0 },
+            Port::NodeIn { node: 1, ch: 0 }
+        )));
+        assert!(links(d).contains(&link(
+            Port::NodeOut { node: 1, ch: 1 },
+            Port::OutIn { ch: 3 }
+        )));
+        // Not idempotent: the pair now has the first node's cables, so a second mixer goes
+        // behind it, fed by it.
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForOutputs(0), Module::Mixer),
+        );
+        c.validate().unwrap();
+        let d = &c.devices[0];
+        assert_eq!(d.nodes.len(), 3);
+        assert!(links(d).contains(&link(
+            Port::NodeOut { node: 0, ch: 1 },
+            Port::NodeIn { node: 2, ch: 1 }
+        )));
+    }
+
+    #[test]
+    fn a_mixer_for_an_unfed_pair_is_wired_to_the_pair_only() {
+        let mut c = cfg_with_dev();
+        c.devices[0].wires.clear();
+        apply(
+            &mut c,
+            Edit::AddNode(0, NewNode::ForOutputs(0), Module::Mixer),
+        );
+        c.validate().unwrap();
+        let d = &c.devices[0];
+        assert_eq!(d.nodes.len(), 1);
+        assert_eq!(
+            links(d),
+            [
+                link(Port::NodeOut { node: 0, ch: 0 }, Port::OutIn { ch: 0 }),
+                link(Port::NodeOut { node: 0, ch: 1 }, Port::OutIn { ch: 1 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mixer_for_outputs_refuses_a_bad_pair_and_a_full_device() {
+        let mut c = two_sources();
+        let before = c.clone();
+        for first in [1, 2, 3, 100] {
+            apply(
+                &mut c,
+                Edit::AddNode(0, NewNode::ForOutputs(first), Module::Mixer),
+            );
+        }
+        assert_eq!(c, before);
+        for _ in 0..=MAX_NODES {
+            apply(
+                &mut c,
+                Edit::AddNode(0, NewNode::ForOutputs(0), Module::Mixer),
+            );
+        }
+        assert!(c.devices[0].nodes.len() <= MAX_NODES);
+        c.validate().unwrap();
+    }
+
     #[test]
     fn output_disconnect_and_shrinking_keep_the_cables_into_a_mixer() {
         let mut c = two_sources();
-        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty, Module::Mixer));
         let row1 = link(Port::Src { src: 0, ch: 1 }, Port::NodeIn { node: 0, ch: 1 });
         apply(&mut c, Edit::Connect(0, row1));
         apply(&mut c, Edit::GrowChannels(0));
@@ -1191,8 +1396,8 @@ pub(crate) mod tests {
     #[test]
     fn mixers_only_feed_later_mixers_and_never_close_a_loop() {
         let mut c = two_sources();
-        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
-        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty, Module::Mixer));
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty, Module::Mixer));
         let fwd = link(
             Port::NodeOut { node: 0, ch: 0 },
             Port::NodeIn { node: 1, ch: 0 },
@@ -1221,7 +1426,7 @@ pub(crate) mod tests {
     #[test]
     fn effects_add_move_set_and_stay_within_the_caps() {
         let mut c = two_sources();
-        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty, Module::Mixer));
         let fx = |c: &Config| c.devices[0].nodes[0].fx.clone();
         let eq = Fx::Eq {
             low_hz: 120.0,
@@ -1256,14 +1461,14 @@ pub(crate) mod tests {
         c.validate().unwrap();
         // Delay lines: 8 channels over the device. Three more stereo delays fit, a fourth not.
         for _ in 0..3 {
-            apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+            apply(&mut c, Edit::AddNode(0, NewNode::Empty, Module::Mixer));
             let n = c.devices[0].nodes.len() - 1;
             apply(
                 &mut c,
                 Edit::NodeFx(0, n, FxEdit::Add(Fx::Delay { ms: 0.0 })),
             );
         }
-        apply(&mut c, Edit::AddNode(0, NewNode::Empty));
+        apply(&mut c, Edit::AddNode(0, NewNode::Empty, Module::Mixer));
         apply(
             &mut c,
             Edit::NodeFx(0, 4, FxEdit::Add(Fx::Delay { ms: 0.0 })),
@@ -1830,8 +2035,16 @@ pub(crate) mod tests {
         fn new_node() -> impl Strategy<Value = NewNode> {
             prop_oneof![
                 Just(NewNode::Empty),
-                (port(), port()).prop_map(|(from, to)| NewNode::OnCable(Link { from, to })),
                 (0usize..4).prop_map(NewNode::ForSource),
+                (0u16..6).prop_map(NewNode::ForOutputs),
+            ]
+        }
+
+        fn module() -> impl Strategy<Value = Module> {
+            prop_oneof![
+                Just(Module::Mixer),
+                Just(Module::Gain),
+                (0usize..4).prop_map(|i| Module::Fx(fx_kinds()[i].clone())),
             ]
         }
 
@@ -1880,8 +2093,8 @@ pub(crate) mod tests {
                 (d.clone(), port(), port(), -2.0f32..2.0)
                     .prop_map(|(d, from, to, p)| Edit::WirePan(d, Link { from, to }, p)),
                 (d.clone(), 0u16..70).prop_map(|(d, ch)| Edit::BalanceCables(d, ch)),
-                (d.clone(), new_node()).prop_map(|(d, at)| Edit::AddNode(d, at)),
-                (d.clone(), new_node()).prop_map(|(d, at)| Edit::AddNode(d, at)),
+                (d.clone(), new_node(), module()).prop_map(|(d, at, m)| Edit::AddNode(d, at, m)),
+                (d.clone(), new_node(), module()).prop_map(|(d, at, m)| Edit::AddNode(d, at, m)),
                 (d.clone(), i.clone()).prop_map(|(d, n)| Edit::RemoveNode(d, n)),
                 (d.clone(), i.clone(), "[ -~]{0,6}")
                     .prop_map(|(d, n, s)| Edit::RenameNode(d, n, s)),
