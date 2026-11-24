@@ -28,6 +28,7 @@ fn dev(id: &str, name: &str, channels: u16, enabled: bool) -> VirtualDevice {
         }],
         wires: vec![],
         monitors: vec![],
+        nodes: Vec::new(),
     }
 }
 

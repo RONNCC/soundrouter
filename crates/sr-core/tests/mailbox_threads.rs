@@ -33,7 +33,7 @@ fn plans_published_while_the_audio_thread_runs_are_applied_without_heap_use() {
     d.monitors.push(mon("spk", true, -3.0));
     let l = layout();
     let (mut m, mut h) = mixer(Arc::new(Meters::new()));
-    h.set_plan(MixPlan::compile(&d, &l));
+    h.set_plan(MixPlan::compile(&d, &l, 48_000.0));
     let done = Arc::new(AtomicBool::new(false));
     let audio = {
         let done = done.clone();
@@ -62,10 +62,10 @@ fn plans_published_while_the_audio_thread_runs_are_applied_without_heap_use() {
     };
     for i in 0..5_000 {
         d.volume_db = -((i % 40) as f32);
-        h.set_plan(MixPlan::compile(&d, &l));
+        h.set_plan(MixPlan::compile(&d, &l, 48_000.0));
     }
     d.volume_db = -12.0;
-    h.set_plan(MixPlan::compile(&d, &l));
+    h.set_plan(MixPlan::compile(&d, &l, 48_000.0));
     done.store(true, std::sync::atomic::Ordering::Release);
     let (heap, blocks, last) = audio.join().unwrap();
     assert_eq!(

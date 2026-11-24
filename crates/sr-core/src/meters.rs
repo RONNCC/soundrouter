@@ -1,5 +1,5 @@
 use crate::backend::MeterReading;
-use crate::config::{MAX_CH, VirtualDevice};
+use crate::config::{MAX_CH, MAX_NODE_CH, MAX_NODE_CH_TOTAL, Node, VirtualDevice};
 use crate::mixer::IoLayout;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
@@ -16,6 +16,8 @@ pub struct Meters {
     /// of the window's [`Meters::take`], so neither reader takes values from the other.
     watched: Box<[AtomicU32]>,
     outputs: Box<[AtomicU32]>,
+    /// Post-fader peaks of the node channels, in config order ([`node_slots`]).
+    nodes: Box<[AtomicU32]>,
     /// Blocks silenced because the buffer layout did not match the plan. Written by the audio thread.
     pub mismatch_count: AtomicU64,
     /// IOProc cycles whose sample time did not follow the previous one: the HAL skipped audio (CPU
@@ -33,6 +35,7 @@ impl Default for Meters {
             inputs: slots(),
             watched: slots(),
             outputs: slots(),
+            nodes: (0..MAX_NODE_CH_TOTAL).map(|_| AtomicU32::new(0)).collect(),
             mismatch_count: AtomicU64::new(0),
             glitch_count: AtomicU64::new(0),
             clipped_blocks: AtomicU64::new(0),
@@ -70,6 +73,20 @@ pub(crate) fn peak_finite(block: &[f32]) -> f32 {
     lane_max(block, |a| a)
 }
 
+/// First `Meters` node slot of each node of `nodes`: the running sum of the channel counts before it, in
+/// config order (a count past the cap is clamped so a hostile config cannot overflow the sum).
+pub(crate) fn node_slots(nodes: &[Node]) -> Vec<usize> {
+    let mut at = 0;
+    nodes
+        .iter()
+        .map(|n| {
+            let s = at;
+            at += usize::from(n.channels).min(MAX_NODE_CH);
+            s
+        })
+        .collect()
+}
+
 fn bump(slot: Option<&AtomicU32>, p: f32) {
     if let Some(s) = slot {
         s.fetch_max(p.to_bits(), Relaxed);
@@ -103,6 +120,11 @@ impl Meters {
     /// Audio thread: record a peak for virtual-device channel `ch`. Out-of-range is ignored.
     pub fn update_output(&self, ch: usize, p: f32) {
         bump(self.outputs.get(ch), p);
+    }
+
+    /// Audio thread: record a post-fader peak for node meter slot `idx`. Out-of-range is ignored.
+    pub fn update_node(&self, idx: usize, p: f32) {
+        bump(self.nodes.get(idx), p);
     }
 
     pub fn mismatch_count(&self) -> u64 {
@@ -142,7 +164,24 @@ impl Meters {
         let channels = (0..usize::from(dev.channels))
             .map(|c| outs.get(c).copied().unwrap_or(0.0))
             .collect();
-        MeterReading { sources, channels }
+        let node_peaks: Vec<f32> = self.nodes.iter().map(take).collect();
+        let nodes = dev
+            .nodes
+            .iter()
+            .zip(node_slots(&dev.nodes))
+            .map(|(n, at)| {
+                let ch = usize::from(n.channels).min(MAX_NODE_CH);
+                let peaks = (at..at + ch)
+                    .map(|i| node_peaks.get(i).copied().unwrap_or(0.0))
+                    .collect();
+                (n.id.clone(), peaks)
+            })
+            .collect();
+        MeterReading {
+            sources,
+            channels,
+            nodes,
+        }
     }
 }
 

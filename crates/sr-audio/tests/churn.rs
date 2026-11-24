@@ -45,6 +45,7 @@ fn cfg(enabled: bool, volume_db: f32, with_app: bool) -> Config {
             sources,
             wires,
             monitors: vec![],
+            nodes: Vec::new(),
         }],
         ..Config::default()
     }

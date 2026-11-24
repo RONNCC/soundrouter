@@ -134,6 +134,7 @@ impl Model {
                 sources,
                 wires,
                 monitors,
+                nodes: Vec::new(),
             }
         };
         Config {

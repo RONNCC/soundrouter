@@ -225,6 +225,7 @@ pub fn new_device(cfg: &mut Config) {
         sources: Vec::new(),
         wires: Vec::new(),
         monitors: Vec::new(),
+        nodes: Vec::new(),
     });
     // Loopback-style: a new device starts as a plain loopback (1->1, 2->2), so apps playing into
     // it reach its input with no setup. The Pass-Thru source is only the device's own output.

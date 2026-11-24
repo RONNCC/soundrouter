@@ -96,6 +96,7 @@ mod tests {
                 sources: vec![],
                 wires: vec![],
                 monitors: vec![],
+                nodes: Vec::new(),
             }],
             ..Config::default()
         }

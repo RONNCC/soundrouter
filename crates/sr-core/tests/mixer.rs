@@ -8,7 +8,7 @@ use std::sync::Arc;
 fn setup(d: &VirtualDevice, l: &IoLayout) -> (Mixer, MixerHandle, Arc<Meters>) {
     let meters = Arc::new(Meters::new());
     let (m, mut h) = mixer(meters.clone());
-    h.set_plan(MixPlan::compile(d, l));
+    h.set_plan(MixPlan::compile(d, l, 48_000.0));
     (m, h, meters)
 }
 
@@ -161,7 +161,7 @@ fn plan_swap_applies_next_block() {
     assert!(o[0].iter().all(|x| *x == 1.0));
     let mut d = dev();
     d.wires = vec![Wire::new("s1", 1, 0)]; // different routing
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     // The new routing is crossfaded in over this block (a step would click) and is exact after it.
     let o = run(&mut m, &ones(8), 4, 8);
     assert!(
@@ -182,11 +182,11 @@ fn many_swaps_and_full_queue() {
     for i in 0..20 {
         let mut d = dev();
         d.sources[0].volume_db = -(i as f32);
-        h.set_plan(MixPlan::compile(&d, &layout())); // audio thread never runs: queue fills
+        h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0)); // audio thread never runs: queue fills
     }
     let mut d = dev();
     d.sources[0].muted = true;
-    h.set_plan(MixPlan::compile(&d, &layout())); // newest wins even when queue was full
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0)); // newest wins even when queue was full
     h.flush();
     for _ in 0..8 {
         h.flush();
@@ -204,7 +204,7 @@ fn ramp_has_no_step() {
     run(&mut m, &ins, 4, n);
     let mut d = dev();
     d.sources[0].muted = true;
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let o = run(&mut m, &ins, 4, n);
     let step = 1.0 / n as f32;
     let mut prev = 1.0;
@@ -215,7 +215,7 @@ fn ramp_has_no_step() {
     assert!(o[0][n - 1].abs() < 1e-5);
     assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 0.0));
     // unmute: ramps 0 -> 1
-    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    h.set_plan(MixPlan::compile(&dev(), &layout(), 48_000.0));
     let o = run(&mut m, &ins, 4, n);
     assert!(o[0][0] <= step + 1e-5 && close(o[0][n - 1], 1.0));
 }
@@ -228,7 +228,7 @@ fn monitor_enable_ramps() {
     let ins = vec![vec![1.0; 512], vec![1.0; 512]];
     run(&mut m, &ins, 4, 512);
     d.monitors[0].enabled = false;
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let o = run(&mut m, &ins, 4, 512);
     assert!(o[2][0] > 0.9 && o[2][511].abs() < 1e-5);
 }
@@ -309,7 +309,7 @@ fn newest_plan_wins_after_audio_thread_was_away() {
     for db in [0.0, -6.0, -12.0, -18.0, -24.0, -30.0] {
         let mut d = dev();
         d.sources[0].volume_db = db;
-        h.set_plan(MixPlan::compile(&d, &layout()));
+        h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     }
     let n = 512;
     let o = run(&mut m, &vec![vec![1.0; n]; 2], 4, n);
@@ -321,8 +321,8 @@ fn newest_plan_wins_after_audio_thread_was_away() {
     // ... and a plan published while the old ones are still outstanding replaces them too
     let mut d = dev();
     d.sources[0].muted = true;
-    h.set_plan(MixPlan::compile(&d, &layout()));
-    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
+    h.set_plan(MixPlan::compile(&dev(), &layout(), 48_000.0));
     run(&mut m, &vec![vec![1.0; n]; 2], 4, n);
     let o = run(&mut m, &vec![vec![1.0; n]; 2], 4, n);
     assert!(o[0].iter().all(|x| *x == 1.0));
@@ -331,13 +331,13 @@ fn newest_plan_wins_after_audio_thread_was_away() {
 #[test]
 fn dropping_either_side_with_plans_pending_is_clean() {
     let (m, mut h) = mixer(Arc::new(Meters::new()));
-    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    h.set_plan(MixPlan::compile(&dev(), &layout(), 48_000.0));
     drop(m);
-    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    h.set_plan(MixPlan::compile(&dev(), &layout(), 48_000.0));
     h.flush();
     drop(h);
     let (m, mut h) = mixer(Arc::new(Meters::new()));
-    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    h.set_plan(MixPlan::compile(&dev(), &layout(), 48_000.0));
     drop(h);
     drop(m);
 }
@@ -372,7 +372,7 @@ fn device_mute_ramps_without_a_step_and_holds_across_blocks() {
     run(&mut m, &ins, 4, n);
     let mut d = dev();
     d.muted = true;
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let step = 1.0 / n as f32;
     let mut prev = 1.0;
     for x in &run(&mut m, &ins, 4, n)[0] {
@@ -383,7 +383,7 @@ fn device_mute_ramps_without_a_step_and_holds_across_blocks() {
     // The ramp is finished: later blocks are exactly silent, not ramping again from 1.
     assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 0.0));
     // A plan that keeps the device muted continues from the applied gain: no jump back to 1 and down again.
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 0.0));
 }
 
@@ -396,7 +396,7 @@ fn a_plan_swap_continues_the_device_ramp_from_what_was_applied() {
     let ins = vec![vec![1.0; n], vec![1.0; n]];
     run(&mut m, &ins, 4, n);
     d.muted = false;
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let o = run(&mut m, &ins, 4, n);
     assert!(
         o[0][0] <= 1.0 / n as f32 + 1e-5,
@@ -414,7 +414,7 @@ fn a_long_ramp_spans_exactly_the_first_chunk() {
     run(&mut m, &ins, 4, n);
     let mut d = dev();
     d.sources[0].volume_db = -200.0; // ~0
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let o = run(&mut m, &ins, 4, n);
     assert!(
         o[0][MAX_FRAMES - 2] > 1e-6,
@@ -474,7 +474,7 @@ fn system_gain_changes_ramp_without_a_step_and_survive_a_plan_swap() {
     assert!(prev.abs() < 1e-5, "ramp must land on the target");
     assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 0.0));
     // A new plan keeps the applied level: no jump back to unity and down again.
-    h.set_plan(MixPlan::compile(&app_dev(), &layout()));
+    h.set_plan(MixPlan::compile(&app_dev(), &layout(), 48_000.0));
     assert!(run(&mut m, &ins, 4, n)[0].iter().all(|x| *x == 0.0));
     // Unmute ramps up from silence, and the source's own gain still multiplies.
     h.sys_gain().set("s1", 1.0);
@@ -543,7 +543,7 @@ fn mute_and_unmute_fade_over_the_same_frames_at_any_block_size() {
         series(&mut m, n, 2);
         let mut d = dev();
         d.muted = true;
-        h.set_plan(MixPlan::compile(&d, &layout()));
+        h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
         let down = series(&mut m, n, blocks);
         let len = n.max(480); // frames the fade takes: 480, or the whole block when that is longer
         let step = 1.0 / len as f32 + 1e-6;
@@ -562,7 +562,7 @@ fn mute_and_unmute_fade_over_the_same_frames_at_any_block_size() {
         );
         assert!(down[first_zero..].iter().all(|x| *x == 0.0), "{n}");
         d.muted = false;
-        h.set_plan(MixPlan::compile(&d, &layout()));
+        h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
         let up = series(&mut m, n, blocks);
         assert!(
             up.windows(2).all(|w| w[1] >= w[0] && w[1] - w[0] <= step),
@@ -580,12 +580,12 @@ fn a_reversal_mid_fade_continues_from_where_it_was() {
     series(&mut m, 64, 1);
     let mut d = dev();
     d.muted = true;
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let down = series(&mut m, 64, 3); // 192 of 480 frames
     let at = *down.last().unwrap();
     assert!((at - (1.0 - 192.0 / 480.0)).abs() < 1e-4, "{at}");
     d.muted = false;
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let up = series(&mut m, 64, 1);
     assert!(
         (up[0] - at).abs() <= 1.0 / 480.0 + 1e-5 && up[0] > at,
@@ -618,7 +618,7 @@ fn after_any_number_of_gain_changes_a_settled_block_is_bit_exact() {
         d.sources[0].muted = muted;
         d.volume_db = dev_db;
         d.muted = dev_muted;
-        h.set_plan(MixPlan::compile(&d, &layout()));
+        h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
         let ins = vec![vec![1.0; 300], vec![1.0; 300]];
         // The fade crosses one unit of gain per 480 frames: 30 x 300 frames cover the widest step (+24 dB).
         for _ in 0..30 {
@@ -700,7 +700,7 @@ fn clipped_blocks_count_blocks_with_a_vdev_sample_over_full_scale() {
     // A routing change runs the old plan once more for the crossfade: still one count per block.
     let mut d = dev();
     d.wires.pop();
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     run(&mut m, &[vec![1.5; 16], vec![1.5; 16]], 4, 16);
     assert_eq!(meters.clipped_blocks(), 4);
 }
@@ -808,7 +808,7 @@ fn a_trim_edit_ramps_and_never_steps() {
     let ins = vec![vec![1.0; 64], vec![1.0; 64]];
     let before = run(&mut m, &ins, 4, 64)[0][63];
     trim(&mut d, 0, -12.0, false);
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let o = run(&mut m, &ins, 4, 64);
     let reach = 64.0 / 480.0; // slew moves at most 1/480 per frame
     assert!((o[0][63] - (before - reach)).abs() < 1e-3, "{}", o[0][63]);
@@ -829,7 +829,7 @@ fn a_polarity_flip_crosses_zero_in_twenty_ms() {
     let ins = vec![vec![1.0; 480], vec![1.0; 480]];
     run(&mut m, &ins, 4, 480);
     trim(&mut d, 0, 0.0, true);
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let first = run(&mut m, &ins, 4, 480)[0].clone();
     assert!(first.windows(2).all(|w| (w[1] - w[0]).abs() < 3e-3));
     assert!(first[479].abs() < 1e-3, "half way is zero: {}", first[479]);

@@ -1,5 +1,5 @@
 use super::*;
-use sr_core::config::{Monitor, MonitorWire, Source, Wire};
+use sr_core::config::{Monitor, MonitorWire, Node, Source, Wire};
 use sr_core::mixer::{IoLayout, OutPort};
 
 fn src(id: &str, kind: SourceKind) -> Source {
@@ -33,6 +33,7 @@ fn vdev(sources: Vec<Source>, wires: Vec<Wire>, monitors: Vec<Monitor>) -> Virtu
         sources,
         wires,
         monitors,
+        nodes: Vec::new(),
     }
 }
 fn wire(source: &str, src_ch: u16, out_ch: u16) -> Wire {
@@ -437,7 +438,7 @@ struct Rig {
 fn rig(dev: &VirtualDevice, lay: &IoLayout, ain: &[u16], aout: &[u16]) -> Rig {
     let meters = Arc::new(Meters::new());
     let (mixer, mut handle) = mixer(meters.clone());
-    handle.set_plan(MixPlan::compile(dev, lay));
+    handle.set_plan(MixPlan::compile(dev, lay, 48_000.0));
     let stats = Arc::new(TapStats::default());
     let (tap_cb, tap) = tap_in(stats.clone());
     let shared = Arc::new(Shared {
@@ -874,6 +875,54 @@ fn a_monitor_wire_into_the_input_the_device_reads_is_a_feedback_loop() {
         vec![bh],
     );
     assert_eq!(without_feedback(&other, &virt), (other.clone(), vec![]));
+}
+
+/// A node does not hide the loop (BlackHole in 0 -> node -> vdev 0 -> BlackHole out 0), and a wire that
+/// only feeds a node is not a wire onto the vdev channel of the same number.
+#[test]
+fn feedback_through_a_node_is_found_and_a_node_input_is_not_a_vdev_channel() {
+    let w = |out_ch, dst_ch| MonitorWire { out_ch, dst_ch };
+    let mut bh = mon("BlackHole16ch_UID", true);
+    bh.wires = vec![w(0, 0), w(1, 1)];
+    let via = |from: &str, src_ch, node: &str, out_ch| Wire {
+        to: Some(node.into()),
+        ..Wire::new(from, src_ch, out_ch)
+    };
+    let mut dev = vdev(
+        vec![src(
+            "bh",
+            SourceKind::Device {
+                uid: "BlackHole16ch_UID".into(),
+            },
+        )],
+        vec![
+            via("bh", 0, "n", 0),
+            wire("n", 0, 0),
+            // Feeds the node's input 1 only: no loop through vdev channel 1.
+            via("bh", 1, "n", 1),
+        ],
+        vec![bh],
+    );
+    dev.nodes = vec![Node {
+        id: "n".into(),
+        name: "Mix".into(),
+        channels: 2,
+        gain_db: 0.0,
+        muted: false,
+    }];
+    let virt = |u: &str| u == "BlackHole16ch_UID";
+    let (clean, warnings) = without_feedback(&dev, &virt);
+    assert_eq!(clean.monitors[0].wires, [w(1, 1)]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    // Through two nodes, too.
+    dev.nodes.push(Node {
+        id: "m".into(),
+        ..dev.nodes[0].clone()
+    });
+    dev.wires = vec![via("bh", 1, "n", 0), via("n", 0, "m", 1), wire("m", 1, 1)];
+    let (clean, warnings) = without_feedback(&dev, &virt);
+    assert_eq!(clean.monitors[0].wires, [w(0, 0)]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
 }
 
 #[test]
@@ -1706,7 +1755,7 @@ fn plan_and_ring_swap_in_either_order_without_a_mismatch() {
     // The app quits: the plan loses the tap's inputs before the (empty) ring replaces the old one.
     let dev = split_dev();
     r._handle
-        .set_plan(MixPlan::compile(&dev, &split_layout(&dev, &[])));
+        .set_plan(MixPlan::compile(&dev, &split_layout(&dev, &[]), 48_000.0));
     let out = run_split(&mut r, |i| sample(i / 2, i % 2));
     assert_eq!(out.data[0][0], sample(0, 0), "main paths unchanged");
     r.tap.publish(TapRx::none(r.stats.clone()));
@@ -1722,6 +1771,7 @@ fn plan_and_ring_swap_in_either_order_without_a_mismatch() {
     r._handle.set_plan(MixPlan::compile(
         &dev,
         &split_layout(&dev, &["a".to_owned()]),
+        48_000.0,
     ));
     let out = run_split(&mut r, |_| 0.0);
     // Frame 1 of the ring's first block: it fades in, so 2/SB of the tap's 1/1024.

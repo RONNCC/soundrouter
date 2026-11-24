@@ -1,5 +1,8 @@
-use crate::config::{MAX_CH, MAX_DB, MAX_FRAMES, SourceKind, VirtualDevice};
-use crate::meters::{METER_SLOTS, Meters, peak, peak_finite};
+use crate::config::{
+    MAX_CH, MAX_DB, MAX_FRAMES, MAX_NODE_CH, MAX_NODE_CH_TOTAL, MAX_NODES, SourceKind,
+    VirtualDevice,
+};
+use crate::meters::{METER_SLOTS, Meters, node_slots, peak, peak_finite};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -75,14 +78,39 @@ impl Gain {
     }
 }
 
+/// Where a tap reads: an aggregate input slot, or a row of `MixPlan::node_buf`.
+#[derive(Clone, Copy)]
+enum Src {
+    Input(usize),
+    Row(usize),
+}
+/// Where a tap adds: a virtual-device channel of `MixPlan::acc`, or a row of `MixPlan::node_buf`.
+#[derive(Clone, Copy)]
+enum Dst {
+    Vdev(usize),
+    Row(usize),
+}
+
 struct Tap {
-    in_idx: usize,
-    vch: usize,
-    src: usize,
-    /// This cable's own trim and polarity, keyed by (source, src_ch, out_ch); 1.0 for a plain wire.
+    src: Src,
+    dst: Dst,
+    /// Index into `MixPlan::srcs`: the source's volume, or the fader of the node it reads.
+    gain: usize,
+    /// This cable's own trim and polarity, keyed by (source, src_ch, to, out_ch); 1.0 for a plain wire.
     wire: Gain,
     /// Index into `MixPlan::apps` for an app source: its level also follows V's system volume (`SysGain`).
     app: Option<usize>,
+}
+
+/// A compiled node: `ch` rows of `MixPlan::node_buf` from `row0` (nodes are numbered in topological
+/// order, so every row a node reads lies before its own).
+struct NodePlan {
+    row0: usize,
+    ch: usize,
+    /// Index into `MixPlan::srcs` of its fader and mute.
+    gain: usize,
+    /// First `Meters` node slot: config order, so `Meters::take` can name them from the device alone.
+    meter: usize,
 }
 
 /// What V's volume and mute (what the volume keys move while V is the system output) do to each app source,
@@ -132,8 +160,18 @@ pub struct MixPlan {
     in_len: usize,
     out_len: usize,
     nch: usize,
+    /// The sources' volumes, then the nodes' faders (config order), each keyed by its id.
     srcs: Vec<Gain>,
+    /// Taps into nodes first (grouped per node in `nodes` order, `node_end` bounds each group), then
+    /// the taps into virtual-device channels in wire order.
     taps: Vec<Tap>,
+    nodes: Vec<NodePlan>,
+    /// `taps[..node_end[i]]` ends node `i`'s group; the virtual-device taps start at the last one.
+    node_end: Vec<usize>,
+    /// Sample rate the plan was compiled for; what filters and delay lines are sized and tuned to.
+    rate: f32,
+    /// `rows * MAX_FRAMES` node scratch, prefaulted like `acc`.
+    node_buf: Vec<f32>,
     /// `(wire key, index into taps)` sorted by key, so `inherit` joins two plans' wire gains in one pass
     /// on the audio thread instead of searching.
     tap_keys: Vec<(u64, usize)>,
@@ -151,7 +189,7 @@ pub struct MixPlan {
     route: u64,
 }
 
-/// Taps into one vdev channel up to which `acc` stays finite: each tap adds at most
+/// Taps into one vdev channel (or node row) up to which it stays finite: each tap adds at most
 /// `SAMPLE_LIMIT` x 15.85 (+24 dB source gain) x 15.85 (+24 dB wire trim) and the device stage
 /// multiplies by at most 15.85 more, so 2^16 x 1e30 x 15.85^3 = 2.6e38 < f32::MAX (3.4e38).
 /// Valid configs have <= 64.
@@ -210,13 +248,68 @@ fn ramp_scale(buf: &mut [f32], from: f32, to: f32) {
     }
 }
 
+/// One tap of `n` frames: reads its source (scaled by the source or node fader, the app's system gain and
+/// the cable's own trim, each ramped) and adds it to its destination.
+#[allow(clippy::too_many_arguments)]
+fn mix_tap(
+    t: &mut Tap,
+    srcs: &[Gain],
+    apps: &[AppSys],
+    inputs: &[&[f32]],
+    (off, end, n): (usize, usize, usize),
+    node_buf: &mut [f32],
+    acc: &mut [f32],
+) {
+    let g = &srcs[t.gain];
+    let (s0, s1) = t.app.map_or((1.0, 1.0), |i| (apps[i].cur, apps[i].next));
+    t.wire.next = slew(t.wire.cur, t.wire.target, n);
+    // x * 1.0 is exact, so a plain wire sums bit for bit as it did before wires had a trim.
+    let (from, to) = (g.cur * s0 * t.wire.cur, g.next * s1 * t.wire.next);
+    match (t.src, t.dst) {
+        (Src::Input(i), Dst::Vdev(c)) => ramp_add(
+            &mut acc[c * MAX_FRAMES..][..n],
+            &inputs[i][off..end],
+            from,
+            to,
+        ),
+        (Src::Input(i), Dst::Row(r)) => ramp_add(
+            &mut node_buf[r * MAX_FRAMES..][..n],
+            &inputs[i][off..end],
+            from,
+            to,
+        ),
+        (Src::Row(s), Dst::Vdev(c)) => ramp_add(
+            &mut acc[c * MAX_FRAMES..][..n],
+            &node_buf[s * MAX_FRAMES..][..n],
+            from,
+            to,
+        ),
+        (Src::Row(s), Dst::Row(r)) => {
+            // `compile` only keeps taps from an earlier row to a later one.
+            let (lo, hi) = node_buf.split_at_mut(r * MAX_FRAMES);
+            ramp_add(&mut hi[..n], &lo[s * MAX_FRAMES..][..n], from, to);
+        }
+    }
+    t.wire.cur = t.wire.next;
+}
+
+/// A tap whose node ends are still config positions: `compile` orders the nodes before it can say rows.
+struct Pending {
+    tap: Tap,
+    from: Option<(usize, usize)>,
+    to: Option<(usize, usize)>,
+}
+
 impl MixPlan {
-    /// Wires whose source/channel is absent from the layout, or out of range, are dropped.
-    /// Source volume/mute -> per-source gain; device volume/mute -> vdev gain;
-    /// monitor volume/enabled -> monitor gain (monitors hear the vdev post gain).
-    pub fn compile(dev: &VirtualDevice, layout: &IoLayout) -> MixPlan {
+    /// Wires whose source/channel is absent from the layout, or out of range, are dropped, and so are
+    /// those that name a node that cannot run (duplicate id, over the caps) or close a loop of nodes
+    /// (the back edge of what Kahn's algorithm cannot order): a plan never trusts `Config::validate`.
+    /// Source volume/mute -> per-source gain; node fader/mute -> its outgoing wires' gain;
+    /// device volume/mute -> vdev gain; monitor volume/enabled -> monitor gain (monitors hear the vdev
+    /// post gain). `rate` is the sample rate of the aggregate this plan will run in.
+    pub fn compile(dev: &VirtualDevice, layout: &IoLayout, rate: f32) -> MixPlan {
         let nch = usize::from(dev.channels).min(MAX_CH);
-        let srcs: Vec<Gain> = dev
+        let mut srcs: Vec<Gain> = dev
             .sources
             .iter()
             .map(|s| Gain::new(&s.id, s.volume_db, s.muted))
@@ -234,41 +327,154 @@ impl MixPlan {
                 next: 1.0,
             })
             .collect();
-        let mut taps = Vec::new();
+        // The nodes that can run, as config indices: unique id (also among the sources), channels and
+        // totals within the caps. `node_srcs` is each one's index in `srcs`.
+        let slots = node_slots(&dev.nodes);
+        let mut ids: HashSet<&str> = dev.sources.iter().map(|s| s.id.as_str()).collect();
+        let mut usable: Vec<usize> = Vec::new();
+        let mut total = 0;
+        for (i, n) in dev.nodes.iter().enumerate() {
+            let c = usize::from(n.channels);
+            if usable.len() < MAX_NODES
+                && (1..=MAX_NODE_CH).contains(&c)
+                && total + c <= MAX_NODE_CH_TOTAL
+                && ids.insert(n.id.as_str())
+            {
+                total += c;
+                usable.push(i);
+                srcs.push(Gain::new(&n.id, n.gain_db, n.muted));
+            }
+        }
+        let node_of = |id: &str| usable.iter().position(|&i| dev.nodes[i].id == id);
+        let node_ch = |k: usize| usize::from(dev.nodes[usable[k]].channels);
+        let src_gain = dev.sources.len();
+        let mut pending: Vec<Pending> = Vec::new();
         // A wire listed twice would sum twice (+6 dB): hand-edited configs and presets can hold one.
         let mut seen = HashSet::new();
         for w in &dev.wires {
-            if !seen.insert((&w.source, w.src_ch, w.out_ch)) {
+            if !seen.insert((&w.source, w.src_ch, &w.to, w.out_ch)) {
                 continue;
             }
-            let (Some(src), vch) = (
-                dev.sources.iter().position(|s| s.id == w.source),
-                usize::from(w.out_ch),
-            ) else {
-                continue;
-            };
-            if vch >= nch {
-                continue;
-            }
-            for (in_idx, slot) in layout.inputs.iter().enumerate() {
-                if let Some((id, ch)) = slot
-                    && *id == w.source
-                    && *ch == w.src_ch
-                {
-                    let mut wire = Gain::new((&w.source, w.src_ch, w.out_ch), w.gain_db, false);
-                    if w.invert {
-                        wire = wire.inverted();
+            let to = match &w.to {
+                None if usize::from(w.out_ch) < nch => None,
+                Some(id) => match node_of(id) {
+                    Some(k) if usize::from(w.out_ch) < node_ch(k) => {
+                        Some((k, usize::from(w.out_ch)))
                     }
-                    taps.push(Tap {
-                        in_idx,
-                        vch,
-                        src,
-                        wire,
-                        app: apps.iter().position(|a| a.id == dev.sources[src].id),
-                    });
+                    _ => continue,
+                },
+                None => continue,
+            };
+            let wire = || {
+                let g = Gain::new((&w.source, w.src_ch, &w.to, w.out_ch), w.gain_db, false);
+                if w.invert { g.inverted() } else { g }
+            };
+            let dst = Dst::Vdev(usize::from(w.out_ch));
+            if let Some(src) = dev.sources.iter().position(|s| s.id == w.source) {
+                for (in_idx, slot) in layout.inputs.iter().enumerate() {
+                    if let Some((id, ch)) = slot
+                        && *id == w.source
+                        && *ch == w.src_ch
+                    {
+                        pending.push(Pending {
+                            tap: Tap {
+                                src: Src::Input(in_idx),
+                                dst,
+                                gain: src,
+                                wire: wire(),
+                                app: apps.iter().position(|a| a.id == dev.sources[src].id),
+                            },
+                            from: None,
+                            to,
+                        });
+                    }
+                }
+            } else if let Some(k) = node_of(&w.source)
+                && usize::from(w.src_ch) < node_ch(k)
+            {
+                pending.push(Pending {
+                    tap: Tap {
+                        src: Src::Row(0),
+                        dst,
+                        gain: src_gain + k,
+                        wire: wire(),
+                        app: None,
+                    },
+                    from: Some((k, usize::from(w.src_ch))),
+                    to,
+                });
+            }
+        }
+        // Topological order of the nodes, ties by config order: Kahn's algorithm over the node-to-node
+        // wires. Nodes it cannot order (a loop) follow in config order, and `retain` below drops the
+        // wires that then point backwards.
+        let n_nodes = usable.len();
+        let mut indeg = vec![0usize; n_nodes];
+        for p in &pending {
+            if let (Some((a, _)), Some((b, _))) = (p.from, p.to)
+                && a != b
+            {
+                indeg[b] += 1;
+            }
+        }
+        let mut order: Vec<usize> = Vec::with_capacity(n_nodes);
+        let mut placed = vec![false; n_nodes];
+        while let Some(k) = (0..n_nodes).find(|&k| !placed[k] && indeg[k] == 0) {
+            placed[k] = true;
+            order.push(k);
+            for p in &pending {
+                if let (Some((a, _)), Some((b, _))) = (p.from, p.to)
+                    && a == k
+                    && b != k
+                {
+                    indeg[b] -= 1;
                 }
             }
         }
+        order.extend((0..n_nodes).filter(|&k| !placed[k]));
+        let mut pos = vec![0usize; n_nodes];
+        for (i, &k) in order.iter().enumerate() {
+            pos[k] = i;
+        }
+        let mut row0 = vec![0usize; n_nodes]; // by config position among the usable
+        let mut rows = 0;
+        for &k in &order {
+            row0[k] = rows;
+            rows += node_ch(k);
+        }
+        pending.retain(|p| match (p.from, p.to) {
+            (Some((a, _)), Some((b, _))) => pos[a] < pos[b],
+            _ => true,
+        });
+        // Taps into nodes first, node by node; the stable sort keeps wire order within each group, and
+        // the virtual-device taps keep theirs, so a device without nodes sums in the order it always did.
+        pending.sort_by_key(|p| p.to.map_or(usize::MAX, |(k, _)| pos[k]));
+        let mut node_end = vec![0usize; n_nodes];
+        let mut taps = Vec::with_capacity(pending.len());
+        for p in pending {
+            let mut t = p.tap;
+            if let Some((k, ch)) = p.from {
+                t.src = Src::Row(row0[k] + ch);
+            }
+            if let Some((k, ch)) = p.to {
+                t.dst = Dst::Row(row0[k] + ch);
+                node_end[pos[k]] = taps.len() + 1;
+            }
+            taps.push(t);
+        }
+        // A node without taps inherits its predecessor's end.
+        for i in 1..n_nodes {
+            node_end[i] = node_end[i].max(node_end[i - 1]);
+        }
+        let nodes: Vec<NodePlan> = order
+            .iter()
+            .map(|&k| NodePlan {
+                row0: row0[k],
+                ch: node_ch(k),
+                gain: src_gain + k,
+                meter: slots[usable[k]],
+            })
+            .collect();
         let mut dev_out = Vec::new();
         for (slot, p) in layout.outputs.iter().enumerate() {
             if let Some(OutPort::Device(c)) = p
@@ -316,8 +522,11 @@ impl MixPlan {
             .filter(|(i, s)| s.is_some() && *i < METER_SLOTS)
             .map(|(i, _)| i)
             .collect();
+        let finite_into = |same: &dyn Fn(&Tap) -> bool| {
+            taps.iter().filter(|t| same(t)).count() <= MAX_FINITE_TAPS
+        };
         let acc_finite =
-            (0..nch).all(|c| taps.iter().filter(|t| t.vch == c).count() <= MAX_FINITE_TAPS);
+            (0..nch).all(|c| finite_into(&|t| matches!(t.dst, Dst::Vdev(d) if d == c)));
         let mut tap_keys: Vec<(u64, usize)> = taps
             .iter()
             .enumerate()
@@ -325,8 +534,19 @@ impl MixPlan {
             .collect();
         tap_keys.sort_unstable();
         let mut h = DefaultHasher::new();
+        let hash_src = |s: Src| match s {
+            Src::Input(i) => (0u8, i),
+            Src::Row(r) => (1, r),
+        };
+        let hash_dst = |d: Dst| match d {
+            Dst::Vdev(c) => (0u8, c),
+            Dst::Row(r) => (1, r),
+        };
         for t in &taps {
-            (t.in_idx, t.vch, srcs[t.src].key).hash(&mut h);
+            (hash_src(t.src), hash_dst(t.dst), srcs[t.gain].key).hash(&mut h);
+        }
+        for n in &nodes {
+            (srcs[n.gain].key, n.row0, n.ch).hash(&mut h);
         }
         dev_out.hash(&mut h);
         for m in &mons {
@@ -341,6 +561,10 @@ impl MixPlan {
             nch,
             srcs,
             taps,
+            nodes,
+            node_end,
+            rate,
+            node_buf: prefaulted(rows * MAX_FRAMES),
             tap_keys,
             dev_gain: Gain::new("dev", dev.volume_db, dev.muted),
             apps,
@@ -351,6 +575,11 @@ impl MixPlan {
             acc_finite,
             route: h.finish(),
         }
+    }
+
+    /// The sample rate this plan was compiled for.
+    pub fn rate(&self) -> f32 {
+        self.rate
     }
 
     /// Continue gain ramps from what `old` last applied.
@@ -392,6 +621,7 @@ impl MixPlan {
         meters: &Meters,
     ) -> bool {
         let end = off + n;
+        let span = (off, end, n);
         for g in &mut self.srcs {
             g.next = slew(g.cur, g.target, n);
         }
@@ -405,20 +635,44 @@ impl MixPlan {
         for c in 0..self.nch {
             self.acc[c * MAX_FRAMES..][..n].fill(0.0);
         }
-        for t in &mut self.taps {
-            let g = &self.srcs[t.src];
-            let (s0, s1) = t
-                .app
-                .map_or((1.0, 1.0), |i| (self.apps[i].cur, self.apps[i].next));
-            t.wire.next = slew(t.wire.cur, t.wire.target, n);
-            // x * 1.0 is exact, so a plain wire sums bit for bit as it did before wires had a trim.
-            ramp_add(
-                &mut self.acc[t.vch * MAX_FRAMES..][..n],
-                &inputs[t.in_idx][off..end],
-                g.cur * s0 * t.wire.cur,
-                g.next * s1 * t.wire.next,
+        let mut start = 0;
+        for (node, &stop) in self.nodes.iter().zip(&self.node_end) {
+            let g = &self.srcs[node.gain];
+            // A node whose mute has settled neither mixes nor meters: its outgoing wires add nothing.
+            if g.cur != 0.0 || g.next != 0.0 {
+                for r in 0..node.ch {
+                    self.node_buf[(node.row0 + r) * MAX_FRAMES..][..n].fill(0.0);
+                }
+                for t in &mut self.taps[start..stop] {
+                    mix_tap(
+                        t,
+                        &self.srcs,
+                        &self.apps,
+                        inputs,
+                        span,
+                        &mut self.node_buf,
+                        &mut self.acc,
+                    );
+                }
+                // What leaves the node: row peak times the fader's larger end of the block.
+                let fader = g.cur.abs().max(g.next.abs());
+                for r in 0..node.ch {
+                    let row = &self.node_buf[(node.row0 + r) * MAX_FRAMES..][..n];
+                    meters.update_node(node.meter + r, peak(row) * fader);
+                }
+            }
+            start = stop;
+        }
+        for t in &mut self.taps[start..] {
+            mix_tap(
+                t,
+                &self.srcs,
+                &self.apps,
+                inputs,
+                span,
+                &mut self.node_buf,
+                &mut self.acc,
             );
-            t.wire.cur = t.wire.next;
         }
         for a in &mut self.apps {
             a.cur = a.next;
@@ -519,7 +773,8 @@ pub fn mixer(meters: Arc<Meters>) -> (Mixer, MixerHandle) {
         Mixer {
             plan: None,
             fade: None,
-            fade_buf: vec![0.0; MAX_CH * MAX_FRAMES],
+            // Prefaulted: the first crossfade would otherwise fault these pages in on the audio thread.
+            fade_buf: prefaulted(MAX_CH * MAX_FRAMES),
             slot: slot.clone(),
             ret,
             meters,
@@ -681,6 +936,7 @@ mod tests {
             sources: vec![src("a"), src("b")],
             wires,
             monitors: vec![],
+            nodes: Vec::new(),
         }
     }
 
@@ -712,6 +968,7 @@ mod tests {
                 trimmed("b", 1, 1, 6.0),
             ]),
             &layout(),
+            48_000.0,
         );
         for (t, cur) in old.taps.iter_mut().zip([0.5f32, 0.25, 0.125, 2.0]) {
             t.wire.cur = cur;
@@ -724,6 +981,7 @@ mod tests {
                 trimmed("b", 0, 0, 0.0),
             ]),
             &layout(),
+            48_000.0,
         );
         new.inherit(&old);
         let cur: Vec<f32> = new.taps.iter().map(|t| t.wire.cur).collect();

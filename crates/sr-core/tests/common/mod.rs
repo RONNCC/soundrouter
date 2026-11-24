@@ -28,6 +28,7 @@ pub fn dev() -> VirtualDevice {
         sources: vec![src("s1", 2, 0.0, false)],
         wires: vec![Wire::new("s1", 0, 0), Wire::new("s1", 1, 1)],
         monitors: vec![],
+        nodes: Vec::new(),
     }
 }
 

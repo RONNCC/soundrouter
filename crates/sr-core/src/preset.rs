@@ -354,6 +354,7 @@ mod tests {
             }],
             wires: vec![Wire::new("s1", 0, 0)],
             monitors: vec![],
+            nodes: Vec::new(),
         }
     }
 

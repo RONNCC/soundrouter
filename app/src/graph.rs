@@ -2234,6 +2234,7 @@ mod tests {
                     })
                     .collect(),
                 channels: vec![0.9, 0.55],
+                ..Default::default()
             });
             Harness::builder()
                 .with_size(vec2(1000.0, 560.0))

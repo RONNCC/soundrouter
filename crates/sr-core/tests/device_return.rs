@@ -17,7 +17,7 @@ fn unplugged() -> IoLayout {
 
 fn mixer_for(d: &VirtualDevice, l: &IoLayout) -> Mixer {
     let (m, mut h) = mixer(Arc::new(Meters::new()));
-    h.set_plan(MixPlan::compile(d, l));
+    h.set_plan(MixPlan::compile(d, l, 48_000.0));
     m
 }
 

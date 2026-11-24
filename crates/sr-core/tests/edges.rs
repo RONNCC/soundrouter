@@ -8,7 +8,7 @@ use std::sync::Arc;
 fn setup(d: &VirtualDevice, l: &IoLayout) -> (Mixer, MixerHandle, Arc<Meters>) {
     let meters = Arc::new(Meters::new());
     let (m, mut h) = mixer(meters.clone());
-    h.set_plan(MixPlan::compile(d, l));
+    h.set_plan(MixPlan::compile(d, l, 48_000.0));
     (m, h, meters)
 }
 
@@ -125,7 +125,7 @@ fn non_finite_input_cannot_poison_the_device() {
         if block == 1 {
             // a ramping plan swap must not smear NaN either
             d.sources[1].volume_db = -6.0;
-            h.set_plan(MixPlan::compile(&d, &l));
+            h.set_plan(MixPlan::compile(&d, &l, 48_000.0));
         }
     }
     let r = meters.take(&l, &d);

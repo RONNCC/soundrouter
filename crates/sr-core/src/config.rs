@@ -6,6 +6,10 @@ pub const MAX_CH: usize = 64;
 pub const MAX_FRAMES: usize = 4096;
 /// Longest device name; matches the driver, which truncates beyond it.
 pub const MAX_NAME_CHARS: usize = 64;
+/// Mixer nodes per virtual device, channels per node, and channels over all of a device's nodes.
+pub const MAX_NODES: usize = 16;
+pub const MAX_NODE_CH: usize = 8;
+pub const MAX_NODE_CH_TOTAL: usize = 32;
 /// Highest accepted volume in dB; anything lower (even -200) is valid and just means near-silence.
 pub const MAX_DB: f32 = 24.0;
 /// Highest `version` this build reads. [`Config`] writes the lowest version that can hold its content
@@ -81,6 +85,26 @@ pub struct VirtualDevice {
     pub wires: Vec<Wire>,
     #[serde(default)]
     pub monitors: Vec<Monitor>,
+    /// Mixer strips between the sources and the output channels, see `docs/NODES.md`. A wire reaches a
+    /// node through `Wire::to` and leaves it through `Wire::source`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<Node>,
+}
+
+/// A mixer strip: `channels` rows, each the sum of its incoming wires, then a fader and a mute.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Node {
+    /// Unique among the device's sources and nodes: a wire's `source` or `to` names it.
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "stereo")]
+    pub channels: u16,
+    /// Fader, `<= MAX_DB`; applied as the gain of the node's outgoing wires.
+    #[serde(default)]
+    pub gain_db: f32,
+    #[serde(default)]
+    pub muted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -128,6 +152,10 @@ pub struct Wire {
     /// Flip polarity (the wire's gain is negated); false is not written.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub invert: bool,
+    /// Node id this wire feeds; `out_ch` is then the node's input channel. Absent: a device output
+    /// channel, as before. When `source` names a node, `src_ch` is that node's output channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
 }
 fn is_zero(x: &f32) -> bool {
     *x == 0.0
@@ -141,11 +169,12 @@ impl Wire {
             out_ch,
             gain_db: 0.0,
             invert: false,
+            to: None,
         }
     }
     /// Whether an older build would misread this wire (see [`Config::written_version`]).
     fn needs_v2(&self) -> bool {
-        self.gain_db != 0.0 || self.invert
+        self.gain_db != 0.0 || self.invert || self.to.is_some()
     }
 }
 
@@ -179,15 +208,97 @@ fn check_db(what: &str, db: f32) -> Result<(), String> {
     }
 }
 
+/// Node ids are unique among sources and nodes (`ids` holds the sources'), counts and channel counts are
+/// within the caps, faders sane.
+fn validate_nodes<'a>(dev: &'a VirtualDevice, ids: &mut HashSet<&'a str>) -> Result<(), String> {
+    if dev.nodes.len() > MAX_NODES {
+        return Err(format!(
+            "device '{}': {} nodes, at most {MAX_NODES}",
+            dev.id,
+            dev.nodes.len()
+        ));
+    }
+    let mut total = 0;
+    for n in &dev.nodes {
+        if n.id.is_empty() || n.id.len() > MAX_ID_BYTES || n.id.contains('\0') {
+            return Err(format!(
+                "device '{}': node id '{}' must be 1..={MAX_ID_BYTES} bytes without NUL",
+                dev.id, n.id
+            ));
+        }
+        if !ids.insert(n.id.as_str()) {
+            return Err(format!(
+                "device '{}': node id '{}' is also another source or node id",
+                dev.id, n.id
+            ));
+        }
+        if n.name.chars().count() > MAX_NAME_CHARS {
+            return Err(format!(
+                "node '{}': name longer than {MAX_NAME_CHARS} characters",
+                n.id
+            ));
+        }
+        if !(1..=MAX_NODE_CH).contains(&usize::from(n.channels)) {
+            return Err(format!(
+                "node '{}': channels {} must be in 1..={MAX_NODE_CH}",
+                n.id, n.channels
+            ));
+        }
+        total += usize::from(n.channels);
+        check_db(&format!("node '{}'", n.id), n.gain_db)?;
+    }
+    if total > MAX_NODE_CH_TOTAL {
+        return Err(format!(
+            "device '{}': {total} node channels, at most {MAX_NODE_CH_TOTAL}",
+            dev.id
+        ));
+    }
+    Ok(())
+}
+
+/// Kahn's algorithm over the node-to-node wires; what it cannot order is a cycle (a self wire included).
+fn check_acyclic(dev: &VirtualDevice) -> Result<(), String> {
+    let pos = |id: &str| dev.nodes.iter().position(|n| n.id == id);
+    let edges: Vec<(usize, usize)> = dev
+        .wires
+        .iter()
+        .filter_map(|w| Some((pos(&w.source)?, pos(w.to.as_deref()?)?)))
+        .collect();
+    let mut indeg = vec![0usize; dev.nodes.len()];
+    for &(_, to) in &edges {
+        indeg[to] += 1;
+    }
+    let mut ready: Vec<usize> = (0..indeg.len()).filter(|&i| indeg[i] == 0).collect();
+    let mut done = 0;
+    while let Some(n) = ready.pop() {
+        done += 1;
+        for &(from, to) in &edges {
+            if from == n {
+                indeg[to] -= 1;
+                if indeg[to] == 0 {
+                    ready.push(to);
+                }
+            }
+        }
+    }
+    match indeg.iter().position(|&d| d > 0) {
+        Some(i) if done < indeg.len() => Err(format!(
+            "device '{}': node '{}' is part of a loop; nodes only feed forward",
+            dev.id, dev.nodes[i].id
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl VirtualDevice {
     /// Whether an older build would misread this device (see [`Config::written_version`]).
     pub fn needs_v2(&self) -> bool {
-        self.wires.iter().any(Wire::needs_v2)
+        !self.nodes.is_empty() || self.wires.iter().any(Wire::needs_v2)
     }
 }
 
 impl Config {
-    /// The lowest version that can hold this content: 1 unless a wire has a trim. Serde ignores unknown
+    /// The lowest version that can hold this content: 1 unless a wire has a trim or goes to a node, or a node exists. Serde ignores unknown
     /// fields, so a v1 build reading trims would route at unity and then overwrite the file on its next
     /// save; at version 2 it takes the newer-version path instead (defaults, file untouched).
     pub fn written_version(&self) -> u32 {
@@ -280,23 +391,40 @@ impl Config {
                     ));
                 }
             }
+            validate_nodes(dev, &mut src_ids)?;
             for w in &dev.wires {
-                let Some(src) = dev.sources.iter().find(|s| s.id == w.source) else {
+                let src_ch_max = if let Some(s) = dev.sources.iter().find(|s| s.id == w.source) {
+                    s.channels
+                } else if let Some(n) = dev.nodes.iter().find(|n| n.id == w.source) {
+                    n.channels
+                } else {
                     return Err(format!(
                         "device '{}': wire references unknown source '{}'",
                         dev.id, w.source
                     ));
                 };
-                if w.src_ch >= src.channels {
+                if w.src_ch >= src_ch_max {
                     return Err(format!(
                         "device '{}': wire src_ch {} out of range for source '{}' ({} ch)",
-                        dev.id, w.src_ch, src.id, src.channels
+                        dev.id, w.src_ch, w.source, src_ch_max
                     ));
                 }
-                if w.out_ch >= dev.channels {
+                let (dst, dst_ch) = match &w.to {
+                    None => ("the device".to_string(), dev.channels),
+                    Some(to) => match dev.nodes.iter().find(|n| n.id == *to) {
+                        Some(n) => (format!("node '{to}'"), n.channels),
+                        None => {
+                            return Err(format!(
+                                "device '{}': wire to '{to}', which is not a node",
+                                dev.id
+                            ));
+                        }
+                    },
+                };
+                if w.out_ch >= dst_ch {
                     return Err(format!(
-                        "device '{}': wire out_ch {} out of range ({} ch)",
-                        dev.id, w.out_ch, dev.channels
+                        "device '{}': wire out_ch {} out of range for {dst} ({dst_ch} ch)",
+                        dev.id, w.out_ch
                     ));
                 }
                 check_db(
@@ -304,6 +432,7 @@ impl Config {
                     w.gain_db,
                 )?;
             }
+            check_acyclic(dev)?;
             for m in &dev.monitors {
                 check_db(&format!("monitor '{}'", m.device_uid), m.volume_db)?;
                 for mw in &m.wires {

@@ -184,12 +184,12 @@ proptest! {
         x in prop::collection::vec(0.1f64..=1.0, SRCS * 2),
     ) {
         let (mut m, mut h) = mixer(Arc::new(Meters::new()));
-        h.set_plan(MixPlan::compile(&device(&seq[0].0), &layout6()));
+        h.set_plan(MixPlan::compile(&device(&seq[0].0), &layout6(), 48_000.0));
         block(&mut m, &x, seq[0].1);
         let mut last = oracle(&seq[0].0, &x, true);
         let mut prevc = seq[0].0.clone();
         for (c, n) in &seq[1..] {
-            h.set_plan(MixPlan::compile(&device(c), &layout6()));
+            h.set_plan(MixPlan::compile(&device(c), &layout6(), 48_000.0));
             let want = oracle(c, &x, true);
             let top = reach(&prevc, c, &x, false);
             let flat = reach(&prevc, c, &x, true);
@@ -229,11 +229,11 @@ fn a_removed_wire_fades_out_and_an_added_one_fades_in() {
     let (mut m, mut h) = mixer(Arc::new(Meters::new()));
     let n = 64;
     let ins = vec![vec![1.0; n], vec![1.0; n]];
-    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    h.set_plan(MixPlan::compile(&dev(), &layout(), 48_000.0));
     run(&mut m, &ins, 4, n);
     let mut d = dev();
     d.wires.pop(); // ch 1 -> out 1 goes away
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     let o = run(&mut m, &ins, 4, n);
     assert!(o[1][0] > 0.9, "starts where it was: {}", o[1][0]);
     assert!(
@@ -247,7 +247,7 @@ fn a_removed_wire_fades_out_and_an_added_one_fades_in() {
         "{:?}",
         o[1]
     );
-    h.set_plan(MixPlan::compile(&dev(), &layout()));
+    h.set_plan(MixPlan::compile(&dev(), &layout(), 48_000.0));
     let o = run(&mut m, &ins, 4, n);
     assert!(o[1][0] < 0.1, "fades in from silence: {}", o[1][0]);
     assert!((o[1][n - 1] - 1.0).abs() < 1e-5);

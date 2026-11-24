@@ -67,14 +67,14 @@ proptest! {
         let base = LIVE.load(Relaxed);
         {
             let (mut m, mut h) = mixer(Arc::new(Meters::new()));
-            h.set_plan(MixPlan::compile(&d, &l));
+            h.set_plan(MixPlan::compile(&d, &l, 48_000.0));
             m.process(&ins, &mut outs.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(), 64);
             let mut want = None;
             for op in &ops {
                 match op {
                     Op::Set(db) => {
                         d.volume_db = *db;
-                        h.set_plan(MixPlan::compile(&d, &l));
+                        h.set_plan(MixPlan::compile(&d, &l, 48_000.0));
                         want = Some(*db);
                     }
                     Op::Process => {

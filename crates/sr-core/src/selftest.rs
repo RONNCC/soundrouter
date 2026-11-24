@@ -48,6 +48,7 @@ pub fn probe_config(cfg: &Config, id: &str) -> Option<Config> {
     dev.wires = (0..dev.channels)
         .map(|ch| Wire::new(source.clone(), ch, ch))
         .collect();
+    dev.nodes.clear(); // the probe is one direct path; a node could also own the new source's id
     for m in &mut dev.monitors {
         m.wires.clear();
     }
@@ -209,6 +210,7 @@ mod tests {
                 }],
                 name: String::new(),
             }],
+            nodes: Vec::new(),
         }
     }
 

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 847a99d2d6aabfe29e8bd1eef41cf3cc4b0431742e105e22346b512a1f83f381 # shrinks to seq = [(G { src_db: [(0.0, false), (0.0, false), (0.0, false)], nodes: [(1, 0.0, false), (2, 0.0, false)], wires: [] }, 16), (G { src_db: [(0.0, false), (0.0, false), (0.0, false)], nodes: [(1, 0.0, false), (2, 0.0, false)], wires: [W { from: Src(0, 0), to: Vdev(0), db: 0.0, invert: false }] }, 16)], x = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+cc 00806fd0e6147efd60173a40f1401eee03c1fca7ffd7fddf9825fa2587dd35e5 # shrinks to g = G { src_db: [(0.0, false), (0.0, false), (0.0, false)], nodes: [(2, 0.0, false), (3, 0.0, false), (3, 0.0, false), (2, 0.0, false)], wires: [W { from: Node(3, 0), to: Node(0, 0), db: 0.0, invert: false }, W { from: Src(0, 0), to: Node(3, 0), db: 0.0, invert: false }, W { from: Node(0, 0), to: Vdev(0), db: 0.0, invert: false }] }, n = 1, x = [0.98425902145638, 0.0, 0.0, 0.0, 0.0, 0.0]
+cc 7a38c46b94f31186e0a8ccabd32ce92ac4cf7e40f6182bbe0cb0e2a281f9a5e3 # shrinks to seq = [(G { src_db: [(0.0, false), (0.0, false), (0.0, false)], nodes: [], wires: [] }, 16), (G { src_db: [(0.0, false), (0.0, false), (0.0, false)], nodes: [(3, 0.0, false), (1, 0.0, false), (1, 0.0, false), (1, 0.0, false), (1, 0.0, false)], wires: [W { from: Node(3, 0), to: Vdev(0), db: 0.0, invert: false }, W { from: Src(2, 1), to: Node(4, 0), db: 0.0, invert: false }, W { from: Node(4, 0), to: Node(3, 0), db: 0.0, invert: false }] }, 16)], x = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]

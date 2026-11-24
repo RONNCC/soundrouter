@@ -21,6 +21,8 @@ pub struct AppInfo {
 pub struct MeterReading {
     pub sources: Vec<(String, Vec<f32>)>,
     pub channels: Vec<f32>,
+    /// One entry per mixer node of the device, in config order: its id and the post-fader peak per channel.
+    pub nodes: Vec<(String, Vec<f32>)>,
 } // linear peak since last read
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TccStatus {

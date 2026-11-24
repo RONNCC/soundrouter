@@ -211,7 +211,11 @@ impl Backend for FakeBackend {
             10f32.powf(dev.volume_db / 20.0)
         };
         channels.iter_mut().for_each(|c| *c *= gain);
-        Some(MeterReading { sources, channels })
+        Some(MeterReading {
+            sources,
+            channels,
+            ..Default::default()
+        })
     }
 }
 

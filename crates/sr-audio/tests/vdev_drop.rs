@@ -25,6 +25,7 @@ fn cfg(enabled: bool) -> Config {
             }],
             wires: vec![],
             monitors: vec![],
+            nodes: Vec::new(),
         }],
         ..Config::default()
     }

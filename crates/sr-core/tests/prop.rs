@@ -86,6 +86,7 @@ fn arb_device() -> impl Strategy<Value = VirtualDevice> {
                     sources,
                     wires,
                     monitors,
+                    nodes: Vec::new(),
                 }
             },
         )
@@ -171,7 +172,7 @@ fn lin(db: f32) -> f32 {
 fn mixer_for(w: &World) -> (Mixer, MixerHandle, Arc<Meters>) {
     let meters = Arc::new(Meters::new());
     let (m, mut h) = mixer(meters.clone());
-    h.set_plan(MixPlan::compile(&w.dev, &w.layout()));
+    h.set_plan(MixPlan::compile(&w.dev, &w.layout(), 48_000.0));
     (m, h, meters)
 }
 
@@ -234,7 +235,7 @@ proptest! {
         let (mut m, _h, _) = {
             let meters = Arc::new(Meters::new());
             let (m, mut h) = mixer(meters.clone());
-            h.set_plan(MixPlan::compile(&dev(), &layout()));
+            h.set_plan(MixPlan::compile(&dev(), &layout(), 48_000.0));
             (m, h, meters)
         };
         for n in sizes {
@@ -310,7 +311,7 @@ proptest! {
             } else {
                 (d.sources[0].volume_db, d.sources[0].muted) = g;
             }
-            MixPlan::compile(&d, &layout())
+            MixPlan::compile(&d, &layout(), 48_000.0)
         };
         let meters = Arc::new(Meters::new());
         let (mut m, mut h) = mixer(meters);
@@ -450,7 +451,7 @@ fn mix_once(d: &VirtualDevice, ins: &[f32]) -> Vec<Vec<f32>> {
     let layout = IoLayout { inputs, outputs };
     let meters = Arc::new(Meters::new());
     let (mut m, mut h) = mixer(meters);
-    h.set_plan(MixPlan::compile(d, &layout));
+    h.set_plan(MixPlan::compile(d, &layout, 48_000.0));
     let data: Vec<Vec<f32>> = (0..layout.inputs.len())
         .map(|i| ins.iter().cycle().skip(i).take(32).copied().collect())
         .collect();
@@ -542,11 +543,11 @@ proptest! {
         let meters = Arc::new(Meters::new());
         let (mut m, mut h) = mixer(meters.clone());
         let l = layout();
-        h.set_plan(MixPlan::compile(&build(&g[..3], flags[0], flags[1]), &l));
+        h.set_plan(MixPlan::compile(&build(&g[..3], flags[0], flags[1]), &l, 48_000.0));
         let blk = |v: &[f32]| vec![v[..24].to_vec(), v[24..].to_vec()];
         let o = run(&mut m, &blk(&a), 4, 24);
         prop_assert!(o.iter().flatten().all(|x| x.is_finite()), "block 1");
-        h.set_plan(MixPlan::compile(&build(&g[3..], flags[2], false), &l));
+        h.set_plan(MixPlan::compile(&build(&g[3..], flags[2], false), &l, 48_000.0));
         let o = run(&mut m, &blk(&b), 4, 24);
         prop_assert!(o.iter().flatten().all(|x| x.is_finite()), "block 2 after a plan swap");
         let r = meters.take(&l, &build(&g[3..], false, false));
@@ -564,7 +565,7 @@ fn speaker_ch0(pairs: &[(u16, u16)], vol_db: f32, l: &[f32], r: &[f32]) -> Vec<f
         .collect();
     d.monitors.push(m);
     let (mut mx, mut h) = mixer(Arc::new(Meters::new()));
-    h.set_plan(MixPlan::compile(&d, &layout()));
+    h.set_plan(MixPlan::compile(&d, &layout(), 48_000.0));
     run(&mut mx, &[l.to_vec(), r.to_vec()], 4, l.len()).swap_remove(2)
 }
 

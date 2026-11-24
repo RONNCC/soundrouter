@@ -68,6 +68,7 @@ fn cfg(player_key: &str, volume_db: f32, muted: bool, wires: &[(u16, u16)]) -> C
             }],
             wires: wires.iter().map(|&(s, o)| Wire::new("s1", s, o)).collect(),
             monitors: vec![],
+            nodes: Vec::new(),
         }],
         ..Config::default()
     }

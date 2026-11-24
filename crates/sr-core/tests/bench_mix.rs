@@ -38,9 +38,38 @@ fn wide(ch: u16) -> (VirtualDevice, IoLayout) {
     (d, l)
 }
 
+/// 32 channels in and out like `wide(32)`, but every channel pair goes through its own stereo bus:
+/// 16 nodes, 32 node channels (the cap), one tap in and one out per channel.
+fn buses16() -> (VirtualDevice, IoLayout) {
+    let (mut d, l) = wide(32);
+    d.monitors.clear();
+    d.nodes = (0..16)
+        .map(|i| Node {
+            id: format!("n{i}"),
+            name: String::new(),
+            channels: 2,
+            gain_db: -1.0,
+            muted: false,
+        })
+        .collect();
+    d.wires = (0..32u16)
+        .flat_map(|c| {
+            let node = format!("n{}", c / 2);
+            [
+                Wire {
+                    to: Some(node.clone()),
+                    ..Wire::new("s1", c, c % 2)
+                },
+                Wire::new(node, c % 2, c),
+            ]
+        })
+        .collect();
+    (d, l)
+}
+
 fn ns_per_call(d: &VirtualDevice, l: &IoLayout, frames: usize) -> f64 {
     let (mut m, mut h) = mixer(Arc::new(Meters::new()));
-    h.set_plan(MixPlan::compile(d, l));
+    h.set_plan(MixPlan::compile(d, l, 48_000.0));
     let ins: Vec<Vec<f32>> = (0..l.inputs.len())
         .map(|c| {
             (0..frames)
@@ -72,11 +101,15 @@ fn ns_per_call(d: &VirtualDevice, l: &IoLayout, frames: usize) -> f64 {
 fn bench_mix() {
     let (d2, l2) = (dev(), layout());
     let (d64, l64) = wide(64);
+    let (d32, l32) = wide(32);
+    let (db, lb) = buses16();
     for frames in [64, 128, 256] {
         println!(
-            "frames {frames:>3}: stereo {:>8.0} ns   64ch {:>8.0} ns",
+            "frames {frames:>3}: stereo {:>8.0} ns   64ch {:>8.0} ns   32ch {:>8.0} ns   16 buses (32 node ch) {:>8.0} ns",
             ns_per_call(&d2, &l2, frames),
-            ns_per_call(&d64, &l64, frames)
+            ns_per_call(&d64, &l64, frames),
+            ns_per_call(&d32, &l32, frames),
+            ns_per_call(&db, &lb, frames)
         );
     }
 }

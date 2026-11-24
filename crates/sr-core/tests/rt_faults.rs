@@ -5,7 +5,7 @@
 //! This is the only test in its binary so that nothing else in the process faults meanwhile.
 mod common;
 use common::*;
-use sr_core::config::Wire;
+use sr_core::config::{Node, Wire};
 use sr_core::meters::Meters;
 use sr_core::mixer::*;
 use std::sync::Arc;
@@ -36,7 +36,37 @@ fn a_plan_swap_does_not_fault_pages_in_on_the_audio_thread() {
         let mut refs: Vec<&mut [f32]> = outs.iter_mut().map(Vec::as_mut_slice).collect();
         let (mut m, mut h) = mixer(Arc::new(Meters::new()));
         for _ in 0..3 {
-            h.set_plan(MixPlan::compile(&d, &l));
+            h.set_plan(MixPlan::compile(&d, &l, 48_000.0));
+            let before = minor_faults();
+            m.process(&ins, &mut refs, 64);
+            faults += minor_faults() - before;
+        }
+        // The same device through 32 node channels (the cap): their scratch is as big as the vdev's.
+        let mut nodes = d.clone();
+        nodes.nodes = (0..4)
+            .map(|i| Node {
+                id: format!("n{i}"),
+                name: String::new(),
+                channels: 8,
+                gain_db: 0.0,
+                muted: false,
+            })
+            .collect();
+        nodes.wires = (0..n as u16)
+            .flat_map(|i| {
+                let node = format!("n{}", usize::from(i) % 4);
+                let row = i / 4 % 8;
+                [
+                    Wire {
+                        to: Some(node.clone()),
+                        ..Wire::new("s1", i, row)
+                    },
+                    Wire::new(node, row, i),
+                ]
+            })
+            .collect();
+        for _ in 0..3 {
+            h.set_plan(MixPlan::compile(&nodes, &l, 48_000.0));
             let before = minor_faults();
             m.process(&ins, &mut refs, 64);
             faults += minor_faults() - before;

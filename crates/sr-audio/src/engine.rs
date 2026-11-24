@@ -28,7 +28,7 @@ use sr_core::backend::{
     AppInfo, Backend, Delay, DeviceState, EngineOptions, EngineStatus, HwDevice, MeterReading,
     ReadAheadState, SelfTest, TccStatus,
 };
-use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice};
+use sr_core::config::{Config, MAX_CH, MAX_FRAMES, SourceKind, VirtualDevice, Wire};
 use sr_core::driver_proto::{
     COMPANION_SUFFIX, DEVICE_UID_PREFIX, DriverDevice, ReadAheadGuard, companion_uid,
     read_ahead_repush,
@@ -2475,6 +2475,32 @@ fn monitor_warnings(dev: &VirtualDevice, subs: &[SubDesc]) -> Vec<String> {
     out
 }
 
+/// Whether input channel `ch` of the Device sources of `uid` reaches virtual-device channel `out`: by a
+/// wire straight onto it, or through mixer nodes (a node row is a single signal, whichever way it leaves).
+fn reaches_vdev(dev: &VirtualDevice, uid: &str, ch: u16, out: u16) -> bool {
+    let from_device = |w: &Wire| {
+        w.src_ch == ch
+            && dev.sources.iter().any(|s| {
+                s.id == w.source && matches!(&s.kind, SourceKind::Device { uid: u } if u == uid)
+            })
+    };
+    // Wires still to follow; a node row is followed once.
+    let mut seen = HashSet::new();
+    let mut todo: Vec<&Wire> = dev.wires.iter().filter(|w| from_device(w)).collect();
+    while let Some(w) = todo.pop() {
+        match &w.to {
+            None if w.out_ch == out => return true,
+            Some(n) if seen.insert((n.as_str(), w.out_ch)) => todo.extend(
+                dev.wires
+                    .iter()
+                    .filter(|x| x.source == *n && x.src_ch == w.out_ch),
+            ),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// `dev` without the monitor wires that would feed its own mix back into itself, and a warning for each.
 /// A loopback device (BlackHole and the like: `loopback(uid)`) hands what is written to its output channel
 /// k back on its input channel k. A monitor wire to channel k of such a device, with a Device source of
@@ -2493,13 +2519,7 @@ fn without_feedback(
         }
         let uid = m.device_uid.clone();
         m.wires.retain(|mw| {
-            let loops = dev.wires.iter().any(|w| {
-                w.out_ch == mw.out_ch
-                    && w.src_ch == mw.dst_ch
-                    && dev.sources.iter().any(|s| {
-                        s.id == w.source && matches!(&s.kind, SourceKind::Device { uid: u } if *u == uid)
-                    })
-            });
+            let loops = reaches_vdev(dev, &uid, mw.dst_ch, mw.out_ch);
             if loops {
                 warnings.push(format!(
                     "device '{}': monitor '{uid}' wire from channel {} to output channel {} is not routed: \
@@ -2574,7 +2594,8 @@ fn publish_plan(v: &mut Vdev) {
         log::warn!("{w}");
     }
     v.warnings = warnings;
-    v.handle.set_plan(MixPlan::compile(&dev, &v.layout));
+    v.handle
+        .set_plan(MixPlan::compile(&dev, &v.layout, 48_000.0));
     sr_core::trace::stage("plan published");
 }
 
