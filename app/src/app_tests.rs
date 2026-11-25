@@ -1072,6 +1072,81 @@ mod snapshots {
         sized("modules_2", cfg, |_| {}, &mut results);
     }
 
+    /// `fx` added in turn through the Add module menu of channels 1 and 2 of a new device: each
+    /// lands last, so they chain left to right (Delay, then Mono, then Limiter).
+    fn chained(k: usize) -> Config {
+        use crate::model::{Module, NewNode, fx_kinds};
+        let mut cfg = crate::model::default_config();
+        let [_, limiter, delay, mono] = fx_kinds();
+        for fx in [delay, mono, limiter].into_iter().take(k) {
+            apply(
+                &mut cfg,
+                Edit::AddNode(0, NewNode::ForOutputs(0), Module::Fx(fx)),
+            );
+        }
+        cfg
+    }
+
+    #[test]
+    fn chained_modules() {
+        let mut results = egui_kittest::SnapshotResults::new();
+        sized("chained_2", || chained(2), |_| {}, &mut results);
+        sized("chained_3", || chained(3), |_| {}, &mut results);
+        // The 1000 px window scrolled to its right end: the Output channels and Monitors in full.
+        let end = |h: &mut Harness<'static, App>| {
+            minimum(h);
+            h.hover_at(h.ctx.content_rect().center());
+            h.step();
+            h.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(-4000.0, 0.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run_steps(10);
+        };
+        for theme in [Theme::Dark, Theme::Light] {
+            shot(
+                "chained_3_1000_end",
+                theme,
+                chained(3),
+                None,
+                end,
+                &mut results,
+            );
+        }
+    }
+
+    /// Four channels: a Delay on channels 1 and 2 beside an EQ on 3 and 4, both in the first stage.
+    #[test]
+    fn parallel_modules() {
+        use crate::model::{Link, Module, NewNode, Port, fx_kinds};
+        let cfg = || {
+            let mut cfg = crate::model::default_config();
+            apply(&mut cfg, Edit::GrowChannels(0));
+            // Pass-Thru on channels 3 and 4 as well, so both modules have something to process.
+            for ch in 0..2 {
+                let to = Port::OutIn { ch: ch + 2 };
+                let from = Port::Src { src: 0, ch };
+                apply(&mut cfg, Edit::Connect(0, Link { from, to }));
+            }
+            let [eq, _, delay, _] = fx_kinds();
+            apply(
+                &mut cfg,
+                Edit::AddNode(0, NewNode::ForOutputs(0), Module::Fx(delay)),
+            );
+            apply(
+                &mut cfg,
+                Edit::AddNode(0, NewNode::ForOutputs(2), Module::Fx(eq)),
+            );
+            assert_eq!(cfg.devices[0].nodes.len(), 2);
+            cfg
+        };
+        let mut results = egui_kittest::SnapshotResults::new();
+        sized("parallel", cfg, |_| {}, &mut results);
+    }
+
     /// Eight channels: a Gain on channels 1 and 2, an EQ on 5 and 6.
     #[test]
     fn eight_channels_with_modules() {
@@ -3932,6 +4007,75 @@ fn the_processing_column_offers_a_module_and_removing_it_restores_the_cables() {
     click(&mut h, "Remove EQ module");
     assert_eq!(links0(&h), before);
     h.get_by_label("No processing. Sound goes straight to the outputs.");
+    h.state().cfg.validate().unwrap();
+}
+
+/// Adding modules for one pair over and over builds a chain left to right: each new one lands
+/// last, right before the outputs, in a stage of its own to the right of the one before. At the
+/// 1000 px window the graph is wider than the pane and scrolls sideways.
+#[test]
+fn adding_modules_to_a_pair_chains_them_left_to_right() {
+    use crate::model::{Link, Port};
+    let mut h = open(crate::model::default_config());
+    click(&mut h, "Add module");
+    click(&mut h, "Add module: Delay");
+    click(&mut h, "Add processing module");
+    click(&mut h, "Add module: Mono");
+    let names: Vec<String> = h.state().cfg.devices[0]
+        .nodes
+        .iter()
+        .map(|n| n.name.clone())
+        .collect();
+    assert_eq!(names, ["Delay", "Mono"]);
+    let all = links0(&h);
+    for ch in 0..2 {
+        let chain = [
+            (Port::Src { src: 0, ch }, Port::NodeIn { node: 0, ch }),
+            (Port::NodeOut { node: 0, ch }, Port::NodeIn { node: 1, ch }),
+            (Port::NodeOut { node: 1, ch }, Port::OutIn { ch }),
+        ];
+        for (from, to) in chain {
+            assert!(all.contains(&Link { from, to }), "{all:?}");
+        }
+    }
+    assert_eq!(all.len(), 6);
+    // Both name the channels the chain ends in; Mono sits right of Delay, level with it.
+    let delay = h
+        .get_by_label("Delay module, processing Channels 1 & 2")
+        .rect();
+    let mono = h
+        .get_by_label("Mono module, processing Channels 1 & 2")
+        .rect();
+    assert!(mono.left() > delay.right() + 20.0, "{delay:?} {mono:?}");
+    assert!((mono.top() - delay.top()).abs() < 0.5);
+    h.get_by_label("Mono input 1 (L)");
+    h.get_by_label("Remove Delay module");
+    // A third, at the smallest window: the Monitors column waits past the right edge.
+    click(&mut h, "Add processing module");
+    click(&mut h, "Add module: Limiter");
+    h.set_size(egui::vec2(1000.0, 600.0));
+    settle(&mut h);
+    let mono = h
+        .get_by_label("Mono module, processing Channels 1 & 2")
+        .rect();
+    let limiter = h
+        .get_by_label("Limiter module, processing Channels 1 & 2")
+        .rect();
+    assert!(limiter.left() > mono.right() + 20.0);
+    assert!(center(&h, "Add source").x < 1000.0);
+    assert!(center(&h, "Add monitor").x > 1000.0);
+    h.hover_at(center(&h, "Add source") + egui::vec2(0.0, 200.0));
+    h.step();
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(-4000.0, 0.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
+        modifiers: egui::Modifiers::NONE,
+    });
+    settle(&mut h);
+    let mon = center(&h, "Add monitor");
+    assert!(mon.x < 1000.0, "{mon:?}");
     h.state().cfg.validate().unwrap();
 }
 

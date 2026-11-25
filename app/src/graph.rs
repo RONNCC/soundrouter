@@ -1,4 +1,4 @@
-//! The four-column graph (Sources | Processing | Output Channels | Monitors): painting and
+//! The graph (Sources | Processing stages | Output Channels | Monitors): painting and
 //! interaction.
 //! Reads the config, emits `Edit`s; never mutates it.
 use crate::app_icons::{LOOK_AHEAD, Look, PickerIcons, visible_rows, wanted};
@@ -6,8 +6,7 @@ use crate::cables::{Cables, assign};
 use crate::icons::{self, IconTextures};
 use crate::layout::{
     CardId, CardLayout, CardSpec, FOOT_H, HEAD_H, Layout, NodeSpec, ROW_H as ROW_PITCH, SAG_MAX,
-    STRIP_LIMIT_H, STRIP_METER_H, STRIP_ROW_H, TOP, body_height, wire_distance, wire_mid,
-    wire_points,
+    STRIP_LIMIT_H, STRIP_ROW_H, TOP, body_height, stages, wire_distance, wire_mid, wire_points,
 };
 use crate::meter::{PeakHold, level};
 use crate::model::{
@@ -16,7 +15,7 @@ use crate::model::{
 };
 use crate::theme::{Tokens, body, cable_color, caption, label, num, radius, section, tile_tint};
 use crate::widgets::{
-    MIN_HIT, Plug, chevron, darken, halo, hit, hit_rect, jack, loops, menu_hint, meter, meter_v,
+    MIN_HIT, Plug, chevron, darken, halo, hit, hit_rect, jack, loops, menu_hint, meter,
     name_button, name_widget, plus_circle, plus_glyph, slider, switch, tile, trim_glyph, x_button,
     xmark,
 };
@@ -225,14 +224,24 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
             mute_row: false,
         })
         .collect();
+    // A chain of modules reads left to right: each module sits one stage after the ones it hears.
+    let chain: Vec<(usize, usize)> = links(dev)
+        .iter()
+        .filter_map(|l| match (l.from, l.to) {
+            (Port::NodeOut { node: a, .. }, Port::NodeIn { node: b, .. }) => Some((a, b)),
+            _ => None,
+        })
+        .collect();
     let node_specs: Vec<NodeSpec> = dev
         .nodes
         .iter()
-        .map(|n| NodeSpec {
+        .zip(stages(dev.nodes.len(), &chain))
+        .map(|(n, stage)| NodeSpec {
             rows: n.channels,
             fx: n.fx.len(),
             limiter: has_limiter(n),
             open: open_height(n, st.open_fx.get(&node_key(dev, n)).copied()),
+            stage,
         })
         .collect();
     let origin = ui.cursor().min;
@@ -267,8 +276,9 @@ pub fn show(ui: &mut Ui, g: &GraphCtx, st: &mut GraphState, edits: &mut Vec<Edit
     let need = layout
         .proc_empty
         .map_or(need, |r| need.max(r.bottom() - origin.y + 8.0));
+    // Wider than the pane when the stages need it: the graph scrolls sideways.
     ui.allocate_exact_size(
-        vec2(width, layout.size.y.max(g.min_h).max(need)),
+        vec2(layout.size.x, layout.size.y.max(g.min_h).max(need)),
         Sense::hover(),
     );
 
@@ -2079,12 +2089,29 @@ fn fx_chip(fx: &Fx) -> String {
     }
 }
 
-/// What a module works on, for its name: the output channels it feeds ("Channels 1 & 2").
+/// What a module works on, for its name: the output channels it feeds ("Channels 1 & 2"), through
+/// the modules after it in a chain.
 fn module_scope(g: &GraphCtx, n: usize) -> String {
-    let mut outs: Vec<u16> = links(g.dev)
+    let all = links(g.dev);
+    let mut reached = vec![n];
+    let mut i = 0;
+    while let Some(&m) = reached.get(i) {
+        for l in &all {
+            if let (Port::NodeOut { node, .. }, Port::NodeIn { node: next, .. }) = (l.from, l.to)
+                && node == m
+                && !reached.contains(&next)
+            {
+                reached.push(next);
+            }
+        }
+        i += 1;
+    }
+    let mut outs: Vec<u16> = all
         .iter()
         .filter_map(|l| match (l.from, l.to) {
-            (Port::NodeOut { node, .. }, Port::OutIn { ch }) if node == n => Some(ch + 1),
+            (Port::NodeOut { node, .. }, Port::OutIn { ch }) if reached.contains(&node) => {
+                Some(ch + 1)
+            }
             _ => None,
         })
         .collect();
@@ -2121,10 +2148,10 @@ fn open_height(node: &Node, open: Option<usize>) -> f32 {
     }
 }
 
-/// A module card in the Processing column: the header (the name, which a double-click renames,
-/// the on switch and the x, as on a source card), the channel rows with their jacks on the edges,
-/// one standing meter per channel, the limiter line, the fader, one row per effect (a click opens
-/// its parameters inside the card) and Add effect.
+/// A module card in a Processing stage: the header (the name, which a double-click renames, the
+/// on switch and the x, as on a source card), the channel rows with their jacks on the edges and
+/// a meter between them, the limiter line, the fader, one row per effect (a click opens its
+/// parameters inside the card) and Add effect.
 fn strip(
     ui: &mut Ui,
     g: &GraphCtx,
@@ -2234,15 +2261,7 @@ fn strip(
     x.on_hover_text(format!("Remove {name} module"));
     painter.hline(r.x_range(), r.top() + HEAD_H, Stroke::new(1.0, t.hairline));
 
-    // One standing ladder per channel, under the channel rows (their jacks say which is which).
-    let top = r.top() + HEAD_H + ROW_PITCH * f32::from(c.rows);
-    let block = Rect::from_min_max(
-        pos2(r.left() + 12.0, top + 6.0),
-        pos2(r.right() - 12.0, top + STRIP_METER_H - 6.0),
-    );
-    let k = f32::from(c.rows.max(1));
-    let w = ((block.width() - 3.0 * (k - 1.0)) / k).min(8.0);
-    let x0 = block.center().x - (k * w + 3.0 * (k - 1.0)) / 2.0;
+    // Each channel row holds its meter between its jacks (they say which channel it is).
     let active = dev.enabled && !node.muted;
     for row in 0..c.rows {
         let lin = if active { row_level(g, c.id, row) } else { 0.0 };
@@ -2251,17 +2270,20 @@ fn strip(
         if pk > lv {
             ui.request_repaint_after(std::time::Duration::from_millis(33));
         }
-        let at = pos2(x0 + f32::from(row) * (w + 3.0), block.top());
-        meter_v(
+        let y = Layout::row_y(c, row);
+        meter(
             &painter,
-            Rect::from_min_size(at, vec2(w, block.height())),
+            Rect::from_x_y_ranges(
+                (r.left() + 16.0)..=(r.right() - 16.0),
+                (y - 3.0)..=(y + 3.0),
+            ),
             lv,
             pk,
             t,
             dim,
         );
     }
-    let mut y = top + STRIP_METER_H;
+    let mut y = r.top() + HEAD_H + ROW_PITCH * f32::from(c.rows);
 
     // How much the limiter takes off, in words (never colour alone).
     if has_limiter(node) {

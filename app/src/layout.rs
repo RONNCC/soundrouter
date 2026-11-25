@@ -1,4 +1,5 @@
-//! Geometry of the four-column graph: card rects, port positions, hit-testing, wire curves.
+//! Geometry of the graph: Sources, the Processing stages, Output channels and Monitors as columns
+//! left to right; card rects, port positions, hit-testing, wire curves.
 use crate::model::Port;
 use eframe::egui::{Color32, Pos2, Rect, Stroke, Vec2, epaint::CubicBezierShape, pos2, vec2};
 
@@ -17,18 +18,20 @@ pub const GAP: f32 = 16.0;
 /// Space above the first card for the column titles.
 pub const TOP: f32 = 40.0;
 pub const SIDE: f32 = 24.0;
-/// Narrowest the Processing column gets (the 1000 px window); it widens to `PROC_W_MAX`.
+/// Width of a module card and of one Processing stage: the narrowest (the 1000 px window) and the
+/// widest it grows to.
 pub const PROC_W_MIN: f32 = 120.0;
 pub const PROC_W_MAX: f32 = 150.0;
 /// Height of the empty-state placeholder in the Processing column.
 pub const PROC_EMPTY_H: f32 = 96.0;
 /// Gutters at the 750 px pane: Sources|Processing, Processing|Output channels, Output channels|Monitors.
 const GUTTERS: [f32; 3] = [40.0, 40.0, 52.0];
-/// 2 SIDE + 3 cards + processing column + gutters at the minimum pane.
+/// Gutter between two Processing stages at the minimum pane.
+const STAGE_GAP: f32 = 40.0;
+/// 2 SIDE + 3 cards + one Processing stage + gutters at the minimum pane.
 const MIN_PANE: f32 = 750.0;
-/// Module card parts below its channel rows: the vertical meters, the limiter line, one row
-/// each for the fader, every effect and Add effect, and the padding at the foot.
-pub const STRIP_METER_H: f32 = 64.0;
+/// Module card parts below its channel rows (each row holds that channel's meter): the limiter
+/// line, one row each for the fader, every effect and Add effect, and the padding at the foot.
 pub const STRIP_LIMIT_H: f32 = 16.0;
 pub const STRIP_ROW_H: f32 = 32.0;
 const STRIP_PAD: f32 = 8.0;
@@ -63,24 +66,45 @@ pub struct CardSpec {
     pub mute_row: bool,
 }
 
-/// What sizes a module card: its channel rows, its effects, whether it shows a limiter line, and
-/// the height of the effect opened in it (0 when none is).
+/// What sizes and places a module card: its channel rows, its effects, whether it shows a limiter
+/// line, the height of the effect opened in it (0 when none is) and its stage (`stages`).
 #[derive(Clone, Copy, Debug)]
 pub struct NodeSpec {
     pub rows: u16,
     pub fx: usize,
     pub limiter: bool,
     pub open: f32,
+    pub stage: usize,
 }
 
 pub fn strip_height(s: NodeSpec) -> f32 {
     HEAD_H
         + ROW_H * f32::from(s.rows)
-        + STRIP_METER_H
         + if s.limiter { STRIP_LIMIT_H } else { 0.0 }
         + STRIP_ROW_H * (2 + s.fx) as f32
         + s.open
         + STRIP_PAD
+}
+
+/// The Processing stage of each of `count` modules, given the module-to-module wires `(from, to)`:
+/// the longest chain of modules in front of it. A module nothing feeds sits in stage 0, the one
+/// after it in stage 1, so a chain reads left to right and parallel modules share a stage.
+pub fn stages(count: usize, edges: &[(usize, usize)]) -> Vec<usize> {
+    let mut s = vec![0; count];
+    // `count` rounds settle any chain; the cap keeps a cycle (which validate rejects) finite.
+    for _ in 0..count {
+        let mut moved = false;
+        for &(a, b) in edges.iter().filter(|(a, b)| *a < count && *b < count) {
+            if s[b] <= s[a] && s[a] + 1 < count {
+                s[b] = s[a] + 1;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    s
 }
 
 #[derive(Debug)]
@@ -91,10 +115,12 @@ pub struct Layout {
     pub card_w: f32,
     /// Left edge of Sources, Processing, Output channels and Monitors (relative to `origin`).
     pub cols: [f32; 4],
-    /// Width of the Processing column and of every module card in it.
+    /// Width of the whole Processing region: every stage and the gutters between them.
     pub proc_w: f32,
     /// Placeholder shown where the first module goes; `None` once the device has modules.
     pub proc_empty: Option<Rect>,
+    /// Width and height of the graph: never narrower than its columns need, so past the pane it
+    /// scrolls sideways.
     pub size: Vec2,
 }
 
@@ -115,10 +141,11 @@ pub fn card_height(rows: u16, options: bool, expanded: bool, icon: bool, mute_ro
 }
 
 impl Layout {
-    /// `width` is the pane width; `origin` the top-left of the graph area. Four columns, the
-    /// Processing one always present: 48 + 3x150 + 120 + 40 + 40 + 52 = 750 px at the 1000 px
-    /// window. Past that a fifth of every pixel goes to each card, a twentieth to the Processing
-    /// column and the rest to the gutters.
+    /// `width` is the pane width; `origin` the top-left of the graph area. Processing holds one
+    /// column per stage (at least one, empty or not): with one, 48 + 3x150 + 120 + 40 + 40 + 52 =
+    /// 750 px at the 1000 px window, and every stage past the first needs 120 + 40 more. Past what
+    /// the columns need, a fifth of every pixel goes to each card, a twentieth to each stage (up
+    /// to 150 px) and the rest to the gutters; short of it the graph keeps that width and scrolls.
     pub fn compute(
         origin: Pos2,
         width: f32,
@@ -127,12 +154,17 @@ impl Layout {
         monitors: &[CardSpec],
         nodes: &[NodeSpec],
     ) -> Layout {
-        let extra = (width - MIN_PANE).max(0.0);
-        let card_w = (150.0 + 0.2 * (width - MIN_PANE)).clamp(150.0, 250.0);
-        let proc_w = (PROC_W_MIN + 0.05 * extra).clamp(PROC_W_MIN, PROC_W_MAX);
-        let gutter_sum: f32 = GUTTERS.iter().sum();
-        let spare = width - 2.0 * SIDE - 3.0 * card_w - proc_w;
+        let n_stages = nodes.iter().map(|s| s.stage + 1).max().unwrap_or(1);
+        let more = (n_stages - 1) as f32;
+        let width = width.max(MIN_PANE + more * (PROC_W_MIN + STAGE_GAP));
+        let extra = width - MIN_PANE - more * (PROC_W_MIN + STAGE_GAP);
+        let card_w = (150.0 + 0.2 * extra).min(250.0);
+        let stage_w = (PROC_W_MIN + 0.05 * extra).min(PROC_W_MAX);
+        let gutter_sum: f32 = GUTTERS.iter().sum::<f32>() + more * STAGE_GAP;
+        let spare = width - 2.0 * SIDE - 3.0 * card_w - n_stages as f32 * stage_w;
         let k = (spare / gutter_sum).max(1.0);
+        let stage_step = stage_w + STAGE_GAP * k;
+        let proc_w = stage_w + more * stage_step;
         let cols = [
             SIDE,
             SIDE + card_w + GUTTERS[0] * k,
@@ -187,27 +219,26 @@ impl Layout {
                 .enumerate()
                 .map(|(i, s)| (CardId::Mon(i), *s, true)),
         );
-        // Module cards stack down the Processing column.
-        let mut y = TOP;
+        // Module cards: one column per stage, left to right; a stage's modules stack down it.
+        let mut ys = vec![TOP; n_stages];
         for (i, s) in nodes.iter().enumerate() {
             let h = strip_height(*s);
+            let x = cols[1] + s.stage as f32 * stage_step;
             cards.push(CardLayout {
                 id: CardId::Node(i),
-                rect: Rect::from_min_size(origin + vec2(cols[1], y), vec2(proc_w, h)),
+                rect: Rect::from_min_size(origin + vec2(x, ys[s.stage]), vec2(stage_w, h)),
                 rows: s.rows,
                 options: false,
                 expanded: false,
                 icon: false,
             });
-            y += h + GAP;
+            ys[s.stage] += h + GAP;
         }
-        let proc_empty = nodes
-            .is_empty()
-            .then(|| Rect::from_min_size(origin + vec2(cols[1], TOP), vec2(proc_w, PROC_EMPTY_H)));
-        if proc_empty.is_some() {
-            y = TOP + PROC_EMPTY_H + GAP;
-        }
-        height = height.max(y);
+        let proc_empty = nodes.is_empty().then(|| {
+            ys[0] = TOP + PROC_EMPTY_H + GAP;
+            Rect::from_min_size(origin + vec2(cols[1], TOP), vec2(stage_w, PROC_EMPTY_H))
+        });
+        height = ys.into_iter().fold(height, f32::max);
         Layout {
             origin,
             cards,
@@ -446,7 +477,13 @@ mod tests {
             fx: 1,
             limiter: true,
             open: 0.0,
+            stage: 0,
         }
+    }
+
+    /// `k` modules in series: one per stage.
+    fn chain(k: usize) -> Vec<NodeSpec> {
+        (0..k).map(|stage| NodeSpec { stage, ..node() }).collect()
     }
 
     /// Four columns left to right, each card inside its column and the pane.
@@ -460,11 +497,27 @@ mod tests {
     }
 
     #[test]
+    fn stages_follow_the_longest_chain_of_modules() {
+        assert_eq!(stages(3, &[]), [0, 0, 0]);
+        // 0 -> 1 -> 2 in series, listed out of order.
+        assert_eq!(stages(3, &[(1, 2), (0, 1)]), [0, 1, 2]);
+        // 2 feeds 0 and 1 side by side (parallel), both feed 3; 2 also skips straight to 3.
+        assert_eq!(
+            stages(4, &[(2, 0), (2, 1), (0, 3), (1, 3), (2, 3)]),
+            [1, 1, 0, 2]
+        );
+        // A cycle (validate rejects it) still ends, inside the module count.
+        assert!(stages(2, &[(0, 1), (1, 0)]).iter().all(|&s| s < 2));
+        assert_eq!(stages(1, &[(0, 0)]), [0]);
+    }
+
+    #[test]
     fn processing_column_is_always_there_at_the_minimum_window() {
         // 750 px: the graph pane of the 1000 px window; 48 + 3x150 + 120 + 40 + 40 + 52.
         let l = Layout::compute(Pos2::ZERO, 750.0, &[spec()], 1, &[spec()], &[]);
         assert_eq!(l.card_w, 150.0);
         assert_eq!(l.proc_w, PROC_W_MIN);
+        assert_eq!(l.size.x, 750.0);
         assert_eq!(l.cols, [24.0, 214.0, 374.0, 576.0]);
         assert_columns(&l, 750.0);
         // Empty device: a placeholder fills the head of the column, no module cards.
@@ -475,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn module_cards_stack_in_the_processing_column() {
+    fn parallel_modules_stack_in_one_stage() {
         let n = node();
         let l = Layout::compute(Pos2::ZERO, 750.0, &[spec()], 1, &[spec()], &[n, n]);
         assert_columns(&l, 750.0);
@@ -500,6 +553,55 @@ mod tests {
         assert!(l.size.y >= b.bottom());
     }
 
+    /// The 1000 px window: one stage fits the pane; each further stage widens the graph by a
+    /// module card and a gutter, and the pane scrolls sideways over it. Sources and Output
+    /// channels keep their full width.
+    #[test]
+    fn chained_modules_sit_side_by_side_and_scroll_at_the_minimum_window() {
+        for k in 1..=3 {
+            let nodes = chain(k);
+            let l = Layout::compute(Pos2::ZERO, 750.0, &[spec()], 1, &[spec()], &nodes);
+            let want = 750.0 + (k - 1) as f32 * (PROC_W_MIN + STAGE_GAP);
+            assert_eq!(l.size.x, want, "{k} stages");
+            assert_columns(&l, want);
+            assert_eq!(l.card_w, 150.0);
+            let rects: Vec<Rect> = (0..k)
+                .map(|i| l.card(CardId::Node(i)).unwrap().rect)
+                .collect();
+            assert_eq!(rects[0].left(), l.cols[1]);
+            assert_eq!(rects[k - 1].right(), l.cols[1] + l.proc_w);
+            for pair in rects.windows(2) {
+                assert_eq!(pair[0].top(), pair[1].top());
+                assert_eq!(pair[1].left() - pair[0].right(), STAGE_GAP);
+                // A cable from one stage to the next runs straight across the gutter.
+                assert_eq!(pair[0].width(), PROC_W_MIN);
+            }
+            let (a, b) = (
+                l.port_pos(Port::NodeOut { node: 0, ch: 1 }).unwrap(),
+                l.port_pos(Port::NodeIn { node: k - 1, ch: 1 }).unwrap(),
+            );
+            assert!(a.y == b.y && (k == 1 || a.x < b.x));
+        }
+        // Two stages fit a 910 px pane (the default window) without scrolling.
+        let l = Layout::compute(Pos2::ZERO, 950.0, &[spec()], 1, &[spec()], &chain(2));
+        assert_eq!(l.size.x, 950.0);
+        assert_columns(&l, 950.0);
+    }
+
+    /// A chain and a parallel pair: the pair shares the first stage, the chain's tail the next.
+    #[test]
+    fn chain_and_parallel_pair_share_stages() {
+        let nodes = [node(), node(), NodeSpec { stage: 1, ..node() }];
+        let l = Layout::compute(Pos2::ZERO, 750.0, &[spec()], 2, &[spec()], &nodes);
+        assert_columns(&l, l.size.x);
+        let r = |i| l.card(CardId::Node(i)).unwrap().rect;
+        assert_eq!(r(0).left(), r(1).left());
+        assert!((r(1).top() - r(0).bottom() - GAP).abs() < 1e-3);
+        assert_eq!(r(2).top(), TOP);
+        assert!(r(2).left() > r(0).right());
+        assert!(l.size.y >= r(1).bottom());
+    }
+
     #[test]
     fn wide_window_spreads_cards_processing_and_gutters() {
         let l = Layout::compute(Pos2::ZERO, 1400.0, &[spec()], 1, &[spec()], &[node()]);
@@ -513,6 +615,13 @@ mod tests {
         assert!(g1 > 40.0 && (g1 - g2).abs() < 1e-3);
         assert!((g3 / g1 - 52.0 / 40.0).abs() < 1e-3);
         assert!((l.cols[3] + l.card_w - (1400.0 - SIDE)).abs() < 1e-3);
+        // Three stages still fit, each card no wider than the widest stage.
+        let l = Layout::compute(Pos2::ZERO, 1400.0, &[spec()], 1, &[spec()], &chain(3));
+        assert_columns(&l, 1400.0);
+        assert_eq!(l.size.x, 1400.0);
+        let r = |i| l.card(CardId::Node(i)).unwrap().rect;
+        assert!(r(0).width() <= PROC_W_MAX && r(1).left() - r(0).right() >= STAGE_GAP);
+        assert!(l.cols[1] - (l.cols[0] + l.card_w) >= 40.0);
     }
 
     #[test]

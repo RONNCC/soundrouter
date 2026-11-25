@@ -1611,23 +1611,21 @@ impl App {
                 let area =
                     Rect::from_min_max(pos2(full.left(), summary::graph_top(card)), full.max);
                 ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink(false)
-                        .show(ui, |ui| {
-                            let g = GraphCtx {
-                                dev_idx: self.selected,
-                                dev,
-                                hw: &hw,
-                                apps: &apps,
-                                icons: &self.icon_tex,
-                                installed: installed.get().map_or(&[], Vec::as_slice),
-                                reading: reading.as_ref(),
-                                t,
-                                mic,
-                                min_h: area.height(),
-                            };
-                            graph::show(ui, &g, &mut self.graph, edits);
-                        });
+                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                        let g = GraphCtx {
+                            dev_idx: self.selected,
+                            dev,
+                            hw: &hw,
+                            apps: &apps,
+                            icons: &self.icon_tex,
+                            installed: installed.get().map_or(&[], Vec::as_slice),
+                            reading: reading.as_ref(),
+                            t,
+                            mic,
+                            min_h: area.height(),
+                        };
+                        graph::show(ui, &g, &mut self.graph, edits);
+                    });
                 });
             });
     }
